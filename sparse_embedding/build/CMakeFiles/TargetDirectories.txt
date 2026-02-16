@@ -1,0 +1,3 @@
+/Users/admin/Vscode/fluxway/fluxway/sparse_embedding/build/CMakeFiles/_core.dir
+/Users/admin/Vscode/fluxway/fluxway/sparse_embedding/build/CMakeFiles/edit_cache.dir
+/Users/admin/Vscode/fluxway/fluxway/sparse_embedding/build/CMakeFiles/rebuild_cache.dir
