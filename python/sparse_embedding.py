@@ -15,7 +15,7 @@ from jax import lax
 import jax.numpy as jnp
 import numpy as np
 
-from .kv_store import JaxKVStore
+from kv_store import JaxKVStore
 
 
 class SparseEmbedding:
