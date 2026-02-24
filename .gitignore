@@ -20,8 +20,8 @@ rad.json
 *.flf
 #Test results file
 TestResults.xml
-build/
-__pycache__/
+*/build/
+*/__pycache__/
 *.pyc
 *.pyo
 *.pyd
