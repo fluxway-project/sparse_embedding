@@ -1,15 +1,16 @@
 #include <stdexcept>
 #include <future>
 #include <numeric>
+#include <random>
 #include "kv_store.h"
 
 
 
-KVStore::KVStore(std::unordered_map<uint32_t, int>& feature_metas, 
-                 std::unordered_map<uint32_t, ExtValueType>& default_values, 
-                 int num_shards) 
+KVStore::KVStore(std::unordered_map<uint32_t, int> feature_metas,
+                 int init_type,
+                 int num_shards)
     : feature_metas_(feature_metas),
-      default_values_(default_values),
+      init_type_(init_type),
       stores_(num_shards),
       data_arenas_(num_shards),
       mutexes_(num_shards),
@@ -99,9 +100,14 @@ void KVStore::update(const std::vector<KeyType>& keys, const std::vector<ExtValu
 }
 
 
-std::vector<std::optional<ExtValueType>> KVStore::lookup(const std::vector<KeyType>& keys) const {
-    std::vector<std::optional<ExtValueType>> results(keys.size());
+RaggedTensors KVStore::lookup(const std::vector<KeyType>& keys) const {
+    RaggedTensors results;
     
+    std::vector<int> dims = get_embedding_dim(keys);
+    size_t total_size = std::accumulate(dims.begin(), dims.end(), size_t(0));
+    results.values.resize(total_size);
+    results.row_lengths.resize(keys.size(), 0);
+
     auto num_shards = stores_.size();
     std::vector<std::vector<size_t>> per_shard_indices(num_shards);
     for (size_t i = 0; i < keys.size(); ++i) {
@@ -112,7 +118,7 @@ std::vector<std::optional<ExtValueType>> KVStore::lookup(const std::vector<KeyTy
     for (size_t i = 0; i < num_shards; ++i) {
         if (!per_shard_indices[i].empty()) {
             // futures.push_back(std::async(std::launch::async, [this, shard_idx = i, &per_shard_indices, &keys, &results]() {
-            futures.push_back(pool_.enqueue([this, shard_idx = i, &per_shard_indices, &keys, &results]() {
+            futures.push_back(pool_.enqueue([this, shard_idx = i, &per_shard_indices, &keys, &results, &dims]() {
 
                 std::shared_lock<std::shared_mutex> lock(mutexes_[shard_idx]);
                 const auto& store = stores_[shard_idx];
@@ -123,7 +129,10 @@ std::vector<std::optional<ExtValueType>> KVStore::lookup(const std::vector<KeyTy
                     auto it = store.find(key);
                     if (it != store.end()) {
                         const auto& ref = it->second;
-                        results[original_index].emplace(arena.begin() + ref.offset, arena.begin() + ref.offset + ref.size);
+                        int offset = std::accumulate(dims.begin(), dims.begin() + original_index, 0);
+                        std::copy(arena.begin() + ref.offset, arena.begin() + ref.offset + ref.size,
+                                  results.values.begin() + offset);
+                        results.row_lengths[original_index] = ref.size;
                     }
                 }
             }));
@@ -135,8 +144,13 @@ std::vector<std::optional<ExtValueType>> KVStore::lookup(const std::vector<KeyTy
 }
 
 
-std::vector<ExtValueType> KVStore::lookup_or_insert(const std::vector<KeyType>& keys) {
-    std::vector<ExtValueType> results(keys.size());
+RaggedTensors KVStore::lookup_or_insert(const std::vector<KeyType>& keys) {
+    RaggedTensors results;
+
+    std::vector<int> dims = get_embedding_dim(keys);
+    size_t total_size = std::accumulate(dims.begin(), dims.end(), size_t(0));
+    results.values.resize(total_size);
+    results.row_lengths.resize(keys.size(), 0);
 
     auto num_shards = stores_.size();
     std::vector<std::vector<size_t>> per_shard_indices(num_shards);
@@ -148,7 +162,7 @@ std::vector<ExtValueType> KVStore::lookup_or_insert(const std::vector<KeyType>& 
     for (size_t i = 0; i < num_shards; ++i) {
         if (!per_shard_indices[i].empty()) {
             // futures.push_back(std::async(std::launch::async, [this, shard_idx = i, &per_shard_indices, &keys, &results]() {
-            futures.push_back(pool_.enqueue([this, shard_idx = i, &per_shard_indices, &keys, &results]() {
+            futures.push_back(pool_.enqueue([this, shard_idx = i, &per_shard_indices, &keys, &results, &dims]() {
 
                 std::unique_lock<std::shared_mutex> lock(mutexes_[shard_idx]);
                 auto& store = stores_[shard_idx];
@@ -159,18 +173,32 @@ std::vector<ExtValueType> KVStore::lookup_or_insert(const std::vector<KeyType>& 
                     auto it = store.find(key);
                     if (it != store.end()) {
                         const auto& ref = it->second;
-                        results[original_index].assign(arena.begin() + ref.offset, arena.begin() + ref.offset + ref.size);
+                        int offset = std::accumulate(dims.begin(), dims.begin() + original_index, 0);
+                        std::copy(arena.begin() + ref.offset, arena.begin() + ref.offset + ref.size,
+                                  results.values.begin() + offset);
+                        results.row_lengths[original_index] = ref.size;
                     } else {
-                        int offset = arena.size();
                         auto slot = fid_to_slot(key);
-                        auto it1 = default_values_.find(slot);
-                        if (it1 == default_values_.end()) {
-                            throw std::invalid_argument(std::to_string(key) + "-> "+std::to_string(fid_to_slot(key))+", Invalid slot.");
+                        auto it1 = feature_metas_.find(slot);
+                        if (it1 == feature_metas_.end()) {
+                            throw std::invalid_argument(std::to_string(key) + "-> " + std::to_string(slot) + ", Invalid slot.");
                         }
-                        auto& default_value_ = it1->second;
-                        arena.insert(arena.end(), default_value_.begin(), default_value_.end());
-                        store[key] = ValueRef{offset, (int)default_value_.size()};
-                        results[original_index] = default_value_;
+                        int dim = it1->second;
+                        ExtValueType init_value(dim);
+                        if (init_type_ == 0) {
+                            std::fill(init_value.begin(), init_value.end(), 0.0f);
+                        } else {
+                            std::mt19937 rng(static_cast<uint32_t>(key ^ (key >> 32)));
+                            std::uniform_real_distribution<float> dist(-0.05f, 0.05f);
+                            for (int i = 0; i < dim; ++i) init_value[i] = dist(rng);
+                        }
+                        int offset = arena.size();
+                        arena.insert(arena.end(), init_value.begin(), init_value.end());
+                        store[key] = ValueRef{offset, dim};
+
+                        int offset_ = std::accumulate(dims.begin(), dims.begin() + original_index, 0);
+                        std::copy(init_value.begin(), init_value.end(), results.values.begin() + offset_);
+                        results.row_lengths[original_index] = dim;
                     }
                 }
             }));
