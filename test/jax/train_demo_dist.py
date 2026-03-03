@@ -61,7 +61,8 @@ class MyModel(nnx.Module):
 
 
 # ---------- 2. Mesh 与分片 ----------
-devices = mesh_utils.create_device_mesh((total_devices,))
+# cpu
+devices = mesh_utils.create_device_mesh((total_devices,)) 
 mesh = Mesh(devices, axis_names=("data",))
 # 数据：batch 沿 p 分片，每设备 (batch_per_device, features) / (batch_per_device,)
 # 定义数据分片：Batch 维分片，Feature 维不分片
