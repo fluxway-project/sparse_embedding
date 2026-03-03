@@ -37,11 +37,10 @@ class BenchmarkConfig:
 def make_kv_store(dim: int, num_shards: int) -> JaxKVStore:
     """
     构造一个简单配置的 JaxKVStore：
-    - 仅一个 slot（121），维度 dim，默认值为全 0。
+    - 仅一个 slot（121），维度 dim，init_type=0 全 0 初始化。
     """
     feature_metas: Dict[int, int] = {121: dim}
-    default_values: Dict[int, List[float]] = {121: [0.0] * dim}
-    return JaxKVStore(feature_metas, default_values, num_shards=num_shards)
+    return JaxKVStore(feature_metas, init_type=0, num_shards=num_shards)
 
 
 def make_keys(batch_size: int, start_id: int = 0, slot: int = 121) -> np.ndarray:

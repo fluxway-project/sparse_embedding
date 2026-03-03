@@ -60,10 +60,6 @@ def build_feature_metas():
     return {1: 5, 2: 6}
 
 
-def build_default_values():
-    return {1: [1.0] * 5, 2: [2.0] * 6}
-
-
 def build_cate_feature_metas():
     return {3: [4, 10], 4: [5, 10], 5: [6, 10]}
 
@@ -75,7 +71,7 @@ class MyModel(nnx.Module):
         for _, v in cate_feature_metas.items():
             dense_in_features += v[0]
         for _, v in id_feature_metas.items():
-            dense_in_features += v[0]
+            dense_in_features += v
         self.dense = DenseModel(dense_in_features, out_features, rngs=rngs)
 
     def __call__(self, id_emb: jax.Array, x: dict, *, axis_name: str | None = None) -> jax.Array:
@@ -159,9 +155,9 @@ def train():
     
     num_classes = 2
     feature_metas = build_feature_metas()
-    default_values = build_default_values()
-    sp = SparseEmbedding(feature_metas, default_values, num_shards=8)
-    model = MyModel(in_features=64, out_features=num_classes, rngs=nnx.Rngs(0))
+    cate_feature_metas = build_cate_feature_metas()
+    sp = SparseEmbedding(feature_metas, init_type=1, num_shards=8)
+    model = MyModel(cate_feature_metas, feature_metas, out_features=num_classes, rngs=nnx.Rngs(0))
     optimizer = nnx.Optimizer(model, optax.adam(1e-3))
 
     for step in range(10):
@@ -172,14 +168,15 @@ def train():
                 id_inputs[k] = inputs.pop(k)
         inputs = jax.device_put(inputs, data_sharding)
         labels = jax.device_put(labels, data_sharding)
+        
         # id forward
-        id_emb = sp.forward(jnp.concatenate(list(id_inputs.values()), axis=1))
+        id_emb = sp.forward(id_inputs, axis_name="data")
         id_emb = jax.device_put(id_emb, replicated_sharding)
         with mesh:
             loss, grads = train_step(model, optimizer, id_emb, inputs, labels)
             grads = jax.device_get(grads, replicated_sharding)
         # id backward
-        sp.backward(grads)
+        sp.backward(jnp.concatenate(list(id_inputs.values()), axis=1), grads, axis_name="data")
         if rank == 0:
             print(f"Step {step}, Loss: {float(loss):.6f}")
 

@@ -3,10 +3,9 @@ import jax.numpy as jnp
 import numpy as np
 from kv_store import JaxKVStore  # 导入我们的包装类
 
-# 1. 初始化 C++ KV Store（slot_id 为 int；默认向量长度需等于对应 embedding_dim）
+# 1. 初始化 C++ KV Store（init_type: 0=全0, 1=随机）
 feature_metas = {121: 5, 2673: 6}
-default_values = {121: [1.0] * 5, 2673: [2.0] * 6}
-store = JaxKVStore(feature_metas, default_values)
+store = JaxKVStore(feature_metas, init_type=1)
 
 # 2. 插入一些数据（key 的高 16 位为 slot，例如 (121 << 48) | id）
 slot121 = 121 << 48
@@ -40,10 +39,9 @@ print(f"Result (sum of embeddings): {result2}")
 ## init variables
 
 def init_var():
-    # init emb store
+    # init emb store（init_type: 0=全0, 1=随机）
     feature_metas = {121: 5, 2673: 6}
-    default_values = {121: [1.0] * 5, 2673: [2.0] * 6}
-    store = JaxKVStore(feature_metas, default_values)
+    store = JaxKVStore(feature_metas, init_type=1)
     # init monment
 
 

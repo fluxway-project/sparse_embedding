@@ -16,13 +16,9 @@ from sparse_embedding import SparseEmbedding
 
 
 def build_layer():
-    # 两个 slot：121 -> dim=5，2673 -> dim=6
+    # 两个 slot：121 -> dim=5，2673 -> dim=6；init_type=1 随机初始化
     feature_metas = {121: 5, 2673: 6}
-    default_values = {
-        121: [0.0] * 5,
-        2673: [0.0] * 6,
-    }
-    layer = SparseEmbedding(feature_metas, default_values, num_shards=256)
+    layer = SparseEmbedding(feature_metas, init_type=1, num_shards=256)
     return layer
 
 

@@ -1,25 +1,11 @@
 # coding=utf-8
 
 import numpy as np
+import jax
+import jax.numpy as jnp
+
 # try:
 from . import _core  # _core.so/pyd from C++ build
-# except ImportError as e:
-#     raise ImportError(
-#         "kv_store C++ extension '_core' not found. Build it from sparse_embedding with:\n"
-#         "  mkdir -p build && cd build\n"
-#         "  cmake .. -DCMAKE_LIBRARY_OUTPUT_DIRECTORY=\"../python/kv_store\" "
-#         "-Dpybind11_DIR=\"$(python3 -c 'import pybind11; print(pybind11.get_cmake_dir())')\"\n"
-#         "  cmake --build . -j4\n"
-#         "Then ensure python/kv_store/ contains _core.cpython-*.so"
-#     ) from e
-
-def _ensure_jax():
-    try:
-        import jax
-        import jax.numpy as jnp
-        return jax, jnp
-    except ImportError as e:
-        raise ImportError("JAX is required for lookup/lookup_or_insert with JAX arrays. Install with: pip install jax jaxlib") from e
 
 
 def _fid_to_slot(fid: int) -> int:
@@ -30,23 +16,23 @@ def _fid_to_slot(fid: int) -> int:
 class JaxKVStore:
     """
     A JAX-compatible Key-Value store backed by a high-performance C++ implementation.
-    Wraps the C++ KVStore with per-slot feature metas and default values.
+    Wraps the C++ KVStore with per-slot feature metas and init_type.
     """
-    def __init__(self, feature_metas: dict, default_values: dict, num_shards: int = 16):
+    def __init__(self, feature_metas: dict, init_type: int = 0, num_shards: int = 16):
         """
         Args:
             feature_metas: dict mapping slot_id (int) -> embedding_dim (int).
-            default_values: dict mapping slot_id (int) -> default vector (list or 1D ndarray of float).
+            init_type: 0 = 全 0 初始化；1 = 随机初始化（以 key 为 seed，可复现）。
             num_shards: number of shards for concurrent access.
         """
         self.feature_metas = feature_metas
-        self.default_values = default_values
+        self.init_type = init_type
         self.num_shards = num_shards
-        self._store = _core.KVStore(feature_metas, default_values, num_shards)
+        self._store = _core.KVStore(feature_metas, init_type, num_shards)
 
-    def get_embedding_dim(self, fid: int) -> int:
+    def get_embedding_dim(self, fids):
         """Return embedding dimension for the given feature id (fid)."""
-        return self._store.get_embedding_dim(int(fid))
+        return self._store.get_embedding_dim(fids)
 
     def insert_one(self, key: int, value: np.ndarray):
         """Insert a single key-value pair. Prefer batch insert for performance."""
@@ -74,10 +60,27 @@ class JaxKVStore:
         self._store.update(keys_np, values_np)
 
     def _embedding_dim_for_keys(self, keys_np: np.ndarray) -> int:
-        """Embedding dim for the batch: from first key's slot, or first meta value if empty."""
+        """Embedding dim for the batch: max of per-key dims, for ragged output shape."""
         if keys_np.size == 0:
             return next(iter(self.feature_metas.values()), 0)
-        return self._store.get_embedding_dim(int(keys_np.flat[0]))
+        dims = self._store.get_embedding_dim(keys_np.flatten())
+        return max(dims) if dims else 0
+
+    def _ragged_to_array(self, values: np.ndarray, row_lengths: np.ndarray, default_dim: int):
+        """将 RaggedTensors (values, row_lengths) 转为 2D 数组。缺失 key 用零向量填充。"""
+        n = len(row_lengths)
+        if n == 0:
+            return np.zeros((0, default_dim), dtype=np.float32)
+        max_len = int(row_lengths.max()) if row_lengths.max() > 0 else default_dim
+        max_len = max(max_len, 1)
+        out = np.zeros((n, max_len), dtype=np.float32)
+        offset = 0
+        for i in range(n):
+            L = int(row_lengths[i])
+            if L > 0:
+                out[i, :L] = values[offset : offset + L]
+                offset += L
+        return out
 
     def lookup(self, keys):
         """
@@ -85,28 +88,20 @@ class JaxKVStore:
         With JAX arrays, the call is JIT-compilable.
         """
         keys_np = np.asarray(keys, dtype=np.uint64)
-        if not hasattr(keys, 'block_until_ready'):  # NumPy/list path
-            dim = self._embedding_dim_for_keys(keys_np)
-            results = self._store.lookup(keys_np)
-            default_value = np.zeros(dim, dtype=np.float32)
-            return np.array(
-                [np.array(res, dtype=np.float32) if res is not None else default_value for res in results],
-                dtype=np.float32,
-            )
-        jax, jnp = _ensure_jax()
+        dim = self._embedding_dim_for_keys(keys_np)
+
+        def _do_lookup(k_np):
+            values, row_lengths = self._store.lookup(k_np)
+            return self._ragged_to_array(np.asarray(values), np.asarray(row_lengths), dim)
+
+        if not hasattr(keys, 'block_until_ready'):
+            return _do_lookup(keys_np).astype(np.float32)
+
         keys = jnp.asarray(keys, dtype=jnp.uint64)
 
         def lookup_callback(k):
-            k_np = np.asarray(k)
-            dim = self._embedding_dim_for_keys(k_np)
-            results = self._store.lookup(k_np)
-            default_value = np.zeros(dim, dtype=np.float32)
-            return np.array(
-                [np.array(res, dtype=np.float32) if res is not None else default_value for res in results],
-                dtype=np.float32,
-            )
+            return _do_lookup(np.asarray(k))
 
-        dim = self._embedding_dim_for_keys(keys_np)
         result_shape_dtype = jax.ShapeDtypeStruct(
             shape=(keys_np.shape[0], dim),
             dtype=jnp.float32,
@@ -119,18 +114,20 @@ class JaxKVStore:
         With JAX arrays, the call is JIT-compilable.
         """
         keys_np = np.asarray(keys, dtype=np.uint64)
-        if not hasattr(keys, 'block_until_ready'):  # NumPy/list path
-            results = self._store.lookup_or_insert(keys_np)
-            return np.array(results, dtype=np.float32)
-        jax, jnp = _ensure_jax()
+        dim = self._embedding_dim_for_keys(keys_np)
+
+        def _do_lookup_or_insert(k_np):
+            values, row_lengths = self._store.lookup_or_insert(k_np)
+            return self._ragged_to_array(np.asarray(values), np.asarray(row_lengths), dim)
+
+        if not hasattr(keys, 'block_until_ready'):
+            return _do_lookup_or_insert(keys_np).astype(np.float32)
+
         keys = jnp.asarray(keys, dtype=jnp.uint64)
 
         def lookup_or_insert_callback(k):
-            k_np = np.asarray(k)
-            results = self._store.lookup_or_insert(k_np)
-            return np.array(results, dtype=np.float32)
+            return _do_lookup_or_insert(np.asarray(k))
 
-        dim = self._embedding_dim_for_keys(keys_np)
         result_shape_dtype = jax.ShapeDtypeStruct(
             shape=(keys_np.shape[0], dim),
             dtype=jnp.float32,
