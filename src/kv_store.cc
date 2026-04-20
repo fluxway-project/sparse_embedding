@@ -5,7 +5,6 @@
 #include "kv_store.h"
 
 
-
 KVStore::KVStore(std::unordered_map<uint32_t, int> feature_metas,
                  int init_type,
                  int num_shards)
@@ -14,14 +13,13 @@ KVStore::KVStore(std::unordered_map<uint32_t, int> feature_metas,
       stores_(num_shards),
       data_arenas_(num_shards),
       mutexes_(num_shards),
-      pool_(std::thread::hardware_concurrency()) { // Initialize the thread pool
+      pool_(std::thread::hardware_concurrency()) {
     if (num_shards <= 0) {
         throw std::invalid_argument("Number of shards must be positive.");
     }
-    // default_value_ = ExtValueType(default_embedding_dim, 0.0f);
     for (auto& arena : data_arenas_) {
         arena.reserve(1024 * 1024); // Pre-allocate 4MB per shard arena
-     }
+    }
 }
 
 
@@ -39,8 +37,6 @@ void KVStore::insert(const std::vector<KeyType>& keys, const std::vector<ExtValu
     std::vector<std::future<void>> futures;
     for (size_t i = 0; i < num_shards; ++i) {
         if (!per_shard_indices[i].empty()) {
-            // futures.push_back(std::async(std::launch::async, [this, shard_idx = i, &per_shard_indices, &keys, &values]() {
-            // Use the thread pool to execute tasks
             futures.push_back(pool_.enqueue([this, shard_idx = i, &per_shard_indices, &keys, &values]() {
 
                 std::unique_lock<std::shared_mutex> lock(mutexes_[shard_idx]);
@@ -76,7 +72,6 @@ void KVStore::update(const std::vector<KeyType>& keys, const std::vector<ExtValu
     std::vector<std::future<void>> futures;
     for (size_t i = 0; i < num_shards; ++i) {
         if (!per_shard_indices[i].empty()) {
-            // futures.push_back(std::async(std::launch::async, [this, shard_idx = i, &per_shard_indices, &keys, &values]() {
             futures.push_back(pool_.enqueue([this, shard_idx = i, &per_shard_indices, &keys, &values]() {
 
                 std::unique_lock<std::shared_mutex> lock(mutexes_[shard_idx]);
@@ -117,7 +112,6 @@ RaggedTensors KVStore::lookup(const std::vector<KeyType>& keys) const {
     std::vector<std::future<void>> futures;
     for (size_t i = 0; i < num_shards; ++i) {
         if (!per_shard_indices[i].empty()) {
-            // futures.push_back(std::async(std::launch::async, [this, shard_idx = i, &per_shard_indices, &keys, &results]() {
             futures.push_back(pool_.enqueue([this, shard_idx = i, &per_shard_indices, &keys, &results, &dims]() {
 
                 std::shared_lock<std::shared_mutex> lock(mutexes_[shard_idx]);
@@ -161,7 +155,6 @@ RaggedTensors KVStore::lookup_or_insert(const std::vector<KeyType>& keys) {
     std::vector<std::future<void>> futures;
     for (size_t i = 0; i < num_shards; ++i) {
         if (!per_shard_indices[i].empty()) {
-            // futures.push_back(std::async(std::launch::async, [this, shard_idx = i, &per_shard_indices, &keys, &results]() {
             futures.push_back(pool_.enqueue([this, shard_idx = i, &per_shard_indices, &keys, &results, &dims]() {
 
                 std::unique_lock<std::shared_mutex> lock(mutexes_[shard_idx]);

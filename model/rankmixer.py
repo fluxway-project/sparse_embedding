@@ -5,21 +5,23 @@ from flax import nnx
 
 class CategoricalEmbedding(nnx.Module):
     """A categorical embedding layer.
-    
+
     This layer applies a one-hot encoding to the input categorical features.
     """
-    
-    def __init__(self, num_categories: int, embedding_size: int, rngs: nnx.Rngs = nnx.Rngs(0)):
+
+    def __init__(
+        self, num_categories: int, embedding_size: int, rngs: nnx.Rngs = nnx.Rngs(0)
+    ):
         self.num_categories = num_categories
         self.embedding_size = embedding_size
         self.embedding = nnx.Embedding(num_categories, embedding_size, rngs=rngs)
 
     def __call__(self, x: jax.Array) -> jax.Array:
         """Forward pass through the CategoricalEmbedding layer.
-        
+
         Args:
             x: Input tensor of shape (batch_size, num_categories).
-            
+
         Returns:
             Output tensor of shape (batch_size, embedding_size).
         """
@@ -117,7 +119,7 @@ class Tokenization(nnx.Module):
         num_tokens: int,
         intermediate_size: int,
         hidden_size: int,
-        rngs: nnx.Rngs = nnx.Rngs(0)
+        rngs: nnx.Rngs = nnx.Rngs(0),
     ) -> None:
         """Initialize the Tokenization layer.
 

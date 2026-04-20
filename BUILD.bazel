@@ -1,0 +1,25 @@
+"""
+Core BUILD file for the sparse_embedding package.
+Defines the C++ extension module target matching the Python integration.
+"""
+
+load("@rules_cc//cc:defs.bzl", "cc_binary")
+
+cc_binary(
+    name = "_core.so",
+    srcs = [
+        "src/bindings.cc",
+        "src/dlpack_capsule_wrapper.hpp",
+        "src/emb_table.cpp",
+        "src/kv_store.cc",
+        "src/kv_store.h",
+        "src/thread_pool.h",
+    ],
+    linkshared = True,
+    deps = [
+        "@dlpack",
+        "@folly",
+        "@nanobind",
+        "@stdexec",
+    ],
+)
