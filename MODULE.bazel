@@ -34,3 +34,6 @@ use_repo(stdexec_deps, "stdexec")
 
 folly_deps = use_extension("//third_party/folly:extensions.bzl", "folly_dep")
 use_repo(folly_deps, "folly")
+
+proxy_deps = use_extension("//third_party/proxy:extensions.bzl", "proxy_dep")
+use_repo(proxy_deps, "proxy")

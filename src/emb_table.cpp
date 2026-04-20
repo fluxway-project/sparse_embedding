@@ -14,7 +14,7 @@
 #include <exec/static_thread_pool.hpp>
 #include <stdexec/execution.hpp>
 
-#include "dlpack_capsule_wrapper.hpp"
+#include "backend/dlpack_capsule_wrapper.hpp"
 
 namespace nb = nanobind;
 
