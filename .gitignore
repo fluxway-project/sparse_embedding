@@ -12,6 +12,7 @@ MODULE.bazel.lock
 *.o
 *.so
 *.a
+*.out
 
 # Python
 __pycache__/
@@ -23,3 +24,5 @@ dist/
 .idea/
 .vscode/
 .DS_Store
+
+tmp/

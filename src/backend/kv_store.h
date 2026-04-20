@@ -1,5 +1,5 @@
 #pragma once
-#include "thread_pool.h" // Include the new thread pool
+#include "thread_pool.h"
 #include <cstdint>
 #include <future>
 #include <iostream>
