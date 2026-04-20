@@ -1,6 +1,25 @@
+# CMake
 build/
-.vscode/
-.idea/
-__pycache__/
+CMakeCache.txt
+CMakeFiles/
+compile_commands.json
+
+# Bazel
+bazel-*
+MODULE.bazel.lock
+
+# C/C++
+*.o
 *.so
-*.pyc
+*.a
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+dist/
+
+# IDE & OS
+.idea/
+.vscode/
+.DS_Store

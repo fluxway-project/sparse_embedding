@@ -1,0 +1,13 @@
+"""
+stdexec BUILD file.
+Defines the cc_library target to expose stdexec headers internally.
+"""
+
+load("@rules_cc//cc:defs.bzl", "cc_library")
+
+cc_library(
+    name = "stdexec",
+    hdrs = glob(["include/**/*.hpp"]),
+    includes = ["include"],
+    visibility = ["//visibility:public"],
+)

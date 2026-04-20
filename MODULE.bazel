@@ -1,0 +1,36 @@
+"""
+Copyright (C) 2026 Fluxway team. All Rights Reserved.
+
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+
+    http://www.apache.org/licenses/LICENSE-2.0
+
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
+==============================================================================
+"""
+
+module(
+    name = "sparse_embedding",
+    version = "0.0.1",
+)
+
+bazel_dep(name = "nanobind", version = "2.9.2")
+bazel_dep(name = "rules_python", version = "0.36.0")
+
+python = use_extension("@rules_python//python/extensions:python.bzl", "python")
+python.toolchain(python_version = "3.11")
+
+dlpack_deps = use_extension("//third_party/dlpack:extensions.bzl", "dlpack_dep")
+use_repo(dlpack_deps, "dlpack")
+
+stdexec_deps = use_extension("//third_party/stdexec:extensions.bzl", "stdexec_dep")
+use_repo(stdexec_deps, "stdexec")
+
+folly_deps = use_extension("//third_party/folly:extensions.bzl", "folly_dep")
+use_repo(folly_deps, "folly")
