@@ -1,20 +1,33 @@
 """
 Core BUILD file for the sparse_embedding package.
-Defines the C++ extension module target matching the Python integration.
 """
 
 load("@rules_cc//cc:defs.bzl", "cc_binary")
 
+# _core: KVStore Python bindings (slot-based sharded hash map)
 cc_binary(
     name = "_core.so",
     srcs = [
+        "src/backend/kv_store.cc",
+        "src/backend/kv_store.h",
+        "src/backend/thread_pool.h",
         "src/bindings.cc",
-        "src/dlpack_capsule_wrapper.hpp",
-        "src/emb_table.cpp",
-        "src/kv_store.cc",
-        "src/kv_store.h",
-        "src/thread_pool.h",
     ],
+    copts = ["-Isrc"],
+    linkshared = True,
+    deps = [
+        "@nanobind",
+    ],
+)
+
+# emb_table_ext: EmbeddingTable Python bindings (DLPack + folly CHM)
+cc_binary(
+    name = "emb_table_ext.so",
+    srcs = [
+        "src/backend/dlpack_capsule_wrapper.hpp",
+        "src/emb_table.cpp",
+    ],
+    copts = ["-Isrc"],
     linkshared = True,
     deps = [
         "@dlpack",

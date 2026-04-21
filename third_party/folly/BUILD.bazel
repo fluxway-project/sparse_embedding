@@ -1,0 +1,41 @@
+"""
+Folly BUILD file.
+
+folly does not ship Bazel build rules.  Its source is fetched at a pinned tag
+to make the dependency reproducible, but the actual compilation happens via the
+system package (libfolly-dev) because folly relies on dozens of CMake-generated
+config headers that cannot be replicated without running CMake first.
+
+cc_library targets here expose the folly headers from the fetched source tree
+and link against the pre-built system shared library.  Install the matching
+version on build machines:
+  sudo apt install libfolly-dev  # version pinned by FOLLY_TAG in repositories.bzl
+"""
+
+load("@rules_cc//cc:defs.bzl", "cc_library")
+
+licenses(["notice"])  # Apache 2
+
+exports_files(["LICENSE"])
+
+cc_library(
+    name = "folly_concurrent_hash_map",
+    hdrs = glob(
+        ["folly/**/*.h"],
+        allow_empty = True,
+    ),
+    includes = ["."],
+    linkopts = [
+        "-lfolly",
+        "-lglog",
+        "-lgflags",
+        "-ldouble-conversion",
+    ],
+    visibility = ["//visibility:public"],
+)
+
+alias(
+    name = "folly",
+    actual = ":folly_concurrent_hash_map",
+    visibility = ["//visibility:public"],
+)
