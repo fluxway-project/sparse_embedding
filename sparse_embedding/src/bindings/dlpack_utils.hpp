@@ -175,7 +175,7 @@ inline void safe_capsule_destructor(PyObject *obj) {
 // DLPackCapsuleWrapper: __dlpack__ / __dlpack_device__ for Python consumers
 // =============================================================================
 
-class DLPackCapsuleWrapper {
+class __attribute__((visibility("hidden"))) DLPackCapsuleWrapper {
 public:
   DLPackCapsuleWrapper(nb::object capsule, DLDevice device)
       : capsule_(std::move(capsule)), device_(device), consumed_(false) {}

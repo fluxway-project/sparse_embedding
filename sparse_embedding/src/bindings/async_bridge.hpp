@@ -19,13 +19,13 @@
 #define SPARSE_EMBEDDING_ASYNC_BRIDGE_HPP_
 
 #include <nanobind/nanobind.h>
+#include <proxy/proxy.h>
 
-#include <atomic>
-#include <condition_variable>
-#include <functional>
-#include <mutex>
-#include <thread>
+#include <exception>
 #include <utility>
+
+#include <exec/static_thread_pool.hpp>
+#include <stdexec/execution.hpp>
 
 #include "python_wake_manager.hpp"
 
@@ -34,43 +34,64 @@ namespace se::py {
 namespace nb = nanobind;
 
 // =============================================================================
-// AsyncTracker: tracks outstanding async operations for safe shutdown
-//
-// Each async operation is dispatched on a detached std::thread. The tracker
-// counts outstanding operations and blocks in wait_all() / destructor until
-// all complete.
+// AsyncTask: pro::proxy-backed type-erased move-only callable (void())
 // =============================================================================
 
-class AsyncTracker {
-public:
-  void spawn(std::function<void()> fn) {
-    outstanding_.fetch_add(1, std::memory_order_relaxed);
-    std::thread([this, fn = std::move(fn)]() mutable {
-      fn();
-      if (outstanding_.fetch_sub(1, std::memory_order_acq_rel) == 1) {
-        std::lock_guard lock(mutex_);
-        cv_.notify_all();
-      }
-    }).detach();
-  }
+PRO_DEF_MEM_DISPATCH(MemInvoke, operator());
 
-  void wait_all() {
-    std::unique_lock lock(mutex_);
-    cv_.wait(lock, [this]() {
-      return outstanding_.load(std::memory_order_acquire) == 0;
-    });
-  }
+struct AsyncTaskFacade
+    : pro::facade_builder ::add_convention<MemInvoke, void()>::support_copy<
+          pro::constraint_level::none>::build {};
 
-  ~AsyncTracker() { wait_all(); }
+// =============================================================================
+// fire_and_forget_receiver: custom receiver for manually connecting to
+// a pool scheduler sender. Self-deletes operation state on completion.
+//
+// This bypasses start_detached's __constant_completion_signatures_v check
+// that is incompatible with static_thread_pool in this stdexec version.
+// =============================================================================
 
-private:
-  std::atomic<size_t> outstanding_{0};
-  std::mutex mutex_;
-  std::condition_variable cv_;
+namespace detail {
+
+struct op_base {
+  virtual ~op_base() = default;
 };
 
-// =============================================================================
-// create_asyncio_future: create a Future from the running event loop (GIL held)
+struct fire_forget_receiver {
+  using receiver_concept = stdexec::receiver_t;
+
+  op_base *op_;
+
+  template <class... As> void set_value(As &&...) noexcept { delete op_; }
+
+  template <class E> [[noreturn]] void set_error(E &&) noexcept {
+    std::terminate();
+  }
+
+  void set_stopped() noexcept { delete op_; }
+
+  auto get_env() const noexcept { return stdexec::empty_env{}; }
+};
+
+template <typename OpState> struct op_impl : op_base {
+  OpState state_;
+
+  template <typename Sender>
+  explicit op_impl(Sender &&sndr)
+      : state_(stdexec::connect(std::forward<Sender>(sndr),
+                                fire_forget_receiver{this})) {}
+
+  void start() { stdexec::start(state_); }
+};
+
+template <typename Sender> void fire_and_forget(Sender &&sndr) {
+  using op_t = op_impl<stdexec::connect_result_t<Sender, fire_forget_receiver>>;
+  auto *op = new op_t(std::forward<Sender>(sndr));
+  op->start();
+}
+
+} // namespace detail
+
 // =============================================================================
 
 inline nb::object create_asyncio_future() {
@@ -80,41 +101,54 @@ inline nb::object create_asyncio_future() {
 }
 
 // =============================================================================
-// async_dispatch: bridge a blocking C++ operation to asyncio.Future
+// async_dispatch: bridge exec::static_thread_pool to asyncio.Future
 //
 // 1. Creates Future (with GIL, on caller thread)
-// 2. Spawns background thread where:
-//    a. work() runs WITHOUT GIL (background thread never holds GIL)
-//    b. Result callback is enqueued to PythonWakeManager (edge-triggered)
-// 3. Returns Future immediately to Python
+// 2. Type-erases work lambda via pro::proxy<AsyncTaskFacade>
+// 3. Builds sender: schedule(pool) | then(task)
+// 4. fire_and_forget: manually connect + start (bypasses start_detached
+//    concept limitations, same mechanism, custom receiver)
+// 5. Pool worker thread executes task, enqueues result to wake manager
+// 6. Returns Future immediately to Python
 //
-// The on_complete callback runs with GIL held inside PythonWakeManager::Drain.
-// The nb::object (future_ref) is moved into the Drain callback so its
-// destructor runs with GIL held — no ref count manipulation without GIL.
+// All execution on exec::static_thread_pool worker threads. Zero extra threads.
 // =============================================================================
 
 template <typename WorkFn, typename CompleteFn>
-nb::object async_dispatch(AsyncTracker &tracker, WorkFn &&work,
+nb::object async_dispatch(exec::static_thread_pool &pool, WorkFn &&work,
                           CompleteFn &&on_complete) {
   nb::object future = create_asyncio_future();
 
-  tracker.spawn([work = std::forward<WorkFn>(work),
-                 on_complete = std::forward<CompleteFn>(on_complete),
-                 future_ref = nb::borrow(future)]() mutable {
-    // Background thread: never holds GIL.
-    // No nb::gil_scoped_release needed (we never acquired it).
+  pro::proxy<AsyncTaskFacade> erased_task = pro::make_proxy<AsyncTaskFacade>(
+      [work = std::forward<WorkFn>(work),
+       on_complete = std::forward<CompleteFn>(on_complete),
+       future_ref = nb::borrow(future)]() mutable {
+        try {
+          auto result = work();
+          GetPythonWakeManager().Enqueue(
+              [on_complete = std::move(on_complete),
+               future_ref = std::move(future_ref),
+               result = std::move(result)]() mutable {
+                on_complete(std::move(future_ref), std::move(result));
+              });
+        } catch (...) {
+          auto eptr = std::current_exception();
+          GetPythonWakeManager().Enqueue([future_ref = std::move(future_ref),
+                                          eptr = std::move(eptr)]() mutable {
+            try {
+              std::rethrow_exception(eptr);
+            } catch (const std::exception &e) {
+              nb::module_ builtins = nb::module_::import_("builtins");
+              future_ref.attr("set_exception")(
+                  builtins.attr("RuntimeError")(e.what()));
+            }
+          });
+        }
+      });
 
-    auto result_or_error = work();
-
-    // Enqueue callback to run with GIL inside Drain().
-    // Move future_ref into the callback so it is destroyed with GIL held.
-    GetPythonWakeManager().Enqueue(
-        [on_complete = std::move(on_complete),
-         future_ref = std::move(future_ref),
-         result = std::move(result_or_error)]() mutable {
-          on_complete(std::move(future_ref), std::move(result));
-        });
-  });
+  detail::fire_and_forget(
+      stdexec::schedule(pool.get_scheduler()) |
+      stdexec::then([t = std::move(erased_task)]() mutable { (*t)(); }));
 
   return future;
 }

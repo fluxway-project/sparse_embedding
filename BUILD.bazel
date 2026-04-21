@@ -2,7 +2,7 @@
 Core BUILD file for the sparse_embedding package.
 
 Single unified _core.so target:
-  multi-slot FollyEmbeddingStore + DLPack zero-copy bindings + asyncio bridge
+  multi-slot HogwildEmbeddingStore + DLPack zero-copy bindings + stdexec parallelism
 """
 
 load("@hedron_compile_commands//:refresh_compile_commands.bzl", "refresh_compile_commands")
@@ -24,18 +24,96 @@ refresh_compile_commands(
     },
 )
 
-# ---- Backend library (Hogwild CHM + stdexec) ----
+# ---- Base and Utility Libraries ----
 
 cc_library(
-    name = "hogwild_embedding_store",
-    srcs = ["sparse_embedding/src/backend/hogwild/hogwild_embedding_store.cpp"],
+    name = "common",
     hdrs = [
-        "sparse_embedding/src/backend/hogwild/hogwild_embedding_store.hpp",
         "sparse_embedding/src/common/embedding_error.hpp",
         "sparse_embedding/src/common/numeric_types.hpp",
     ],
     copts = ["-Isparse_embedding/src"],
+)
+
+cc_library(
+    name = "simd",
+    hdrs = ["sparse_embedding/src/simd/simd_ops.hpp"],
+    copts = ["-Isparse_embedding/src"],
+)
+
+# ---- Interface Libraries ----
+
+cc_library(
+    name = "interface",
+    hdrs = [
+        "sparse_embedding/src/interface/embedding_config.hpp",
+        "sparse_embedding/src/interface/embedding_table_interface.hpp",
+        "sparse_embedding/src/interface/initializer_interface.hpp",
+        "sparse_embedding/src/interface/optimizer_interface.hpp",
+    ],
+    copts = ["-Isparse_embedding/src"],
     deps = [
+        ":common",
+        "@proxy",
+    ],
+)
+
+# ---- Core Components ----
+
+cc_library(
+    name = "initializer",
+    hdrs = [
+        "sparse_embedding/src/initializer/initializer_config.hpp",
+        "sparse_embedding/src/initializer/uniform_initializer.hpp",
+        "sparse_embedding/src/initializer/zeros_initializer.hpp",
+    ],
+    copts = ["-Isparse_embedding/src"],
+    deps = [
+        ":interface",
+        ":simd",
+    ],
+)
+
+cc_library(
+    name = "optimizer",
+    hdrs = [
+        "sparse_embedding/src/optimizer/adam_optimizer.hpp",
+        "sparse_embedding/src/optimizer/optimizer_config.hpp",
+        "sparse_embedding/src/optimizer/optimizer_state.hpp",
+        "sparse_embedding/src/optimizer/sgd_optimizer.hpp",
+    ],
+    copts = ["-Isparse_embedding/src"],
+    deps = [
+        ":interface",
+    ],
+)
+
+cc_library(
+    name = "arena",
+    hdrs = ["sparse_embedding/src/arena/transient_arena.hpp"],
+    copts = ["-Isparse_embedding/src"],
+    deps = [
+        ":simd",
+        "@robin_map",
+        "@unordered_dense",
+    ],
+)
+
+# ---- Backend library (Hogwild + stdexec + SIMD + Adam) ----
+
+cc_library(
+    name = "hogwild_embedding_store",
+    srcs = ["sparse_embedding/src/backend/hogwild/hogwild_embedding_store.cpp"],
+    hdrs = ["sparse_embedding/src/backend/hogwild/hogwild_embedding_store.hpp"],
+    copts = ["-Isparse_embedding/src"],
+    deps = [
+        ":arena",
+        ":common",
+        ":initializer",
+        ":interface",
+        ":optimizer",
+        ":simd",
+        "@proxy",
         "@robin_map",
         "@stdexec",
         "@unordered_dense",
@@ -56,9 +134,14 @@ cc_binary(
     copts = ["-Isparse_embedding/src"],
     linkshared = True,
     deps = [
+        ":common",
         ":hogwild_embedding_store",
+        ":initializer",
+        ":interface",
+        ":optimizer",
         "@dlpack",
         "@nanobind",
+        "@proxy",
     ],
 )
 

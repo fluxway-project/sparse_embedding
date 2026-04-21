@@ -28,9 +28,12 @@ find . -type f \( \
 	-o -name "WORKSPACE" \
 	\) -exec buildifier {} \;
 
-# Format Python files using Black with Google style (line length 100)
+# Format Python files using ruff
 find . -type d -name "bazel-*" -prune -o -type f \( \
 	-name "*.py" \
-	\) -print0 | xargs -0 black --target-version=py311
+	\) -print0 | xargs -0 ruff format
+find . -type d -name "bazel-*" -prune -o -type f \( \
+	-name "*.py" \
+	\) -print0 | xargs -0 ruff check --fix
 
 echo "Formatting complete."

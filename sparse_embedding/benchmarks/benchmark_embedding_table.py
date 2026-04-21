@@ -1,54 +1,88 @@
-import asyncio
-import numpy as np
 import time
-
+import numpy as np
 import sparse_embedding
 
 
-def benchmark_embedding_table_lookup():
-    slot_dims = {0: 128}
-    store = sparse_embedding.EmbeddingStore(
-        slot_dims, num_threads=4, init_type=0, dtype="float32"
-    )
+class BenchmarkRunner:
+    def __init__(self, name: str, iters: int = 10):
+        self.name = name
+        self.iters = iters
 
-    # Pre-insert 1M keys
-    keys = np.arange(1000000, dtype=np.int64)
-    values = np.random.rand(1000000, 128).astype(np.float32)
-    store.assign(keys, values)
+    def run(self, func, batch_size: int):
+        start = time.perf_counter()
+        for _ in range(self.iters):
+            func()
+        end = time.perf_counter()
 
-    # Benchmark Lookup
-    lookup_keys = np.random.randint(0, 1000000, size=100000, dtype=np.int64)
+        total_time = end - start
+        total_operations = (
+            len(batch_size) * self.iters
+            if isinstance(batch_size, np.ndarray)
+            else batch_size * self.iters
+        )
+        mops = (total_operations / total_time) / 1e6
 
-    start = time.time()
-    for _ in range(10):
-        # lookup 100k keys
-        store.lookup(lookup_keys)
-    end = time.time()
-
-    print(
-        f"EmbeddingTable Lookup 100k elements (10 iters) Time: {(end - start) * 1000:.2f} ms"
-    )
+        print(
+            f"[{self.name}] Batch Size: {batch_size:<10} | "
+            f"Time: {total_time * 1000:8.2f} ms | "
+            f"Throughput: {mops:8.2f} MOPS"
+        )
 
 
-def benchmark_embedding_table_lookup_or_insert():
-    slot_dims = {0: 128}
-    store = sparse_embedding.EmbeddingStore(
-        slot_dims, num_threads=4, init_type=0, dtype="float32"
-    )
+class EmbeddingTableBenchmark:
+    def __init__(self, dim: int = 128, num_threads: int = 4):
+        self.dim = dim
+        self.num_threads = num_threads
+        self.store = self._create_store()
 
-    # Benchmark Lookup or Insert
-    lookup_keys = np.random.randint(0, 500000, size=100000, dtype=np.int64)
+    def _create_store(self) -> sparse_embedding.EmbeddingStore:
+        slot_dims = {0: self.dim}
+        config = sparse_embedding.EmbeddingConfig(
+            slot_dims=slot_dims, num_threads=self.num_threads, dtype="float32"
+        )
+        initializer = sparse_embedding.Zeros()
+        return sparse_embedding.EmbeddingStore(
+            embedding_config=config, initializer_config=initializer
+        )
 
-    start = time.time()
-    for _ in range(10):
-        store.lookup_or_insert(lookup_keys)
-    end = time.time()
+    def benchmark_insertion(self, batch_sizes: list[int], iters: int = 10):
+        print(
+            f"=== Insertion Benchmark (lookup_or_insert) [Threads: {self.num_threads}] ==="
+        )
+        for batch_size in batch_sizes:
+            runner = BenchmarkRunner("Insert", iters=iters)
+            keys = np.random.randint(
+                0, batch_size * 10, size=batch_size, dtype=np.int64
+            )
+            runner.run(lambda: self.store.lookup_or_insert(keys), batch_size)
 
-    print(
-        f"EmbeddingTable LookupOrInsert 100k elements (10 iters) Time: {(end - start) * 1000:.2f} ms"
-    )
+    def benchmark_query(self, batch_sizes: list[int], iters: int = 10):
+        print(f"\n=== Query Benchmark (lookup) [Threads: {self.num_threads}] ===")
+        max_batch = max(batch_sizes) if batch_sizes else 1000000
+        num_keys = max(2000000, max_batch * 2)
+
+        pre_insert_keys = np.arange(num_keys, dtype=np.int64)
+        pre_insert_values = np.random.rand(num_keys, self.dim).astype(np.float32)
+        self.store.assign(pre_insert_keys, pre_insert_values)
+
+        for batch_size in batch_sizes:
+            runner = BenchmarkRunner("Lookup", iters=iters)
+            keys = np.random.randint(0, num_keys, size=batch_size, dtype=np.int64)
+            runner.run(lambda: self.store.lookup(keys), batch_size)
+
+
+def main():
+    thread_counts = [1, 2, 4, 8, 16]
+    batch_sizes = [10000, 100000, 1000000]
+
+    for num_threads in thread_counts:
+        print("\n\n===============================================")
+        print(f"Testing with {num_threads} Threads")
+        print("===============================================")
+        benchmark = EmbeddingTableBenchmark(dim=128, num_threads=num_threads)
+        benchmark.benchmark_insertion(batch_sizes, iters=10)
+        benchmark.benchmark_query(batch_sizes, iters=10)
 
 
 if __name__ == "__main__":
-    benchmark_embedding_table_lookup()
-    benchmark_embedding_table_lookup_or_insert()
+    main()

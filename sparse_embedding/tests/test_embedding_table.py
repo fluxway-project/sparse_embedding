@@ -1,4 +1,3 @@
-import asyncio
 import numpy as np
 
 import sparse_embedding
@@ -8,7 +7,10 @@ def test_embedding_table_basic():
     # 1 slot, dimension 128
     slot_dims = {0: 128}
     store = sparse_embedding.EmbeddingStore(
-        slot_dims, num_threads=4, init_type=0, dtype="float32"
+        embedding_config=sparse_embedding.EmbeddingConfig(
+            slot_dims=slot_dims, num_threads=4, dtype="float32"
+        ),
+        initializer_config=sparse_embedding.Zeros(),
     )
 
     assert store.num_slots() == 1
@@ -35,7 +37,10 @@ def test_embedding_table_basic():
 def test_embedding_table_assign():
     slot_dims = {0: 128}
     store = sparse_embedding.EmbeddingStore(
-        slot_dims, num_threads=4, init_type=0, dtype="float32"
+        embedding_config=sparse_embedding.EmbeddingConfig(
+            slot_dims=slot_dims, num_threads=4, dtype="float32"
+        ),
+        initializer_config=sparse_embedding.Zeros(),
     )
 
     keys = np.array([10, 20], dtype=np.int64)

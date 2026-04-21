@@ -17,6 +17,7 @@
 #include <nanobind/ndarray.h>
 #include <nanobind/stl/string.h>
 #include <nanobind/stl/unordered_map.h>
+#include <nanobind/stl/variant.h>
 #include <nanobind/stl/vector.h>
 
 #include <dlpack/dlpack.h>
@@ -37,7 +38,15 @@
 #include "bindings/async_bridge.hpp"
 #include "bindings/dlpack_utils.hpp"
 #include "bindings/python_wake_manager.hpp"
+#include "initializer/initializer_config.hpp"
+#include "initializer/uniform_initializer.hpp"
+#include "initializer/zeros_initializer.hpp"
+#include "interface/embedding_config.hpp"
+#include "interface/embedding_table_interface.hpp"
 #include "ops/tensor_ops.hpp"
+#include "optimizer/adam_optimizer.hpp"
+#include "optimizer/optimizer_config.hpp"
+#include "optimizer/sgd_optimizer.hpp"
 
 namespace nb = nanobind;
 
@@ -49,7 +58,7 @@ inline void check_error(std::error_code ec) {
 }
 
 // =============================================================================
-// KeyDType detection from ndarray
+// KeyDType detection
 // =============================================================================
 
 enum class KeyDType { kInt64, kUInt64 };
@@ -73,10 +82,6 @@ keys_span(const nb::ndarray<nb::c_contig, nb::device::cpu> &arr) {
   return {static_cast<const KeyT *>(arr.data()), arr.shape(0)};
 }
 
-// =============================================================================
-// dispatch_on_key: run a lambda with the correct KeyT deduced from ndarray
-// =============================================================================
-
 template <typename Fn>
 auto dispatch_on_key(const nb::ndarray<nb::c_contig, nb::device::cpu> &keys,
                      Fn &&fn) {
@@ -87,72 +92,179 @@ auto dispatch_on_key(const nb::ndarray<nb::c_contig, nb::device::cpu> &keys,
 }
 
 // =============================================================================
-// EmbeddingStoreWrapper: type-erased wrapper (variant over ValT)
+// Builder Proxies for Initializers and Optimizers
+// =============================================================================
+
+struct PyOptimizer {
+  std::shared_ptr<pro::proxy<se::OptimizerBuilderFacade>> builder;
+};
+
+struct PyInitializer {
+  std::shared_ptr<pro::proxy<se::InitializerBuilderFacade>> builder;
+};
+
+template <template <typename> class OptT, typename ConfigT>
+struct DefaultOptimizerBuilder {
+  ConfigT config;
+
+  pro::proxy<se::OptimizerFacade<float>> build_f32(size_t dim) {
+    return pro::make_proxy<se::OptimizerFacade<float>, OptT<float>>(dim,
+                                                                    config);
+  }
+  pro::proxy<se::OptimizerFacade<se::float16_t>> build_f16(size_t dim) {
+    return pro::make_proxy<se::OptimizerFacade<se::float16_t>,
+                           OptT<se::float16_t>>(dim, config);
+  }
+  pro::proxy<se::OptimizerFacade<se::bfloat16_t>> build_bf16(size_t dim) {
+    return pro::make_proxy<se::OptimizerFacade<se::bfloat16_t>,
+                           OptT<se::bfloat16_t>>(dim, config);
+  }
+};
+
+struct ZerosInitializerBuilder {
+  pro::proxy<se::InitializerFacade<float>> build_f32() {
+    return pro::make_proxy<se::InitializerFacade<float>,
+                           se::ZerosInitializer<float>>();
+  }
+  pro::proxy<se::InitializerFacade<se::float16_t>> build_f16() {
+    return pro::make_proxy<se::InitializerFacade<se::float16_t>,
+                           se::ZerosInitializer<se::float16_t>>();
+  }
+  pro::proxy<se::InitializerFacade<se::bfloat16_t>> build_bf16() {
+    return pro::make_proxy<se::InitializerFacade<se::bfloat16_t>,
+                           se::ZerosInitializer<se::bfloat16_t>>();
+  }
+};
+
+struct UniformInitializerBuilder {
+  float min_val, max_val;
+  pro::proxy<se::InitializerFacade<float>> build_f32() {
+    return pro::make_proxy<se::InitializerFacade<float>,
+                           se::UniformInitializer<float>>(min_val, max_val);
+  }
+  pro::proxy<se::InitializerFacade<se::float16_t>> build_f16() {
+    return pro::make_proxy<se::InitializerFacade<se::float16_t>,
+                           se::UniformInitializer<se::float16_t>>(min_val,
+                                                                  max_val);
+  }
+  pro::proxy<se::InitializerFacade<se::bfloat16_t>> build_bf16() {
+    return pro::make_proxy<se::InitializerFacade<se::bfloat16_t>,
+                           se::UniformInitializer<se::bfloat16_t>>(min_val,
+                                                                   max_val);
+  }
+};
+
+// =============================================================================
+// EmbeddingStoreWrapper: proxy wrapper for orthogonality
 // =============================================================================
 
 class EmbeddingStoreWrapper {
-  using StoreVar =
-      std::variant<std::unique_ptr<se::HogwildEmbeddingStore<float>>,
-                   std::unique_ptr<se::HogwildEmbeddingStore<se::float16_t>>,
-                   std::unique_ptr<se::HogwildEmbeddingStore<se::bfloat16_t>>>;
+  using StoreProxyVariant =
+      std::variant<pro::proxy<se::EmbeddingTableFacade<float>>,
+                   pro::proxy<se::EmbeddingTableFacade<se::float16_t>>,
+                   pro::proxy<se::EmbeddingTableFacade<se::bfloat16_t>>>;
+  StoreProxyVariant store_;
+  exec::static_thread_pool async_pool_;
+  std::unordered_map<uint32_t, size_t> slot_dims_;
+  size_t max_dim_ = 0;
+  std::string dtype_;
 
-  StoreVar store_;
-  se::py::AsyncTracker async_tracker_;
+  template <typename ValT> auto &get_store() {
+    return std::get<pro::proxy<se::EmbeddingTableFacade<ValT>>>(store_);
+  }
 
-  template <typename Fn> auto visit_store(Fn &&fn) {
-    return std::visit([&](auto &ptr) -> decltype(auto) { return fn(*ptr); },
-                      store_);
+  template <typename Fn> auto dispatch_val(Fn &&fn) {
+    if (dtype_ == "float32" || dtype_ == "f32")
+      return fn.template operator()<float>();
+    if (dtype_ == "float16" || dtype_ == "f16")
+      return fn.template operator()<se::float16_t>();
+    if (dtype_ == "bfloat16" || dtype_ == "bf16")
+      return fn.template operator()<se::bfloat16_t>();
+    throw std::invalid_argument("unsupported dtype: " + dtype_);
+  }
+
+  size_t compute_output_size(auto ks, std::span<int64_t> out_row_lengths) {
+    size_t total = 0;
+    for (size_t i = 0; i < ks.size(); ++i) {
+      uint64_t key = static_cast<uint64_t>(ks[i]);
+      uint32_t slot_id = static_cast<uint32_t>((key >> 48) & 0xFFFF);
+      auto dim = static_cast<int64_t>(slot_dims_.at(slot_id));
+      out_row_lengths[i] = dim;
+      total += dim;
+    }
+    return total;
   }
 
 public:
-  EmbeddingStoreWrapper(std::unordered_map<uint32_t, size_t> slot_dims,
-                        size_t num_threads, int init_type,
-                        const std::string &dtype) {
-    auto itype =
-        (init_type == 0)
-            ? se::HogwildEmbeddingStore<float>::InitType::kZeros
-            : se::HogwildEmbeddingStore<float>::InitType::kRandomSeeded;
-    size_t nt = (num_threads == 0)
-                    ? std::max(1u, std::thread::hardware_concurrency())
-                    : num_threads;
-
-    if (dtype == "float32" || dtype == "f32") {
-      store_ = std::make_unique<se::HogwildEmbeddingStore<float>>(
-          std::move(slot_dims), nt, itype);
-    } else if (dtype == "float16" || dtype == "f16") {
-      store_ = std::make_unique<se::HogwildEmbeddingStore<se::float16_t>>(
-          std::move(slot_dims), nt,
-          static_cast<se::HogwildEmbeddingStore<se::float16_t>::InitType>(
-              itype));
-    } else if (dtype == "bfloat16" || dtype == "bf16") {
-      store_ = std::make_unique<se::HogwildEmbeddingStore<se::bfloat16_t>>(
-          std::move(slot_dims), nt,
-          static_cast<se::HogwildEmbeddingStore<se::bfloat16_t>::InitType>(
-              itype));
-    } else {
-      throw std::invalid_argument("unsupported dtype: " + dtype);
+  EmbeddingStoreWrapper(const se::EmbeddingConfig &emb_cfg,
+                        PyInitializer init_cfg, PyOptimizer opt_cfg)
+      : async_pool_((emb_cfg.num_threads == 0)
+                        ? std::max(1u, std::thread::hardware_concurrency())
+                        : emb_cfg.num_threads),
+        slot_dims_(emb_cfg.slot_dims), dtype_(emb_cfg.dtype) {
+    for (auto &[slot, dim] : slot_dims_) {
+      if (dim > max_dim_)
+        max_dim_ = dim;
     }
+
+    size_t nt = (emb_cfg.num_threads == 0)
+                    ? std::max(1u, std::thread::hardware_concurrency())
+                    : emb_cfg.num_threads;
+
+    auto construct = [&]<typename ValT>() {
+      pro::proxy<se::InitializerFacade<ValT>> init_proxy;
+
+      if constexpr (std::is_same_v<ValT, float>) {
+        init_proxy = (*init_cfg.builder)->build_f32();
+      } else if constexpr (std::is_same_v<ValT, se::float16_t>) {
+        init_proxy = (*init_cfg.builder)->build_f16();
+      } else if constexpr (std::is_same_v<ValT, se::bfloat16_t>) {
+        init_proxy = (*init_cfg.builder)->build_bf16();
+      }
+
+      using OptFacade = se::OptimizerFacade<ValT>;
+      using OptFactory = std::function<pro::proxy<OptFacade>(size_t)>;
+
+      OptFactory opt_factory;
+
+      if constexpr (std::is_same_v<ValT, float>) {
+        opt_factory = [builder = opt_cfg.builder](size_t d) mutable {
+          return (*builder)->build_f32(d);
+        };
+      } else if constexpr (std::is_same_v<ValT, se::float16_t>) {
+        opt_factory = [builder = opt_cfg.builder](size_t d) mutable {
+          return (*builder)->build_f16(d);
+        };
+      } else if constexpr (std::is_same_v<ValT, se::bfloat16_t>) {
+        opt_factory = [builder = opt_cfg.builder](size_t d) mutable {
+          return (*builder)->build_bf16(d);
+        };
+      }
+
+      using StoreType = se::HogwildEmbeddingStore<ValT>;
+      store_ = pro::make_proxy<se::EmbeddingTableFacade<ValT>, StoreType>(
+          slot_dims_, nt, std::move(init_proxy), emb_cfg.grad_accum_steps,
+          emb_cfg.max_active_keys, std::move(opt_factory));
+    };
+
+    dispatch_val(construct);
   }
 
   // ---- Metadata ----
 
   size_t total_size() {
-    return visit_store([](auto &s) { return s.total_size(); });
+    size_t sz = 0;
+    dispatch_val([&]<typename ValT>() { sz = get_store<ValT>()->size(); });
+    return sz;
   }
 
-  size_t max_dim() {
-    return visit_store([](auto &s) { return s.max_dim(); });
-  }
+  size_t max_dim() { return max_dim_; }
 
-  size_t num_slots() {
-    return visit_store([](auto &s) { return s.num_slots(); });
-  }
+  size_t num_slots() { return slot_dims_.size(); }
 
-  size_t dim_for_slot(uint32_t slot_id) {
-    return visit_store([=](auto &s) { return s.dim_for_slot(slot_id); });
-  }
+  size_t dim_for_slot(uint32_t slot_id) { return slot_dims_.at(slot_id); }
 
-  // ---- get_dims: return per-key dims ----
+  // ---- get_dims ----
 
   nb::object get_dims(nb::ndarray<nb::c_contig, nb::device::cpu> keys) {
     size_t n = keys.shape(0);
@@ -161,149 +273,44 @@ public:
         se::py::create_output_tensor<int64_t>(std::span(shape));
     auto *out = static_cast<int64_t *>(dlm->dl_tensor.data);
 
-    visit_store([&](auto &s) {
-      dispatch_on_key(keys, [&](auto ks) {
-        for (size_t i = 0; i < n; ++i) {
-          out[i] =
-              static_cast<int64_t>(s.dim_for_key(static_cast<uint64_t>(ks[i])));
-        }
-      });
+    dispatch_on_key(keys, [&](auto ks) {
+      for (size_t i = 0; i < n; ++i) {
+        uint64_t key = static_cast<uint64_t>(ks[i]);
+        uint32_t slot_id = static_cast<uint32_t>((key >> 48) & 0xFFFF);
+        out[i] = static_cast<int64_t>(slot_dims_.at(slot_id));
+      }
     });
 
     return se::py::wrap_output_tensor(dlm);
   }
 
-  // ---- Sync Lookup (ragged) ----
+  // ---- Sync Lookup ----
 
   nb::tuple lookup(nb::ndarray<nb::c_contig, nb::device::cpu> keys) {
-    return visit_store(
-        [&](auto &store) -> nb::tuple { return lookup_impl(store, keys); });
-  }
-
-  // ---- Sync lookup_or_insert ----
-
-  nb::tuple lookup_or_insert(nb::ndarray<nb::c_contig, nb::device::cpu> keys) {
-    return visit_store([&](auto &store) -> nb::tuple {
-      return lookup_or_insert_impl(store, keys);
-    });
-  }
-
-  // ---- Sync assign ----
-
-  void assign(nb::ndarray<nb::c_contig, nb::device::cpu> keys,
-              nb::ndarray<nb::c_contig, nb::device::cpu> values) {
-    visit_store([&](auto &store) { assign_impl(store, keys, values); });
-  }
-
-  // ---- Sync contains ----
-
-  nb::object contains(nb::ndarray<nb::c_contig, nb::device::cpu> keys) {
     size_t n = keys.shape(0);
-    int64_t shape[1] = {static_cast<int64_t>(n)};
-    DLManagedTensor *dlm =
-        se::py::create_output_tensor<uint8_t>(std::span(shape));
-    auto buf = std::make_unique<bool[]>(n);
-    std::fill_n(buf.get(), n, false);
-
-    std::error_code ec;
-    {
-      nb::gil_scoped_release release;
-      auto exists_span = std::span<bool>(buf.get(), n);
-      dispatch_on_key(keys, [&](auto ks) {
-        visit_store([&](auto &s) { ec = s.contains(ks, exists_span); });
-      });
-
-      auto *out = static_cast<uint8_t *>(dlm->dl_tensor.data);
-      for (size_t i = 0; i < n; ++i)
-        out[i] = buf[i] ? 1 : 0;
-    }
-
-    check_error(ec);
-    return se::py::wrap_output_tensor(dlm);
-  }
-
-  // ---- Sync erase ----
-
-  void erase(nb::ndarray<nb::c_contig, nb::device::cpu> keys) {
-    std::error_code ec;
-    {
-      nb::gil_scoped_release release;
-      dispatch_on_key(keys, [&](auto ks) {
-        visit_store([&](auto &s) { ec = s.erase(ks); });
-      });
-    }
-    check_error(ec);
-  }
-
-  // ---- Sync clear ----
-
-  void clear() {
-    nb::gil_scoped_release release;
-    visit_store([](auto &s) { s.clear(); });
-  }
-
-  // ---- Assign scores ----
-
-  void assign_scores(nb::ndarray<nb::c_contig, nb::device::cpu> keys,
-                     nb::ndarray<nb::c_contig, nb::device::cpu> scores) {
-    std::error_code ec;
-    auto scores_span = std::span<const uint64_t>(
-        static_cast<const uint64_t *>(scores.data()), scores.shape(0));
-    {
-      nb::gil_scoped_release release;
-      dispatch_on_key(keys, [&](auto ks) {
-        visit_store([&](auto &s) { ec = s.assign_scores(ks, scores_span); });
-      });
-    }
-    check_error(ec);
-  }
-
-  // ---- Async lookup ----
-
-  nb::object async_lookup(nb::ndarray<nb::c_contig, nb::device::cpu> keys) {
-    return visit_store([&](auto &store) -> nb::object {
-      return async_lookup_impl(store, keys);
-    });
-  }
-
-  // ---- Async assign ----
-
-  nb::object async_assign(nb::ndarray<nb::c_contig, nb::device::cpu> keys,
-                          nb::ndarray<nb::c_contig, nb::device::cpu> values) {
-    return visit_store([&](auto &store) -> nb::object {
-      return async_assign_impl(store, keys, values);
-    });
-  }
-
-private:
-  // ---- lookup_impl (typed) ----
-
-  template <typename ValT>
-  nb::tuple lookup_impl(se::HogwildEmbeddingStore<ValT> &store,
-                        nb::ndarray<nb::c_contig, nb::device::cpu> keys) {
-    size_t n = keys.shape(0);
-
     DLManagedTensor *vals_dlm = nullptr;
     DLManagedTensor *lens_dlm = nullptr;
     std::error_code ec;
 
     {
       nb::gil_scoped_release release;
+      dispatch_val([&]<typename ValT>() {
+        dispatch_on_key(keys, [&](auto ks) {
+          auto row_lengths = std::make_unique<int64_t[]>(n);
+          size_t total = compute_output_size(ks, {row_lengths.get(), n});
 
-      dispatch_on_key(keys, [&](auto ks) {
-        auto row_lengths = std::make_unique<int64_t[]>(n);
-        size_t total = store.compute_output_size(ks, {row_lengths.get(), n});
+          int64_t vals_shape[] = {static_cast<int64_t>(total)};
+          vals_dlm = se::py::create_output_tensor<ValT>(vals_shape);
+          int64_t lens_shape[] = {static_cast<int64_t>(n)};
+          lens_dlm = se::py::create_output_tensor<int64_t>(lens_shape);
+          std::memcpy(lens_dlm->dl_tensor.data, row_lengths.get(),
+                      n * sizeof(int64_t));
 
-        int64_t vals_shape[] = {static_cast<int64_t>(total)};
-        vals_dlm = se::py::create_output_tensor<ValT>(vals_shape);
-        int64_t lens_shape[] = {static_cast<int64_t>(n)};
-        lens_dlm = se::py::create_output_tensor<int64_t>(lens_shape);
-        std::memcpy(lens_dlm->dl_tensor.data, row_lengths.get(),
-                    n * sizeof(int64_t));
-
-        auto vals_span = std::span<ValT>(
-            static_cast<ValT *>(vals_dlm->dl_tensor.data), total);
-        ec = store.lookup(ks, vals_span, {row_lengths.get(), n});
+          auto vals_span = std::span<ValT>(
+              static_cast<ValT *>(vals_dlm->dl_tensor.data), total);
+          ec = get_store<ValT>()->forward_lookup(ks, vals_span,
+                                                 {row_lengths.get(), n});
+        });
       });
     }
 
@@ -319,14 +326,10 @@ private:
                           se::py::wrap_output_tensor(lens_dlm));
   }
 
-  // ---- lookup_or_insert_impl ----
+  // ---- Sync lookup_or_insert ----
 
-  template <typename ValT>
-  nb::tuple
-  lookup_or_insert_impl(se::HogwildEmbeddingStore<ValT> &store,
-                        nb::ndarray<nb::c_contig, nb::device::cpu> keys) {
+  nb::tuple lookup_or_insert(nb::ndarray<nb::c_contig, nb::device::cpu> keys) {
     size_t n = keys.shape(0);
-
     DLManagedTensor *vals_dlm = nullptr;
     DLManagedTensor *lens_dlm = nullptr;
     DLManagedTensor *mask_dlm = nullptr;
@@ -334,32 +337,35 @@ private:
 
     {
       nb::gil_scoped_release release;
+      dispatch_val([&]<typename ValT>() {
+        dispatch_on_key(keys, [&](auto ks) {
+          auto row_lengths = std::make_unique<int64_t[]>(n);
+          size_t total = compute_output_size(ks, {row_lengths.get(), n});
 
-      dispatch_on_key(keys, [&](auto ks) {
-        auto row_lengths = std::make_unique<int64_t[]>(n);
-        size_t total = store.compute_output_size(ks, {row_lengths.get(), n});
+          int64_t vals_shape[] = {static_cast<int64_t>(total)};
+          vals_dlm = se::py::create_output_tensor<ValT>(vals_shape);
+          int64_t lens_shape[] = {static_cast<int64_t>(n)};
+          lens_dlm = se::py::create_output_tensor<int64_t>(lens_shape);
+          int64_t mask_shape[] = {static_cast<int64_t>(n)};
+          mask_dlm = se::py::create_output_tensor<uint8_t>(mask_shape);
 
-        int64_t vals_shape[] = {static_cast<int64_t>(total)};
-        vals_dlm = se::py::create_output_tensor<ValT>(vals_shape);
-        int64_t lens_shape[] = {static_cast<int64_t>(n)};
-        lens_dlm = se::py::create_output_tensor<int64_t>(lens_shape);
-        int64_t mask_shape[] = {static_cast<int64_t>(n)};
-        mask_dlm = se::py::create_output_tensor<uint8_t>(mask_shape);
+          std::memcpy(lens_dlm->dl_tensor.data, row_lengths.get(),
+                      n * sizeof(int64_t));
 
-        std::memcpy(lens_dlm->dl_tensor.data, row_lengths.get(),
-                    n * sizeof(int64_t));
+          auto vals_span = std::span<ValT>(
+              static_cast<ValT *>(vals_dlm->dl_tensor.data), total);
 
-        auto vals_span = std::span<ValT>(
-            static_cast<ValT *>(vals_dlm->dl_tensor.data), total);
+          auto mask_buf = std::make_unique<bool[]>(n);
+          std::fill_n(mask_buf.get(), n, false);
 
-        auto mask_buf = std::make_unique<bool[]>(n);
-        std::fill_n(mask_buf.get(), n, false);
-        ec = store.lookup_or_insert(ks, vals_span, {row_lengths.get(), n},
-                                    std::span<bool>(mask_buf.get(), n));
+          ec = get_store<ValT>()->lookup_or_insert(
+              ks, vals_span, {row_lengths.get(), n},
+              std::span<bool>(mask_buf.get(), n));
 
-        auto *mask_out = static_cast<uint8_t *>(mask_dlm->dl_tensor.data);
-        for (size_t i = 0; i < n; ++i)
-          mask_out[i] = mask_buf[i] ? 1 : 0;
+          auto *mask_out = static_cast<uint8_t *>(mask_dlm->dl_tensor.data);
+          for (size_t i = 0; i < n; ++i)
+            mask_out[i] = mask_buf[i] ? 1 : 0;
+        });
       });
     }
 
@@ -378,115 +384,134 @@ private:
                           se::py::wrap_output_tensor(mask_dlm));
   }
 
-  // ---- assign_impl ----
+  // ---- Sync assign ----
 
-  template <typename ValT>
-  void assign_impl(se::HogwildEmbeddingStore<ValT> &store,
-                   nb::ndarray<nb::c_contig, nb::device::cpu> keys,
-                   nb::ndarray<nb::c_contig, nb::device::cpu> values) {
+  void assign(nb::ndarray<nb::c_contig, nb::device::cpu> keys,
+              nb::ndarray<nb::c_contig, nb::device::cpu> values) {
+    size_t n = keys.shape(0);
+    std::error_code ec;
+    {
+      nb::gil_scoped_release release;
+      dispatch_val([&]<typename ValT>() {
+        dispatch_on_key(keys, [&](auto ks) {
+          if (values.ndim() == 2) {
+            size_t dim = values.shape(1);
+            auto val_span = std::span<const ValT>(
+                static_cast<const ValT *>(values.data()), n * dim);
+            auto row_lengths = std::make_unique<int64_t[]>(n);
+            std::fill_n(row_lengths.get(), n, dim);
+            ec =
+                get_store<ValT>()->assign(ks, val_span, {row_lengths.get(), n});
+          } else if (values.ndim() == 1) {
+            auto row_lengths = std::make_unique<int64_t[]>(n);
+            compute_output_size(ks, {row_lengths.get(), n});
+            auto val_span = std::span<const ValT>(
+                static_cast<const ValT *>(values.data()), values.shape(0));
+            ec =
+                get_store<ValT>()->assign(ks, val_span, {row_lengths.get(), n});
+          } else {
+            throw std::invalid_argument("values must be 1D (ragged) or 2D");
+          }
+        });
+      });
+    }
+    check_error(ec);
+  }
+
+  // ---- Sync contains ----
+
+  nb::object contains(nb::ndarray<nb::c_contig, nb::device::cpu> keys) {
+    size_t n = keys.shape(0);
+    int64_t shape[1] = {static_cast<int64_t>(n)};
+    DLManagedTensor *dlm =
+        se::py::create_output_tensor<uint8_t>(std::span(shape));
+    auto buf = std::make_unique<bool[]>(n);
+    std::fill_n(buf.get(), n, false);
+
+    std::error_code ec;
+    {
+      nb::gil_scoped_release release;
+      auto exists_span = std::span<bool>(buf.get(), n);
+      dispatch_val([&]<typename ValT>() {
+        dispatch_on_key(keys, [&](auto ks) {
+          ec = get_store<ValT>()->contains(ks, exists_span);
+        });
+      });
+
+      auto *out = static_cast<uint8_t *>(dlm->dl_tensor.data);
+      for (size_t i = 0; i < n; ++i)
+        out[i] = buf[i] ? 1 : 0;
+    }
+
+    check_error(ec);
+    return se::py::wrap_output_tensor(dlm);
+  }
+
+  // ---- Accumulate gradients ----
+
+  void accumulate_gradients(nb::ndarray<nb::c_contig, nb::device::cpu> keys,
+                            nb::ndarray<nb::c_contig, nb::device::cpu> grads) {
     size_t n = keys.shape(0);
 
     std::error_code ec;
     {
       nb::gil_scoped_release release;
-
-      dispatch_on_key(keys, [&](auto ks) {
-        if (values.ndim() == 2) {
-          size_t dim = values.shape(1);
-          auto val_span = std::span<const ValT>(
-              static_cast<const ValT *>(values.data()), n * dim);
-          ec = store.assign_uniform(ks, val_span, dim);
-        } else if (values.ndim() == 1) {
+      dispatch_val([&]<typename ValT>() {
+        auto grads_span = std::span<const ValT>(
+            static_cast<const ValT *>(grads.data()), grads.size());
+        dispatch_on_key(keys, [&](auto ks) {
           auto row_lengths = std::make_unique<int64_t[]>(n);
-          store.compute_output_size(ks, {row_lengths.get(), n});
-          auto val_span = std::span<const ValT>(
-              static_cast<const ValT *>(values.data()), values.shape(0));
-          ec = store.assign(ks, val_span, {row_lengths.get(), n});
-        } else {
-          throw std::invalid_argument("values must be 1D (ragged) or 2D");
-        }
+          compute_output_size(ks, {row_lengths.get(), n});
+          ec = get_store<ValT>()->accumulate_gradients(ks, grads_span,
+                                                       {row_lengths.get(), n});
+        });
       });
     }
-
     check_error(ec);
   }
 
-  // ---- async_lookup_impl ----
+  // ---- Sync erase ----
 
-  template <typename ValT>
-  nb::object
-  async_lookup_impl(se::HogwildEmbeddingStore<ValT> &store,
-                    nb::ndarray<nb::c_contig, nb::device::cpu> keys) {
-    size_t n = keys.shape(0);
-    auto kdt = detect_key_dtype(keys);
-
-    std::shared_ptr<void> keys_copy;
-    if (kdt == KeyDType::kInt64) {
-      auto *buf = new int64_t[n];
-      std::memcpy(buf, keys.data(), n * sizeof(int64_t));
-      keys_copy.reset(buf, [](void *p) { delete[] static_cast<int64_t *>(p); });
-    } else {
-      auto *buf = new uint64_t[n];
-      std::memcpy(buf, keys.data(), n * sizeof(uint64_t));
-      keys_copy.reset(buf,
-                      [](void *p) { delete[] static_cast<uint64_t *>(p); });
+  void erase(nb::ndarray<nb::c_contig, nb::device::cpu> keys) {
+    std::error_code ec;
+    {
+      nb::gil_scoped_release release;
+      dispatch_val([&]<typename ValT>() {
+        dispatch_on_key(keys,
+                        [&](auto ks) { ec = get_store<ValT>()->erase(ks); });
+      });
     }
-
-    auto *store_ptr = &store;
-
-    return se::py::async_dispatch(
-        async_tracker_,
-        [store_ptr, n, kdt,
-         keys_copy]() -> std::pair<DLManagedTensor *, DLManagedTensor *> {
-          DLManagedTensor *vals_dlm = nullptr;
-          DLManagedTensor *lens_dlm = nullptr;
-
-          auto do_lookup = [&](auto ks) {
-            auto row_lengths = std::make_unique<int64_t[]>(n);
-            size_t total =
-                store_ptr->compute_output_size(ks, {row_lengths.get(), n});
-
-            int64_t vals_shape[] = {static_cast<int64_t>(total)};
-            vals_dlm = se::py::create_output_tensor<ValT>(vals_shape);
-            int64_t lens_shape[] = {static_cast<int64_t>(n)};
-            lens_dlm = se::py::create_output_tensor<int64_t>(lens_shape);
-            std::memcpy(lens_dlm->dl_tensor.data, row_lengths.get(),
-                        n * sizeof(int64_t));
-
-            auto vals_span = std::span<ValT>(
-                static_cast<ValT *>(vals_dlm->dl_tensor.data), total);
-            auto ec = store_ptr->lookup(ks, vals_span, {row_lengths.get(), n});
-            if (ec)
-              throw std::runtime_error(ec.message());
-          };
-
-          if (kdt == KeyDType::kInt64) {
-            auto ks = std::span<const int64_t>(
-                static_cast<const int64_t *>(keys_copy.get()), n);
-            do_lookup(ks);
-          } else {
-            auto ks = std::span<const uint64_t>(
-                static_cast<const uint64_t *>(keys_copy.get()), n);
-            do_lookup(ks);
-          }
-          return {vals_dlm, lens_dlm};
-        },
-        [](nb::object future,
-           std::pair<DLManagedTensor *, DLManagedTensor *> result) {
-          auto [vals_dlm, lens_dlm] = result;
-          future.attr("set_result")(
-              nb::make_tuple(se::py::wrap_output_tensor(vals_dlm),
-                             se::py::wrap_output_tensor(lens_dlm)));
-        });
+    check_error(ec);
   }
 
-  // ---- async_assign_impl ----
+  // ---- Sync clear ----
 
-  template <typename ValT>
-  nb::object
-  async_assign_impl(se::HogwildEmbeddingStore<ValT> &store,
-                    nb::ndarray<nb::c_contig, nb::device::cpu> keys,
-                    nb::ndarray<nb::c_contig, nb::device::cpu> values) {
+  void clear() {
+    nb::gil_scoped_release release;
+    dispatch_val([&]<typename ValT>() { get_store<ValT>()->clear(); });
+  }
+
+  // ---- Assign scores ----
+
+  void assign_scores(nb::ndarray<nb::c_contig, nb::device::cpu> keys,
+                     nb::ndarray<nb::c_contig, nb::device::cpu> scores) {
+    std::error_code ec;
+    auto scores_span = std::span<const uint64_t>(
+        static_cast<const uint64_t *>(scores.data()), scores.shape(0));
+    {
+      nb::gil_scoped_release release;
+      dispatch_val([&]<typename ValT>() {
+        dispatch_on_key(keys, [&](auto ks) {
+          ec = get_store<ValT>()->assign_scores(ks, scores_span);
+        });
+      });
+    }
+    check_error(ec);
+  }
+
+  // ---- Async lookup ----
+
+  nb::object async_lookup(nb::ndarray<nb::c_contig, nb::device::cpu> keys) {
     size_t n = keys.shape(0);
     auto kdt = detect_key_dtype(keys);
 
@@ -502,47 +527,124 @@ private:
                       [](void *p) { delete[] static_cast<uint64_t *>(p); });
     }
 
-    size_t val_count = 1;
-    for (size_t d = 0; d < values.ndim(); ++d)
-      val_count *= values.shape(d);
-    auto vals_copy = std::make_shared<std::vector<ValT>>(val_count);
-    std::memcpy(vals_copy->data(), values.data(), val_count * sizeof(ValT));
+    auto wrapper_ptr = this;
+
+    return dispatch_val([&]<typename ValT>() -> nb::object {
+      return se::py::async_dispatch(
+          async_pool_,
+          [wrapper_ptr, n, kdt,
+           keys_copy]() -> std::pair<DLManagedTensor *, DLManagedTensor *> {
+            DLManagedTensor *vals_dlm = nullptr;
+            DLManagedTensor *lens_dlm = nullptr;
+
+            auto do_lookup = [&](auto ks) {
+              auto row_lengths = std::make_unique<int64_t[]>(n);
+              size_t total =
+                  wrapper_ptr->compute_output_size(ks, {row_lengths.get(), n});
+
+              int64_t vals_shape[] = {static_cast<int64_t>(total)};
+              vals_dlm = se::py::create_output_tensor<ValT>(vals_shape);
+              int64_t lens_shape[] = {static_cast<int64_t>(n)};
+              lens_dlm = se::py::create_output_tensor<int64_t>(lens_shape);
+              std::memcpy(lens_dlm->dl_tensor.data, row_lengths.get(),
+                          n * sizeof(int64_t));
+
+              auto vals_span = std::span<ValT>(
+                  static_cast<ValT *>(vals_dlm->dl_tensor.data), total);
+              auto ec = wrapper_ptr->get_store<ValT>()->forward_lookup(
+                  ks, vals_span, {row_lengths.get(), n});
+              if (ec)
+                throw std::runtime_error(ec.message());
+            };
+
+            if (kdt == KeyDType::kInt64) {
+              auto ks = std::span<const int64_t>(
+                  static_cast<const int64_t *>(keys_copy.get()), n);
+              do_lookup(ks);
+            } else {
+              auto ks = std::span<const uint64_t>(
+                  static_cast<const uint64_t *>(keys_copy.get()), n);
+              do_lookup(ks);
+            }
+            return {vals_dlm, lens_dlm};
+          },
+          [](nb::object future,
+             std::pair<DLManagedTensor *, DLManagedTensor *> result) {
+            auto [vals_dlm, lens_dlm] = result;
+            future.attr("set_result")(
+                nb::make_tuple(se::py::wrap_output_tensor(vals_dlm),
+                               se::py::wrap_output_tensor(lens_dlm)));
+          });
+    });
+  }
+
+  // ---- Async assign ----
+
+  nb::object async_assign(nb::ndarray<nb::c_contig, nb::device::cpu> keys,
+                          nb::ndarray<nb::c_contig, nb::device::cpu> values) {
+    size_t n = keys.shape(0);
+    auto kdt = detect_key_dtype(keys);
+
+    std::shared_ptr<void> keys_copy;
+    if (kdt == KeyDType::kInt64) {
+      auto *buf = new int64_t[n];
+      std::memcpy(buf, keys.data(), n * sizeof(int64_t));
+      keys_copy.reset(buf, [](void *p) { delete[] static_cast<int64_t *>(p); });
+    } else {
+      auto *buf = new uint64_t[n];
+      std::memcpy(buf, keys.data(), n * sizeof(uint64_t));
+      keys_copy.reset(buf,
+                      [](void *p) { delete[] static_cast<uint64_t *>(p); });
+    }
+
     auto val_ndim = values.ndim();
     auto val_dim1 = (val_ndim == 2) ? values.shape(1) : size_t(0);
+    size_t val_count = 1;
+    for (size_t d = 0; d < val_ndim; ++d)
+      val_count *= values.shape(d);
 
-    auto *store_ptr = &store;
+    auto wrapper_ptr = this;
 
-    return se::py::async_dispatch(
-        async_tracker_,
-        [store_ptr, n, kdt, keys_copy, vals_copy, val_ndim,
-         val_dim1]() -> std::error_code {
-          auto do_assign = [&](auto ks) -> std::error_code {
-            if (val_ndim == 2) {
-              return store_ptr->assign_uniform(
-                  ks, std::span<const ValT>(*vals_copy), val_dim1);
+    return dispatch_val([&]<typename ValT>() -> nb::object {
+      auto vals_copy = std::make_shared<std::vector<ValT>>(val_count);
+      std::memcpy(vals_copy->data(), values.data(), val_count * sizeof(ValT));
+
+      return se::py::async_dispatch(
+          async_pool_,
+          [wrapper_ptr, n, kdt, keys_copy, vals_copy, val_ndim,
+           val_dim1]() -> std::error_code {
+            auto do_assign = [&](auto ks) -> std::error_code {
+              if (val_ndim == 2) {
+                auto row_lengths = std::make_unique<int64_t[]>(n);
+                std::fill_n(row_lengths.get(), n, val_dim1);
+                return wrapper_ptr->get_store<ValT>()->assign(
+                    ks, std::span<const ValT>(*vals_copy),
+                    {row_lengths.get(), n});
+              }
+              auto row_lengths = std::make_unique<int64_t[]>(n);
+              wrapper_ptr->compute_output_size(ks, {row_lengths.get(), n});
+              return wrapper_ptr->get_store<ValT>()->assign(
+                  ks, std::span<const ValT>(*vals_copy),
+                  {row_lengths.get(), n});
+            };
+
+            if (kdt == KeyDType::kInt64) {
+              return do_assign(std::span<const int64_t>(
+                  static_cast<const int64_t *>(keys_copy.get()), n));
             }
-            auto row_lengths = std::make_unique<int64_t[]>(n);
-            store_ptr->compute_output_size(ks, {row_lengths.get(), n});
-            return store_ptr->assign(ks, std::span<const ValT>(*vals_copy),
-                                     {row_lengths.get(), n});
-          };
-
-          if (kdt == KeyDType::kInt64) {
-            return do_assign(std::span<const int64_t>(
-                static_cast<const int64_t *>(keys_copy.get()), n));
-          }
-          return do_assign(std::span<const uint64_t>(
-              static_cast<const uint64_t *>(keys_copy.get()), n));
-        },
-        [](nb::object future, std::error_code ec) {
-          if (!ec) {
-            future.attr("set_result")(nb::none());
-          } else {
-            nb::module_ builtins = nb::module_::import_("builtins");
-            future.attr("set_exception")(
-                builtins.attr("RuntimeError")(ec.message()));
-          }
-        });
+            return do_assign(std::span<const uint64_t>(
+                static_cast<const uint64_t *>(keys_copy.get()), n));
+          },
+          [](nb::object future, std::error_code ec) {
+            if (!ec) {
+              future.attr("set_result")(nb::none());
+            } else {
+              nb::module_ builtins = nb::module_::import_("builtins");
+              future.attr("set_exception")(
+                  builtins.attr("RuntimeError")(ec.message()));
+            }
+          });
+    });
   }
 };
 
@@ -553,8 +655,77 @@ private:
 // =============================================================================
 
 NB_MODULE(_core, m) {
-  m.doc() = "sparse_embedding C++ backend: multi-slot, arena-allocated, "
-            "DLPack zero-copy, folly CHM, stdexec parallelism";
+  m.doc() = "sparse_embedding C++ backend";
+
+  nb::class_<se::EmbeddingConfig>(m, "EmbeddingConfig")
+      .def(nb::init<std::unordered_map<uint32_t, size_t>, size_t, std::string,
+                    uint32_t, size_t>(),
+           nb::arg("slot_dims"), nb::arg("num_threads") = 0,
+           nb::arg("dtype") = "float32", nb::arg("grad_accum_steps") = 100,
+           nb::arg("max_active_keys") = 1 << 20)
+      .def_rw("slot_dims", &se::EmbeddingConfig::slot_dims)
+      .def_rw("num_threads", &se::EmbeddingConfig::num_threads)
+      .def_rw("dtype", &se::EmbeddingConfig::dtype)
+      .def_rw("grad_accum_steps", &se::EmbeddingConfig::grad_accum_steps)
+      .def_rw("max_active_keys", &se::EmbeddingConfig::max_active_keys);
+
+  nb::class_<PyInitializer>(m, "Initializer");
+
+  struct ZerosInitializerPy : PyInitializer {};
+  nb::class_<ZerosInitializerPy, PyInitializer>(m, "Zeros")
+      .def("__init__", [](ZerosInitializerPy *self) {
+        new (self) ZerosInitializerPy();
+        self->builder =
+            std::make_shared<pro::proxy<se::InitializerBuilderFacade>>(
+                pro::make_proxy<se::InitializerBuilderFacade,
+                                ZerosInitializerBuilder>());
+      });
+
+  struct UniformInitializerPy : PyInitializer {};
+  nb::class_<UniformInitializerPy, PyInitializer>(m, "Uniform")
+      .def(
+          "__init__",
+          [](UniformInitializerPy *self, float min_val, float max_val) {
+            new (self) UniformInitializerPy();
+            self->builder =
+                std::make_shared<pro::proxy<se::InitializerBuilderFacade>>(
+                    pro::make_proxy<se::InitializerBuilderFacade,
+                                    UniformInitializerBuilder>(min_val,
+                                                               max_val));
+          },
+          nb::arg("min_val") = -0.05f, nb::arg("max_val") = 0.05f);
+
+  nb::class_<PyOptimizer>(m, "Optimizer");
+
+  struct AdamOptimizerPy : PyOptimizer {};
+  nb::class_<AdamOptimizerPy, PyOptimizer>(m, "Adam").def(
+      "__init__",
+      [](AdamOptimizerPy *self, float lr, float beta1, float beta2, float eps,
+         float weight_decay) {
+        new (self) AdamOptimizerPy();
+        self->builder =
+            std::make_shared<pro::proxy<se::OptimizerBuilderFacade>>(
+                pro::make_proxy<
+                    se::OptimizerBuilderFacade,
+                    DefaultOptimizerBuilder<se::AdamOptimizer, se::AdamConfig>>(
+                    se::AdamConfig{lr, beta1, beta2, eps, weight_decay}));
+      },
+      nb::arg("lr") = 1e-3f, nb::arg("beta1") = 0.9f, nb::arg("beta2") = 0.999f,
+      nb::arg("eps") = 1e-8f, nb::arg("weight_decay") = 0.0f);
+
+  struct SgdOptimizerPy : PyOptimizer {};
+  nb::class_<SgdOptimizerPy, PyOptimizer>(m, "Sgd").def(
+      "__init__",
+      [](SgdOptimizerPy *self, float lr, float weight_decay) {
+        new (self) SgdOptimizerPy();
+        self->builder =
+            std::make_shared<pro::proxy<se::OptimizerBuilderFacade>>(
+                pro::make_proxy<
+                    se::OptimizerBuilderFacade,
+                    DefaultOptimizerBuilder<se::SgdOptimizer, se::SgdConfig>>(
+                    se::SgdConfig{lr, weight_decay}));
+      },
+      nb::arg("lr") = 1e-2f, nb::arg("weight_decay") = 0.0f);
 
   nb::class_<se::py::DLPackCapsuleWrapper>(m, "DLPackCapsuleWrapper")
       .def("__dlpack__", &se::py::DLPackCapsuleWrapper::dlpack, nb::kw_only(),
@@ -563,10 +734,22 @@ NB_MODULE(_core, m) {
       .def("__dlpack_device__", &se::py::DLPackCapsuleWrapper::dlpack_device);
 
   nb::class_<EmbeddingStoreWrapper>(m, "EmbeddingStore")
-      .def(nb::init<std::unordered_map<uint32_t, size_t>, size_t, int,
-                    std::string>(),
-           nb::arg("slot_dims"), nb::arg("num_threads") = 0,
-           nb::arg("init_type") = 0, nb::arg("dtype") = "float32")
+      .def(
+          nb::init<const se::EmbeddingConfig &, PyInitializer, PyOptimizer>(),
+          nb::arg("embedding_config"),
+          nb::arg("initializer_config") =
+              PyInitializer{
+                  std::make_shared<pro::proxy<se::InitializerBuilderFacade>>(
+                      pro::make_proxy<se::InitializerBuilderFacade,
+                                      UniformInitializerBuilder>(-0.05f,
+                                                                 0.05f))},
+          nb::arg("optimizer_config") =
+              PyOptimizer{
+                  std::make_shared<pro::proxy<se::OptimizerBuilderFacade>>(
+                      pro::make_proxy<se::OptimizerBuilderFacade,
+                                      DefaultOptimizerBuilder<se::AdamOptimizer,
+                                                              se::AdamConfig>>(
+                          se::AdamConfig{}))})
 
       .def("total_size", &EmbeddingStoreWrapper::total_size)
       .def("max_dim", &EmbeddingStoreWrapper::max_dim)
@@ -585,78 +768,83 @@ NB_MODULE(_core, m) {
       .def("clear", &EmbeddingStoreWrapper::clear)
       .def("assign_scores", &EmbeddingStoreWrapper::assign_scores,
            nb::arg("keys"), nb::arg("scores"))
+      .def("accumulate_gradients", &EmbeddingStoreWrapper::accumulate_gradients,
+           nb::arg("keys"), nb::arg("grads"))
 
       .def("async_lookup", &EmbeddingStoreWrapper::async_lookup,
            nb::arg("keys"))
       .def("async_assign", &EmbeddingStoreWrapper::async_assign,
            nb::arg("keys"), nb::arg("values"));
 
-  m.def("async_unique", [](nb::ndarray<nb::c_contig, nb::device::cpu> keys) {
-    size_t n = keys.shape(0);
-    auto kdt = detect_key_dtype(keys);
+  m.def(
+      "async_unique",
+      [](nb::ndarray<nb::c_contig, nb::device::cpu> keys) -> nb::object {
+        size_t n = keys.shape(0);
+        auto kdt = detect_key_dtype(keys);
 
-    std::shared_ptr<void> keys_copy;
-    if (kdt == KeyDType::kInt64) {
-      auto *buf = new int64_t[n];
-      std::memcpy(buf, keys.data(), n * sizeof(int64_t));
-      keys_copy.reset(buf, [](void *p) { delete[] static_cast<int64_t *>(p); });
-    } else {
-      auto *buf = new uint64_t[n];
-      std::memcpy(buf, keys.data(), n * sizeof(uint64_t));
-      keys_copy.reset(buf,
-                      [](void *p) { delete[] static_cast<uint64_t *>(p); });
-    }
+        std::shared_ptr<void> keys_copy;
+        if (kdt == KeyDType::kInt64) {
+          auto *buf = new int64_t[n];
+          std::memcpy(buf, keys.data(), n * sizeof(int64_t));
+          keys_copy.reset(buf,
+                          [](void *p) { delete[] static_cast<int64_t *>(p); });
+        } else {
+          auto *buf = new uint64_t[n];
+          std::memcpy(buf, keys.data(), n * sizeof(uint64_t));
+          keys_copy.reset(buf,
+                          [](void *p) { delete[] static_cast<uint64_t *>(p); });
+        }
 
-    static se::py::AsyncTracker global_tracker;
+        static exec::static_thread_pool global_pool(
+            std::thread::hardware_concurrency());
 
-    return se::py::async_dispatch(
-        global_tracker,
-        [n, kdt,
-         keys_copy]() -> std::pair<DLManagedTensor *, DLManagedTensor *> {
-          size_t u_count = 0;
-          DLManagedTensor *u_dlm = nullptr;
-          DLManagedTensor *inv_dlm = nullptr;
+        return se::py::async_dispatch(
+            global_pool,
+            [n, kdt,
+             keys_copy]() -> std::pair<DLManagedTensor *, DLManagedTensor *> {
+              DLManagedTensor *u_dlm = nullptr;
+              DLManagedTensor *inv_dlm = nullptr;
 
-          if (kdt == KeyDType::kInt64) {
-            auto span = std::span<const int64_t>(
-                static_cast<const int64_t *>(keys_copy.get()), n);
-            auto res = se::ops::unique_keys_inverse(span);
+              if (kdt == KeyDType::kInt64) {
+                auto span = std::span<const int64_t>(
+                    static_cast<const int64_t *>(keys_copy.get()), n);
+                auto res = se::ops::unique_keys_inverse(span);
 
-            int64_t shape_u[] = {static_cast<int64_t>(res.unique_count)};
-            u_dlm = se::py::create_output_tensor<int64_t>(shape_u);
-            std::memcpy(u_dlm->dl_tensor.data, res.unique_keys.get(),
-                        res.unique_count * sizeof(int64_t));
+                int64_t shape_u[] = {static_cast<int64_t>(res.unique_count)};
+                u_dlm = se::py::create_output_tensor<int64_t>(shape_u);
+                std::memcpy(u_dlm->dl_tensor.data, res.unique_keys.get(),
+                            res.unique_count * sizeof(int64_t));
 
-            int64_t shape_inv[] = {static_cast<int64_t>(res.inverse_count)};
-            inv_dlm = se::py::create_output_tensor<int64_t>(shape_inv);
-            std::memcpy(inv_dlm->dl_tensor.data, res.inverse_indices.get(),
-                        res.inverse_count * sizeof(int64_t));
-          } else {
-            auto span = std::span<const uint64_t>(
-                static_cast<const uint64_t *>(keys_copy.get()), n);
-            auto res = se::ops::unique_keys_inverse(span);
+                int64_t shape_inv[] = {static_cast<int64_t>(res.inverse_count)};
+                inv_dlm = se::py::create_output_tensor<int64_t>(shape_inv);
+                std::memcpy(inv_dlm->dl_tensor.data, res.inverse_indices.get(),
+                            res.inverse_count * sizeof(int64_t));
+              } else {
+                auto span = std::span<const uint64_t>(
+                    static_cast<const uint64_t *>(keys_copy.get()), n);
+                auto res = se::ops::unique_keys_inverse(span);
 
-            int64_t shape_u[] = {static_cast<int64_t>(res.unique_count)};
-            u_dlm = se::py::create_output_tensor<uint64_t>(shape_u);
-            std::memcpy(u_dlm->dl_tensor.data, res.unique_keys.get(),
-                        res.unique_count * sizeof(uint64_t));
+                int64_t shape_u[] = {static_cast<int64_t>(res.unique_count)};
+                u_dlm = se::py::create_output_tensor<uint64_t>(shape_u);
+                std::memcpy(u_dlm->dl_tensor.data, res.unique_keys.get(),
+                            res.unique_count * sizeof(uint64_t));
 
-            int64_t shape_inv[] = {static_cast<int64_t>(res.inverse_count)};
-            inv_dlm = se::py::create_output_tensor<int64_t>(shape_inv);
-            std::memcpy(inv_dlm->dl_tensor.data, res.inverse_indices.get(),
-                        res.inverse_count * sizeof(int64_t));
-          }
+                int64_t shape_inv[] = {static_cast<int64_t>(res.inverse_count)};
+                inv_dlm = se::py::create_output_tensor<int64_t>(shape_inv);
+                std::memcpy(inv_dlm->dl_tensor.data, res.inverse_indices.get(),
+                            res.inverse_count * sizeof(int64_t));
+              }
 
-          return {u_dlm, inv_dlm};
-        },
-        [](nb::object future,
-           std::pair<DLManagedTensor *, DLManagedTensor *> result) {
-          auto [u_dlm, inv_dlm] = result;
-          future.attr("set_result")(
-              nb::make_tuple(se::py::wrap_output_tensor(u_dlm),
-                             se::py::wrap_output_tensor(inv_dlm)));
-        });
-  });
+              return {u_dlm, inv_dlm};
+            },
+            [](nb::object future,
+               std::pair<DLManagedTensor *, DLManagedTensor *> result) {
+              auto [u_dlm, inv_dlm] = result;
+              future.attr("set_result")(
+                  nb::make_tuple(se::py::wrap_output_tensor(u_dlm),
+                                 se::py::wrap_output_tensor(inv_dlm)));
+            });
+      });
 
   m.def("wake_fd", []() { return se::py::GetPythonWakeManager().fd(); });
   m.def("drain_wake_queue", []() { se::py::GetPythonWakeManager().Drain(); });
