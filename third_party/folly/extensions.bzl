@@ -1,6 +1,6 @@
 """
-Bzlmod extensions for Folly dependency.
-Defines module_extension to expose folly_repo mapping.
+Bzlmod extension for Folly dependency.
+Fetches folly at a pinned weekly tag via new_git_repository.
 """
 
 load("//third_party/folly:repositories.bzl", "folly_repo")
