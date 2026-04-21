@@ -14,12 +14,26 @@
 // =============================================================================
 
 #include "hogwild_embedding_store.hpp"
+#include "optimizer/adam_optimizer.hpp"
+#include "optimizer/sgd_optimizer.hpp"
 
 namespace se {
 
 template class EmbeddingArena<float>;
 template class EmbeddingArena<float16_t>;
 template class EmbeddingArena<bfloat16_t>;
+
+template class TransientArena<float>;
+template class TransientArena<float16_t>;
+template class TransientArena<bfloat16_t>;
+
+template class AdamOptimizer<float>;
+template class AdamOptimizer<float16_t>;
+template class AdamOptimizer<bfloat16_t>;
+
+template class SgdOptimizer<float>;
+template class SgdOptimizer<float16_t>;
+template class SgdOptimizer<bfloat16_t>;
 
 template class HogwildEmbeddingStore<float>;
 template class HogwildEmbeddingStore<float16_t>;

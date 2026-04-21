@@ -18,41 +18,11 @@
 #ifndef SPARSE_EMBEDDING_EMBEDDING_TABLE_INTERFACE_HPP_
 #define SPARSE_EMBEDDING_EMBEDDING_TABLE_INTERFACE_HPP_
 
-// ms proxy — zero-overhead polymorphism for plugin backends
-// See: https://github.com/ngcpp/proxy
-#include <proxy.h> // from @proxy
+#include <proxy/proxy.h>
 
 #include <system_error>
 
-#include "common/numeric_types.hpp"
-
-// =============================================================================
-// Interface semantics
-// =============================================================================
-//
-// KV Embedding backends in recommendation/search systems share a narrow set of
-// operations.  Each backend (in-process hash table, Redis, RocksDB, …) is
-// provided as a *plugin* — a concrete type that is never inherited from an
-// abstract base class.  ms proxy acts as the type-erased handle, eliminating
-// both vtable inheritance overhead and the "fragile base class" problem.
-//
-// Key type  : uint64_t or int64_t  (feature ID)
-// Value type: dense float vector   (embedding row), typed via template
-//             Supported scalar elements: float, se::float16_t, se::bfloat16_t
-// Score type: uint64_t             (priority / LRU timestamp for eviction)
-//
-// All mutating operations write through immediately; async flushing is the
-// backend's responsibility.
-// =============================================================================
-
 namespace se {
-
-// ---------------------------------------------------------------------------
-// Dispatch declarations
-// Each PRO_DEF_MEM_DISPATCH / PRO_DEF_WEAK_DISPATCH pair maps a method name
-// to one or more overloaded call signatures.  WEAK variants fall back to
-// NotImplemented so that backends only override what they actually support.
-// ---------------------------------------------------------------------------
 
 struct NotImplemented {
   explicit NotImplemented(auto &&...) {
@@ -90,104 +60,86 @@ PRO_DEF_MEM_DISPATCH(MemInsertAndEvict, insert_and_evict);
 // --- Export / snapshot -------------------------------------------------------
 PRO_DEF_MEM_DISPATCH(MemExportBatch, export_batch);
 
-// Weak (optional) wrappers
-PRO_DEF_WEAK_DISPATCH(WeakMemInit, MemInit, NotImplemented);
-PRO_DEF_WEAK_DISPATCH(WeakMemShutdown, MemShutdown, NotImplemented);
-PRO_DEF_WEAK_DISPATCH(WeakMemName, MemName, NotImplemented);
-PRO_DEF_WEAK_DISPATCH(WeakMemDim, MemDim, NotImplemented);
-PRO_DEF_WEAK_DISPATCH(WeakMemSize, MemSize, NotImplemented);
-PRO_DEF_WEAK_DISPATCH(WeakMemCapacity, MemCapacity, NotImplemented);
-PRO_DEF_WEAK_DISPATCH(WeakMemReserve, MemReserve, NotImplemented);
-PRO_DEF_WEAK_DISPATCH(WeakMemLookup, MemLookup, NotImplemented);
-PRO_DEF_WEAK_DISPATCH(WeakMemLookupOrInsert, MemLookupOrInsert, NotImplemented);
-PRO_DEF_WEAK_DISPATCH(WeakMemAssign, MemAssign, NotImplemented);
-PRO_DEF_WEAK_DISPATCH(WeakMemContains, MemContains, NotImplemented);
-PRO_DEF_WEAK_DISPATCH(WeakMemErase, MemErase, NotImplemented);
-PRO_DEF_WEAK_DISPATCH(WeakMemClear, MemClear, NotImplemented);
-PRO_DEF_WEAK_DISPATCH(WeakMemAssignScores, MemAssignScores, NotImplemented);
-PRO_DEF_WEAK_DISPATCH(WeakMemInsertAndEvict, MemInsertAndEvict, NotImplemented);
-PRO_DEF_WEAK_DISPATCH(WeakMemExportBatch, MemExportBatch, NotImplemented);
+// --- Training: Forward -------------------------------------------------------
+PRO_DEF_MEM_DISPATCH(MemForwardLookup, forward_lookup);
+
+// --- Training: Backward ------------------------------------------------------
+PRO_DEF_MEM_DISPATCH(MemAccumulateGradients, accumulate_gradients);
+PRO_DEF_MEM_DISPATCH(MemOptimizerStep, optimizer_step);
 
 // ---------------------------------------------------------------------------
-// Signature expansion macros
-// All tensor arguments are passed as std::span<const T> (read) or
-// std::span<T> (write) to remain allocation-free at the call boundary.
-// The backend owns its own memory / arena.
+// Weak wrappers (optional)
+// ---------------------------------------------------------------------------
+using WeakMemInit = pro::weak_dispatch<MemInit>;
+using WeakMemShutdown = pro::weak_dispatch<MemShutdown>;
+using WeakMemName = pro::weak_dispatch<MemName>;
+using WeakMemDim = pro::weak_dispatch<MemDim>;
+using WeakMemSize = pro::weak_dispatch<MemSize>;
+using WeakMemCapacity = pro::weak_dispatch<MemCapacity>;
+using WeakMemReserve = pro::weak_dispatch<MemReserve>;
+using WeakMemLookup = pro::weak_dispatch<MemLookup>;
+using WeakMemLookupOrInsert = pro::weak_dispatch<MemLookupOrInsert>;
+using WeakMemAssign = pro::weak_dispatch<MemAssign>;
+using WeakMemContains = pro::weak_dispatch<MemContains>;
+using WeakMemErase = pro::weak_dispatch<MemErase>;
+using WeakMemClear = pro::weak_dispatch<MemClear>;
+using WeakMemAssignScores = pro::weak_dispatch<MemAssignScores>;
+using WeakMemInsertAndEvict = pro::weak_dispatch<MemInsertAndEvict>;
+using WeakMemExportBatch = pro::weak_dispatch<MemExportBatch>;
+using WeakMemForwardLookup = pro::weak_dispatch<MemForwardLookup>;
+using WeakMemAccumulateGradients = pro::weak_dispatch<MemAccumulateGradients>;
+using WeakMemOptimizerStep = pro::weak_dispatch<MemOptimizerStep>;
+
+// ---------------------------------------------------------------------------
+// Signature macros
 // ---------------------------------------------------------------------------
 
-// lookup(n_keys, keys, out_values[n_keys * dim])
-#define SE_LOOKUP_SIG(key_t, val_t)                                            \
-  std::error_code(std::size_t n_keys, std::span<const key_t> keys,             \
-                  std::span<val_t> out_values)
+#define SE_LOOKUP_FACADE_SIG(key_t)                                            \
+  std::error_code(std::span<const key_t> keys, std::span<ValT> out_values,     \
+                  std::span<const int64_t> row_lengths)
 
-// lookup_or_insert(n_keys, keys, out_values[n_keys * dim], out_inserted_mask)
-#define SE_LOOKUP_OR_INSERT_SIG(key_t, val_t)                                  \
-  std::error_code(std::size_t n_keys, std::span<const key_t> keys,             \
-                  std::span<val_t> out_values,                                 \
+#define SE_LOOKUP_OR_INSERT_FACADE_SIG(key_t)                                  \
+  std::error_code(std::span<const key_t> keys, std::span<ValT> out_values,     \
+                  std::span<const int64_t> row_lengths,                        \
                   std::span<bool> out_inserted_mask)
 
-// assign(n_keys, keys, values[n_keys * dim])
-#define SE_ASSIGN_SIG(key_t, val_t)                                            \
-  std::error_code(std::size_t n_keys, std::span<const key_t> keys,             \
-                  std::span<const val_t> values)
+#define SE_ASSIGN_FACADE_SIG(key_t)                                            \
+  std::error_code(std::span<const key_t> keys, std::span<const ValT> values,   \
+                  std::span<const int64_t> row_lengths)
 
-// contains(n_keys, keys, out_exists)
-#define SE_CONTAINS_SIG(key_t)                                                 \
-  std::error_code(std::size_t n_keys, std::span<const key_t> keys,             \
-                  std::span<bool> out_exists)
+#define SE_CONTAINS_FACADE_SIG(key_t)                                          \
+  std::error_code(std::span<const key_t> keys, std::span<bool> out_exists)
 
-// erase(n_keys, keys)
-#define SE_ERASE_SIG(key_t)                                                    \
-  std::error_code(std::size_t n_keys, std::span<const key_t> keys)
+#define SE_ERASE_FACADE_SIG(key_t) std::error_code(std::span<const key_t> keys)
 
-// assign_scores(n_keys, keys, scores)
-#define SE_ASSIGN_SCORES_SIG(key_t)                                            \
-  std::error_code(std::size_t n_keys, std::span<const key_t> keys,             \
-                  std::span<const uint64_t> scores)
+#define SE_ASSIGN_SCORES_FACADE_SIG(key_t)                                     \
+  std::error_code(std::span<const key_t> keys, std::span<const uint64_t> scores)
 
-// insert_and_evict(n_keys, keys, values, scores,
-//                  out_evicted_keys, out_evicted_values, out_evicted_count)
-#define SE_INSERT_AND_EVICT_SIG(key_t, val_t)                                  \
+#define SE_FORWARD_LOOKUP_FACADE_SIG(key_t)                                    \
+  std::error_code(std::span<const key_t> keys, std::span<ValT> out_values,     \
+                  std::span<const int64_t> row_lengths)
+
+#define SE_ACCUMULATE_GRADIENTS_FACADE_SIG(key_t)                              \
+  std::error_code(std::span<const key_t> keys,                                 \
+                  std::span<const ValT> grad_values,                           \
+                  std::span<const int64_t> row_lengths)
+
+#define SE_INSERT_AND_EVICT_FACADE_SIG(key_t)                                  \
   std::error_code(                                                             \
       std::size_t n_keys, std::span<const key_t> keys,                         \
-      std::span<const val_t> values, std::span<const uint64_t> scores,         \
-      std::span<key_t> out_evicted_keys, std::span<val_t> out_evicted_values,  \
+      std::span<const ValT> values, std::span<const uint64_t> scores,          \
+      std::span<key_t> out_evicted_keys, std::span<ValT> out_evicted_values,   \
       std::size_t &out_evicted_count)
 
-// export_batch(max_n, cursor_offset, out_exported_count, out_keys,
-//              out_values, out_scores)
-#define SE_EXPORT_BATCH_SIG(key_t, val_t)                                      \
+#define SE_EXPORT_BATCH_FACADE_SIG(key_t)                                      \
   std::error_code(std::size_t max_n, std::size_t cursor_offset,                \
                   std::size_t &out_exported_count, std::span<key_t> out_keys,  \
-                  std::span<val_t> out_values, std::span<uint64_t> out_scores)
-
-// ---------------------------------------------------------------------------
-// Type-list expansion helpers
-// Expand each operation over the Cartesian product of supported key and value
-// element types.  Adding a new type only requires touching this section.
-// ---------------------------------------------------------------------------
-
-#define SE_FOREACH_KEY_VAL(OP)                                                 \
-  OP(int64_t, float), OP(int64_t, se::float16_t), OP(int64_t, se::bfloat16_t), \
-      OP(uint64_t, float), OP(uint64_t, se::float16_t),                        \
-      OP(uint64_t, se::bfloat16_t)
-
-#define SE_FOREACH_KEY(OP) OP(int64_t), OP(uint64_t)
-
-// ---------------------------------------------------------------------------
-// EmbeddingTable — the ms proxy facade
-//
-// A backend plugin exposes its concrete type to this facade by implementing
-// the requisite methods; it never derives from any base class.
-//
-// Usage:
-//   pro::proxy<EmbeddingTable> table = pro::make_proxy<EmbeddingTable,
-//   MyBackend>(args...); table->lookup(n, keys, out);
-// ---------------------------------------------------------------------------
+                  std::span<ValT> out_values, std::span<uint64_t> out_scores)
 
 // clang-format off
 // NOLINTBEGIN(whitespace/indent_namespace)
-struct EmbeddingTable : pro::facade_builder
+template <typename ValT>
+struct EmbeddingTableFacade : pro::facade_builder
   // --- Lifecycle -------------------------------------------------------------
   ::add_convention<WeakMemInit,
                    std::error_code(std::string_view config_json)>
@@ -196,64 +148,72 @@ struct EmbeddingTable : pro::facade_builder
 
   // --- Metadata -------------------------------------------------------------
   ::add_convention<WeakMemName,
-                   std::string_view()>
+                   std::string_view() const>
   ::add_convention<WeakMemDim,
-                   std::size_t()>
+                   std::size_t() const>
   ::add_convention<WeakMemSize,
-                   std::size_t()>
+                   std::size_t() const>
   ::add_convention<WeakMemCapacity,
-                   std::size_t()>
+                   std::size_t() const>
   ::add_convention<WeakMemReserve,
                    std::error_code(std::size_t new_capacity)>
 
   // --- Lookup ---------------------------------------------------------------
   ::add_convention<WeakMemLookup,
-                   SE_FOREACH_KEY_VAL(SE_LOOKUP_SIG)>
+                   SE_LOOKUP_FACADE_SIG(int64_t), SE_LOOKUP_FACADE_SIG(uint64_t)>
 
   // --- Lookup-or-insert -----------------------------------------------------
   ::add_convention<WeakMemLookupOrInsert,
-                   SE_FOREACH_KEY_VAL(SE_LOOKUP_OR_INSERT_SIG)>
+                   SE_LOOKUP_OR_INSERT_FACADE_SIG(int64_t), SE_LOOKUP_OR_INSERT_FACADE_SIG(uint64_t)>
 
   // --- Assign ---------------------------------------------------------------
   ::add_convention<WeakMemAssign,
-                   SE_FOREACH_KEY_VAL(SE_ASSIGN_SIG)>
+                   SE_ASSIGN_FACADE_SIG(int64_t), SE_ASSIGN_FACADE_SIG(uint64_t)>
 
   // --- Contains -------------------------------------------------------------
   ::add_convention<WeakMemContains,
-                   SE_FOREACH_KEY(SE_CONTAINS_SIG)>
+                   SE_CONTAINS_FACADE_SIG(int64_t), SE_CONTAINS_FACADE_SIG(uint64_t)>
 
   // --- Erase / clear --------------------------------------------------------
   ::add_convention<WeakMemErase,
-                   SE_FOREACH_KEY(SE_ERASE_SIG)>
+                   SE_ERASE_FACADE_SIG(int64_t), SE_ERASE_FACADE_SIG(uint64_t)>
   ::add_convention<WeakMemClear,
                    std::error_code()>
 
-  // --- Score / eviction (optional, backends may leave unimplemented) --------
+  // --- Score / eviction -----------------------------------------------------
   ::add_convention<WeakMemAssignScores,
-                   SE_FOREACH_KEY(SE_ASSIGN_SCORES_SIG)>
+                   SE_ASSIGN_SCORES_FACADE_SIG(int64_t), SE_ASSIGN_SCORES_FACADE_SIG(uint64_t)>
   ::add_convention<WeakMemInsertAndEvict,
-                   SE_FOREACH_KEY_VAL(SE_INSERT_AND_EVICT_SIG)>
+                   SE_INSERT_AND_EVICT_FACADE_SIG(int64_t), SE_INSERT_AND_EVICT_FACADE_SIG(uint64_t)>
 
   // --- Export / snapshot ----------------------------------------------------
   ::add_convention<WeakMemExportBatch,
-                   SE_FOREACH_KEY_VAL(SE_EXPORT_BATCH_SIG)>
+                   SE_EXPORT_BATCH_FACADE_SIG(int64_t), SE_EXPORT_BATCH_FACADE_SIG(uint64_t)>
+
+  // --- Training: Forward ----------------------------------------------------
+  ::add_convention<WeakMemForwardLookup,
+                   SE_FORWARD_LOOKUP_FACADE_SIG(int64_t), SE_FORWARD_LOOKUP_FACADE_SIG(uint64_t)>
+
+  // --- Training: Backward ---------------------------------------------------
+  ::add_convention<WeakMemAccumulateGradients,
+                   SE_ACCUMULATE_GRADIENTS_FACADE_SIG(int64_t), SE_ACCUMULATE_GRADIENTS_FACADE_SIG(uint64_t)>
+  ::add_convention<WeakMemOptimizerStep,
+                   std::error_code()>
 
   ::build {};
 // NOLINTEND(whitespace/indent_namespace)
 // clang-format on
 
-// Clean up internal macros — only the se:: types and the facade itself leak
-// out of this header.
-#undef SE_LOOKUP_SIG
-#undef SE_LOOKUP_OR_INSERT_SIG
-#undef SE_ASSIGN_SIG
-#undef SE_CONTAINS_SIG
-#undef SE_ERASE_SIG
-#undef SE_ASSIGN_SCORES_SIG
-#undef SE_INSERT_AND_EVICT_SIG
-#undef SE_EXPORT_BATCH_SIG
-#undef SE_FOREACH_KEY_VAL
-#undef SE_FOREACH_KEY
+#undef SE_LOOKUP_FACADE_SIG
+#undef SE_LOOKUP_OR_INSERT_FACADE_SIG
+#undef SE_ASSIGN_FACADE_SIG
+#undef SE_CONTAINS_FACADE_SIG
+#undef SE_ERASE_FACADE_SIG
+#undef SE_ASSIGN_SCORES_FACADE_SIG
+#undef SE_FORWARD_LOOKUP_FACADE_SIG
+#undef SE_ACCUMULATE_GRADIENTS_FACADE_SIG
+#undef SE_INSERT_AND_EVICT_FACADE_SIG
+#undef SE_EXPORT_BATCH_FACADE_SIG
 
 } // namespace se
 
