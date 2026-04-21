@@ -1,0 +1,12 @@
+"""tsl::robin_map build file."""
+
+load("@rules_cc//cc:defs.bzl", "cc_library")
+
+licenses(["notice"])
+
+cc_library(
+    name = "robin_map",
+    hdrs = glob(["include/tsl/*.h"]),
+    includes = ["include"],
+    visibility = ["//visibility:public"],
+)

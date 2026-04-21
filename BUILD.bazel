@@ -1,38 +1,83 @@
 """
 Core BUILD file for the sparse_embedding package.
+
+Single unified _core.so target:
+  multi-slot FollyEmbeddingStore + DLPack zero-copy bindings + asyncio bridge
 """
 
-load("@rules_cc//cc:defs.bzl", "cc_binary")
+load("@hedron_compile_commands//:refresh_compile_commands.bzl", "refresh_compile_commands")
+load("@rules_cc//cc:defs.bzl", "cc_binary", "cc_library")
+load("@rules_python//python:defs.bzl", "py_library")
+load("@rules_python//python:packaging.bzl", "py_wheel")
+load("@rules_shell//shell:sh_binary.bzl", "sh_binary")
 
-# _core: KVStore Python bindings (slot-based sharded hash map)
-cc_binary(
-    name = "_core.so",
-    srcs = [
-        "src/backend/kv_store.cc",
-        "src/backend/kv_store.h",
-        "src/backend/thread_pool.h",
-        "src/bindings.cc",
+sh_binary(
+    name = "format",
+    srcs = ["format.sh"],
+)
+
+refresh_compile_commands(
+    name = "refresh_compile_commands",
+    exclude_external_sources = True,
+    targets = {
+        "//:sparse_embedding/_core.so": "",
+    },
+)
+
+# ---- Backend library (Hogwild CHM + stdexec) ----
+
+cc_library(
+    name = "hogwild_embedding_store",
+    srcs = ["sparse_embedding/src/backend/hogwild/hogwild_embedding_store.cpp"],
+    hdrs = [
+        "sparse_embedding/src/backend/hogwild/hogwild_embedding_store.hpp",
+        "sparse_embedding/src/common/embedding_error.hpp",
+        "sparse_embedding/src/common/numeric_types.hpp",
     ],
-    copts = ["-Isrc"],
+    copts = ["-Isparse_embedding/src"],
+    deps = [
+        "@robin_map",
+        "@stdexec",
+        "@unordered_dense",
+    ],
+)
+
+# ---- _core.so: unified Python extension module ----
+
+cc_binary(
+    name = "sparse_embedding/_core.so",
+    srcs = [
+        "sparse_embedding/src/bindings/async_bridge.hpp",
+        "sparse_embedding/src/bindings/dlpack_utils.hpp",
+        "sparse_embedding/src/bindings/module.cpp",
+        "sparse_embedding/src/bindings/python_wake_manager.hpp",
+        "sparse_embedding/src/ops/tensor_ops.hpp",
+    ],
+    copts = ["-Isparse_embedding/src"],
     linkshared = True,
     deps = [
+        ":hogwild_embedding_store",
+        "@dlpack",
         "@nanobind",
     ],
 )
 
-# emb_table_ext: EmbeddingTable Python bindings (DLPack + folly CHM)
-cc_binary(
-    name = "emb_table_ext.so",
-    srcs = [
-        "src/backend/dlpack_capsule_wrapper.hpp",
-        "src/emb_table.cpp",
-    ],
-    copts = ["-Isrc"],
-    linkshared = True,
+py_library(
+    name = "sparse_embedding_lib",
+    srcs = glob(["sparse_embedding/**/*.py"]),
+    data = [":sparse_embedding/_core.so"],
+    imports = ["."],
+    visibility = ["//visibility:public"],
+)
+
+py_wheel(
+    name = "sparse_embedding_wheel",
+    distribution = "sparse_embedding",
+    python_requires = ">=3.11",
+    python_tag = "py3",
+    version = "0.1.0",
     deps = [
-        "@dlpack",
-        "@folly",
-        "@nanobind",
-        "@stdexec",
+        ":sparse_embedding/_core.so",
+        ":sparse_embedding_lib",
     ],
 )

@@ -20,8 +20,20 @@ module(
     version = "0.0.1",
 )
 
+bazel_dep(name = "rules_shell", version = "0.6.1")
+bazel_dep(name = "rules_python", version = "1.9.0")
+bazel_dep(name = "rules_cc", version = "0.2.17")
+
+# Hedron's Compile Commands Extractor for Bazel
+# https://github.com/hedronvision/bazel-compile-commands-extractor
+bazel_dep(name = "hedron_compile_commands", dev_dependency = True)
+git_override(
+    module_name = "hedron_compile_commands",
+    commit = "2dc498f24587eccc2752f8a892da004d9baa8318",
+    remote = "https://github.com/ultimateanu/bazel-compile-commands-extractor.git",
+)
+
 bazel_dep(name = "nanobind", version = "2.9.2")
-bazel_dep(name = "rules_python", version = "0.36.0")
 
 python = use_extension("@rules_python//python/extensions:python.bzl", "python")
 python.toolchain(python_version = "3.11")
@@ -32,8 +44,11 @@ use_repo(dlpack_deps, "dlpack")
 stdexec_deps = use_extension("//third_party/stdexec:extensions.bzl", "stdexec_dep")
 use_repo(stdexec_deps, "stdexec")
 
-folly_deps = use_extension("//third_party/folly:extensions.bzl", "folly_dep")
-use_repo(folly_deps, "folly")
-
 proxy_deps = use_extension("//third_party/proxy:extensions.bzl", "proxy_dep")
 use_repo(proxy_deps, "proxy")
+
+robin_map_deps = use_extension("//third_party/robin_map:extensions.bzl", "robin_map_dep")
+use_repo(robin_map_deps, "robin_map")
+
+unordered_dense_deps = use_extension("//third_party/unordered_dense:extensions.bzl", "unordered_dense_dep")
+use_repo(unordered_dense_deps, "unordered_dense")
