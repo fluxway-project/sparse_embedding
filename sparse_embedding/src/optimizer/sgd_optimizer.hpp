@@ -36,16 +36,13 @@ public:
   void clear() {}
 
   void step(uint32_t idx, std::span<ValT> param_span,
-            std::span<const ValT> grad_span, uint32_t k_batches,
-            uint64_t global_step) {
+            std::span<const ValT> grad_span, uint64_t global_step) {
     size_t dim = param_span.size();
     ValT *param = param_span.data();
     const ValT *accumulated_grad = grad_span.data();
 
-    float inv_k = 1.0f / static_cast<float>(k_batches);
-
     for (size_t d = 0; d < dim; ++d) {
-      float g = static_cast<float>(accumulated_grad[d]) * inv_k;
+      float g = static_cast<float>(accumulated_grad[d]);
       if (config.weight_decay > 0.0f) {
         g += config.weight_decay * static_cast<float>(param[d]);
       }

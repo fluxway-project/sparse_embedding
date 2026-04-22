@@ -29,7 +29,6 @@ struct EmbeddingConfig {
   std::unordered_map<uint32_t, size_t> slot_dims;
   size_t num_threads = 0; // 0 means auto
   std::string dtype = "float32";
-  uint32_t grad_accum_steps = 100;
   size_t max_active_keys = 1048576; // 1 << 20
 };
 

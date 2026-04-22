@@ -41,7 +41,6 @@ struct OptimizerFacade
                   add_convention<OptMemStep,
                                  void(uint32_t idx, std::span<ValT> param,
                                       std::span<const ValT> grad,
-                                      uint32_t k_batches,
                                       uint64_t global_step)>::build {};
 
 PRO_DEF_MEM_DISPATCH(MemBuildOptF32, build_f32);

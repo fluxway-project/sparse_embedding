@@ -55,7 +55,7 @@ async def run_benchmark():
 
     store = se.EmbeddingStore(
         embedding_config=se.EmbeddingConfig(
-            slot_dims=slot_dims, num_threads=8, dtype="float32", grad_accum_steps=100
+            slot_dims=slot_dims, num_threads=8, dtype="float32"
         ),
         initializer_config=se.Zeros(),
         optimizer_config=se.Adam(lr=0.01),
