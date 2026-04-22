@@ -1,0 +1,10 @@
+cc_library(
+    name = "arena",
+    hdrs = glob(["*.hpp"]),
+    visibility = ["//visibility:public"],
+    deps = [
+        "//sparse_embedding/src/simd",
+        "@robin_map",
+        "@unordered_dense",
+    ],
+)

@@ -34,19 +34,19 @@
 #include <utility>
 #include <variant>
 
-#include "backend/hogwild/hogwild_embedding_store.hpp"
-#include "bindings/async_bridge.hpp"
-#include "bindings/dlpack_utils.hpp"
-#include "bindings/python_wake_manager.hpp"
-#include "initializer/initializer_config.hpp"
-#include "initializer/uniform_initializer.hpp"
-#include "initializer/zeros_initializer.hpp"
-#include "interface/embedding_config.hpp"
-#include "interface/embedding_table_interface.hpp"
-#include "ops/tensor_ops.hpp"
-#include "optimizer/adam_optimizer.hpp"
-#include "optimizer/optimizer_config.hpp"
-#include "optimizer/sgd_optimizer.hpp"
+#include "sparse_embedding/src/backend/hogwild/hogwild_embedding_store.hpp"
+#include "sparse_embedding/src/bindings/async_bridge.hpp"
+#include "sparse_embedding/src/bindings/dlpack_utils.hpp"
+#include "sparse_embedding/src/bindings/python_wake_manager.hpp"
+#include "sparse_embedding/src/initializer/initializer_config.hpp"
+#include "sparse_embedding/src/initializer/uniform_initializer.hpp"
+#include "sparse_embedding/src/initializer/zeros_initializer.hpp"
+#include "sparse_embedding/src/interface/embedding_config.hpp"
+#include "sparse_embedding/src/interface/embedding_table_interface.hpp"
+#include "sparse_embedding/src/ops/tensor_ops.hpp"
+#include "sparse_embedding/src/optimizer/adam_optimizer.hpp"
+#include "sparse_embedding/src/optimizer/optimizer_config.hpp"
+#include "sparse_embedding/src/optimizer/sgd_optimizer.hpp"
 
 namespace nb = nanobind;
 

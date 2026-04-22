@@ -13,9 +13,9 @@
 // limitations under the License.
 // =============================================================================
 
-#include "hogwild_embedding_store.hpp"
-#include "optimizer/adam_optimizer.hpp"
-#include "optimizer/sgd_optimizer.hpp"
+#include "sparse_embedding/src/backend/hogwild/hogwild_embedding_store.hpp"
+#include "sparse_embedding/src/optimizer/adam_optimizer.hpp"
+#include "sparse_embedding/src/optimizer/sgd_optimizer.hpp"
 
 namespace se {
 

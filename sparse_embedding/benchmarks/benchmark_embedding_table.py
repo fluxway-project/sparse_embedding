@@ -47,13 +47,16 @@ class EmbeddingTableBenchmark:
 
     def benchmark_insertion(self, batch_sizes: list[int], iters: int = 10):
         print(
-            f"=== Insertion Benchmark (lookup_or_insert) [Threads: {self.num_threads}] ==="
+            f"\n=== Insertion Benchmark (lookup_or_insert) [Threads: {self.num_threads}] ==="
         )
         for batch_size in batch_sizes:
             runner = BenchmarkRunner("Insert", iters=iters)
             keys = np.random.randint(
                 0, batch_size * 10, size=batch_size, dtype=np.int64
             )
+            # Warmup to ensure JIT/OS pages are ready
+            for _ in range(3):
+                self.store.lookup_or_insert(keys)
             runner.run(lambda: self.store.lookup_or_insert(keys), batch_size)
 
     def benchmark_query(self, batch_sizes: list[int], iters: int = 10):
@@ -68,7 +71,25 @@ class EmbeddingTableBenchmark:
         for batch_size in batch_sizes:
             runner = BenchmarkRunner("Lookup", iters=iters)
             keys = np.random.randint(0, num_keys, size=batch_size, dtype=np.int64)
+            # Warmup
+            for _ in range(3):
+                self.store.lookup(keys)
             runner.run(lambda: self.store.lookup(keys), batch_size)
+
+    def benchmark_assign(self, batch_sizes: list[int], iters: int = 10):
+        print(
+            f"\n=== Assign Benchmark (Raw Compute throughput) [Threads: {self.num_threads}] ==="
+        )
+        for batch_size in batch_sizes:
+            runner = BenchmarkRunner("Assign", iters=iters)
+            keys = np.random.randint(
+                0, batch_size * 10, size=batch_size, dtype=np.int64
+            )
+            values = np.random.rand(batch_size, self.dim).astype(np.float32)
+            # Warmup
+            for _ in range(3):
+                self.store.assign(keys, values)
+            runner.run(lambda: self.store.assign(keys, values), batch_size)
 
 
 def main():
@@ -80,6 +101,7 @@ def main():
         print(f"Testing with {num_threads} Threads")
         print("===============================================")
         benchmark = EmbeddingTableBenchmark(dim=128, num_threads=num_threads)
+        benchmark.benchmark_assign(batch_sizes, iters=10)
         benchmark.benchmark_insertion(batch_sizes, iters=10)
         benchmark.benchmark_query(batch_sizes, iters=10)
 

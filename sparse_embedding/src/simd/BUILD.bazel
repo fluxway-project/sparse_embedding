@@ -1,0 +1,5 @@
+cc_library(
+    name = "simd",
+    hdrs = ["simd_ops.hpp"],
+    visibility = ["//visibility:public"],
+)

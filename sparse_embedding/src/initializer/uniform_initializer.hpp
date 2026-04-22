@@ -21,7 +21,7 @@
 #include <cstdint>
 #include <span>
 
-#include "simd/simd_ops.hpp"
+#include "sparse_embedding/src/simd/simd_ops.hpp"
 
 namespace se {
 

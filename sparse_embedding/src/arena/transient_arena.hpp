@@ -30,7 +30,7 @@
 #include <ankerl/unordered_dense.h>
 #include <tsl/robin_map.h>
 
-#include "simd/simd_ops.hpp"
+#include "sparse_embedding/src/simd/simd_ops.hpp"
 
 namespace se {
 

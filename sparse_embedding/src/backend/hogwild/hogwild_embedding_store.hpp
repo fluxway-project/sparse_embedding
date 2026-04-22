@@ -24,14 +24,12 @@
 #include <cstdlib>
 #include <cstring>
 #include <memory>
-#include <random>
 #include <shared_mutex>
 #include <span>
 #include <stdexcept>
 #include <string>
 #include <system_error>
 #include <thread>
-#include <type_traits>
 #include <unordered_map>
 #include <vector>
 
@@ -41,13 +39,14 @@
 #include <ankerl/unordered_dense.h>
 #include <tsl/robin_map.h>
 
-#include "arena/transient_arena.hpp"
-#include "common/embedding_error.hpp"
-#include "common/numeric_types.hpp"
-#include "interface/initializer_interface.hpp"
-#include "interface/optimizer_interface.hpp"
-#include "optimizer/optimizer_state.hpp"
-#include "simd/simd_ops.hpp"
+#include "sparse_embedding/src/arena/transient_arena.hpp"
+#include "sparse_embedding/src/backend/hogwild/parallel_dispatch.hpp"
+#include "sparse_embedding/src/common/embedding_error.hpp"
+#include "sparse_embedding/src/common/numeric_types.hpp"
+#include "sparse_embedding/src/interface/initializer_interface.hpp"
+#include "sparse_embedding/src/interface/optimizer_interface.hpp"
+#include "sparse_embedding/src/optimizer/optimizer_state.hpp"
+#include "sparse_embedding/src/simd/simd_ops.hpp"
 
 namespace se {
 
@@ -153,7 +152,10 @@ public:
 
   static constexpr size_t kNumShards = 256;
 
-  struct Shard {
+  // "alignas(64)" ensures that regardless of how memory is allocated, each
+  // Shard mutex lock firmly occupies an independent cache line, completely
+  // cutting off False Sharing based on hardware.
+  struct alignas(64) Shard {
     std::shared_mutex mtx;
     tsl::robin_map<uint64_t, ArenaHandle<ValT>,
                    ankerl::unordered_dense::hash<uint64_t>>
@@ -193,10 +195,10 @@ public:
                                  uint32_t grad_accum_steps = 1,
                                  size_t max_active_keys = 1 << 20,
                                  OptimizerFactory opt_factory = nullptr)
-      : pool_(static_cast<uint32_t>(
-            num_threads > 0
-                ? num_threads
-                : std::max(1u, std::thread::hardware_concurrency()))),
+      : num_threads_(num_threads > 0
+                         ? num_threads
+                         : std::max(1u, std::thread::hardware_concurrency())),
+        pool_(static_cast<uint32_t>(num_threads_)),
         initializer_(std::move(initializer)) {
     if (slot_dims.empty()) {
       throw std::invalid_argument("slot_dims must not be empty");
@@ -562,9 +564,17 @@ private:
 
   template <typename Fn> void dispatch_parallel(size_t n, Fn &&fn) {
     if (n >= kParallelThreshold) {
-      stdexec::sync_wait(stdexec::bulk_chunked(
-          stdexec::schedule(pool_.get_scheduler()), stdexec::par, n,
-          [&fn](size_t begin, size_t end) { fn(begin, end); }));
+      uint32_t num_threads = num_threads_;
+      if (num_threads == 0)
+        num_threads = std::thread::hardware_concurrency();
+      TaskClosure closure{
+          &fn, [](void *ctx, size_t begin, size_t end) {
+            auto *f =
+                static_cast<std::add_pointer_t<std::remove_reference_t<Fn>>>(
+                    ctx);
+            (*f)(begin, end);
+          }};
+      dispatch_parallel_tasks(pool_, num_threads, n, closure);
     } else {
       fn(0, n);
     }
@@ -582,6 +592,7 @@ private:
   }
 
   std::unordered_map<uint32_t, std::unique_ptr<SlotStore>> slots_;
+  size_t num_threads_ = 0;
   exec::static_thread_pool pool_;
   Initializer initializer_;
   size_t max_dim_ = 0;

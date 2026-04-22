@@ -24,9 +24,9 @@
 #include <type_traits>
 #include <vector>
 
-#include "optimizer/optimizer_config.hpp"
-#include "optimizer/optimizer_state.hpp"
-#include "simd/simd_ops.hpp"
+#include "sparse_embedding/src/optimizer/optimizer_config.hpp"
+#include "sparse_embedding/src/optimizer/optimizer_state.hpp"
+#include "sparse_embedding/src/simd/simd_ops.hpp"
 
 namespace se {
 

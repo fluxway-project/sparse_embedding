@@ -6,7 +6,7 @@ Single unified _core.so target:
 """
 
 load("@hedron_compile_commands//:refresh_compile_commands.bzl", "refresh_compile_commands")
-load("@rules_cc//cc:defs.bzl", "cc_binary", "cc_library")
+load("@rules_cc//cc:defs.bzl", "cc_binary")
 load("@rules_python//python:defs.bzl", "py_library")
 load("@rules_python//python:packaging.bzl", "py_wheel")
 load("@rules_shell//shell:sh_binary.bzl", "sh_binary")
@@ -19,105 +19,10 @@ sh_binary(
 refresh_compile_commands(
     name = "refresh_compile_commands",
     exclude_external_sources = True,
+    tags = ["manual"],
     targets = {
         "//:sparse_embedding/_core.so": "",
     },
-)
-
-# ---- Base and Utility Libraries ----
-
-cc_library(
-    name = "common",
-    hdrs = [
-        "sparse_embedding/src/common/embedding_error.hpp",
-        "sparse_embedding/src/common/numeric_types.hpp",
-    ],
-    copts = ["-Isparse_embedding/src"],
-)
-
-cc_library(
-    name = "simd",
-    hdrs = ["sparse_embedding/src/simd/simd_ops.hpp"],
-    copts = ["-Isparse_embedding/src"],
-)
-
-# ---- Interface Libraries ----
-
-cc_library(
-    name = "interface",
-    hdrs = [
-        "sparse_embedding/src/interface/embedding_config.hpp",
-        "sparse_embedding/src/interface/embedding_table_interface.hpp",
-        "sparse_embedding/src/interface/initializer_interface.hpp",
-        "sparse_embedding/src/interface/optimizer_interface.hpp",
-    ],
-    copts = ["-Isparse_embedding/src"],
-    deps = [
-        ":common",
-        "@proxy",
-    ],
-)
-
-# ---- Core Components ----
-
-cc_library(
-    name = "initializer",
-    hdrs = [
-        "sparse_embedding/src/initializer/initializer_config.hpp",
-        "sparse_embedding/src/initializer/uniform_initializer.hpp",
-        "sparse_embedding/src/initializer/zeros_initializer.hpp",
-    ],
-    copts = ["-Isparse_embedding/src"],
-    deps = [
-        ":interface",
-        ":simd",
-    ],
-)
-
-cc_library(
-    name = "optimizer",
-    hdrs = [
-        "sparse_embedding/src/optimizer/adam_optimizer.hpp",
-        "sparse_embedding/src/optimizer/optimizer_config.hpp",
-        "sparse_embedding/src/optimizer/optimizer_state.hpp",
-        "sparse_embedding/src/optimizer/sgd_optimizer.hpp",
-    ],
-    copts = ["-Isparse_embedding/src"],
-    deps = [
-        ":interface",
-    ],
-)
-
-cc_library(
-    name = "arena",
-    hdrs = ["sparse_embedding/src/arena/transient_arena.hpp"],
-    copts = ["-Isparse_embedding/src"],
-    deps = [
-        ":simd",
-        "@robin_map",
-        "@unordered_dense",
-    ],
-)
-
-# ---- Backend library (Hogwild + stdexec + SIMD + Adam) ----
-
-cc_library(
-    name = "hogwild_embedding_store",
-    srcs = ["sparse_embedding/src/backend/hogwild/hogwild_embedding_store.cpp"],
-    hdrs = ["sparse_embedding/src/backend/hogwild/hogwild_embedding_store.hpp"],
-    copts = ["-Isparse_embedding/src"],
-    deps = [
-        ":arena",
-        ":common",
-        ":initializer",
-        ":interface",
-        ":optimizer",
-        ":simd",
-        "@proxy",
-        "@robin_map",
-        "@stdexec",
-        "@unordered_dense",
-    ],
 )
 
 # ---- _core.so: unified Python extension module ----
@@ -125,20 +30,16 @@ cc_library(
 cc_binary(
     name = "sparse_embedding/_core.so",
     srcs = [
-        "sparse_embedding/src/bindings/async_bridge.hpp",
-        "sparse_embedding/src/bindings/dlpack_utils.hpp",
-        "sparse_embedding/src/bindings/module.cpp",
-        "sparse_embedding/src/bindings/python_wake_manager.hpp",
-        "sparse_embedding/src/ops/tensor_ops.hpp",
+        "//sparse_embedding/src/bindings:srcs",
+        "//sparse_embedding/src/ops:srcs",
     ],
-    copts = ["-Isparse_embedding/src"],
     linkshared = True,
     deps = [
-        ":common",
-        ":hogwild_embedding_store",
-        ":initializer",
-        ":interface",
-        ":optimizer",
+        "//sparse_embedding/src/backend/hogwild:hogwild_embedding_store",
+        "//sparse_embedding/src/common",
+        "//sparse_embedding/src/initializer",
+        "//sparse_embedding/src/interface",
+        "//sparse_embedding/src/optimizer",
         "@dlpack",
         "@nanobind",
         "@proxy",
