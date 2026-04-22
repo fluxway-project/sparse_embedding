@@ -21,7 +21,7 @@
 #include <cstdint>
 #include <span>
 
-#include "optimizer/optimizer_config.hpp"
+#include "sparse_embedding/src/optimizer/optimizer_config.hpp"
 
 namespace se {
 

@@ -27,7 +27,7 @@
 #include <exec/static_thread_pool.hpp>
 #include <stdexec/execution.hpp>
 
-#include "python_wake_manager.hpp"
+#include "sparse_embedding/src/bindings/python_wake_manager.hpp"
 
 namespace se::py {
 

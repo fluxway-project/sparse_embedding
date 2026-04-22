@@ -1,2 +1,3 @@
 build --cxxopt=-std=c++2b
 build --cxxopt=-march=native
+build --enable_runfiles=false

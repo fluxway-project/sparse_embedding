@@ -1,0 +1,9 @@
+cc_library(
+    name = "interface",
+    hdrs = glob(["*.hpp"]),
+    visibility = ["//visibility:public"],
+    deps = [
+        "//sparse_embedding/src/common",
+        "@proxy",
+    ],
+)

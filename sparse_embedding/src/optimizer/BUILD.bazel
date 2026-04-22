@@ -1,0 +1,9 @@
+cc_library(
+    name = "optimizer",
+    hdrs = glob(["*.hpp"]),
+    visibility = ["//visibility:public"],
+    deps = [
+        "//sparse_embedding/src/interface",
+        "//sparse_embedding/src/simd",
+    ],
+)

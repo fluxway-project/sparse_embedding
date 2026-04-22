@@ -1,0 +1,18 @@
+cc_library(
+    name = "hogwild_embedding_store",
+    srcs = glob(["*.cpp"]),
+    hdrs = glob(["*.hpp"]),
+    visibility = ["//visibility:public"],
+    deps = [
+        "//sparse_embedding/src/arena",
+        "//sparse_embedding/src/common",
+        "//sparse_embedding/src/initializer",
+        "//sparse_embedding/src/interface",
+        "//sparse_embedding/src/optimizer",
+        "//sparse_embedding/src/simd",
+        "@proxy",
+        "@robin_map",
+        "@stdexec",
+        "@unordered_dense",
+    ],
+)

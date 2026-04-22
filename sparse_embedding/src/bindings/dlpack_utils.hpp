@@ -29,7 +29,7 @@
 #include <utility>
 #include <vector>
 
-#include "common/numeric_types.hpp"
+#include "sparse_embedding/src/common/numeric_types.hpp"
 
 namespace se::py {
 
