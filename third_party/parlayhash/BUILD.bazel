@@ -1,0 +1,19 @@
+"""parlay::parlay_unordered_map build file."""
+
+load("@rules_cc//cc:defs.bzl", "cc_library")
+
+licenses(["notice"])
+
+cc_library(
+    name = "parlayhash",
+    hdrs = glob(
+        ["include/**/*.h"],
+        exclude = [
+            "benchmarks/**",
+            "other/**",
+            "test/**",
+        ],
+    ),
+    includes = ["include"],
+    visibility = ["//visibility:public"],
+)

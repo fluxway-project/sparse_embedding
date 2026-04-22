@@ -243,8 +243,8 @@ public:
 
       using StoreType = se::HogwildEmbeddingStore<ValT>;
       store_ = pro::make_proxy<se::EmbeddingTableFacade<ValT>, StoreType>(
-          slot_dims_, nt, std::move(init_proxy), emb_cfg.grad_accum_steps,
-          emb_cfg.max_active_keys, std::move(opt_factory));
+          slot_dims_, nt, std::move(init_proxy), emb_cfg.max_active_keys,
+          std::move(opt_factory));
     };
 
     dispatch_val(construct);
@@ -470,6 +470,16 @@ public:
     check_error(ec);
   }
 
+  // ---- Optimizer Step ----
+
+  void optimizer_step() {
+    nb::gil_scoped_release release;
+    std::error_code ec;
+    dispatch_val(
+        [&]<typename ValT>() { ec = get_store<ValT>()->optimizer_step(); });
+    check_error(ec);
+  }
+
   // ---- Sync erase ----
 
   void erase(nb::ndarray<nb::c_contig, nb::device::cpu> keys) {
@@ -659,14 +669,12 @@ NB_MODULE(_core, m) {
 
   nb::class_<se::EmbeddingConfig>(m, "EmbeddingConfig")
       .def(nb::init<std::unordered_map<uint32_t, size_t>, size_t, std::string,
-                    uint32_t, size_t>(),
+                    size_t>(),
            nb::arg("slot_dims"), nb::arg("num_threads") = 0,
-           nb::arg("dtype") = "float32", nb::arg("grad_accum_steps") = 100,
-           nb::arg("max_active_keys") = 1 << 20)
+           nb::arg("dtype") = "float32", nb::arg("max_active_keys") = 1 << 20)
       .def_rw("slot_dims", &se::EmbeddingConfig::slot_dims)
       .def_rw("num_threads", &se::EmbeddingConfig::num_threads)
       .def_rw("dtype", &se::EmbeddingConfig::dtype)
-      .def_rw("grad_accum_steps", &se::EmbeddingConfig::grad_accum_steps)
       .def_rw("max_active_keys", &se::EmbeddingConfig::max_active_keys);
 
   nb::class_<PyInitializer>(m, "Initializer");
@@ -770,6 +778,7 @@ NB_MODULE(_core, m) {
            nb::arg("keys"), nb::arg("scores"))
       .def("accumulate_gradients", &EmbeddingStoreWrapper::accumulate_gradients,
            nb::arg("keys"), nb::arg("grads"))
+      .def("optimizer_step", &EmbeddingStoreWrapper::optimizer_step)
 
       .def("async_lookup", &EmbeddingStoreWrapper::async_lookup,
            nb::arg("keys"))

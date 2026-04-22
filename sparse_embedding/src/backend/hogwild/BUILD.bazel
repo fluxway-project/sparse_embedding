@@ -10,9 +10,8 @@ cc_library(
         "//sparse_embedding/src/interface",
         "//sparse_embedding/src/optimizer",
         "//sparse_embedding/src/simd",
+        "@parlayhash",
         "@proxy",
-        "@robin_map",
         "@stdexec",
-        "@unordered_dense",
     ],
 )

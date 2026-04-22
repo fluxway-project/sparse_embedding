@@ -47,6 +47,9 @@ use_repo(stdexec_deps, "stdexec")
 proxy_deps = use_extension("//third_party/proxy:extensions.bzl", "proxy_dep")
 use_repo(proxy_deps, "proxy")
 
+parlayhash_deps = use_extension("//third_party/parlayhash:extensions.bzl", "parlayhash_dep")
+use_repo(parlayhash_deps, "parlayhash")
+
 robin_map_deps = use_extension("//third_party/robin_map:extensions.bzl", "robin_map_dep")
 use_repo(robin_map_deps, "robin_map")
 

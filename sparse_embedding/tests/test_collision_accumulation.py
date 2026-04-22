@@ -16,7 +16,6 @@ def test_heavy_collision_adam_update():
             slot_dims={0: 16},
             num_threads=2,
             dtype="float32",
-            grad_accum_steps=4,  # Every 4 accumulations, we apply an adam step
         ),
         initializer_config=se.Zeros(),
         optimizer_config=se.Adam(lr=0.01),
@@ -36,7 +35,8 @@ def test_heavy_collision_adam_update():
         grads = np.ones((2, 16), dtype=np.float32) * 0.1
         store.accumulate_gradients(keys, grads)
 
-    # Since k_batches=4, the 4th accumulation should trigger the optimizer step!
+    # Trigger optimizer step manually!
+    store.optimizer_step()
     res_vals, _ = store.lookup(keys)
     v_end = np.from_dlpack(res_vals)
 
@@ -52,6 +52,7 @@ def test_heavy_collision_adam_update():
     for _ in range(4):
         grads = np.ones((2, 16), dtype=np.float32) * 0.1
         store.accumulate_gradients(keys, grads)
+    store.optimizer_step()
 
     res_vals2, _ = store.lookup(keys)
     v_end2 = np.from_dlpack(res_vals2)
