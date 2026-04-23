@@ -116,6 +116,20 @@
 
 `erase` 在 8T 时达到峰值（64.49 Mops/s），超线程后因 NUMA 跨 socket 竞争开始下降。
 
+### Python 端性能表现
+
+以下是在 Python 中调用相应接口（通过 `nanobind` 和 DLPack 零拷贝封装）测得的吞吐量，包含 Python 和 C++ 侧上下文切换及 asyncio 调度开销：
+
+| API | 吞吐量 (Mops/s) | 说明 |
+|-----|----------------|------|
+| `async_unique` | ~16.48 Mops/s | 异步获取 unique keys，极速哈希去重 |
+| `lookup_or_insert` | ~9.65 Mops/s | 同步的插入及查找，零拷贝张量返回 |
+| `async_lookup` | ~11.11 Mops/s | 异步的前向查询，无阻滞事件循环 |
+| `accumulate_gradients` | ~3.10 Mops/s | 同步的梯度累积操作 |
+| **端到端 Step** | **~2.50 Mops/s** | `lookup` + `accumulate` + `optimizer_step` 的完整训练步 |
+
+得益于 DLPack 和 eventfd 无锁 asyncio 挂载，Python 端的调用开销被降到最低，依然保持了数以百万计的吞吐率。
+
 ---
 
 ## 架构说明
@@ -132,13 +146,13 @@ HogwildEmbeddingStore
 
 ### 关键设计决策
 
-1. **EmbeddingArena 预清零**：`ensure_capacity` 在分配新 page 时对整页（4096 × dim × sizeof(float)）做一次 `memset(0)`，`allocate()` 不再对单 entry 重复清零。
+1. **键值解耦架构（Decoupled KV Storage）**：将传统哈希表的 `Key -> Vector` 拆分为 `Key -> Index`（`parlayhash`）和 `Index -> Vector`（`EmbeddingArena`）两级结构。哈希表仅存储轻量级的整数索引，使嵌入向量的存储保持紧凑、连续且对齐，极大提升了 CPU 缓存命中率与 SIMD 向量化效率。
 
-2. **Epoch 批次化**：`epoch::with_epoch` 提升到每个 dispatch chunk 的外层，而非每个 key 单独进出，消除高并发下全局 epoch 原子计数器的竞争。
+2. **全局无锁并发（Lock-Free Everywhere）**：从前向查询到反向传播，全链路消除互斥锁（Mutex）。哈希表通过 CAS 原语实现并发插入，内存分配通过原子指针（Atomic Pointers）进行，梯度更新采用 Hogwild! 松弛一致性模型，彻底打通多核环境下的扩展瓶颈。
 
-3. **parlayhash 预分配**：以 `max_active_keys * 2` 初始化哈希表容量，避免运行时 rehash 导致的并发死锁（`copy_if_needed` 竞态）。
+3. **分页内存管理（Paged Arena Allocation）**：嵌入表底层的 `EmbeddingArena` 采用类似操作系统的虚拟内存页表（PageTable）结构。通过惰性分配（Lazy Allocation）大块连续内存页，不仅避免了启动时的巨量内存开销，也防止了高频小规模内存分配导致的内存碎片化问题。
 
-4. **`lookup_or_insert` 零冗余 Find**：新插入路径从 `upsert_fn` 闭包直接捕获 arena_idx，消除 Upsert 后的额外 Find 调用。
+4. **无冲突梯度累积（Conflict-Free Gradient Accumulation）**：反向传播时为每个线程分配独立的 `TransientArena` 分片。各线程先在本地分片中累积梯度，最后再进行 SIMD 加速的汇总与优化器更新，避免了多线程同时更新同一 embedding 时的伪共享（False Sharing）和原子竞争。
 
 ---
 
