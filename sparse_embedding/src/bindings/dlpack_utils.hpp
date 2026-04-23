@@ -69,10 +69,16 @@ template <> constexpr DLDataType to_dl_dtype<se::bfloat16_t>() {
 
 inline std::pair<DLManagedTensor *, nb::object>
 extract_dlpack_tensor(const nb::object &py_tensor) {
-  if (!nb::hasattr(py_tensor, "__dlpack__")) {
-    throw std::invalid_argument("object has no __dlpack__");
+  nb::object capsule;
+  if (PyCapsule_CheckExact(py_tensor.ptr())) {
+    capsule = py_tensor;
+  } else if (nb::hasattr(py_tensor, "__dlpack__")) {
+    capsule = py_tensor.attr("__dlpack__")();
+  } else {
+    throw std::invalid_argument(
+        "object must be a PyCapsule or have __dlpack__");
   }
-  nb::object capsule = py_tensor.attr("__dlpack__")();
+
   if (!PyCapsule_CheckExact(capsule.ptr())) {
     throw std::invalid_argument("__dlpack__ must return a PyCapsule");
   }
