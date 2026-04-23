@@ -22,7 +22,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <memory>
-#include <stdexcept>
+#include <mutex>
 #include <vector>
 
 namespace se {
@@ -47,6 +47,7 @@ public:
   OptimizerStateArena &operator=(OptimizerStateArena &&) = default;
 
   uint32_t allocate() {
+    std::lock_guard<std::mutex> lock(alloc_mtx_);
     uint32_t idx;
     if (!free_list_.empty()) {
       idx = free_list_.back();
@@ -66,9 +67,13 @@ public:
     return idx;
   }
 
-  void deallocate(uint32_t index) { free_list_.push_back(index); }
+  void deallocate(uint32_t index) {
+    std::lock_guard<std::mutex> lock(alloc_mtx_);
+    free_list_.push_back(index);
+  }
 
   void clear() {
+    std::lock_guard<std::mutex> lock(alloc_mtx_);
     pages_.clear();
     free_list_.clear();
     next_index_ = 0;
@@ -91,6 +96,7 @@ private:
   std::vector<std::unique_ptr<std::byte[], AlignedDeleter>> pages_;
   std::vector<uint32_t> free_list_;
   uint32_t next_index_ = 0;
+  std::mutex alloc_mtx_;
 };
 
 } // namespace se

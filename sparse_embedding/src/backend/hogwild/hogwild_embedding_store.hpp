@@ -39,7 +39,6 @@
 #include <parlay_hash/unordered_map.h>
 
 #include "sparse_embedding/src/arena/transient_arena.hpp"
-#include "sparse_embedding/src/backend/hogwild/parallel_dispatch.hpp"
 #include "sparse_embedding/src/common/embedding_error.hpp"
 #include "sparse_embedding/src/common/numeric_types.hpp"
 #include "sparse_embedding/src/interface/initializer_interface.hpp"
@@ -98,7 +97,6 @@ public:
   uint32_t allocate() {
     uint32_t idx = next_index_.fetch_add(1, std::memory_order_relaxed);
     ensure_capacity(idx);
-    std::memset(data_raw(idx), 0, data_stride_);
     score(idx).store(0, std::memory_order_relaxed);
     return idx;
   }
@@ -220,8 +218,9 @@ public:
 
     SlotStore(size_t d, size_t max_active_keys,
               const OptimizerFactory &opt_factory, size_t num_threads)
-        : dim(d), entries(false), key_map(1024, &entries, false), arena(d),
-          optimizer(opt_factory(d)), opt_factory(opt_factory) {
+        : dim(d), entries(false),
+          key_map(std::max(size_t(1024), max_active_keys * 2), &entries, false),
+          arena(d), optimizer(opt_factory(d)), opt_factory(opt_factory) {
       for (size_t i = 0; i < num_threads; ++i) {
         transient_shards.push_back(std::make_unique<TransientArena<ValT>>(
             d, max_active_keys / num_threads + 1));
@@ -295,29 +294,30 @@ public:
     auto offsets = compute_offsets(row_lengths);
 
     auto do_range = [&](size_t begin, size_t end) {
-      for (size_t i = begin; i < end; ++i) {
-        uint64_t key = static_cast<uint64_t>(keys[i]);
-        uint32_t slot_id = extract_slot(key);
-        auto &slot = *slots_.at(slot_id);
-        size_t dim = static_cast<size_t>(row_lengths[i]);
-        ValT *out = out_flat_values.data() + offsets[i];
+      epoch::with_epoch([&] {
+        for (size_t i = begin; i < end; ++i) {
+          uint64_t key = static_cast<uint64_t>(keys[i]);
+          uint32_t slot_id = extract_slot(key);
+          auto &slot = *slots_.at(slot_id);
+          size_t dim = static_cast<size_t>(row_lengths[i]);
+          ValT *out = out_flat_values.data() + offsets[i];
 
-        auto found = epoch::with_epoch([&] {
-          return slot.key_map.Find(
-              Key::Entry::make_key(key),
-              [](const auto &e) { return e.get_entry().second; });
-        });
-        if (found.has_value()) {
-          const ValT *src = slot.arena.data(*found);
-          if constexpr (simd::is_simd_supported_v<ValT>) {
-            simd::simd_copy(src, out, dim);
+          auto found =
+              slot.key_map.Find(Key::Entry::make_key(key), [](const auto &e) {
+                return e.get_entry().second;
+              });
+          if (found.has_value()) {
+            const ValT *src = slot.arena.data(*found);
+            if constexpr (simd::is_simd_supported_v<ValT>) {
+              simd::simd_copy(src, out, dim);
+            } else {
+              std::copy_n(src, dim, out);
+            }
           } else {
-            std::copy_n(src, dim, out);
+            std::fill_n(out, dim, ValT{0});
           }
-        } else {
-          std::fill_n(out, dim, ValT{0});
         }
-      }
+      });
     };
 
     dispatch_parallel(n, do_range);
@@ -335,9 +335,7 @@ public:
     size_t n = keys.size();
     auto offsets = compute_offsets(row_lengths);
 
-    uint32_t num_shards = num_threads_;
-    if (num_shards == 0)
-      num_shards = std::thread::hardware_concurrency();
+    size_t num_shards = num_threads_;
 
     std::vector<std::vector<uint32_t>> thread_counts(
         num_shards, std::vector<uint32_t>(num_shards, 0));
@@ -406,7 +404,7 @@ public:
           __m512i v_shards = _mm512_and_si512(v_hash, v_mask);
 
           uint64_t extracted[8] __attribute__((aligned(64)));
-          _mm512_storeu_si512(extracted, v_shards);
+          _mm512_store_si512(extracted, v_shards);
 
           for (int j = 0; j < 8; ++j) {
             shuffled_indices[thread_offsets[t][extracted[j]]++] = i + j;
@@ -462,35 +460,33 @@ public:
       slot->global_step++;
     }
 
-    uint32_t num_shards = num_threads_;
-    if (num_shards == 0)
-      num_shards = std::thread::hardware_concurrency();
+    size_t num_shards = num_threads_;
 
     auto do_shard = [&](size_t shard_begin, size_t shard_end) {
-      for (size_t shard_id = shard_begin; shard_id < shard_end; ++shard_id) {
-        for (auto &[_, slot] : slots_) {
-          auto &shard = slot->transient_shards[shard_id];
-          shard->for_each_accumulated(
-              [&](uint64_t feature_id, const ValT *accumulated_grad) {
-                auto found = epoch::with_epoch([&] {
-                  return slot->key_map.Find(
+      epoch::with_epoch([&] {
+        for (size_t shard_id = shard_begin; shard_id < shard_end; ++shard_id) {
+          for (auto &[_, slot] : slots_) {
+            auto &shard = slot->transient_shards[shard_id];
+            shard->for_each_accumulated(
+                [&](uint64_t feature_id, const ValT *accumulated_grad) {
+                  auto found = slot->key_map.Find(
                       Key::Entry::make_key(feature_id),
                       [](const auto &e) { return e.get_entry().second; });
+                  if (!found.has_value())
+                    return;
+
+                  uint32_t arena_idx = *found;
+                  ValT *param = slot->arena.data(arena_idx);
+
+                  slot->optimizer->step(
+                      arena_idx, std::span<ValT>(param, slot->dim),
+                      std::span<const ValT>(accumulated_grad, slot->dim),
+                      slot->global_step);
                 });
-                if (!found.has_value())
-                  return;
-
-                uint32_t arena_idx = *found;
-                ValT *param = slot->arena.data(arena_idx);
-
-                slot->optimizer->step(
-                    arena_idx, std::span<ValT>(param, slot->dim),
-                    std::span<const ValT>(accumulated_grad, slot->dim),
-                    slot->global_step);
-              });
-          shard->clear();
+            shard->clear();
+          }
         }
-      }
+      });
     };
 
     dispatch_parallel(num_shards, do_shard);
@@ -530,24 +526,24 @@ public:
     auto offsets = compute_offsets(row_lengths);
 
     auto do_range = [&](size_t begin, size_t end) {
-      for (size_t i = begin; i < end; ++i) {
-        uint64_t key = static_cast<uint64_t>(keys[i]);
-        uint32_t slot_id = extract_slot(key);
-        auto &slot = *slots_.at(slot_id);
-        const ValT *src = flat_values.data() + offsets[i];
+      epoch::with_epoch([&] {
+        for (size_t i = begin; i < end; ++i) {
+          uint64_t key = static_cast<uint64_t>(keys[i]);
+          uint32_t slot_id = extract_slot(key);
+          auto &slot = *slots_.at(slot_id);
+          const ValT *src = flat_values.data() + offsets[i];
 
-        auto upsert_fn = [&](std::optional<uint32_t> existing) -> uint32_t {
-          if (existing.has_value()) {
-            std::copy_n(src, slot.dim, slot.arena.data(*existing));
-            return *existing;
-          }
-          uint32_t idx = slot.arena.allocate();
-          slot.optimizer->allocate();
-          std::copy_n(src, slot.dim, slot.arena.data(idx));
-          return idx;
-        };
+          auto upsert_fn = [&](std::optional<uint32_t> existing) -> uint32_t {
+            if (existing.has_value()) {
+              std::copy_n(src, slot.dim, slot.arena.data(*existing));
+              return *existing;
+            }
+            uint32_t idx = slot.arena.allocate();
+            slot.optimizer->allocate();
+            std::copy_n(src, slot.dim, slot.arena.data(idx));
+            return idx;
+          };
 
-        epoch::with_epoch([&] {
           auto g = [&](std::optional<typename Key::Entry> opt_e)
               -> std::pair<uint64_t, uint32_t> {
             if (opt_e.has_value()) {
@@ -562,9 +558,9 @@ public:
                        : slot.entries.make_entry(Key::Entry::make_key(key),
                                                  g(std::nullopt));
           };
-          return slot.key_map.Upsert(Key::Entry::make_key(key), constr, g);
-        });
-      }
+          slot.key_map.Upsert(Key::Entry::make_key(key), constr, g);
+        }
+      });
     };
     dispatch_parallel(n, do_range);
     return {};
@@ -574,36 +570,38 @@ public:
   std::error_code lookup_or_insert(std::span<const KeyT> keys,
                                    std::span<ValT> out_flat_values,
                                    std::span<const int64_t> row_lengths,
-                                   std::span<bool> out_inserted_mask) {
+                                   std::span<uint8_t> out_inserted_mask) {
     size_t n = keys.size();
     auto offsets = compute_offsets(row_lengths);
 
     auto do_range = [&](size_t begin, size_t end) {
-      for (size_t i = begin; i < end; ++i) {
-        uint64_t key = static_cast<uint64_t>(keys[i]);
-        uint32_t slot_id = extract_slot(key);
-        auto &slot = *slots_.at(slot_id);
-        size_t dim = slot.dim;
-        ValT *out = out_flat_values.data() + offsets[i];
+      epoch::with_epoch([&] {
+        for (size_t i = begin; i < end; ++i) {
+          uint64_t key = static_cast<uint64_t>(keys[i]);
+          uint32_t slot_id = extract_slot(key);
+          auto &slot = *slots_.at(slot_id);
+          size_t dim = slot.dim;
+          ValT *out = out_flat_values.data() + offsets[i];
 
-        bool was_inserted = false;
-        auto upsert_fn = [&](std::optional<uint32_t> existing) -> uint32_t {
-          if (existing.has_value()) {
-            return *existing;
-          }
-          was_inserted = true;
-          uint32_t idx = slot.arena.allocate();
-          slot.optimizer->allocate();
-          if (initializer_.has_value()) {
-            initializer_->initialize(std::span<ValT>(slot.arena.data(idx), dim),
-                                     key);
-          } else {
-            std::fill_n(slot.arena.data(idx), dim, ValT{0});
-          }
-          return idx;
-        };
+          bool was_inserted = false;
+          uint32_t arena_idx_from_upsert = 0;
+          auto upsert_fn = [&](std::optional<uint32_t> existing) -> uint32_t {
+            if (existing.has_value()) {
+              return *existing;
+            }
+            was_inserted = true;
+            uint32_t idx = slot.arena.allocate();
+            slot.optimizer->allocate();
+            if (initializer_.has_value()) {
+              initializer_->initialize(
+                  std::span<ValT>(slot.arena.data(idx), dim), key);
+            } else {
+              std::fill_n(slot.arena.data(idx), dim, ValT{0});
+            }
+            arena_idx_from_upsert = idx;
+            return idx;
+          };
 
-        auto prev = epoch::with_epoch([&] {
           auto g = [&](std::optional<typename Key::Entry> opt_e)
               -> std::pair<uint64_t, uint32_t> {
             if (opt_e.has_value()) {
@@ -618,20 +616,14 @@ public:
                        : slot.entries.make_entry(Key::Entry::make_key(key),
                                                  g(std::nullopt));
           };
-          return slot.key_map.Upsert(Key::Entry::make_key(key), constr, g);
-        });
-        out_inserted_mask[i] = was_inserted;
+          auto prev = slot.key_map.Upsert(Key::Entry::make_key(key), constr, g);
 
-        uint32_t arena_idx =
-            was_inserted ? epoch::with_epoch([&] {
-                             return slot.key_map.Find(
-                                 Key::Entry::make_key(key), [](const auto &e) {
-                                   return e.get_entry().second;
-                                 });
-                           }).value()
-                         : prev->second;
-        std::copy_n(slot.arena.data(arena_idx), dim, out);
-      }
+          uint32_t arena_idx =
+              was_inserted ? arena_idx_from_upsert : prev->second;
+          out_inserted_mask[i] = was_inserted;
+          std::copy_n(slot.arena.data(arena_idx), dim, out);
+        }
+      });
     };
     dispatch_parallel(n, do_range);
     return {};
@@ -639,19 +631,20 @@ public:
 
   template <typename KeyT>
   std::error_code contains(std::span<const KeyT> keys,
-                           std::span<bool> out_exists) {
+                           std::span<uint8_t> out_exists) {
     size_t n = keys.size();
     auto do_range = [&](size_t begin, size_t end) {
-      for (size_t i = begin; i < end; ++i) {
-        uint64_t key = static_cast<uint64_t>(keys[i]);
-        uint32_t slot_id = extract_slot(key);
-        auto &slot = *slots_.at(slot_id);
-        out_exists[i] =
-            epoch::with_epoch([&] {
-              return slot.key_map.Find(Key::Entry::make_key(key),
-                                       [](const auto &e) { return true; });
-            }).has_value();
-      }
+      epoch::with_epoch([&] {
+        for (size_t i = begin; i < end; ++i) {
+          uint64_t key = static_cast<uint64_t>(keys[i]);
+          uint32_t slot_id = extract_slot(key);
+          auto &slot = *slots_.at(slot_id);
+          out_exists[i] = slot.key_map
+                              .Find(Key::Entry::make_key(key),
+                                    [](const auto &e) { return true; })
+                              .has_value();
+        }
+      });
     };
     dispatch_parallel(n, do_range);
     return {};
@@ -660,15 +653,15 @@ public:
   template <typename KeyT> std::error_code erase(std::span<const KeyT> keys) {
     size_t n = keys.size();
     auto do_range = [&](size_t begin, size_t end) {
-      for (size_t i = begin; i < end; ++i) {
-        uint64_t key = static_cast<uint64_t>(keys[i]);
-        uint32_t slot_id = extract_slot(key);
-        auto &slot = *slots_.at(slot_id);
-        epoch::with_epoch([&] {
+      epoch::with_epoch([&] {
+        for (size_t i = begin; i < end; ++i) {
+          uint64_t key = static_cast<uint64_t>(keys[i]);
+          uint32_t slot_id = extract_slot(key);
+          auto &slot = *slots_.at(slot_id);
           slot.key_map.Remove(Key::Entry::make_key(key),
                               [](const auto &e) { return true; });
-        });
-      }
+        }
+      });
     };
     dispatch_parallel(n, do_range);
     return {};
@@ -735,17 +728,19 @@ public:
 private:
   template <typename Fn> void dispatch_parallel(size_t n, Fn &&fn) {
     if (n >= kParallelThreshold) {
-      uint32_t num_threads = num_threads_;
-      if (num_threads == 0)
-        num_threads = std::thread::hardware_concurrency();
-      TaskClosure closure{
-          &fn, [](void *ctx, size_t begin, size_t end) {
-            auto *f =
-                static_cast<std::add_pointer_t<std::remove_reference_t<Fn>>>(
-                    ctx);
-            (*f)(begin, end);
-          }};
-      dispatch_parallel_tasks(pool_, num_threads, n, closure);
+      size_t num_threads = num_threads_;
+      size_t chunk_size = (n + num_threads - 1) / num_threads;
+      stdexec::sync_wait(stdexec::schedule(pool_.get_scheduler()) |
+                         stdexec::bulk(stdexec::par_unseq, num_threads,
+                                       [&fn, n, chunk_size](size_t i) {
+                                         size_t begin =
+                                             std::min(i * chunk_size, n);
+                                         size_t end =
+                                             std::min(begin + chunk_size, n);
+                                         if (begin < end) {
+                                           fn(begin, end);
+                                         }
+                                       }));
     } else {
       fn(0, n);
     }

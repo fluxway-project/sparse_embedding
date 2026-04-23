@@ -1,3 +1,9 @@
+"""
+BUILD file for initializer
+"""
+
+load("@rules_cc//cc:defs.bzl", "cc_library")
+
 cc_library(
     name = "initializer",
     hdrs = glob(["*.hpp"]),
