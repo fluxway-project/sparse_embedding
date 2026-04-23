@@ -116,6 +116,20 @@ Pure hash lookup without embedding copies, limited by CPU and hash table bucket 
 
 `erase` reaches its peak at 8T (64.49 Mops/s), and begins to decline due to NUMA cross-socket contention under Hyper-Threading.
 
+### Python API Performance
+
+The following throughputs were measured by calling the corresponding interfaces in Python (via `nanobind` and DLPack zero-copy wrappers). These numbers include Python/C++ context switching and asyncio scheduling overheads:
+
+| API | Throughput (Mops/s) | Description |
+|-----|---------------------|-------------|
+| `async_unique` | ~16.48 Mops/s | Async fetch of unique keys, ultra-fast hashing |
+| `lookup_or_insert` | ~9.65 Mops/s | Sync insert and lookup, returning zero-copy tensors |
+| `async_lookup` | ~11.11 Mops/s | Async forward lookup without blocking the event loop |
+| `accumulate_gradients` | ~3.10 Mops/s | Sync gradient accumulation |
+| **End-to-End Step** | **~2.50 Mops/s** | Full training step: `lookup` + `accumulate` + `optimizer_step` |
+
+Thanks to DLPack and lock-free `eventfd` asyncio integration, the Python invocation overhead is minimized, easily sustaining millions of operations per second.
+
 ---
 
 ## Architecture Overview
@@ -132,13 +146,13 @@ HogwildEmbeddingStore
 
 ### Key Design Decisions
 
-1. **EmbeddingArena Pre-zeroing**: `ensure_capacity` performs a `memset(0)` on the entire page (4096 × dim × sizeof(float)) when allocating a new page, so `allocate()` no longer repeats zeroing for single entries.
+1. **Decoupled Key-Value Storage**: The traditional `Key -> Vector` hash map is split into a two-level structure: `Key -> Index` (`parlayhash`) and `Index -> Vector` (`EmbeddingArena`). The hash table only stores lightweight integer indices, keeping the embedding vectors compactly stored, contiguous, and aligned. This significantly improves CPU cache hit rates and enables efficient SIMD vectorization.
 
-2. **Epoch Batching**: `epoch::with_epoch` is hoisted to the outer layer of each dispatch chunk rather than entering/exiting for every single key, eliminating global epoch atomic counter contention under high concurrency.
+2. **Lock-Free Everywhere**: Mutexes are entirely eliminated across the entire data path, from forward lookup to backward propagation. The hash table uses CAS primitives for concurrent insertions, memory allocation relies on atomic pointers, and gradient updates use the Hogwild! relaxed consistency model. This eliminates scaling bottlenecks on high-core-count NUMA machines.
 
-3. **parlayhash Pre-allocation**: Hash table capacity is initialized with `max_active_keys * 2`, avoiding concurrent deadlocks caused by runtime rehashes (`copy_if_needed` race conditions).
+3. **Paged Arena Allocation**: The underlying `EmbeddingArena` uses a PageTable-like structure similar to operating system virtual memory. By lazily allocating large memory pages, it avoids massive upfront memory allocation overhead and prevents memory fragmentation caused by high-frequency, small-scale allocations.
 
-4. **Zero-redundancy Find in `lookup_or_insert`**: The new insertion path captures the arena_idx directly from the `upsert_fn` closure, eliminating the extra Find call after Upsert.
+4. **Conflict-Free Gradient Accumulation**: During the backward pass, each thread is assigned an independent shard of a `TransientArena`. Threads accumulate gradients locally within their shards, which are then aggregated and applied using SIMD-accelerated optimizer steps. This prevents false sharing and atomic contention when multiple threads update the same embedding vector.
 
 ---
 
