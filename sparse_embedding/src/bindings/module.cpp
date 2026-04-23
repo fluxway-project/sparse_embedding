@@ -319,15 +319,14 @@ public:
 
           int64_t vals_shape[] = {static_cast<int64_t>(total)};
           vals_dlm = se::py::create_output_tensor<ValT>(vals_shape);
-          int64_t lens_shape[] = {static_cast<int64_t>(n)};
-          lens_dlm = se::py::create_output_tensor<int64_t>(lens_shape);
-          std::memcpy(lens_dlm->dl_tensor.data, row_lengths.get(),
-                      n * sizeof(int64_t));
+          lens_dlm =
+              se::py::wrap_unique_ptr_as_tensor(std::move(row_lengths), n);
 
           auto vals_span = std::span<ValT>(
               static_cast<ValT *>(vals_dlm->dl_tensor.data), total);
-          ec = get_store<ValT>()->forward_lookup(ks, vals_span,
-                                                 {row_lengths.get(), n});
+          ec = get_store<ValT>()->forward_lookup(
+              ks, vals_span,
+              {static_cast<const int64_t *>(lens_dlm->dl_tensor.data), n});
         });
       });
     }
@@ -535,28 +534,18 @@ public:
     size_t n = get_dlm_size(dlm_keys);
     auto kdt = detect_key_dtype(dlm_keys);
 
-    std::shared_ptr<void> keys_copy;
-    if (kdt == KeyDType::kInt64) {
-      keys_copy.reset(new int64_t[n],
-                      [](void *p) { delete[] static_cast<int64_t *>(p); });
-      nb::gil_scoped_release release;
-      auto span = se::py::dlpack_to_span<const int64_t>(dlm_keys);
-      std::memcpy(keys_copy.get(), span.data(), n * sizeof(int64_t));
-    } else {
-      keys_copy.reset(new uint64_t[n],
-                      [](void *p) { delete[] static_cast<uint64_t *>(p); });
-      nb::gil_scoped_release release;
-      auto span = se::py::dlpack_to_span<const uint64_t>(dlm_keys);
-      std::memcpy(keys_copy.get(), span.data(), n * sizeof(uint64_t));
-    }
+    const void *keys_data =
+        reinterpret_cast<const char *>(dlm_keys->dl_tensor.data) +
+        dlm_keys->dl_tensor.byte_offset;
 
     auto wrapper_ptr = this;
 
     return dispatch_val([&]<typename ValT>() -> nb::object {
       return se::py::async_dispatch(
           async_pool_,
-          [wrapper_ptr, n, kdt,
-           keys_copy]() -> std::pair<DLManagedTensor *, DLManagedTensor *> {
+          [wrapper_ptr, n, kdt, keys_data,
+           keys_keeper = std::make_shared<AsyncPyObjectKeeper>(
+               cap_keys)]() -> std::pair<DLManagedTensor *, DLManagedTensor *> {
             DLManagedTensor *vals_dlm = nullptr;
             DLManagedTensor *lens_dlm = nullptr;
 
@@ -567,26 +556,25 @@ public:
 
               int64_t vals_shape[] = {static_cast<int64_t>(total)};
               vals_dlm = se::py::create_output_tensor<ValT>(vals_shape);
-              int64_t lens_shape[] = {static_cast<int64_t>(n)};
-              lens_dlm = se::py::create_output_tensor<int64_t>(lens_shape);
-              std::memcpy(lens_dlm->dl_tensor.data, row_lengths.get(),
-                          n * sizeof(int64_t));
+              lens_dlm =
+                  se::py::wrap_unique_ptr_as_tensor(std::move(row_lengths), n);
 
               auto vals_span = std::span<ValT>(
                   static_cast<ValT *>(vals_dlm->dl_tensor.data), total);
               auto ec = wrapper_ptr->get_store<ValT>()->forward_lookup(
-                  ks, vals_span, {row_lengths.get(), n});
+                  ks, vals_span,
+                  {static_cast<const int64_t *>(lens_dlm->dl_tensor.data), n});
               if (ec)
                 throw std::runtime_error(ec.message());
             };
 
             if (kdt == KeyDType::kInt64) {
               auto ks = std::span<const int64_t>(
-                  static_cast<const int64_t *>(keys_copy.get()), n);
+                  static_cast<const int64_t *>(keys_data), n);
               do_lookup(ks);
             } else {
               auto ks = std::span<const uint64_t>(
-                  static_cast<const uint64_t *>(keys_copy.get()), n);
+                  static_cast<const uint64_t *>(keys_data), n);
               do_lookup(ks);
             }
             return {vals_dlm, lens_dlm};
@@ -821,29 +809,19 @@ NB_MODULE(_core, m) {
                 static_cast<const int64_t *>(keys_data), n);
             auto res = se::ops::unique_keys_inverse(span);
 
-            int64_t shape_u[] = {static_cast<int64_t>(res.unique_count)};
-            u_dlm = se::py::create_output_tensor<int64_t>(shape_u);
-            std::memcpy(u_dlm->dl_tensor.data, res.unique_keys.get(),
-                        res.unique_count * sizeof(int64_t));
-
-            int64_t shape_inv[] = {static_cast<int64_t>(res.inverse_count)};
-            inv_dlm = se::py::create_output_tensor<int64_t>(shape_inv);
-            std::memcpy(inv_dlm->dl_tensor.data, res.inverse_indices.get(),
-                        res.inverse_count * sizeof(int64_t));
+            u_dlm = se::py::wrap_shared_ptr_as_tensor(res.unique_keys,
+                                                      res.unique_count);
+            inv_dlm = se::py::wrap_shared_ptr_as_tensor(res.inverse_indices,
+                                                        res.inverse_count);
           } else {
             auto span = std::span<const uint64_t>(
                 static_cast<const uint64_t *>(keys_data), n);
             auto res = se::ops::unique_keys_inverse(span);
 
-            int64_t shape_u[] = {static_cast<int64_t>(res.unique_count)};
-            u_dlm = se::py::create_output_tensor<uint64_t>(shape_u);
-            std::memcpy(u_dlm->dl_tensor.data, res.unique_keys.get(),
-                        res.unique_count * sizeof(uint64_t));
-
-            int64_t shape_inv[] = {static_cast<int64_t>(res.inverse_count)};
-            inv_dlm = se::py::create_output_tensor<int64_t>(shape_inv);
-            std::memcpy(inv_dlm->dl_tensor.data, res.inverse_indices.get(),
-                        res.inverse_count * sizeof(int64_t));
+            u_dlm = se::py::wrap_shared_ptr_as_tensor(res.unique_keys,
+                                                      res.unique_count);
+            inv_dlm = se::py::wrap_shared_ptr_as_tensor(res.inverse_indices,
+                                                        res.inverse_count);
           }
 
           return {u_dlm, inv_dlm};

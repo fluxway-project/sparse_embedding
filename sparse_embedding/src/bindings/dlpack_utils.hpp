@@ -162,6 +162,72 @@ DLManagedTensor *create_output_tensor(std::span<const int64_t> shape) {
 }
 
 // =============================================================================
+// WrapSharedPtrAsTensor: wrap an existing std::shared_ptr<T[]> into DLPack
+// =============================================================================
+
+template <typename T> struct SharedTensorCtx {
+  std::shared_ptr<T[]> data;
+  int64_t shape[1];
+};
+
+template <typename T>
+DLManagedTensor *wrap_shared_ptr_as_tensor(std::shared_ptr<T[]> data,
+                                           size_t size) {
+  auto *ctx = new SharedTensorCtx<T>();
+  ctx->data = std::move(data);
+  ctx->shape[0] = static_cast<int64_t>(size);
+
+  auto *dlm = new DLManagedTensor;
+  dlm->dl_tensor.data = ctx->data.get();
+  dlm->dl_tensor.device = {kDLCPU, 0};
+  dlm->dl_tensor.ndim = 1;
+  dlm->dl_tensor.dtype = to_dl_dtype<T>();
+  dlm->dl_tensor.shape = ctx->shape;
+  dlm->dl_tensor.strides = nullptr;
+  dlm->dl_tensor.byte_offset = 0;
+  dlm->manager_ctx = ctx;
+  dlm->deleter = [](DLManagedTensor *self) {
+    delete static_cast<SharedTensorCtx<T> *>(self->manager_ctx);
+    delete self;
+  };
+
+  return dlm;
+}
+
+// =============================================================================
+// WrapUniquePtrAsTensor: wrap an existing std::unique_ptr<T[]> into DLPack
+// =============================================================================
+
+template <typename T> struct UniqueTensorCtx {
+  std::unique_ptr<T[]> data;
+  int64_t shape[1];
+};
+
+template <typename T>
+DLManagedTensor *wrap_unique_ptr_as_tensor(std::unique_ptr<T[]> data,
+                                           size_t size) {
+  auto *ctx = new UniqueTensorCtx<T>();
+  ctx->data = std::move(data);
+  ctx->shape[0] = static_cast<int64_t>(size);
+
+  auto *dlm = new DLManagedTensor;
+  dlm->dl_tensor.data = ctx->data.get();
+  dlm->dl_tensor.device = {kDLCPU, 0};
+  dlm->dl_tensor.ndim = 1;
+  dlm->dl_tensor.dtype = to_dl_dtype<T>();
+  dlm->dl_tensor.shape = ctx->shape;
+  dlm->dl_tensor.strides = nullptr;
+  dlm->dl_tensor.byte_offset = 0;
+  dlm->manager_ctx = ctx;
+  dlm->deleter = [](DLManagedTensor *self) {
+    delete static_cast<UniqueTensorCtx<T> *>(self->manager_ctx);
+    delete self;
+  };
+
+  return dlm;
+}
+
+// =============================================================================
 // Safe capsule destructor for unconsumed PyCapsules
 // =============================================================================
 
