@@ -135,7 +135,7 @@ DLManagedTensor *create_output_tensor(std::span<const int64_t> shape) {
     total *= static_cast<size_t>(s);
 
   auto *ctx = new OutputTensorCtx<T>();
-  ctx->data = std::make_unique<T[]>(total);
+  ctx->data = std::make_unique_for_overwrite<T[]>(total);
   ctx->shape.assign(shape.begin(), shape.end());
 
   auto *dlm = new DLManagedTensor;

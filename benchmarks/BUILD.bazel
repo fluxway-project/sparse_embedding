@@ -1,0 +1,27 @@
+"""
+BUILD file for benchmarks
+"""
+
+load("@rules_cc//cc:defs.bzl", "cc_binary")
+
+cc_binary(
+    name = "embedding_store_benchmark",
+    srcs = ["embedding_store_benchmark.cpp"],
+    linkopts = ["-pthread"],
+    deps = [
+        "//sparse_embedding/src/backend/hogwild:hogwild_embedding_store",
+        "//sparse_embedding/src/interface",
+        "//sparse_embedding/src/optimizer",
+        "@proxy",
+    ],
+)
+
+cc_binary(
+    name = "hotpath_microbench",
+    srcs = ["hotpath_microbench.cpp"],
+    linkopts = ["-pthread"],
+    deps = [
+        "@parlayhash",
+        "@stdexec",
+    ],
+)

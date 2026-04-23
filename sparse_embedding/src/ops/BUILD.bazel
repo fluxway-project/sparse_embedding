@@ -1,3 +1,7 @@
+"""
+BUILD file for ops
+"""
+
 filegroup(
     name = "srcs",
     srcs = glob([

@@ -33,7 +33,7 @@
  
      // update overflow list with new ptr (assumes buffer is full)
      state(const state& s, link* ptr)
-@@ -156,15 +156,15 @@
+@@ -156,17 +156,17 @@
      bool is_forwarded() const {return list_head == forwarded_val ;}
  
      // number of entries in buffer, or buffer_size+1 if overflow

@@ -24,6 +24,7 @@
 #include <exception>
 #include <utility>
 
+#include <exec/start_detached.hpp>
 #include <exec/static_thread_pool.hpp>
 #include <stdexec/execution.hpp>
 
@@ -44,55 +45,6 @@ struct AsyncTaskFacade
           pro::constraint_level::none>::build {};
 
 // =============================================================================
-// fire_and_forget_receiver: custom receiver for manually connecting to
-// a pool scheduler sender. Self-deletes operation state on completion.
-//
-// This bypasses start_detached's __constant_completion_signatures_v check
-// that is incompatible with static_thread_pool in this stdexec version.
-// =============================================================================
-
-namespace detail {
-
-struct op_base {
-  virtual ~op_base() = default;
-};
-
-struct fire_forget_receiver {
-  using receiver_concept = stdexec::receiver_t;
-
-  op_base *op_;
-
-  template <class... As> void set_value(As &&...) noexcept { delete op_; }
-
-  template <class E> [[noreturn]] void set_error(E &&) noexcept {
-    std::terminate();
-  }
-
-  void set_stopped() noexcept { delete op_; }
-
-  auto get_env() const noexcept { return stdexec::empty_env{}; }
-};
-
-template <typename OpState> struct op_impl : op_base {
-  OpState state_;
-
-  template <typename Sender>
-  explicit op_impl(Sender &&sndr)
-      : state_(stdexec::connect(std::forward<Sender>(sndr),
-                                fire_forget_receiver{this})) {}
-
-  void start() { stdexec::start(state_); }
-};
-
-template <typename Sender> void fire_and_forget(Sender &&sndr) {
-  using op_t = op_impl<stdexec::connect_result_t<Sender, fire_forget_receiver>>;
-  auto *op = new op_t(std::forward<Sender>(sndr));
-  op->start();
-}
-
-} // namespace detail
-
-// =============================================================================
 
 inline nb::object create_asyncio_future() {
   nb::module_ asyncio = nb::module_::import_("asyncio");
@@ -106,8 +58,7 @@ inline nb::object create_asyncio_future() {
 // 1. Creates Future (with GIL, on caller thread)
 // 2. Type-erases work lambda via pro::proxy<AsyncTaskFacade>
 // 3. Builds sender: schedule(pool) | then(task)
-// 4. fire_and_forget: manually connect + start (bypasses start_detached
-//    concept limitations, same mechanism, custom receiver)
+// 4. start_detached: schedules the execution without blocking
 // 5. Pool worker thread executes task, enqueues result to wake manager
 // 6. Returns Future immediately to Python
 //
@@ -146,7 +97,7 @@ nb::object async_dispatch(exec::static_thread_pool &pool, WorkFn &&work,
         }
       });
 
-  detail::fire_and_forget(
+  exec::start_detached(
       stdexec::schedule(pool.get_scheduler()) |
       stdexec::then([t = std::move(erased_task)]() mutable { (*t)(); }));
 

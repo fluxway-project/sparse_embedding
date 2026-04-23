@@ -1,3 +1,7 @@
+"""
+BUILD file for bindings
+"""
+
 filegroup(
     name = "srcs",
     srcs = glob([
