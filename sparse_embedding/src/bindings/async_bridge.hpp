@@ -22,6 +22,7 @@
 #include <proxy/proxy.h>
 
 #include <exception>
+#include <memory>
 #include <utility>
 
 #include <exec/start_detached.hpp>
@@ -45,6 +46,31 @@ struct AsyncTaskFacade
           pro::constraint_level::none>::build {};
 
 // =============================================================================
+// AsyncPyObjectKeeper: safely defers Py_DECREF to the GIL-holding wake thread
+//
+// Storing nb::object in a lambda captured by a worker thread is unsafe because
+// the destructor calls Py_DECREF without holding the GIL. This wrapper holds a
+// raw PyObject* and enqueues the decref via PythonWakeManager so it executes on
+// the main asyncio thread (which holds the GIL).
+// =============================================================================
+
+struct AsyncPyObjectKeeper {
+  PyObject *ptr;
+  explicit AsyncPyObjectKeeper(nb::handle obj) : ptr(obj.ptr()) {
+    if (ptr) {
+      nb::handle(ptr).inc_ref();
+    }
+  }
+  ~AsyncPyObjectKeeper() {
+    if (ptr) {
+      GetPythonWakeManager().Enqueue([p = ptr]() { nb::handle(p).dec_ref(); });
+    }
+  }
+  AsyncPyObjectKeeper(const AsyncPyObjectKeeper &) = delete;
+  AsyncPyObjectKeeper &operator=(const AsyncPyObjectKeeper &) = delete;
+};
+
+// =============================================================================
 
 inline nb::object create_asyncio_future() {
   nb::module_ asyncio = nb::module_::import_("asyncio");
@@ -56,11 +82,12 @@ inline nb::object create_asyncio_future() {
 // async_dispatch: bridge exec::static_thread_pool to asyncio.Future
 //
 // 1. Creates Future (with GIL, on caller thread)
-// 2. Type-erases work lambda via pro::proxy<AsyncTaskFacade>
-// 3. Builds sender: schedule(pool) | then(task)
-// 4. start_detached: schedules the execution without blocking
-// 5. Pool worker thread executes task, enqueues result to wake manager
-// 6. Returns Future immediately to Python
+// 2. Wraps future in AsyncPyObjectKeeper — never stored as nb::object on worker
+// 3. Type-erases work lambda via pro::proxy<AsyncTaskFacade>
+// 4. Builds sender: schedule(pool) | then(task)
+// 5. start_detached: schedules the execution without blocking
+// 6. Pool worker thread executes task, enqueues result to wake manager
+// 7. Returns Future immediately to Python
 //
 // All execution on exec::static_thread_pool worker threads. Zero extra threads.
 // =============================================================================
@@ -70,30 +97,36 @@ nb::object async_dispatch(exec::static_thread_pool &pool, WorkFn &&work,
                           CompleteFn &&on_complete) {
   nb::object future = create_asyncio_future();
 
+  auto future_keeper =
+      std::make_shared<AsyncPyObjectKeeper>(nb::borrow(future));
+
   pro::proxy<AsyncTaskFacade> erased_task = pro::make_proxy<AsyncTaskFacade>(
       [work = std::forward<WorkFn>(work),
        on_complete = std::forward<CompleteFn>(on_complete),
-       future_ref = nb::borrow(future)]() mutable {
+       future_keeper]() mutable {
         try {
           auto result = work();
           GetPythonWakeManager().Enqueue(
               [on_complete = std::move(on_complete),
-               future_ref = std::move(future_ref),
+               future_keeper = std::move(future_keeper),
                result = std::move(result)]() mutable {
-                on_complete(std::move(future_ref), std::move(result));
+                nb::object fut = nb::borrow(future_keeper->ptr);
+                on_complete(std::move(fut), std::move(result));
               });
         } catch (...) {
           auto eptr = std::current_exception();
-          GetPythonWakeManager().Enqueue([future_ref = std::move(future_ref),
-                                          eptr = std::move(eptr)]() mutable {
-            try {
-              std::rethrow_exception(eptr);
-            } catch (const std::exception &e) {
-              nb::module_ builtins = nb::module_::import_("builtins");
-              future_ref.attr("set_exception")(
-                  builtins.attr("RuntimeError")(e.what()));
-            }
-          });
+          GetPythonWakeManager().Enqueue(
+              [future_keeper = std::move(future_keeper),
+               eptr = std::move(eptr)]() mutable {
+                nb::object fut = nb::borrow(future_keeper->ptr);
+                try {
+                  std::rethrow_exception(eptr);
+                } catch (const std::exception &e) {
+                  nb::module_ builtins = nb::module_::import_("builtins");
+                  fut.attr("set_exception")(
+                      builtins.attr("RuntimeError")(e.what()));
+                }
+              });
         }
       });
 

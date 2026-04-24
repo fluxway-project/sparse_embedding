@@ -56,24 +56,6 @@ inline void check_error(std::error_code ec) {
     throw std::runtime_error(ec.message());
 }
 
-// =============================================================================
-
-struct AsyncPyObjectKeeper {
-  PyObject *ptr;
-  AsyncPyObjectKeeper(nb::handle obj) : ptr(obj.ptr()) {
-    if (ptr) {
-      nb::handle(ptr).inc_ref();
-    }
-  }
-  ~AsyncPyObjectKeeper() {
-    if (ptr) {
-      se::py::GetPythonWakeManager().Enqueue(
-          [p = ptr]() { nb::handle(p).dec_ref(); });
-    }
-  }
-  AsyncPyObjectKeeper(const AsyncPyObjectKeeper &) = delete;
-  AsyncPyObjectKeeper &operator=(const AsyncPyObjectKeeper &) = delete;
-};
 // KeyDType detection
 // =============================================================================
 
@@ -86,9 +68,7 @@ inline KeyDType detect_key_dtype(const DLManagedTensor *dlm) {
     return KeyDType::kInt64;
   if (code == static_cast<uint8_t>(kDLUInt) && bits == 64)
     return KeyDType::kUInt64;
-  if (code == static_cast<uint8_t>(kDLInt) && bits == 32)
-    return KeyDType::kInt64;
-  throw std::invalid_argument("keys must be int32, int64 or uint64");
+  throw std::invalid_argument("keys must be int64 or uint64");
 }
 
 template <typename Fn>
@@ -432,22 +412,16 @@ public:
     int64_t shape[1] = {static_cast<int64_t>(n)};
     DLManagedTensor *dlm =
         se::py::create_output_tensor<uint8_t>(std::span(shape));
-    auto buf = std::make_unique_for_overwrite<bool[]>(n);
-    std::fill_n(buf.get(), n, false);
+    auto *out = static_cast<uint8_t *>(dlm->dl_tensor.data);
 
     std::error_code ec;
     {
       nb::gil_scoped_release release;
-      auto exists_span = std::span<bool>(buf.get(), n);
       dispatch_val([&]<typename ValT>() {
         dispatch_on_key(dlm_keys, [&](auto ks) {
-          ec = get_store<ValT>()->contains(ks, exists_span);
+          ec = get_store<ValT>()->contains(ks, std::span<uint8_t>(out, n));
         });
       });
-
-      auto *out = static_cast<uint8_t *>(dlm->dl_tensor.data);
-      for (size_t i = 0; i < n; ++i)
-        out[i] = buf[i] ? 1 : 0;
     }
 
     check_error(ec);
@@ -544,7 +518,7 @@ public:
       return se::py::async_dispatch(
           async_pool_,
           [wrapper_ptr, n, kdt, keys_data,
-           keys_keeper = std::make_shared<AsyncPyObjectKeeper>(
+           keys_keeper = std::make_shared<se::py::AsyncPyObjectKeeper>(
                cap_keys)]() -> std::pair<DLManagedTensor *, DLManagedTensor *> {
             DLManagedTensor *vals_dlm = nullptr;
             DLManagedTensor *lens_dlm = nullptr;
@@ -613,8 +587,9 @@ public:
       return se::py::async_dispatch(
           async_pool_,
           [wrapper_ptr, n, kdt, keys_data, values_data, val_ndim, val_dim1,
-           keys_keeper = std::make_shared<AsyncPyObjectKeeper>(cap_keys),
-           values_keeper = std::make_shared<AsyncPyObjectKeeper>(
+           keys_keeper =
+               std::make_shared<se::py::AsyncPyObjectKeeper>(cap_keys),
+           values_keeper = std::make_shared<se::py::AsyncPyObjectKeeper>(
                cap_values)]() -> std::error_code {
             auto do_assign = [&](auto ks) -> std::error_code {
               if (val_ndim == 2) {
@@ -799,7 +774,7 @@ NB_MODULE(_core, m) {
     return se::py::async_dispatch(
         global_pool,
         [n, kdt, keys_data,
-         keys_keeper = std::make_shared<AsyncPyObjectKeeper>(
+         keys_keeper = std::make_shared<se::py::AsyncPyObjectKeeper>(
              cap_keys)]() -> std::pair<DLManagedTensor *, DLManagedTensor *> {
           DLManagedTensor *u_dlm = nullptr;
           DLManagedTensor *inv_dlm = nullptr;

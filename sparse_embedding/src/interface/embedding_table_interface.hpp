@@ -108,7 +108,7 @@ using WeakMemOptimizerStep = pro::weak_dispatch<MemOptimizerStep>;
                   std::span<const int64_t> row_lengths)
 
 #define SE_CONTAINS_FACADE_SIG(key_t)                                          \
-  std::error_code(std::span<const key_t> keys, std::span<bool> out_exists)
+  std::error_code(std::span<const key_t> keys, std::span<uint8_t> out_exists)
 
 #define SE_ERASE_FACADE_SIG(key_t) std::error_code(std::span<const key_t> keys)
 

@@ -696,6 +696,12 @@ public:
             } else {
               idx = slot.arena.allocate();
               slot.optimizer->allocate();
+              if (initializer_.has_value()) {
+                initializer_->initialize(
+                    std::span<ValT>(slot.arena.data(idx), slot.dim), key);
+              } else {
+                std::fill_n(slot.arena.data(idx), slot.dim, ValT{0});
+              }
             }
             slot.arena.score(idx).store(scores[i], std::memory_order_relaxed);
             return std::make_pair(key, idx);

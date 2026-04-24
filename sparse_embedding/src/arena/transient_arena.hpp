@@ -93,7 +93,6 @@ public:
   void clear() {
     id_map_.clear();
     next_slot_ = 0;
-    std::memset(grad_buffer_, 0, capacity_ * grad_stride_);
   }
 
   size_t dim() const { return dim_; }
