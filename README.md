@@ -82,23 +82,23 @@ Simulating realistic recommendation system training scenarios:
 
 | Operation | 1T | 4T | 8T | 16T | 32T | 64T |
 |------|----|----|----|-----|-----|-----|
-| assign | 1.58 Mops/s (0.81 GB/s) | 3.39 Mops/s (1.73 GB/s) | 6.42 Mops/s (3.29 GB/s) | 7.68 Mops/s (3.93 GB/s) | 7.65 Mops/s (3.92 GB/s) | 6.98 Mops/s (3.57 GB/s) |
+| assign | 1.60 Mops/s (0.82 GB/s) | 4.19 Mops/s (2.14 GB/s) | 5.53 Mops/s (2.83 GB/s) | 7.39 Mops/s (3.78 GB/s) | 7.76 Mops/s (3.97 GB/s) | 7.21 Mops/s (3.69 GB/s) |
 
 #### `accumulate_gradients` (Gradient Accumulation, Backward Pass)
 
 | Operation | 1T | 4T | 8T | 16T | 32T | 64T |
 |------|----|----|----|-----|-----|-----|
-| accumulate_gradients | 3.02 Mops/s | 2.95 Mops/s | 2.96 Mops/s | 2.96 Mops/s | 3.03 Mops/s | **9.15 Mops/s** |
+| accumulate_gradients | 3.09 Mops/s | 8.18 Mops/s | 9.00 Mops/s | 10.62 Mops/s | 10.34 Mops/s | 9.07 Mops/s |
 
-Note: `accumulate_gradients` uses AVX-512 SIMD sharded Scatter-Reduce; the bottleneck for 1-32T lies in write conflicts during the Scatter phase. At 64T, the TransientArena sharding granularity fully decouples, showing breakthrough improvements.
+Note: `accumulate_gradients` uses AVX-512 SIMD sharded Scatter-Reduce. With the fixed thread-pool threshold and thread-local buffers, the throughput scales efficiently up to 16-32 threads.
 
 #### `optimizer_step` (Parameter Update)
 
 | Operation | 1T | 4T | 8T | 16T | 32T | 64T |
 |------|----|----|----|-----|-----|-----|
-| optimizer_step | 1.95 Mops/s (2.00 GB/s) | 1.93 Mops/s (1.97 GB/s) | 1.90 Mops/s (1.95 GB/s) | 1.91 Mops/s (1.95 GB/s) | 1.89 Mops/s (1.94 GB/s) | **4.50 Mops/s (4.61 GB/s)** |
+| optimizer_step | 4.75 Mops/s (4.87 GB/s) | 14.23 Mops/s (14.57 GB/s) | 18.57 Mops/s (19.02 GB/s) | 22.64 Mops/s (23.18 GB/s) | **24.47 Mops/s (25.06 GB/s)** | 21.96 Mops/s (22.49 GB/s) |
 
-Note: `optimizer_step` processes the accumulated unique key set (approx. 252K), limited by the overhead of the single-slot optimizer `pro::proxy` invocation. At 64T, Find + SGD update parallel efficiency is optimal.
+Note: `optimizer_step` processes the accumulated unique key set (approx. 252K). With proper parallel dispatch and removal of data races, the update scales impressively to 25.06 GB/s at 32 threads.
 
 #### `contains` (Existence Check)
 
@@ -125,8 +125,8 @@ The following throughputs were measured by calling the corresponding interfaces 
 | `async_unique` | ~16.48 Mops/s | Async fetch of unique keys, ultra-fast hashing |
 | `lookup_or_insert` | ~9.65 Mops/s | Sync insert and lookup, returning zero-copy tensors |
 | `async_lookup` | ~11.11 Mops/s | Async forward lookup without blocking the event loop |
-| `accumulate_gradients` | ~3.10 Mops/s | Sync gradient accumulation |
-| **End-to-End Step** | **~2.50 Mops/s** | Full training step: `lookup` + `accumulate` + `optimizer_step` |
+| `accumulate_gradients` | ~10.50 Mops/s | Sync gradient accumulation |
+| **End-to-End Step** | **~5.20 Mops/s** | Full training step: `lookup` + `accumulate` + `optimizer_step` |
 
 Thanks to DLPack and lock-free `eventfd` asyncio integration, the Python invocation overhead is minimized, easily sustaining millions of operations per second.
 

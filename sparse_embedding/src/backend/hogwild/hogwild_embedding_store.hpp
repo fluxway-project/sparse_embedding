@@ -371,7 +371,7 @@ public:
         }
       }
     };
-    dispatch_parallel(num_shards, do_count);
+    dispatch_parallel(num_shards, do_count, 1);
 
     // 2. Prefix Sum (Sequential)
     std::vector<std::vector<uint32_t>> thread_offsets(
@@ -388,7 +388,9 @@ public:
     }
 
     // 3. Parallel Scatter
-    std::vector<uint32_t> shuffled_indices(n);
+    thread_local std::vector<uint32_t> shuffled_indices_buf;
+    shuffled_indices_buf.resize(n);
+    std::span<uint32_t> shuffled_indices(shuffled_indices_buf.data(), n);
     auto do_scatter = [&](size_t t_begin, size_t t_end) {
       for (size_t t = t_begin; t < t_end; ++t) {
         size_t start = t * n / num_shards;
@@ -418,7 +420,7 @@ public:
         }
       }
     };
-    dispatch_parallel(num_shards, do_scatter);
+    dispatch_parallel(num_shards, do_scatter, 1);
 
     auto do_shard = [&](size_t shard_begin, size_t shard_end) {
       for (size_t shard_id = shard_begin; shard_id < shard_end; ++shard_id) {
@@ -437,7 +439,7 @@ public:
       }
     };
 
-    dispatch_parallel(num_shards, do_shard);
+    dispatch_parallel(num_shards, do_shard, 1);
 
     // Manual step requirement: optimizer_step() must be called explicitly
 
@@ -489,7 +491,7 @@ public:
       });
     };
 
-    dispatch_parallel(num_shards, do_shard);
+    dispatch_parallel(num_shards, do_shard, 1);
 
     return {};
   }
@@ -732,8 +734,10 @@ public:
   size_t num_slots() const { return slots_.size(); }
 
 private:
-  template <typename Fn> void dispatch_parallel(size_t n, Fn &&fn) {
-    if (n >= kParallelThreshold) {
+  template <typename Fn>
+  void dispatch_parallel(size_t n, Fn &&fn,
+                         size_t threshold = kParallelThreshold) {
+    if (n >= threshold) {
       size_t num_threads = num_threads_;
       size_t chunk_size = (n + num_threads - 1) / num_threads;
       stdexec::sync_wait(stdexec::schedule(pool_.get_scheduler()) |
@@ -752,15 +756,16 @@ private:
     }
   }
 
-  std::vector<size_t>
+  std::span<const size_t>
   compute_offsets(std::span<const int64_t> row_lengths) const {
-    std::vector<size_t> offsets(row_lengths.size());
+    thread_local std::vector<size_t> offsets;
+    offsets.resize(row_lengths.size());
     size_t total = 0;
     for (size_t i = 0; i < row_lengths.size(); ++i) {
       offsets[i] = total;
       total += static_cast<size_t>(row_lengths[i]);
     }
-    return offsets;
+    return {offsets.data(), offsets.size()};
   }
 
   std::unordered_map<uint32_t, std::unique_ptr<SlotStore>> slots_;
