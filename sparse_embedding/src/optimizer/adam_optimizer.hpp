@@ -34,6 +34,9 @@ template <typename ValT> class AdamOptimizer {
   OptimizerStateArena m_state;
   OptimizerStateArena v_state;
   AdamConfig config;
+  uint64_t cached_step_ = 0;
+  float cached_bc1_ = 1.0f;
+  float cached_bc2_ = 1.0f;
 
 public:
   explicit AdamOptimizer(size_t dim, const AdamConfig &cfg)
@@ -56,17 +59,22 @@ public:
 
   void step(uint32_t idx, std::span<ValT> param_span,
             std::span<const ValT> grad_span, uint64_t global_step) {
+    if (global_step != cached_step_) {
+      cached_bc1_ = 1.0f / (1.0f - std::pow(config.beta1,
+                                            static_cast<float>(global_step)));
+      cached_bc2_ = 1.0f / (1.0f - std::pow(config.beta2,
+                                            static_cast<float>(global_step)));
+      cached_step_ = global_step;
+    }
+    const float bc1 = cached_bc1_;
+    const float bc2 = cached_bc2_;
+
     size_t dim = param_span.size();
     ValT *param = param_span.data();
     const ValT *accumulated_grad = grad_span.data();
 
     float *m = m_state.data(idx);
     float *v = v_state.data(idx);
-
-    float bc1 =
-        1.0f / (1.0f - std::pow(config.beta1, static_cast<float>(global_step)));
-    float bc2 =
-        1.0f / (1.0f - std::pow(config.beta2, static_cast<float>(global_step)));
 
     if constexpr (simd::is_simd_supported_v<ValT>) {
       thread_local std::vector<float> avg_grad;
