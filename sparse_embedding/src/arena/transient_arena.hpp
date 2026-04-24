@@ -56,17 +56,13 @@ public:
   TransientArena &operator=(const TransientArena &) = delete;
 
   uint32_t get_or_allocate(uint64_t feature_id) {
-    auto it = id_map_.find(feature_id);
-    if (it != id_map_.end())
-      return it->second;
     auto [it_new, inserted] = id_map_.try_emplace(feature_id, next_slot_);
     if (inserted) {
-      uint32_t slot = next_slot_++;
-      if (slot >= capacity_) {
+      if (next_slot_ >= capacity_) {
         throw std::overflow_error("transient arena capacity exceeded");
       }
-      std::memset(grad_data(slot), 0, dim_ * sizeof(ValT));
-      it_new.value() = slot;
+      std::memset(grad_data(next_slot_), 0, dim_ * sizeof(ValT));
+      ++next_slot_;
     }
     return it_new->second;
   }
