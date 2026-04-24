@@ -68,19 +68,36 @@ public:
     float *v = v_state.data(idx);
 
     if constexpr (simd::is_simd_supported_v<ValT>) {
-      thread_local std::vector<float> avg_grad;
-      avg_grad.resize(dim);
-      for (size_t d = 0; d < dim; ++d) {
-        avg_grad[d] = accumulated_grad[d];
-      }
-      if (config.weight_decay > 0.0f) {
-        for (size_t d = 0; d < dim; ++d) {
-          avg_grad[d] += config.weight_decay * param[d];
+      const float *grad_ptr;
+      thread_local std::vector<float> grad_buf;
+
+      if constexpr (std::is_same_v<ValT, float>) {
+        if (config.weight_decay > 0.0f) {
+          grad_buf.resize(dim);
+          for (size_t d = 0; d < dim; ++d) {
+            grad_buf[d] = accumulated_grad[d] + config.weight_decay * param[d];
+          }
+          grad_ptr = grad_buf.data();
+        } else {
+          grad_ptr = accumulated_grad;
         }
+      } else {
+        grad_buf.resize(dim);
+        if (config.weight_decay > 0.0f) {
+          for (size_t d = 0; d < dim; ++d) {
+            grad_buf[d] = static_cast<float>(accumulated_grad[d]) +
+                          config.weight_decay * static_cast<float>(param[d]);
+          }
+        } else {
+          for (size_t d = 0; d < dim; ++d) {
+            grad_buf[d] = static_cast<float>(accumulated_grad[d]);
+          }
+        }
+        grad_ptr = grad_buf.data();
       }
-      simd::simd_adam_update(param, avg_grad.data(), m, v, config.lr,
-                             config.beta1, config.beta2, config.eps, bc1, bc2,
-                             dim);
+
+      simd::simd_adam_update(param, grad_ptr, m, v, config.lr, config.beta1,
+                             config.beta2, config.eps, bc1, bc2, dim);
     } else {
       for (size_t d = 0; d < dim; ++d) {
         float g = static_cast<float>(accumulated_grad[d]);
