@@ -214,7 +214,7 @@ public:
     pro::proxy<OptimizerFacade<ValT>> optimizer;
     std::vector<std::unique_ptr<TransientArena<ValT>>> transient_shards;
     OptimizerFactory opt_factory;
-    uint64_t global_step = 1;
+    uint64_t global_step = 0;
 
     SlotStore(size_t d, size_t max_active_keys,
               const OptimizerFactory &opt_factory, size_t num_threads)

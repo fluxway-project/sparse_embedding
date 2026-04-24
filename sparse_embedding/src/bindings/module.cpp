@@ -523,33 +523,42 @@ public:
             DLManagedTensor *vals_dlm = nullptr;
             DLManagedTensor *lens_dlm = nullptr;
 
-            auto do_lookup = [&](auto ks) {
-              auto row_lengths = std::make_unique_for_overwrite<int64_t[]>(n);
-              size_t total =
-                  wrapper_ptr->compute_output_size(ks, {row_lengths.get(), n});
+            try {
+              auto do_lookup = [&](auto ks) {
+                auto row_lengths = std::make_unique_for_overwrite<int64_t[]>(n);
+                size_t total = wrapper_ptr->compute_output_size(
+                    ks, {row_lengths.get(), n});
 
-              int64_t vals_shape[] = {static_cast<int64_t>(total)};
-              vals_dlm = se::py::create_output_tensor<ValT>(vals_shape);
-              lens_dlm =
-                  se::py::wrap_unique_ptr_as_tensor(std::move(row_lengths), n);
+                int64_t vals_shape[] = {static_cast<int64_t>(total)};
+                vals_dlm = se::py::create_output_tensor<ValT>(vals_shape);
+                lens_dlm = se::py::wrap_unique_ptr_as_tensor(
+                    std::move(row_lengths), n);
 
-              auto vals_span = std::span<ValT>(
-                  static_cast<ValT *>(vals_dlm->dl_tensor.data), total);
-              auto ec = wrapper_ptr->get_store<ValT>()->forward_lookup(
-                  ks, vals_span,
-                  {static_cast<const int64_t *>(lens_dlm->dl_tensor.data), n});
-              if (ec)
-                throw std::runtime_error(ec.message());
-            };
+                auto vals_span = std::span<ValT>(
+                    static_cast<ValT *>(vals_dlm->dl_tensor.data), total);
+                auto ec = wrapper_ptr->get_store<ValT>()->forward_lookup(
+                    ks, vals_span,
+                    {static_cast<const int64_t *>(lens_dlm->dl_tensor.data),
+                     n});
+                if (ec)
+                  throw std::runtime_error(ec.message());
+              };
 
-            if (kdt == KeyDType::kInt64) {
-              auto ks = std::span<const int64_t>(
-                  static_cast<const int64_t *>(keys_data), n);
-              do_lookup(ks);
-            } else {
-              auto ks = std::span<const uint64_t>(
-                  static_cast<const uint64_t *>(keys_data), n);
-              do_lookup(ks);
+              if (kdt == KeyDType::kInt64) {
+                auto ks = std::span<const int64_t>(
+                    static_cast<const int64_t *>(keys_data), n);
+                do_lookup(ks);
+              } else {
+                auto ks = std::span<const uint64_t>(
+                    static_cast<const uint64_t *>(keys_data), n);
+                do_lookup(ks);
+              }
+            } catch (...) {
+              if (vals_dlm)
+                vals_dlm->deleter(vals_dlm);
+              if (lens_dlm)
+                lens_dlm->deleter(lens_dlm);
+              throw;
             }
             return {vals_dlm, lens_dlm};
           },
