@@ -389,6 +389,9 @@ public:
 
     // 3. Parallel Scatter
     thread_local std::vector<uint32_t> shuffled_indices_buf;
+    if (shuffled_indices_buf.capacity() > n * 2) {
+      shuffled_indices_buf.shrink_to_fit();
+    }
     shuffled_indices_buf.resize(n);
     std::span<uint32_t> shuffled_indices(shuffled_indices_buf.data(), n);
     auto do_scatter = [&](size_t t_begin, size_t t_end) {
@@ -528,79 +531,38 @@ public:
     auto offsets = compute_offsets(row_lengths);
 
     auto do_range = [&](size_t begin, size_t end) {
+      std::unordered_map<uint32_t, std::vector<uint32_t>> local_free_slots;
       epoch::with_epoch([&] {
         for (size_t i = begin; i < end; ++i) {
           uint64_t key = static_cast<uint64_t>(keys[i]);
           uint32_t slot_id = extract_slot(key);
           auto &slot = *slots_.at(slot_id);
+          auto &free_slots = local_free_slots[slot_id];
           const ValT *src = flat_values.data() + offsets[i];
 
-          auto upsert_fn = [&](std::optional<uint32_t> existing) -> uint32_t {
-            if (existing.has_value()) {
-              std::copy_n(src, slot.dim, slot.arena.data(*existing));
-              return *existing;
-            }
-            uint32_t idx = slot.arena.allocate();
-            slot.optimizer->allocate();
-            std::copy_n(src, slot.dim, slot.arena.data(idx));
-            return idx;
-          };
-
-          auto g = [&](std::optional<typename Key::Entry> opt_e)
-              -> std::pair<uint64_t, uint32_t> {
-            if (opt_e.has_value()) {
-              return std::make_pair(key, upsert_fn(opt_e->get_entry().second));
-            }
-            return std::make_pair(key, upsert_fn(std::nullopt));
-          };
-          auto constr = [&](const auto &opt_e) {
-            return opt_e.has_value()
-                       ? slot.entries.make_entry(Key::Entry::make_key(key),
-                                                 g(opt_e))
-                       : slot.entries.make_entry(Key::Entry::make_key(key),
-                                                 g(std::nullopt));
-          };
-          slot.key_map.Upsert(Key::Entry::make_key(key), constr, g);
-        }
-      });
-    };
-    dispatch_parallel(n, do_range);
-    return {};
-  }
-
-  template <typename KeyT>
-  std::error_code lookup_or_insert(std::span<const KeyT> keys,
-                                   std::span<ValT> out_flat_values,
-                                   std::span<const int64_t> row_lengths,
-                                   std::span<uint8_t> out_inserted_mask) {
-    size_t n = keys.size();
-    auto offsets = compute_offsets(row_lengths);
-
-    auto do_range = [&](size_t begin, size_t end) {
-      epoch::with_epoch([&] {
-        for (size_t i = begin; i < end; ++i) {
-          uint64_t key = static_cast<uint64_t>(keys[i]);
-          uint32_t slot_id = extract_slot(key);
-          auto &slot = *slots_.at(slot_id);
-          size_t dim = slot.dim;
-          ValT *out = out_flat_values.data() + offsets[i];
-
+          std::optional<uint32_t> preallocated_idx = std::nullopt;
           bool was_inserted = false;
-          uint32_t arena_idx_from_upsert = 0;
+
           auto upsert_fn = [&](std::optional<uint32_t> existing) -> uint32_t {
+            was_inserted = false;
             if (existing.has_value()) {
               return *existing;
             }
             was_inserted = true;
-            uint32_t idx = slot.arena.allocate();
-            slot.optimizer->allocate();
-            if (initializer_.has_value()) {
-              initializer_->initialize(
-                  std::span<ValT>(slot.arena.data(idx), dim), key);
+            uint32_t idx;
+            if (preallocated_idx.has_value()) {
+              idx = *preallocated_idx;
+            } else if (!free_slots.empty()) {
+              idx = free_slots.back();
+              free_slots.pop_back();
+              preallocated_idx = idx;
+              std::copy_n(src, slot.dim, slot.arena.data(idx));
             } else {
-              std::fill_n(slot.arena.data(idx), dim, ValT{0});
+              idx = slot.arena.allocate();
+              slot.optimizer->allocate();
+              preallocated_idx = idx;
+              std::copy_n(src, slot.dim, slot.arena.data(idx));
             }
-            arena_idx_from_upsert = idx;
             return idx;
           };
 
@@ -620,8 +582,94 @@ public:
           };
           auto prev = slot.key_map.Upsert(Key::Entry::make_key(key), constr, g);
 
-          uint32_t arena_idx =
-              was_inserted ? arena_idx_from_upsert : prev->second;
+          if (preallocated_idx.has_value() && !was_inserted) {
+            free_slots.push_back(*preallocated_idx);
+          }
+          if (!was_inserted) {
+            std::copy_n(src, slot.dim, slot.arena.data(prev->second));
+          }
+        }
+      });
+    };
+    dispatch_parallel(n, do_range);
+    return {};
+  }
+
+  template <typename KeyT>
+  std::error_code lookup_or_insert(std::span<const KeyT> keys,
+                                   std::span<ValT> out_flat_values,
+                                   std::span<const int64_t> row_lengths,
+                                   std::span<uint8_t> out_inserted_mask) {
+    size_t n = keys.size();
+    auto offsets = compute_offsets(row_lengths);
+
+    auto do_range = [&](size_t begin, size_t end) {
+      std::unordered_map<uint32_t, std::vector<uint32_t>> local_free_slots;
+      epoch::with_epoch([&] {
+        for (size_t i = begin; i < end; ++i) {
+          uint64_t key = static_cast<uint64_t>(keys[i]);
+          uint32_t slot_id = extract_slot(key);
+          auto &slot = *slots_.at(slot_id);
+          auto &free_slots = local_free_slots[slot_id];
+          size_t dim = slot.dim;
+          ValT *out = out_flat_values.data() + offsets[i];
+
+          std::optional<uint32_t> preallocated_idx = std::nullopt;
+          bool was_inserted = false;
+
+          auto upsert_fn = [&](std::optional<uint32_t> existing) -> uint32_t {
+            was_inserted = false;
+            if (existing.has_value()) {
+              return *existing;
+            }
+            was_inserted = true;
+            uint32_t idx;
+            if (preallocated_idx.has_value()) {
+              idx = *preallocated_idx;
+            } else if (!free_slots.empty()) {
+              idx = free_slots.back();
+              free_slots.pop_back();
+              preallocated_idx = idx;
+              if (initializer_.has_value()) {
+                initializer_->initialize(
+                    std::span<ValT>(slot.arena.data(idx), dim), key);
+              } else {
+                std::fill_n(slot.arena.data(idx), dim, ValT{0});
+              }
+            } else {
+              idx = slot.arena.allocate();
+              slot.optimizer->allocate();
+              preallocated_idx = idx;
+              if (initializer_.has_value()) {
+                initializer_->initialize(
+                    std::span<ValT>(slot.arena.data(idx), dim), key);
+              } else {
+                std::fill_n(slot.arena.data(idx), dim, ValT{0});
+              }
+            }
+            return idx;
+          };
+
+          auto g = [&](std::optional<typename Key::Entry> opt_e)
+              -> std::pair<uint64_t, uint32_t> {
+            if (opt_e.has_value()) {
+              return std::make_pair(key, upsert_fn(opt_e->get_entry().second));
+            }
+            return std::make_pair(key, upsert_fn(std::nullopt));
+          };
+          auto constr = [&](const auto &opt_e) {
+            return opt_e.has_value()
+                       ? slot.entries.make_entry(Key::Entry::make_key(key),
+                                                 g(opt_e))
+                       : slot.entries.make_entry(Key::Entry::make_key(key),
+                                                 g(std::nullopt));
+          };
+          auto prev = slot.key_map.Upsert(Key::Entry::make_key(key), constr, g);
+
+          if (preallocated_idx.has_value() && !was_inserted) {
+            free_slots.push_back(*preallocated_idx);
+          }
+          uint32_t arena_idx = was_inserted ? *preallocated_idx : prev->second;
           out_inserted_mask[i] = was_inserted;
           std::copy_n(slot.arena.data(arena_idx), dim, out);
         }
@@ -684,25 +732,47 @@ public:
                                 std::span<const uint64_t> scores) {
     size_t n = keys.size();
     auto do_range = [&](size_t begin, size_t end) {
+      std::unordered_map<uint32_t, std::vector<uint32_t>> local_free_slots;
       for (size_t i = begin; i < end; ++i) {
         uint64_t key = static_cast<uint64_t>(keys[i]);
         uint32_t slot_id = extract_slot(key);
         auto &slot = *slots_.at(slot_id);
+        auto &free_slots = local_free_slots[slot_id];
 
         epoch::with_epoch([&] {
+          std::optional<uint32_t> preallocated_idx = std::nullopt;
+          bool was_inserted = false;
+
           auto g = [&](std::optional<typename Key::Entry> opt_e)
               -> std::pair<uint64_t, uint32_t> {
+            was_inserted = false;
             uint32_t idx;
             if (opt_e.has_value()) {
               idx = opt_e->get_entry().second;
             } else {
-              idx = slot.arena.allocate();
-              slot.optimizer->allocate();
-              if (initializer_.has_value()) {
-                initializer_->initialize(
-                    std::span<ValT>(slot.arena.data(idx), slot.dim), key);
+              was_inserted = true;
+              if (preallocated_idx.has_value()) {
+                idx = *preallocated_idx;
+              } else if (!free_slots.empty()) {
+                idx = free_slots.back();
+                free_slots.pop_back();
+                preallocated_idx = idx;
+                if (initializer_.has_value()) {
+                  initializer_->initialize(
+                      std::span<ValT>(slot.arena.data(idx), slot.dim), key);
+                } else {
+                  std::fill_n(slot.arena.data(idx), slot.dim, ValT{0});
+                }
               } else {
-                std::fill_n(slot.arena.data(idx), slot.dim, ValT{0});
+                idx = slot.arena.allocate();
+                slot.optimizer->allocate();
+                preallocated_idx = idx;
+                if (initializer_.has_value()) {
+                  initializer_->initialize(
+                      std::span<ValT>(slot.arena.data(idx), slot.dim), key);
+                } else {
+                  std::fill_n(slot.arena.data(idx), slot.dim, ValT{0});
+                }
               }
             }
             slot.arena.score(idx).store(scores[i], std::memory_order_relaxed);
@@ -715,7 +785,11 @@ public:
                        : slot.entries.make_entry(Key::Entry::make_key(key),
                                                  g(std::nullopt));
           };
-          return slot.key_map.Upsert(Key::Entry::make_key(key), constr, g);
+          slot.key_map.Upsert(Key::Entry::make_key(key), constr, g);
+
+          if (preallocated_idx.has_value() && !was_inserted) {
+            free_slots.push_back(*preallocated_idx);
+          }
         });
       }
     };
@@ -756,16 +830,15 @@ private:
     }
   }
 
-  std::span<const size_t>
+  std::vector<size_t>
   compute_offsets(std::span<const int64_t> row_lengths) const {
-    thread_local std::vector<size_t> offsets;
-    offsets.resize(row_lengths.size());
+    std::vector<size_t> offsets(row_lengths.size());
     size_t total = 0;
     for (size_t i = 0; i < row_lengths.size(); ++i) {
       offsets[i] = total;
       total += static_cast<size_t>(row_lengths[i]);
     }
-    return {offsets.data(), offsets.size()};
+    return offsets;
   }
 
   std::unordered_map<uint32_t, std::unique_ptr<SlotStore>> slots_;
