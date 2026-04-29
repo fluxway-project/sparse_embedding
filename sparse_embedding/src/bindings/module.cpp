@@ -37,6 +37,10 @@
 #include "sparse_embedding/src/bindings/async_bridge.hpp"
 #include "sparse_embedding/src/bindings/dlpack_utils.hpp"
 #include "sparse_embedding/src/bindings/python_wake_manager.hpp"
+#include "sparse_embedding/src/checkpoint/checkpoint_interface.hpp"
+#include "sparse_embedding/src/checkpoint/lance/lance_checkpoint.hpp"
+#include "sparse_embedding/src/common/function.hpp"
+#include "sparse_embedding/src/eviction/score_policy.hpp"
 #include "sparse_embedding/src/initializer/initializer_config.hpp"
 #include "sparse_embedding/src/initializer/uniform_initializer.hpp"
 #include "sparse_embedding/src/initializer/zeros_initializer.hpp"
@@ -193,7 +197,8 @@ class EmbeddingStoreWrapper {
 
 public:
   EmbeddingStoreWrapper(const se::EmbeddingConfig &emb_cfg,
-                        PyInitializer init_cfg, PyOptimizer opt_cfg)
+                        PyInitializer init_cfg, PyOptimizer opt_cfg,
+                        std::string score_policy_name)
       : async_pool_((emb_cfg.num_threads == 0)
                         ? std::max(1u, std::thread::hardware_concurrency())
                         : emb_cfg.num_threads),
@@ -219,28 +224,49 @@ public:
       }
 
       using OptFacade = se::OptimizerFacade<ValT>;
-      using OptFactory = std::function<pro::proxy<OptFacade>(size_t)>;
+      using OptFactory = se::Function<pro::proxy<OptFacade>(size_t)>;
 
       OptFactory opt_factory;
 
       if constexpr (std::is_same_v<ValT, float>) {
-        opt_factory = [builder = opt_cfg.builder](size_t d) mutable {
-          return (*builder)->build_f32(d);
-        };
+        opt_factory =
+            pro::make_proxy<se::FunctionFacade<pro::proxy<OptFacade>(size_t)>>(
+                [builder = opt_cfg.builder](size_t d) mutable {
+                  return (*builder)->build_f32(d);
+                });
       } else if constexpr (std::is_same_v<ValT, se::float16_t>) {
-        opt_factory = [builder = opt_cfg.builder](size_t d) mutable {
-          return (*builder)->build_f16(d);
-        };
+        opt_factory =
+            pro::make_proxy<se::FunctionFacade<pro::proxy<OptFacade>(size_t)>>(
+                [builder = opt_cfg.builder](size_t d) mutable {
+                  return (*builder)->build_f16(d);
+                });
       } else if constexpr (std::is_same_v<ValT, se::bfloat16_t>) {
-        opt_factory = [builder = opt_cfg.builder](size_t d) mutable {
-          return (*builder)->build_bf16(d);
-        };
+        opt_factory =
+            pro::make_proxy<se::FunctionFacade<pro::proxy<OptFacade>(size_t)>>(
+                [builder = opt_cfg.builder](size_t d) mutable {
+                  return (*builder)->build_bf16(d);
+                });
       }
 
-      using StoreType = se::HogwildEmbeddingStore<ValT>;
-      store_ = pro::make_proxy<se::EmbeddingTableFacade<ValT>, StoreType>(
-          slot_dims_, nt, std::move(init_proxy), emb_cfg.max_active_keys,
-          std::move(opt_factory));
+      auto construct_with_policy = [&]<typename Policy>(Policy policy) {
+        using StoreType = se::HogwildEmbeddingStore<ValT, Policy>;
+        store_ = pro::make_proxy<se::EmbeddingTableFacade<ValT>, StoreType>(
+            slot_dims_, nt, std::move(init_proxy), emb_cfg.max_active_keys,
+            std::move(opt_factory), std::move(policy));
+      };
+
+      if (score_policy_name == "none") {
+        construct_with_policy(se::NoScorePolicy{});
+      } else if (score_policy_name == "lfu") {
+        construct_with_policy(se::LfuScorePolicy{});
+      } else if (score_policy_name == "lru") {
+        construct_with_policy(se::LruScorePolicy{});
+      } else if (score_policy_name == "manual") {
+        construct_with_policy(se::ManualScorePolicy{});
+      } else {
+        throw std::invalid_argument("unknown score policy: " +
+                                    score_policy_name);
+      }
     };
 
     dispatch_val(construct);
@@ -640,6 +666,137 @@ public:
           });
     });
   }
+
+  void save_checkpoint(const std::string &uri, const std::string &mode,
+                       uint64_t min_score, bool include_optimizer_state) {
+    se::CheckpointExportOptions options;
+    options.mode = (mode == "incremental")
+                       ? se::CheckpointExportOptions::Mode::kIncremental
+                       : se::CheckpointExportOptions::Mode::kFull;
+    options.min_score = min_score;
+    options.include_optimizer_state = include_optimizer_state;
+
+    auto writer = checkpoint_writer_factory_;
+    if (!writer.has_value()) {
+      throw std::runtime_error("checkpoint backend not configured");
+    }
+    bool has_score_policy = false;
+    dispatch_val([&]<typename ValT>() {
+      has_score_policy = get_store<ValT>()->has_score_policy();
+    });
+
+    {
+      nb::gil_scoped_release release;
+      dispatch_val([&]<typename ValT>() {
+        writer->begin(uri, 0, 0, 0, has_score_policy, options.mode);
+
+        for (auto &[slot_id, dim] : slot_dims_) {
+          // begin this slot
+          writer->begin(uri, static_cast<uint32_t>(slot_id), dim, 0,
+                        has_score_policy, options.mode);
+
+          get_store<ValT>()->export_batch(
+              pro::make_proxy<se::FunctionFacade<bool(
+                  std::span<const uint64_t>, std::span<const ValT>,
+                  std::span<const uint64_t>)>>(
+                  [&](std::span<const uint64_t> keys,
+                      std::span<const ValT> vals,
+                      std::span<const uint64_t> scores) -> bool {
+                    // Filter by min_score for incremental mode
+                    if (options.mode ==
+                            se::CheckpointExportOptions::Mode::kIncremental &&
+                        has_score_policy) {
+                      std::vector<uint64_t> fkeys;
+                      std::vector<ValT> fvals;
+                      std::vector<uint64_t> fscores;
+                      for (size_t i = 0; i < keys.size(); ++i) {
+                        if (scores[i] >= options.min_score) {
+                          fkeys.push_back(keys[i]);
+                          fvals.insert(fvals.end(), vals.data() + i * dim,
+                                       vals.data() + (i + 1) * dim);
+                          if (!scores.empty())
+                            fscores.push_back(scores[i]);
+                        }
+                      }
+                      if (!fkeys.empty()) {
+                        writer->write_batch(fkeys, fvals.data(),
+                                            fvals.size() * sizeof(ValT),
+                                            fscores, nullptr, 0);
+                      }
+                    } else {
+                      std::vector<uint64_t> ukeys(keys.begin(), keys.end());
+                      writer->write_batch(ukeys, vals.data(),
+                                          vals.size() * sizeof(ValT), scores,
+                                          nullptr, 0);
+                    }
+                    return true;
+                  }),
+              options.batch_size);
+
+          writer->commit();
+        }
+      });
+    }
+  }
+
+  void load_checkpoint(const std::string &uri, uint64_t version, bool clear,
+                       bool load_optimizer_state) {
+    se::CheckpointLoadOptions options;
+    options.version = version;
+    options.clear_before_load = clear;
+    options.load_optimizer_state = load_optimizer_state;
+
+    auto reader = checkpoint_reader_factory_;
+    if (!reader.has_value()) {
+      throw std::runtime_error("checkpoint backend not configured");
+    }
+    {
+      nb::gil_scoped_release release;
+      if (clear)
+        dispatch_val([&]<typename ValT>() { get_store<ValT>()->clear(); });
+
+      dispatch_val([&]<typename ValT>() {
+        bool has_score = get_store<ValT>()->has_score_policy();
+
+        for (auto &[slot_id, dim] : slot_dims_) {
+          reader->open(uri, static_cast<uint32_t>(slot_id), version,
+                       static_cast<int64_t>(options.batch_size));
+
+          std::vector<uint64_t> keys;
+          std::vector<std::byte> embs;
+          std::vector<uint64_t> scores;
+          std::vector<std::byte> opt_states;
+
+          while (reader->read_batch(options.batch_size, keys, embs, scores,
+                                    opt_states)) {
+            size_t n = keys.size();
+            auto vals = std::span<const ValT>(
+                reinterpret_cast<const ValT *>(embs.data()), n * dim);
+            auto row_lengths = std::make_unique<int64_t[]>(n);
+            std::fill_n(row_lengths.get(), n, static_cast<int64_t>(dim));
+            get_store<ValT>()->assign(
+                std::span<const uint64_t>(keys), vals,
+                std::span<const int64_t>(row_lengths.get(), n));
+            if (has_score && !scores.empty()) {
+              get_store<ValT>()->assign_scores(
+                  std::span<const uint64_t>(keys),
+                  std::span<const uint64_t>(scores));
+            }
+          }
+        }
+      });
+    }
+  }
+
+  void set_checkpoint_factories(se::CheckpointWriterFactory wf,
+                                se::CheckpointReaderFactory rf) {
+    checkpoint_writer_factory_ = std::move(wf);
+    checkpoint_reader_factory_ = std::move(rf);
+  }
+
+private:
+  se::CheckpointWriterFactory checkpoint_writer_factory_;
+  se::CheckpointReaderFactory checkpoint_reader_factory_;
 };
 
 } // namespace
@@ -727,7 +884,8 @@ NB_MODULE(_core, m) {
 
   nb::class_<EmbeddingStoreWrapper>(m, "EmbeddingStore")
       .def(
-          nb::init<const se::EmbeddingConfig &, PyInitializer, PyOptimizer>(),
+          nb::init<const se::EmbeddingConfig &, PyInitializer, PyOptimizer,
+                   std::string>(),
           nb::arg("embedding_config"),
           nb::arg("initializer_config") =
               PyInitializer{
@@ -741,7 +899,8 @@ NB_MODULE(_core, m) {
                       pro::make_proxy<se::OptimizerBuilderFacade,
                                       DefaultOptimizerBuilder<se::AdamOptimizer,
                                                               se::AdamConfig>>(
-                          se::AdamConfig{}))})
+                          se::AdamConfig{}))},
+          nb::arg("score_policy") = "none")
 
       .def("total_size", &EmbeddingStoreWrapper::total_size)
       .def("max_dim", &EmbeddingStoreWrapper::max_dim)
@@ -767,7 +926,26 @@ NB_MODULE(_core, m) {
       .def("async_lookup", &EmbeddingStoreWrapper::async_lookup,
            nb::arg("keys"))
       .def("async_assign", &EmbeddingStoreWrapper::async_assign,
-           nb::arg("keys"), nb::arg("values"));
+           nb::arg("keys"), nb::arg("values"))
+
+      .def("save_checkpoint", &EmbeddingStoreWrapper::save_checkpoint,
+           nb::arg("uri"), nb::arg("mode") = "full", nb::arg("min_score") = 0,
+           nb::arg("include_optimizer_state") = false)
+      .def("load_checkpoint", &EmbeddingStoreWrapper::load_checkpoint,
+           nb::arg("uri"), nb::arg("version") = 0, nb::arg("clear") = true,
+           nb::arg("load_optimizer_state") = false)
+      .def("set_checkpoint_factories",
+           [](EmbeddingStoreWrapper &self, const std::string &backend) {
+             if (backend == "lance") {
+               auto wf = pro::make_proxy<se::CheckpointWriterFacade,
+                                         se::LanceCheckpointWriter>();
+               auto rf = pro::make_proxy<se::CheckpointReaderFacade,
+                                         se::LanceCheckpointReader>();
+               self.set_checkpoint_factories(std::move(wf), std::move(rf));
+             } else {
+               throw std::runtime_error("Unsupported backend: " + backend);
+             }
+           });
 
   m.def("async_unique", [](nb::object keys) -> nb::object {
     auto [dlm_keys, cap_keys] = se::py::extract_dlpack_tensor(keys);

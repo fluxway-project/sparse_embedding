@@ -9,6 +9,8 @@ High-performance Sparse Embedding Table library—designed for large-scale recom
 - **Hogwild! Gradient Accumulation**: Sharded TransientArena for lock-free gradient aggregation, avoiding cross-thread synchronization.
 - **C++26 Standard Concurrency**: Standard Sender/Receiver task scheduling based on NVIDIA `stdexec` + `exec::static_thread_pool`.
 - **Epoch Memory Safety**: Batch protection for concurrent hash map read/write using `epoch::with_epoch`, avoiding ABA problems.
+- **High-Performance Checkpointing**: Zero-copy binary-blob data transfer using Lance-C for efficient storage and restoration.
+- **Eviction Management**: Memory-efficient scoring policies (e.g., LFU) using thread-safe `std::atomic_ref` for concurrent state updates without locking.
 
 ## System Dependencies
 
@@ -17,6 +19,8 @@ High-performance Sparse Embedding Table library—designed for large-scale recom
 | GCC | ≥ 15.0 (Requires C++26 constexpr exceptions support) |
 | stdexec | NVIDIA main branch `931f256c` |
 | parlayhash | main branch (including 56-bit pointer mask patch) |
+| lance-c | main branch (Rust-based C shared library) |
+| Rust | 1.70+ (2024 Edition) |
 | Bazel | ≥ 7.0 |
 
 > **Note**: GCC 13 and below do not support `__cpp_constexpr_exceptions`, causing `stdexec`'s `sender_in` concept checks to fail, rendering `sync_wait` / `start_detached` unusable. GCC 15+ is required.

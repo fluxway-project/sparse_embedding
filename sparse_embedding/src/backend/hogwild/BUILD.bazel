@@ -6,12 +6,17 @@ load("@rules_cc//cc:cc_library.bzl", "cc_library")
 
 cc_library(
     name = "hogwild_embedding_store",
-    srcs = glob(["*.cpp"]),
+    srcs = glob(
+        ["*.cpp"],
+        exclude = ["*_test.cpp"],
+    ),
     hdrs = glob(["*.hpp"]),
     visibility = ["//visibility:public"],
     deps = [
         "//sparse_embedding/src/arena",
+        "//sparse_embedding/src/checkpoint",
         "//sparse_embedding/src/common",
+        "//sparse_embedding/src/eviction",
         "//sparse_embedding/src/initializer",
         "//sparse_embedding/src/interface",
         "//sparse_embedding/src/optimizer",
@@ -19,5 +24,16 @@ cc_library(
         "@parlayhash",
         "@proxy",
         "@stdexec",
+    ],
+)
+
+cc_test(
+    name = "hogwild_score_checkpoint_test",
+    srcs = ["hogwild_score_checkpoint_test.cpp"],
+    linkopts = ["-pthread"],
+    deps = [
+        ":hogwild_embedding_store",
+        "//sparse_embedding/src/checkpoint",
+        "//sparse_embedding/src/eviction",
     ],
 )

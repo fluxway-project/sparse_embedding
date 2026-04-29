@@ -27,6 +27,8 @@
 #include <utility>
 #include <vector>
 
+#include "sparse_embedding/src/common/function.hpp"
+
 namespace se::py {
 
 // =============================================================================
@@ -59,7 +61,7 @@ public:
   PythonWakeManager(const PythonWakeManager &) = delete;
   PythonWakeManager &operator=(const PythonWakeManager &) = delete;
 
-  void Enqueue(std::function<void()> task) {
+  void Enqueue(se::Function<void()> task) {
     {
       std::lock_guard lock(mutex_);
       pending_.push_back(std::move(task));
@@ -72,13 +74,13 @@ public:
     uint64_t val;
     [[maybe_unused]] auto _ = ::read(event_fd_, &val, sizeof(val));
 
-    std::vector<std::function<void()>> tasks;
+    std::vector<se::Function<void()>> tasks;
     {
       std::lock_guard lock(mutex_);
       std::swap(tasks, pending_);
     }
     for (auto &task : tasks) {
-      task();
+      (*task)();
     }
   }
 
@@ -86,7 +88,7 @@ public:
 
 private:
   std::mutex mutex_;
-  std::vector<std::function<void()>> pending_;
+  std::vector<se::Function<void()>> pending_;
   int event_fd_ = -1;
 };
 

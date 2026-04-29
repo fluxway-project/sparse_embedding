@@ -1,0 +1,39 @@
+"""
+lance-c C/C++ headers.
+
+lance-c is a Rust crate that produces a C shared library (liblance_c.so).
+This BUILD exports the headers for compilation; the shared library must be
+linked separately (either prebuilt or via rules_rust cargo_build_script).
+"""
+
+load("@rules_cc//cc:defs.bzl", "cc_library")
+
+genrule(
+    name = "build_lance_c",
+    srcs = glob(["**/*"]) + ["@rules_rust//rust/toolchain:current_rustc_files"],
+    outs = ["liblance_c.so"],
+    cmd = """
+        export CARGO_HOME=$$PWD/.cargo
+        export RUSTUP_HOME=$$PWD/.rustup
+        CARGO_PATH=$$PWD/$(CARGO)
+        export PATH=$$(dirname $$CARGO_PATH):$$PATH
+        cd $$(dirname $(location Cargo.toml))
+        rm -f Cargo.lock
+        $$CARGO_PATH build --release --lib
+        cp target/release/liblance_c.so $$OLDPWD/$(@D)/liblance_c.so
+    """,
+    tags = ["requires-network"],
+    toolchains = ["@rules_rust//rust/toolchain:current_rust_toolchain"],
+    visibility = ["//visibility:public"],
+)
+
+cc_library(
+    name = "lance_c",
+    srcs = [":build_lance_c"],
+    hdrs = glob([
+        "include/lance/*.h",
+        "include/lance/*.hpp",
+    ]),
+    includes = ["include"],
+    visibility = ["//visibility:public"],
+)

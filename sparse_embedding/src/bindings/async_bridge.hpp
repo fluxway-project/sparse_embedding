@@ -35,17 +35,6 @@ namespace se::py {
 
 namespace nb = nanobind;
 
-// =============================================================================
-// AsyncTask: pro::proxy-backed type-erased move-only callable (void())
-// =============================================================================
-
-PRO_DEF_MEM_DISPATCH(MemInvoke, operator());
-
-struct AsyncTaskFacade
-    : pro::facade_builder ::add_convention<MemInvoke, void()>::support_copy<
-          pro::constraint_level::none>::build {};
-
-// =============================================================================
 // AsyncPyObjectKeeper: safely defers Py_DECREF to the GIL-holding wake thread
 //
 // Storing nb::object in a lambda captured by a worker thread is unsafe because
@@ -63,7 +52,13 @@ struct AsyncPyObjectKeeper {
   }
   ~AsyncPyObjectKeeper() {
     if (ptr) {
-      GetPythonWakeManager().Enqueue([p = ptr]() { nb::handle(p).dec_ref(); });
+      if (PyGILState_Check()) {
+        nb::handle(ptr).dec_ref();
+      } else {
+        GetPythonWakeManager().Enqueue(
+            pro::make_proxy_shared<se::FunctionFacade<void()>>(
+                [p = ptr]() { nb::handle(p).dec_ref(); }));
+      }
     }
   }
   AsyncPyObjectKeeper(const AsyncPyObjectKeeper &) = delete;
@@ -100,39 +95,39 @@ nb::object async_dispatch(exec::static_thread_pool &pool, WorkFn &&work,
   auto future_keeper =
       std::make_shared<AsyncPyObjectKeeper>(nb::borrow(future));
 
-  pro::proxy<AsyncTaskFacade> erased_task = pro::make_proxy<AsyncTaskFacade>(
-      [work = std::forward<WorkFn>(work),
-       on_complete = std::forward<CompleteFn>(on_complete),
-       future_keeper]() mutable {
-        try {
-          auto result = work();
-          GetPythonWakeManager().Enqueue(
-              [on_complete = std::move(on_complete),
-               future_keeper = std::move(future_keeper),
-               result = std::move(result)]() mutable {
-                nb::object fut = nb::borrow(future_keeper->ptr);
-                on_complete(std::move(fut), std::move(result));
-              });
-        } catch (...) {
-          auto eptr = std::current_exception();
-          GetPythonWakeManager().Enqueue(
-              [future_keeper = std::move(future_keeper),
-               eptr = std::move(eptr)]() mutable {
-                nb::object fut = nb::borrow(future_keeper->ptr);
-                try {
-                  std::rethrow_exception(eptr);
-                } catch (const std::exception &e) {
-                  nb::module_ builtins = nb::module_::import_("builtins");
-                  fut.attr("set_exception")(
-                      builtins.attr("RuntimeError")(e.what()));
-                }
-              });
-        }
-      });
+  se::Function<void()> erased_task =
+      pro::make_proxy_shared<se::FunctionFacade<void()>>(
+          [work = std::forward<WorkFn>(work),
+           on_complete = std::forward<CompleteFn>(on_complete),
+           future_keeper]() mutable {
+            try {
+              auto result = work();
+              GetPythonWakeManager().Enqueue(
+                  pro::make_proxy_shared<se::FunctionFacade<void()>>(
+                      [on_complete, future_keeper, result]() mutable {
+                        nb::object fut = nb::borrow(future_keeper->ptr);
+                        on_complete(std::move(fut), std::move(result));
+                      }));
+            } catch (...) {
+              auto eptr = std::current_exception();
+              GetPythonWakeManager().Enqueue(
+                  pro::make_proxy_shared<se::FunctionFacade<void()>>(
+                      [future_keeper, eptr]() mutable {
+                        nb::object fut = nb::borrow(future_keeper->ptr);
+                        try {
+                          std::rethrow_exception(eptr);
+                        } catch (const std::exception &e) {
+                          nb::module_ builtins =
+                              nb::module_::import_("builtins");
+                          fut.attr("set_exception")(
+                              builtins.attr("RuntimeError")(e.what()));
+                        }
+                      }));
+            }
+          });
 
-  exec::start_detached(
-      stdexec::schedule(pool.get_scheduler()) |
-      stdexec::then([t = std::move(erased_task)]() mutable { (*t)(); }));
+  exec::start_detached(stdexec::schedule(pool.get_scheduler()) |
+                       stdexec::then([t = erased_task]() mutable { (*t)(); }));
 
   return future;
 }
