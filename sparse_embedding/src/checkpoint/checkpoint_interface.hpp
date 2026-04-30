@@ -19,7 +19,6 @@
 #define SPARSE_EMBEDDING_CHECKPOINT_INTERFACE_HPP_
 
 #include <cstdint>
-#include <functional>
 #include <span>
 #include <string>
 #include <string_view>
@@ -40,6 +39,7 @@ struct CheckpointExportOptions {
   uint64_t min_score = 0;
   bool include_optimizer_state = false;
   size_t batch_size = 65536;
+  bool use_compression = false;
 };
 
 struct CheckpointLoadOptions {
@@ -78,7 +78,7 @@ struct CheckpointWriterFacade
     : pro::facade_builder ::add_convention<
           MemCkptWriterBegin, void(std::string_view uri, uint32_t slot_id,
                                    size_t optimizer_state_dim, bool has_score,
-                                   CheckpointExportOptions::Mode mode)>::
+                                   CheckpointExportOptions options)>::
           add_convention<
               MemCkptWriteBatch,
               void(std::span<const uint64_t> keys, const void *embeddings,

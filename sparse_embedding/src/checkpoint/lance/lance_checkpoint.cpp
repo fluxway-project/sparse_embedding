@@ -101,6 +101,24 @@ std::string slot_uri(std::string_view base, uint32_t slot_id) {
   return oss.str();
 }
 
+const char *get_zstd_metadata() {
+  static std::string meta;
+  if (meta.empty()) {
+    int32_t num_kvs = 1;
+    std::string key = "lance-encoding:compression";
+    std::string val = "zstd";
+    int32_t key_len = key.size();
+    int32_t val_len = val.size();
+
+    meta.append(reinterpret_cast<const char *>(&num_kvs), 4);
+    meta.append(reinterpret_cast<const char *>(&key_len), 4);
+    meta.append(key);
+    meta.append(reinterpret_cast<const char *>(&val_len), 4);
+    meta.append(val);
+  }
+  return meta.c_str();
+}
+
 } // namespace
 
 // =============================================================================
@@ -109,12 +127,12 @@ std::string slot_uri(std::string_view base, uint32_t slot_id) {
 
 void LanceCheckpointWriter::begin(std::string_view uri, uint32_t slot_id,
                                   size_t optimizer_state_dim, bool has_score,
-                                  CheckpointExportOptions::Mode mode) {
+                                  CheckpointExportOptions options) {
   uri_ = slot_uri(uri, slot_id);
   slot_id_ = slot_id;
   opt_state_dim_ = optimizer_state_dim;
   has_score_ = has_score;
-  mode_ = mode;
+  options_ = options;
   is_first_batch_ = true;
   committed_version_ = 0;
 
@@ -181,6 +199,9 @@ void LanceCheckpointWriter::build_schema(ArrowSchema *out) const {
   emb_format = "w:" + std::to_string(entry_bytes);
   out->children[col] = new ArrowSchema();
   make_child_schema(out->children[col], "embedding", emb_format.c_str());
+  if (options_.use_compression) {
+    out->children[col]->metadata = get_zstd_metadata();
+  }
   ++col;
 
   if (has_score_) {
@@ -195,6 +216,9 @@ void LanceCheckpointWriter::build_schema(ArrowSchema *out) const {
     out->children[col] = new ArrowSchema();
     make_child_schema(out->children[col], "optimizer_state",
                       opt_format.c_str());
+    if (options_.use_compression) {
+      out->children[col]->metadata = get_zstd_metadata();
+    }
     ++col;
   }
 }
@@ -294,7 +318,7 @@ void LanceCheckpointWriter::flush_to_lance() {
   if (is_first_batch_) {
     bool exists = std::filesystem::exists(uri_ + "/_versions");
     if (exists) {
-      if (mode_ == CheckpointExportOptions::Mode::kIncremental) {
+      if (options_.mode == CheckpointExportOptions::Mode::kIncremental) {
         mode = LANCE_WRITE_APPEND;
       } else {
         mode = LANCE_WRITE_OVERWRITE;
@@ -308,8 +332,19 @@ void LanceCheckpointWriter::flush_to_lance() {
   }
 
   LanceDataset *out_ds = nullptr;
-  int32_t rc = lance_dataset_write(uri_.c_str(), &schema, &stream, mode,
-                                   nullptr, &out_ds);
+  int32_t rc;
+
+  if (options_.use_compression) {
+    LanceWriteParams params{};
+    std::memset(&params, 0, sizeof(params));
+    params.data_storage_version =
+        "next"; // Use next version for compression support
+    rc = lance_dataset_write_with_params(uri_.c_str(), &schema, &stream, mode,
+                                         &params, nullptr, &out_ds);
+  } else {
+    rc = lance_dataset_write(uri_.c_str(), &schema, &stream, mode, nullptr,
+                             &out_ds);
+  }
 
   if (schema.release)
     schema.release(&schema);
