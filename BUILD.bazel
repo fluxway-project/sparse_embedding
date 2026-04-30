@@ -41,7 +41,7 @@ genrule(
 )
 
 cc_binary(
-    name = "sparse_embedding/_core.so",
+    name = "core_so",
     srcs = [
         "//sparse_embedding/src/bindings:srcs",
         "//sparse_embedding/src/ops:srcs",
@@ -63,12 +63,19 @@ cc_binary(
     ],
 )
 
+genrule(
+    name = "copy_core_so",
+    srcs = [":core_so"],
+    outs = ["sparse_embedding/_core.so"],
+    cmd = "cp $< $@",
+)
+
 py_library(
     name = "sparse_embedding_lib",
     srcs = glob(["sparse_embedding/**/*.py"]),
     data = [
+        ":copy_core_so",
         ":copy_liblance_c",
-        ":sparse_embedding/_core.so",
     ],
     imports = ["."],
     visibility = ["//visibility:public"],
@@ -81,8 +88,8 @@ py_wheel(
     python_tag = "py3",
     version = "0.1.0",
     deps = [
+        ":copy_core_so",
         ":copy_liblance_c",
-        ":sparse_embedding/_core.so",
         ":sparse_embedding_lib",
     ],
 )
