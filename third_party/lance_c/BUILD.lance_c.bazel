@@ -18,7 +18,6 @@ genrule(
         CARGO_PATH=$$PWD/$(CARGO)
         export PATH=$$(dirname $$CARGO_PATH):$$PATH
         cd $$(dirname $(location Cargo.toml))
-        rm -f Cargo.lock
         $$CARGO_PATH build --release --lib
         cp target/release/liblance_c.so $$OLDPWD/$(@D)/liblance_c.so
     """,

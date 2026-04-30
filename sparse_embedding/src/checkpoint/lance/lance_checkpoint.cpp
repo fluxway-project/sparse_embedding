@@ -108,12 +108,10 @@ std::string slot_uri(std::string_view base, uint32_t slot_id) {
 // =============================================================================
 
 void LanceCheckpointWriter::begin(std::string_view uri, uint32_t slot_id,
-                                  size_t dim, size_t optimizer_state_dim,
-                                  bool has_score,
+                                  size_t optimizer_state_dim, bool has_score,
                                   CheckpointExportOptions::Mode mode) {
   uri_ = slot_uri(uri, slot_id);
   slot_id_ = slot_id;
-  dim_ = dim;
   opt_state_dim_ = optimizer_state_dim;
   has_score_ = has_score;
   mode_ = mode;

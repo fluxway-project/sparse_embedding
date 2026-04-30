@@ -76,10 +76,9 @@ PRO_DEF_MEM_DISPATCH(MemCkptCommit, commit);
 
 struct CheckpointWriterFacade
     : pro::facade_builder ::add_convention<
-          MemCkptWriterBegin,
-          void(std::string_view uri, uint32_t slot_id, size_t dim,
-               size_t optimizer_state_dim, bool has_score,
-               CheckpointExportOptions::Mode mode)>::
+          MemCkptWriterBegin, void(std::string_view uri, uint32_t slot_id,
+                                   size_t optimizer_state_dim, bool has_score,
+                                   CheckpointExportOptions::Mode mode)>::
           add_convention<
               MemCkptWriteBatch,
               void(std::span<const uint64_t> keys, const void *embeddings,

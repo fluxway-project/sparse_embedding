@@ -688,11 +688,11 @@ public:
     {
       nb::gil_scoped_release release;
       dispatch_val([&]<typename ValT>() {
-        writer->begin(uri, 0, 0, 0, has_score_policy, options.mode);
+        writer->begin(uri, 0, 0, has_score_policy, options.mode);
 
         for (auto &[slot_id, dim] : slot_dims_) {
           // begin this slot
-          writer->begin(uri, static_cast<uint32_t>(slot_id), dim, 0,
+          writer->begin(uri, static_cast<uint32_t>(slot_id), 0,
                         has_score_policy, options.mode);
 
           get_store<ValT>()->export_batch(

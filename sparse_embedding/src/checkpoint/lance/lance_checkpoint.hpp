@@ -37,7 +37,6 @@ namespace se {
 class LanceCheckpointWriter {
   std::string uri_;
   uint32_t slot_id_ = 0;
-  size_t dim_ = 0;
   size_t opt_state_dim_ = 0;
   bool has_score_ = false;
   CheckpointExportOptions::Mode mode_ = CheckpointExportOptions::Mode::kFull;
@@ -68,9 +67,8 @@ class LanceCheckpointWriter {
   static void release_array(ArrowArray *array);
 
 public:
-  void begin(std::string_view uri, uint32_t slot_id, size_t dim,
-             size_t optimizer_state_dim, bool has_score,
-             CheckpointExportOptions::Mode mode);
+  void begin(std::string_view uri, uint32_t slot_id, size_t optimizer_state_dim,
+             bool has_score, CheckpointExportOptions::Mode mode);
 
   void write_batch(std::span<const uint64_t> keys, const void *embeddings,
                    size_t embedding_bytes, std::span<const uint64_t> scores,

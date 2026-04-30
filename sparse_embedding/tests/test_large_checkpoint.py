@@ -52,7 +52,9 @@ def test_large_checkpoint_lance():
         print(f"Save completed in {perf_counter() - t0:.3f}s.")
 
         # Verify it was actually created
-        assert os.path.exists(ckpt_uri) or os.path.exists(os.path.join(ckpt_uri, "0"))
+        assert os.path.exists(ckpt_uri) or os.path.exists(
+            os.path.join(ckpt_uri, "slot_0000")
+        )
 
         # Now create a new store and load it
         print("Loading checkpoint into new store...")
