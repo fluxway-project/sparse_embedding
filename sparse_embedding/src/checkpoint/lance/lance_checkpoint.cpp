@@ -102,20 +102,21 @@ std::string slot_uri(std::string_view base, uint32_t slot_id) {
 }
 
 const char *get_zstd_metadata() {
-  static std::string meta;
-  if (meta.empty()) {
+  static const std::string meta = [] {
+    std::string m;
     int32_t num_kvs = 1;
     std::string key = "lance-encoding:compression";
     std::string val = "zstd";
-    int32_t key_len = key.size();
-    int32_t val_len = val.size();
+    int32_t key_len = static_cast<int32_t>(key.size());
+    int32_t val_len = static_cast<int32_t>(val.size());
 
-    meta.append(reinterpret_cast<const char *>(&num_kvs), 4);
-    meta.append(reinterpret_cast<const char *>(&key_len), 4);
-    meta.append(key);
-    meta.append(reinterpret_cast<const char *>(&val_len), 4);
-    meta.append(val);
-  }
+    m.append(reinterpret_cast<const char *>(&num_kvs), 4);
+    m.append(reinterpret_cast<const char *>(&key_len), 4);
+    m.append(key);
+    m.append(reinterpret_cast<const char *>(&val_len), 4);
+    m.append(val);
+    return m;
+  }();
   return meta.c_str();
 }
 
@@ -336,7 +337,6 @@ void LanceCheckpointWriter::flush_to_lance() {
 
   if (options_.use_compression) {
     LanceWriteParams params{};
-    std::memset(&params, 0, sizeof(params));
     params.data_storage_version =
         "next"; // Use next version for compression support
     rc = lance_dataset_write_with_params(uri_.c_str(), &schema, &stream, mode,
@@ -420,7 +420,7 @@ void LanceCheckpointReader::open(std::string_view uri, uint32_t slot_id,
     throw std::runtime_error("failed to create lance scanner: " + err);
   }
 
-  std::memset(&stream_, 0, sizeof(stream_));
+  stream_ = ArrowArrayStream{};
   lance_scanner_set_batch_size(scanner, batch_size_);
   if (lance_scanner_to_arrow_stream(scanner, &stream_) != 0) {
     lance_scanner_close(scanner);
@@ -433,7 +433,7 @@ void LanceCheckpointReader::open(std::string_view uri, uint32_t slot_id,
   }
   stream_open_ = true;
 
-  std::memset(&schema_, 0, sizeof(schema_));
+  schema_ = ArrowSchema{};
   stream_.get_schema(&stream_, &schema_);
 
   has_score_ = false;

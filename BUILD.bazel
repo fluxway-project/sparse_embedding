@@ -13,16 +13,22 @@ load("@rules_shell//shell:sh_binary.bzl", "sh_binary")
 
 sh_binary(
     name = "format",
-    srcs = ["format.sh"],
+    srcs = ["scripts/format.sh"],
 )
 
 refresh_compile_commands(
-    name = "refresh_compile_commands",
+    name = "refresh_compile_commands_internal",
     exclude_external_sources = True,
     tags = ["manual"],
     targets = {
         "//:sparse_embedding/_core.so": "",
     },
+)
+
+sh_binary(
+    name = "refresh_compile_commands",
+    srcs = ["scripts/refresh_compile_commands.sh"],
+    tags = ["manual"],
 )
 
 # ---- _core.so: unified Python extension module ----
