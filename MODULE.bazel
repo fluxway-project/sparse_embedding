@@ -23,6 +23,13 @@ module(
 bazel_dep(name = "rules_shell", version = "0.6.1")
 bazel_dep(name = "rules_python", version = "1.9.0")
 bazel_dep(name = "rules_cc", version = "0.2.17")
+bazel_dep(name = "rules_rust", version = "0.70.0")
+
+rust = use_extension("@rules_rust//rust:extensions.bzl", "rust")
+rust.toolchain(edition = "2024")
+use_repo(rust, "rust_toolchains")
+
+register_toolchains("@rust_toolchains//:all")
 
 # Hedron's Compile Commands Extractor for Bazel
 # https://github.com/hedronvision/bazel-compile-commands-extractor
@@ -55,3 +62,6 @@ use_repo(robin_map_deps, "robin_map")
 
 unordered_dense_deps = use_extension("//third_party/unordered_dense:extensions.bzl", "unordered_dense_dep")
 use_repo(unordered_dense_deps, "unordered_dense")
+
+lance_c_deps = use_extension("//third_party/lance_c:extensions.bzl", "lance_c_dep")
+use_repo(lance_c_deps, "lance_c")

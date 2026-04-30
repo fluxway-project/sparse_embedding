@@ -1,0 +1,25 @@
+"""
+BUILD file for checkpoint
+"""
+
+load("@rules_cc//cc:defs.bzl", "cc_library")
+
+cc_library(
+    name = "checkpoint",
+    hdrs = ["checkpoint_interface.hpp"],
+    visibility = ["//visibility:public"],
+    deps = [
+        "@proxy",
+    ],
+)
+
+cc_library(
+    name = "checkpoint_lance",
+    srcs = ["lance/lance_checkpoint.cpp"],
+    hdrs = ["lance/lance_checkpoint.hpp"],
+    visibility = ["//visibility:public"],
+    deps = [
+        ":checkpoint",
+        "@lance_c",
+    ],
+)

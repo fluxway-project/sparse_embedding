@@ -40,7 +40,9 @@
 
 #include "sparse_embedding/src/arena/transient_arena.hpp"
 #include "sparse_embedding/src/common/embedding_error.hpp"
+#include "sparse_embedding/src/common/function.hpp"
 #include "sparse_embedding/src/common/numeric_types.hpp"
+#include "sparse_embedding/src/eviction/score_policy.hpp"
 #include "sparse_embedding/src/interface/initializer_interface.hpp"
 #include "sparse_embedding/src/interface/optimizer_interface.hpp"
 #include "sparse_embedding/src/optimizer/optimizer_state.hpp"
@@ -71,8 +73,9 @@ template <typename ValT> class EmbeddingArena {
   };
 
 public:
-  explicit EmbeddingArena(size_t dim)
-      : dim_(dim), pages_(std::make_unique<PageTable>()) {
+  explicit EmbeddingArena(size_t dim, bool enable_score = true)
+      : dim_(dim), enable_score_(enable_score),
+        pages_(std::make_unique<PageTable>()) {
     data_stride_ =
         (dim * sizeof(ValT) + kCacheLineSize - 1) & ~(kCacheLineSize - 1);
   }
@@ -82,8 +85,10 @@ public:
       auto *dp = pages_->data[i].load(std::memory_order_relaxed);
       if (dp)
         std::free(dp);
-      auto *sp = pages_->score[i].load(std::memory_order_relaxed);
-      delete[] sp;
+      if (enable_score_) {
+        auto *sp = pages_->score[i].load(std::memory_order_relaxed);
+        delete[] sp;
+      }
     }
   }
 
@@ -93,18 +98,19 @@ public:
   EmbeddingArena &operator=(EmbeddingArena &&) = delete;
 
   size_t dim() const { return dim_; }
+  bool score_enabled() const { return enable_score_; }
 
   uint32_t allocate() {
     uint32_t idx = next_index_.fetch_add(1, std::memory_order_relaxed);
     ensure_capacity(idx);
-    score(idx).store(0, std::memory_order_relaxed);
+    if (enable_score_)
+      score_raw(idx) = 0;
     return idx;
   }
 
-  std::atomic_ref<uint64_t> score(uint32_t index) const {
-    return std::atomic_ref<uint64_t>(
-        pages_->score[index / kEntriesPerPage].load(
-            std::memory_order_acquire)[index % kEntriesPerPage]);
+  uint64_t &score_raw(uint32_t index) const {
+    return pages_->score[index / kEntriesPerPage].load(
+        std::memory_order_acquire)[index % kEntriesPerPage];
   }
 
   ValT *data(uint32_t index) const {
@@ -121,12 +127,17 @@ public:
       auto *dp = pages_->data[i].exchange(nullptr, std::memory_order_relaxed);
       if (dp)
         std::free(dp);
-      auto *sp = pages_->score[i].exchange(nullptr, std::memory_order_relaxed);
-      delete[] sp;
+      if (enable_score_) {
+        auto *sp =
+            pages_->score[i].exchange(nullptr, std::memory_order_relaxed);
+        delete[] sp;
+      }
     }
     num_pages_.store(0, std::memory_order_relaxed);
     next_index_.store(0, std::memory_order_relaxed);
   }
+
+  size_t data_stride() const { return data_stride_; }
 
 private:
   void ensure_capacity(uint32_t idx) {
@@ -141,9 +152,11 @@ private:
       if (!dp)
         throw std::bad_alloc();
       std::memset(dp, 0, kEntriesPerPage * data_stride_);
-      auto *sp = new uint64_t[kEntriesPerPage]();
       pages_->data[pg].store(dp, std::memory_order_release);
-      pages_->score[pg].store(sp, std::memory_order_release);
+      if (enable_score_) {
+        auto *sp = new uint64_t[kEntriesPerPage]();
+        pages_->score[pg].store(sp, std::memory_order_release);
+      }
       num_pages_.store(pg + 1, std::memory_order_release);
     }
   }
@@ -156,6 +169,7 @@ private:
 
   size_t dim_;
   size_t data_stride_;
+  bool enable_score_;
   std::unique_ptr<PageTable> pages_;
   std::atomic<uint32_t> next_index_{0};
   std::atomic<size_t> num_pages_{0};
@@ -170,12 +184,13 @@ private:
 // 64-byte aligned contiguous memory for SIMD-friendly dense vectors.
 // =============================================================================
 
-template <typename ValT> class HogwildEmbeddingStore {
+template <typename ValT, typename ScorePolicyT = NoScorePolicy>
+class HogwildEmbeddingStore {
 public:
   using ValueType = ValT;
   using Initializer = pro::proxy<InitializerFacade<ValT>>;
   using OptimizerFactory =
-      std::function<pro::proxy<OptimizerFacade<ValT>>(size_t)>;
+      se::Function<pro::proxy<OptimizerFacade<ValT>>(size_t)>;
 
   struct SplitMix64Hash {
     size_t operator()(uint64_t x) const {
@@ -216,11 +231,13 @@ public:
     OptimizerFactory opt_factory;
     uint64_t global_step = 0;
 
-    SlotStore(size_t d, size_t max_active_keys,
-              const OptimizerFactory &opt_factory, size_t num_threads)
+    SlotStore(size_t d, size_t max_active_keys, OptimizerFactory opt_factory,
+              size_t num_threads, bool enable_score = true)
         : dim(d), entries(false),
           key_map(std::max(size_t(1024), max_active_keys * 2), &entries, false),
-          arena(d), optimizer(opt_factory(d)), opt_factory(opt_factory) {
+          arena(d, enable_score),
+          optimizer(opt_factory.has_value() ? (*opt_factory)(d) : nullptr),
+          opt_factory(opt_factory) {
       for (size_t i = 0; i < num_threads; ++i) {
         transient_shards.push_back(std::make_unique<TransientArena<ValT>>(
             d, max_active_keys / num_threads + 1));
@@ -232,17 +249,21 @@ public:
                                  size_t num_threads = 0,
                                  Initializer initializer = {},
                                  size_t max_active_keys = 1 << 20,
-                                 OptimizerFactory opt_factory = nullptr)
+                                 OptimizerFactory opt_factory = nullptr,
+                                 ScorePolicyT score_policy = {})
       : num_threads_(num_threads > 0
                          ? num_threads
                          : std::max(1u, std::thread::hardware_concurrency())),
         pool_(static_cast<uint32_t>(num_threads_)),
-        initializer_(std::move(initializer)) {
+        initializer_(std::move(initializer)),
+        score_policy_(std::move(score_policy)) {
     uint32_t p2 = 1;
     while (p2 < num_threads_) {
       p2 <<= 1;
     }
     num_threads_ = p2;
+
+    bool enable_score = ScorePolicyT::kHasScore;
 
     if (slot_dims.empty()) {
       throw std::invalid_argument("slot_dims must not be empty");
@@ -252,9 +273,9 @@ public:
         throw std::invalid_argument("dim must be > 0 for slot " +
                                     std::to_string(slot_id));
       }
-      slots_.emplace(slot_id,
-                     std::make_unique<SlotStore>(dim, max_active_keys,
-                                                 opt_factory, num_threads_));
+      slots_.emplace(slot_id, std::make_unique<SlotStore>(
+                                  dim, max_active_keys, opt_factory,
+                                  num_threads_, enable_score));
       if (dim > max_dim_)
         max_dim_ = dim;
     }
@@ -312,6 +333,9 @@ public:
               simd::simd_copy(src, out, dim);
             } else {
               std::copy_n(src, dim, out);
+            }
+            if constexpr (ScorePolicyT::kHasScore) {
+              score_policy_.on_access(&slot.arena.score_raw(*found));
             }
           } else {
             std::fill_n(out, dim, ValT{0});
@@ -483,10 +507,12 @@ public:
                   uint32_t arena_idx = *found;
                   ValT *param = slot->arena.data(arena_idx);
 
-                  slot->optimizer->step(
-                      arena_idx, std::span<ValT>(param, slot->dim),
-                      std::span<const ValT>(accumulated_grad, slot->dim),
-                      slot->global_step);
+                  if (slot->optimizer.has_value()) {
+                    slot->optimizer->step(
+                        arena_idx, std::span<ValT>(param, slot->dim),
+                        std::span<const ValT>(accumulated_grad, slot->dim),
+                        slot->global_step);
+                  }
                 });
             shard->clear();
           }
@@ -559,7 +585,8 @@ public:
               std::copy_n(src, slot.dim, slot.arena.data(idx));
             } else {
               idx = slot.arena.allocate();
-              slot.optimizer->allocate();
+              if (slot.optimizer.has_value())
+                slot.optimizer->allocate();
               preallocated_idx = idx;
               std::copy_n(src, slot.dim, slot.arena.data(idx));
             }
@@ -638,7 +665,8 @@ public:
               }
             } else {
               idx = slot.arena.allocate();
-              slot.optimizer->allocate();
+              if (slot.optimizer.has_value())
+                slot.optimizer->allocate();
               preallocated_idx = idx;
               if (initializer_.has_value()) {
                 initializer_->initialize(
@@ -720,9 +748,13 @@ public:
   std::error_code clear() {
     for (auto &[_, slot] : slots_) {
       slot->key_map.clear();
-      slot->optimizer->clear();
+      if (slot->optimizer.has_value()) {
+        slot->optimizer->clear();
+      }
       slot->arena.reset();
-      slot->optimizer = slot->opt_factory(slot->dim);
+      slot->optimizer = slot->opt_factory.has_value()
+                            ? (*slot->opt_factory)(slot->dim)
+                            : nullptr;
     }
     return {};
   }
@@ -730,6 +762,9 @@ public:
   template <typename KeyT>
   std::error_code assign_scores(std::span<const KeyT> keys,
                                 std::span<const uint64_t> scores) {
+    if constexpr (!ScorePolicyT::kHasScore) {
+      throw std::runtime_error("assign_scores requires a score-enabled policy");
+    }
     size_t n = keys.size();
     auto do_range = [&](size_t begin, size_t end) {
       std::unordered_map<uint32_t, std::vector<uint32_t>> local_free_slots;
@@ -765,7 +800,8 @@ public:
                 }
               } else {
                 idx = slot.arena.allocate();
-                slot.optimizer->allocate();
+                if (slot.optimizer.has_value())
+                  slot.optimizer->allocate();
                 preallocated_idx = idx;
                 if (initializer_.has_value()) {
                   initializer_->initialize(
@@ -775,7 +811,8 @@ public:
                 }
               }
             }
-            slot.arena.score(idx).store(scores[i], std::memory_order_relaxed);
+            std::atomic_ref<uint64_t>(slot.arena.score_raw(idx))
+                .store(scores[i], std::memory_order_relaxed);
             return std::make_pair(key, idx);
           };
           auto constr = [&](const auto &e) {
@@ -845,8 +882,286 @@ private:
   size_t num_threads_ = 0;
   exec::static_thread_pool pool_;
   Initializer initializer_;
+  ScorePolicyT score_policy_;
   size_t max_dim_ = 0;
   static constexpr size_t kParallelThreshold = 64;
+
+public:
+  bool has_score_policy() const { return ScorePolicyT::kHasScore; }
+
+  std::unordered_map<uint32_t, size_t> slot_dims() const {
+    std::unordered_map<uint32_t, size_t> result;
+    for (auto &[id, slot] : slots_)
+      result[id] = slot->dim;
+    return result;
+  }
+
+  // =========================================================================
+  // export_batch — visitor-callback snapshot export.
+  //
+  // Iterates all entries in the hash map via for_each (which is safe to call
+  // concurrently with reads; writes may or may not be observed). For each
+  // batch of up to batch_size entries, calls visitor(keys, values, scores).
+  // If visitor returns false, iteration stops early.
+  // =========================================================================
+
+  template <typename KeyT>
+  std::error_code
+  export_batch(se::Function<bool(std::span<const KeyT>, std::span<const ValT>,
+                                 std::span<const uint64_t>)>
+                   visitor,
+               size_t batch_size) {
+    bool has_score = ScorePolicyT::kHasScore;
+
+    for (auto &[slot_id, slot] : slots_) {
+      size_t dim = slot->dim;
+      int num_workers = static_cast<int>(parlay::num_workers());
+
+      struct LocalTinyBuffer {
+        std::vector<KeyT> keys;
+        std::vector<ValT> vals;
+        std::vector<uint64_t> scores;
+      };
+
+      struct GlobalBuffer {
+        std::vector<KeyT> keys;
+        std::vector<ValT> vals;
+        std::vector<uint64_t> scores;
+      };
+
+      std::vector<LocalTinyBuffer> local_buffers(num_workers);
+      for (int i = 0; i < num_workers; ++i) {
+        local_buffers[i].keys.reserve(256);
+        local_buffers[i].vals.reserve(256 * dim);
+        if (has_score)
+          local_buffers[i].scores.reserve(256);
+      }
+
+      GlobalBuffer global_buf;
+      global_buf.keys.reserve(batch_size);
+      global_buf.vals.reserve(batch_size * dim);
+      if (has_score)
+        global_buf.scores.reserve(batch_size);
+
+      std::atomic<bool> stopped{false};
+      std::mutex m;
+      std::mutex visitor_m;
+
+      auto flush_global = [&](GlobalBuffer &buf) -> bool {
+        if (buf.keys.empty())
+          return true;
+        bool cont = (*visitor)(std::span<const KeyT>(buf.keys),
+                               std::span<const ValT>(buf.vals),
+                               std::span<const uint64_t>(buf.scores));
+        return cont;
+      };
+
+      slot->key_map.for_each([&](const auto &entry) {
+        if (stopped.load(std::memory_order_relaxed))
+          return;
+
+        int w = parlay::worker_id();
+        auto [key, idx] = entry.get_entry();
+        auto &lb = local_buffers[w];
+
+        lb.keys.push_back(static_cast<KeyT>(key));
+        const ValT *src = slot->arena.data(idx);
+        lb.vals.insert(lb.vals.end(), src, src + dim);
+        if (has_score) {
+          lb.scores.push_back(
+              std::atomic_ref<uint64_t>(slot->arena.score_raw(idx))
+                  .load(std::memory_order_relaxed));
+        }
+
+        if (lb.keys.size() >= 256) {
+          bool need_flush = false;
+          GlobalBuffer local_flush_buf;
+
+          {
+            std::lock_guard<std::mutex> lock(m);
+            if (stopped.load(std::memory_order_relaxed))
+              return;
+
+            global_buf.keys.insert(global_buf.keys.end(), lb.keys.begin(),
+                                   lb.keys.end());
+            global_buf.vals.insert(global_buf.vals.end(), lb.vals.begin(),
+                                   lb.vals.end());
+            if (has_score) {
+              global_buf.scores.insert(global_buf.scores.end(),
+                                       lb.scores.begin(), lb.scores.end());
+            }
+
+            lb.keys.clear();
+            lb.vals.clear();
+            lb.scores.clear();
+
+            if (global_buf.keys.size() >= batch_size) {
+              local_flush_buf = std::move(global_buf);
+              global_buf.keys.reserve(batch_size);
+              global_buf.vals.reserve(batch_size * dim);
+              if (has_score)
+                global_buf.scores.reserve(batch_size);
+              need_flush = true;
+            }
+          }
+
+          if (need_flush) {
+            std::lock_guard<std::mutex> vlock(visitor_m);
+            if (stopped.load(std::memory_order_relaxed))
+              return;
+            if (!flush_global(local_flush_buf)) {
+              stopped.store(true, std::memory_order_relaxed);
+            }
+          }
+        }
+      });
+
+      if (stopped.load(std::memory_order_relaxed))
+        break;
+
+      for (int w = 0; w < num_workers; ++w) {
+        auto &lb = local_buffers[w];
+        if (!lb.keys.empty()) {
+          std::lock_guard<std::mutex> lock(m);
+          if (stopped.load(std::memory_order_relaxed))
+            break;
+          global_buf.keys.insert(global_buf.keys.end(), lb.keys.begin(),
+                                 lb.keys.end());
+          global_buf.vals.insert(global_buf.vals.end(), lb.vals.begin(),
+                                 lb.vals.end());
+          if (has_score) {
+            global_buf.scores.insert(global_buf.scores.end(), lb.scores.begin(),
+                                     lb.scores.end());
+          }
+        }
+      }
+
+      if (!stopped.load(std::memory_order_relaxed)) {
+        bool need_flush = false;
+        GlobalBuffer local_flush_buf;
+        {
+          std::lock_guard<std::mutex> lock(m);
+          if (!global_buf.keys.empty()) {
+            local_flush_buf = std::move(global_buf);
+            need_flush = true;
+          }
+        }
+        if (need_flush) {
+          std::lock_guard<std::mutex> vlock(visitor_m);
+          flush_global(local_flush_buf);
+        }
+      }
+    }
+    return {};
+  }
+
+  // =========================================================================
+  // evict_by_score — GC operation, decoupled from insertion.
+  //
+  // Evicts entries with score <= max_score, up to max_evict_count entries.
+  // Safe to call from a background thread. Operates per-slot.
+  // =========================================================================
+
+  template <typename KeyT>
+  std::error_code evict_by_score(uint64_t max_score, size_t max_evict_count,
+                                 std::span<KeyT> out_evicted_keys,
+                                 std::span<ValT> out_evicted_values,
+                                 size_t &out_evicted_count) {
+    if constexpr (!ScorePolicyT::kHasScore)
+      throw std::runtime_error(
+          "evict_by_score requires a score-enabled policy");
+
+    out_evicted_count = 0;
+
+    for (auto &[slot_id, slot] : slots_) {
+      if (out_evicted_count >= max_evict_count)
+        break;
+
+      size_t dim = slot->dim;
+      int num_workers = static_cast<int>(parlay::num_workers());
+      size_t slot_budget = max_evict_count - out_evicted_count;
+
+      struct LocalEvictBuffer {
+        std::vector<std::pair<uint64_t, uint64_t>> candidates;
+      };
+      std::vector<LocalEvictBuffer> local_buffers(num_workers);
+      for (int i = 0; i < num_workers; ++i) {
+        local_buffers[i].candidates.reserve(1024);
+      }
+
+      std::mutex m;
+      std::vector<std::pair<uint64_t, uint64_t>> global_candidates;
+      global_candidates.reserve(slot_budget);
+
+      auto merge_global =
+          [&](std::vector<std::pair<uint64_t, uint64_t>> &local_cands) {
+            std::lock_guard<std::mutex> lock(m);
+            for (auto &cand : local_cands) {
+              if (global_candidates.size() < slot_budget) {
+                global_candidates.push_back(cand);
+                if (global_candidates.size() == slot_budget) {
+                  std::make_heap(global_candidates.begin(),
+                                 global_candidates.end());
+                }
+              } else if (cand.first < global_candidates.front().first) {
+                std::pop_heap(global_candidates.begin(),
+                              global_candidates.end());
+                global_candidates.back() = cand;
+                std::push_heap(global_candidates.begin(),
+                               global_candidates.end());
+              }
+            }
+            local_cands.clear();
+          };
+
+      slot->key_map.for_each([&](const auto &entry) {
+        int w = parlay::worker_id();
+        auto [key, idx] = entry.get_entry();
+        uint64_t s = std::atomic_ref<uint64_t>(slot->arena.score_raw(idx))
+                         .load(std::memory_order_relaxed);
+        if (s <= max_score) {
+          local_buffers[w].candidates.emplace_back(s, key);
+          if (local_buffers[w].candidates.size() >= 1024) {
+            merge_global(local_buffers[w].candidates);
+          }
+        }
+      });
+
+      for (int w = 0; w < num_workers; ++w) {
+        if (!local_buffers[w].candidates.empty()) {
+          merge_global(local_buffers[w].candidates);
+        }
+      }
+
+      // Sort ascending by score — lowest score evicted first.
+      std::sort(global_candidates.begin(), global_candidates.end());
+
+      epoch::with_epoch([&] {
+        for (auto &[score, key] : global_candidates) {
+          if (out_evicted_count >= max_evict_count)
+            break;
+
+          auto found =
+              slot->key_map.Find(Key::Entry::make_key(key), [](const auto &e) {
+                return e.get_entry().second;
+              });
+          if (!found.has_value())
+            continue;
+
+          uint32_t idx = *found;
+          if (out_evicted_count < out_evicted_keys.size()) {
+            out_evicted_keys[out_evicted_count] = static_cast<KeyT>(key);
+            std::copy_n(slot->arena.data(idx), dim,
+                        out_evicted_values.data() + out_evicted_count * dim);
+          }
+          slot->key_map.Remove(Key::Entry::make_key(key),
+                               [](const auto &) { return true; });
+          ++out_evicted_count;
+        }
+      });
+    }
+    return {};
+  }
 };
 
 } // namespace se

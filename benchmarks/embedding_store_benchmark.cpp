@@ -105,9 +105,11 @@ int main() {
 
   std::vector<size_t> thread_counts = {1, 4, 8, 16, 32, 64};
 
-  auto opt_factory = [](size_t d) {
-    return pro::make_proxy<OptimizerFacade<float>, SGDOptimizer>();
-  };
+  auto opt_factory = pro::make_proxy<
+      se::FunctionFacade<pro::proxy<OptimizerFacade<float>>(size_t)>>(
+      [](size_t d) {
+        return pro::make_proxy<OptimizerFacade<float>, SGDOptimizer>();
+      });
 
   for (size_t num_threads : thread_counts) {
     print_header("Threads: " + std::to_string(num_threads));
@@ -116,8 +118,9 @@ int main() {
               << "\n"
               << std::string(56, '-') << "\n";
 
-    HogwildEmbeddingStore<float> store({{0, kDim}}, num_threads, {},
-                                       kMaxActiveKeys, opt_factory);
+    HogwildEmbeddingStore<float, NoScorePolicy> store(
+        {{0, kDim}}, num_threads, {}, kMaxActiveKeys, opt_factory,
+        NoScorePolicy{});
 
     std::mt19937_64 gen(42);
     Timer timer;

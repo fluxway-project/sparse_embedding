@@ -9,6 +9,8 @@
 - **Hogwild! 梯度累积**：分片 TransientArena 实现无锁梯度聚合，避免跨线程同步
 - **C++26 标准并发**：基于 NVIDIA `stdexec` + `exec::static_thread_pool` 实现标准 Sender/Receiver 任务调度
 - **Epoch 内存安全**：通过 `epoch::with_epoch` 批次保护并发哈希表读写，避免 ABA 问题
+- **高性能 Checkpoint**：基于 Lance-C 的零拷贝二进制大对象（Blob）数据传输，实现高效存储与恢复
+- **驱逐与内存管理**：高效的打分策略（如 LFU），使用线程安全的 `std::atomic_ref` 实现无锁并发状态更新
 
 ## 系统依赖
 
@@ -17,6 +19,8 @@
 | GCC | ≥ 15.0（需要 C++26 constexpr exceptions 支持） |
 | stdexec | NVIDIA main branch `931f256c` |
 | parlayhash | main branch（含 56-bit 指针 mask 补丁） |
+| lance-c | main branch (基于 Rust 的 C 共享库) |
+| Rust | 1.70+ (2024 Edition) |
 | Bazel | ≥ 7.0 |
 
 > **注意**：GCC 13 及以下不支持 `__cpp_constexpr_exceptions`，导致 `stdexec` 的 `sender_in` 概念检查失败，无法使用 `sync_wait` / `start_detached`。必须使用 GCC 15+。

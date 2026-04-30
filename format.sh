@@ -29,11 +29,12 @@ find . -type f \( \
 	\) -exec buildifier {} \;
 
 # Format Python files using ruff
-find . -type d -name "bazel-*" -prune -o -type f \( \
-	-name "*.py" \
-	\) -print0 | xargs -0 ruff format
-find . -type d -name "bazel-*" -prune -o -type f \( \
-	-name "*.py" \
-	\) -print0 | xargs -0 ruff check --fix
+find . -type d -name "bazel-*" -prune -o \
+       -type d -name "tmp" -prune -o \
+       -type f \( -name "*.py" \) -print0 | xargs -0 ruff format
+
+find . -type d -name "bazel-*" -prune -o \
+       -type d -name "tmp" -prune -o \
+       -type f \( -name "*.py" \) -print0 | xargs -0 ruff check --fix
 
 echo "Formatting complete."

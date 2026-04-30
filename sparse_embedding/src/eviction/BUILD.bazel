@@ -1,0 +1,23 @@
+"""
+BUILD file for eviction
+"""
+
+load("@rules_cc//cc:defs.bzl", "cc_library")
+
+cc_library(
+    name = "eviction",
+    hdrs = glob(["*.hpp"]),
+    visibility = ["//visibility:public"],
+    deps = [
+        "@proxy",
+    ],
+)
+
+cc_test(
+    name = "score_policy_test",
+    srcs = ["score_policy_test.cpp"],
+    linkopts = ["-pthread"],
+    deps = [
+        ":eviction",
+    ],
+)

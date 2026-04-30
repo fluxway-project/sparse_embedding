@@ -8,7 +8,11 @@ cc_library(
     name = "common",
     hdrs = [
         "embedding_error.hpp",
+        "function.hpp",
         "numeric_types.hpp",
     ],
     visibility = ["//visibility:public"],
+    deps = [
+        "@proxy",
+    ],
 )

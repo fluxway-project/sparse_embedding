@@ -18,9 +18,12 @@
 #ifndef SPARSE_EMBEDDING_EMBEDDING_TABLE_INTERFACE_HPP_
 #define SPARSE_EMBEDDING_EMBEDDING_TABLE_INTERFACE_HPP_
 
+#include <functional>
 #include <proxy/proxy.h>
-
+#include <span>
 #include <system_error>
+
+#include "sparse_embedding/src/common/function.hpp"
 
 namespace se {
 
@@ -54,10 +57,14 @@ PRO_DEF_MEM_DISPATCH(MemErase, erase);
 PRO_DEF_MEM_DISPATCH(MemClear, clear);
 
 // --- Score / eviction (optional) ---------------------------------------------
+PRO_DEF_MEM_DISPATCH(MemHasScorePolicy, has_score_policy);
 PRO_DEF_MEM_DISPATCH(MemAssignScores, assign_scores);
-PRO_DEF_MEM_DISPATCH(MemInsertAndEvict, insert_and_evict);
+PRO_DEF_MEM_DISPATCH(MemEvictByScore, evict_by_score);
 
 // --- Export / snapshot -------------------------------------------------------
+// export_batch uses a visitor callback — backend iterates all entries via
+// for_each and calls visitor(keys, values, scores) per batch.
+// visitor returns false to stop early.
 PRO_DEF_MEM_DISPATCH(MemExportBatch, export_batch);
 
 // --- Training: Forward -------------------------------------------------------
@@ -83,8 +90,9 @@ using WeakMemAssign = pro::weak_dispatch<MemAssign>;
 using WeakMemContains = pro::weak_dispatch<MemContains>;
 using WeakMemErase = pro::weak_dispatch<MemErase>;
 using WeakMemClear = pro::weak_dispatch<MemClear>;
+using WeakMemHasScorePolicy = pro::weak_dispatch<MemHasScorePolicy>;
 using WeakMemAssignScores = pro::weak_dispatch<MemAssignScores>;
-using WeakMemInsertAndEvict = pro::weak_dispatch<MemInsertAndEvict>;
+using WeakMemEvictByScore = pro::weak_dispatch<MemEvictByScore>;
 using WeakMemExportBatch = pro::weak_dispatch<MemExportBatch>;
 using WeakMemForwardLookup = pro::weak_dispatch<MemForwardLookup>;
 using WeakMemAccumulateGradients = pro::weak_dispatch<MemAccumulateGradients>;
@@ -124,17 +132,25 @@ using WeakMemOptimizerStep = pro::weak_dispatch<MemOptimizerStep>;
                   std::span<const ValT> grad_values,                           \
                   std::span<const int64_t> row_lengths)
 
-#define SE_INSERT_AND_EVICT_FACADE_SIG(key_t)                                  \
-  std::error_code(                                                             \
-      std::size_t n_keys, std::span<const key_t> keys,                         \
-      std::span<const ValT> values, std::span<const uint64_t> scores,          \
-      std::span<key_t> out_evicted_keys, std::span<ValT> out_evicted_values,   \
-      std::size_t &out_evicted_count)
+// evict_by_score: asynchronous-safe GC operation.
+// Evicts entries with score <= max_score, up to max_evict_count entries.
+// out_evicted_* are filled with evicted (key, value) pairs.
+#define SE_EVICT_BY_SCORE_FACADE_SIG(key_t)                                    \
+  std::error_code(uint64_t max_score, std::size_t max_evict_count,             \
+                  std::span<key_t> out_evicted_keys,                           \
+                  std::span<ValT> out_evicted_values,                          \
+                  std::size_t &out_evicted_count)
 
+// export_batch: visitor-callback snapshot export.
+// Backend calls visitor(keys, values, scores) for each batch.
+// visitor returns false to stop early.
+// batch_size controls the maximum number of entries per visitor call.
 #define SE_EXPORT_BATCH_FACADE_SIG(key_t)                                      \
-  std::error_code(std::size_t max_n, std::size_t cursor_offset,                \
-                  std::size_t &out_exported_count, std::span<key_t> out_keys,  \
-                  std::span<ValT> out_values, std::span<uint64_t> out_scores)
+  std::error_code(                                                             \
+      se::Function<bool(std::span<const key_t>, std::span<const ValT>,         \
+                        std::span<const uint64_t>)>                            \
+          visitor,                                                             \
+      std::size_t batch_size)
 
 // clang-format off
 // NOLINTBEGIN(whitespace/indent_namespace)
@@ -181,10 +197,12 @@ struct EmbeddingTableFacade : pro::facade_builder
                    std::error_code()>
 
   // --- Score / eviction -----------------------------------------------------
+  ::add_convention<WeakMemHasScorePolicy,
+                   bool() const>
   ::add_convention<WeakMemAssignScores,
                    SE_ASSIGN_SCORES_FACADE_SIG(int64_t), SE_ASSIGN_SCORES_FACADE_SIG(uint64_t)>
-  ::add_convention<WeakMemInsertAndEvict,
-                   SE_INSERT_AND_EVICT_FACADE_SIG(int64_t), SE_INSERT_AND_EVICT_FACADE_SIG(uint64_t)>
+  ::add_convention<WeakMemEvictByScore,
+                   SE_EVICT_BY_SCORE_FACADE_SIG(int64_t), SE_EVICT_BY_SCORE_FACADE_SIG(uint64_t)>
 
   // --- Export / snapshot ----------------------------------------------------
   ::add_convention<WeakMemExportBatch,
@@ -212,7 +230,7 @@ struct EmbeddingTableFacade : pro::facade_builder
 #undef SE_ASSIGN_SCORES_FACADE_SIG
 #undef SE_FORWARD_LOOKUP_FACADE_SIG
 #undef SE_ACCUMULATE_GRADIENTS_FACADE_SIG
-#undef SE_INSERT_AND_EVICT_FACADE_SIG
+#undef SE_EVICT_BY_SCORE_FACADE_SIG
 #undef SE_EXPORT_BATCH_FACADE_SIG
 
 } // namespace se
