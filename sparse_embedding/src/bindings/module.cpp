@@ -668,13 +668,15 @@ public:
   }
 
   void save_checkpoint(const std::string &uri, const std::string &mode,
-                       uint64_t min_score, bool include_optimizer_state) {
+                       uint64_t min_score, bool include_optimizer_state,
+                       bool use_compression) {
     se::CheckpointExportOptions options;
     options.mode = (mode == "incremental")
                        ? se::CheckpointExportOptions::Mode::kIncremental
                        : se::CheckpointExportOptions::Mode::kFull;
     options.min_score = min_score;
     options.include_optimizer_state = include_optimizer_state;
+    options.use_compression = use_compression;
 
     auto writer = checkpoint_writer_factory_;
     if (!writer.has_value()) {
@@ -688,12 +690,12 @@ public:
     {
       nb::gil_scoped_release release;
       dispatch_val([&]<typename ValT>() {
-        writer->begin(uri, 0, 0, has_score_policy, options.mode);
+        writer->begin(uri, 0, 0, has_score_policy, options);
 
         for (auto &[slot_id, dim] : slot_dims_) {
           // begin this slot
           writer->begin(uri, static_cast<uint32_t>(slot_id), 0,
-                        has_score_policy, options.mode);
+                        has_score_policy, options);
 
           get_store<ValT>()->export_batch(
               pro::make_proxy<se::FunctionFacade<bool(
@@ -930,7 +932,8 @@ NB_MODULE(_core, m) {
 
       .def("save_checkpoint", &EmbeddingStoreWrapper::save_checkpoint,
            nb::arg("uri"), nb::arg("mode") = "full", nb::arg("min_score") = 0,
-           nb::arg("include_optimizer_state") = false)
+           nb::arg("include_optimizer_state") = false,
+           nb::arg("use_compression") = false)
       .def("load_checkpoint", &EmbeddingStoreWrapper::load_checkpoint,
            nb::arg("uri"), nb::arg("version") = 0, nb::arg("clear") = true,
            nb::arg("load_optimizer_state") = false)

@@ -20,8 +20,6 @@
 
 #include <cstdint>
 #include <cstring>
-#include <memory>
-#include <stdexcept>
 #include <string>
 #include <string_view>
 #include <vector>
@@ -39,7 +37,7 @@ class LanceCheckpointWriter {
   uint32_t slot_id_ = 0;
   size_t opt_state_dim_ = 0;
   bool has_score_ = false;
-  CheckpointExportOptions::Mode mode_ = CheckpointExportOptions::Mode::kFull;
+  CheckpointExportOptions options_;
 
   std::vector<uint64_t> buf_keys_;
   std::vector<std::byte> buf_embeddings_;
@@ -68,7 +66,7 @@ class LanceCheckpointWriter {
 
 public:
   void begin(std::string_view uri, uint32_t slot_id, size_t optimizer_state_dim,
-             bool has_score, CheckpointExportOptions::Mode mode);
+             bool has_score, CheckpointExportOptions options);
 
   void write_batch(std::span<const uint64_t> keys, const void *embeddings,
                    size_t embedding_bytes, std::span<const uint64_t> scores,
