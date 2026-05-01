@@ -34,6 +34,8 @@ template <typename KeyT> struct UniqueResult {
   size_t unique_count;
   std::shared_ptr<int64_t[]> inverse_indices;
   size_t inverse_count;
+  std::shared_ptr<int64_t[]> first_indices;
+  std::shared_ptr<int64_t[]> counts;
 };
 
 // High-performance Unique operator using ankerl::unordered_dense map.
@@ -43,20 +45,36 @@ template <typename KeyT> struct UniqueResult {
 // elements), a tight sequential pass on ankerl map often outperforms complex
 // parallel-sorts due to prefetching.
 template <typename KeyT>
-UniqueResult<KeyT> unique_keys_inverse(std::span<const KeyT> keys) {
+UniqueResult<KeyT> unique_keys_inverse(std::span<const KeyT> keys,
+                                       bool compute_first_indices = false,
+                                       bool compute_counts = false) {
   size_t n = keys.size();
 
   auto inverse = std::shared_ptr<int64_t[]>(new int64_t[n]);
+  std::shared_ptr<int64_t[]> first_indices =
+      compute_first_indices ? std::shared_ptr<int64_t[]>(new int64_t[n])
+                            : nullptr;
+  std::shared_ptr<int64_t[]> counts =
+      compute_counts ? std::shared_ptr<int64_t[]>(new int64_t[n]) : nullptr;
 
   // Fast hash map to deduce uniqueness and contiguous IDs
   ankerl::unordered_dense::map<KeyT, int64_t> unique_map;
-  unique_map.reserve(n / 2); // heuristic pre-allocation
+  unique_map.reserve(n);
 
-  // Single pass to assign inverse indices and find all unique elements
   for (size_t i = 0; i < n; ++i) {
     KeyT key = keys[i];
     auto [it, inserted] = unique_map.try_emplace(key, unique_map.size());
-    inverse[i] = it->second;
+    int64_t uid = it->second;
+    inverse[i] = uid;
+    if (inserted) {
+      if (compute_first_indices)
+        first_indices[uid] = i;
+      if (compute_counts)
+        counts[uid] = 1;
+    } else {
+      if (compute_counts)
+        counts[uid]++;
+    }
   }
 
   size_t unique_count = unique_map.size();
@@ -69,7 +87,7 @@ UniqueResult<KeyT> unique_keys_inverse(std::span<const KeyT> keys) {
     unique_keys[idx++] = kv.first;
   }
 
-  return {unique_keys, unique_count, inverse, n};
+  return {unique_keys, unique_count, inverse, n, first_indices, counts};
 }
 
 } // namespace ops
