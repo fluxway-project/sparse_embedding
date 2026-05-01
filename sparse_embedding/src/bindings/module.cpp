@@ -21,6 +21,7 @@
 
 #include <dlpack/dlpack.h>
 
+#include <algorithm>
 #include <cstdint>
 #include <cstring>
 #include <memory>
@@ -63,21 +64,28 @@ inline void check_error(std::error_code ec) {
 // KeyDType detection
 // =============================================================================
 
-enum class KeyDType { kInt64, kUInt64 };
+enum class KeyDType { kInt32, kUInt32, kInt64, kUInt64 };
 
 inline KeyDType detect_key_dtype(const DLManagedTensor *dlm) {
   auto code = dlm->dl_tensor.dtype.code;
   auto bits = dlm->dl_tensor.dtype.bits;
+  if (code == static_cast<uint8_t>(kDLInt) && bits == 32)
+    return KeyDType::kInt32;
+  if (code == static_cast<uint8_t>(kDLUInt) && bits == 32)
+    return KeyDType::kUInt32;
   if (code == static_cast<uint8_t>(kDLInt) && bits == 64)
     return KeyDType::kInt64;
   if (code == static_cast<uint8_t>(kDLUInt) && bits == 64)
     return KeyDType::kUInt64;
-  throw std::invalid_argument("keys must be int64 or uint64");
+  throw std::invalid_argument("keys must be int32, uint32, int64 or uint64");
 }
 
 template <typename Fn>
 auto dispatch_on_key(const DLManagedTensor *dlm, Fn &&fn) {
   auto kdt = detect_key_dtype(dlm);
+  if (kdt == KeyDType::kInt32 || kdt == KeyDType::kUInt32)
+    throw std::invalid_argument(
+        "embedding table operations only support 64-bit keys");
   if (kdt == KeyDType::kInt64)
     return fn(se::py::dlpack_to_span<const int64_t>(dlm));
   return fn(se::py::dlpack_to_span<const uint64_t>(dlm));
@@ -950,55 +958,93 @@ NB_MODULE(_core, m) {
              }
            });
 
-  m.def("async_unique", [](nb::object keys) -> nb::object {
-    auto [dlm_keys, cap_keys] = se::py::extract_dlpack_tensor(keys);
-    size_t n = get_dlm_size(dlm_keys);
-    auto kdt = detect_key_dtype(dlm_keys);
-    const void *keys_data =
-        reinterpret_cast<const char *>(dlm_keys->dl_tensor.data) +
-        dlm_keys->dl_tensor.byte_offset;
+  m.def(
+      "async_unique",
+      [](nb::object keys, bool return_inverse, bool return_first_indices,
+         bool return_counts) -> nb::object {
+        auto [dlm_keys, cap_keys] = se::py::extract_dlpack_tensor(keys);
+        size_t n = get_dlm_size(dlm_keys);
+        auto kdt = detect_key_dtype(dlm_keys);
+        const void *keys_data =
+            reinterpret_cast<const char *>(dlm_keys->dl_tensor.data) +
+            dlm_keys->dl_tensor.byte_offset;
 
-    static exec::static_thread_pool global_pool(
-        std::thread::hardware_concurrency());
+        static exec::static_thread_pool global_pool(
+            std::max(1u, std::thread::hardware_concurrency()));
 
-    return se::py::async_dispatch(
-        global_pool,
-        [n, kdt, keys_data,
-         keys_keeper = std::make_shared<se::py::AsyncPyObjectKeeper>(
-             cap_keys)]() -> std::pair<DLManagedTensor *, DLManagedTensor *> {
+        struct ResultWrapper {
           DLManagedTensor *u_dlm = nullptr;
           DLManagedTensor *inv_dlm = nullptr;
+          DLManagedTensor *first_dlm = nullptr;
+          DLManagedTensor *counts_dlm = nullptr;
+          bool return_inverse;
+          bool return_first_indices;
+          bool return_counts;
+        };
 
-          if (kdt == KeyDType::kInt64) {
-            auto span = std::span<const int64_t>(
-                static_cast<const int64_t *>(keys_data), n);
-            auto res = se::ops::unique_keys_inverse(span);
+        return se::py::async_dispatch(
+            global_pool,
+            [n, kdt, keys_data, return_inverse, return_first_indices,
+             return_counts,
+             keys_keeper = std::make_shared<se::py::AsyncPyObjectKeeper>(
+                 cap_keys)]() -> ResultWrapper {
+              ResultWrapper wrap;
+              wrap.return_inverse = return_inverse;
+              wrap.return_first_indices = return_first_indices;
+              wrap.return_counts = return_counts;
 
-            u_dlm = se::py::wrap_shared_ptr_as_tensor(res.unique_keys,
-                                                      res.unique_count);
-            inv_dlm = se::py::wrap_shared_ptr_as_tensor(res.inverse_indices,
-                                                        res.inverse_count);
-          } else {
-            auto span = std::span<const uint64_t>(
-                static_cast<const uint64_t *>(keys_data), n);
-            auto res = se::ops::unique_keys_inverse(span);
+              auto process_res = [&](auto &res) {
+                wrap.u_dlm = se::py::wrap_shared_ptr_as_tensor(
+                    res.unique_keys, res.unique_count);
+                if (return_inverse)
+                  wrap.inv_dlm = se::py::wrap_shared_ptr_as_tensor(
+                      res.inverse_indices, res.inverse_count);
+                if (return_first_indices)
+                  wrap.first_dlm = se::py::wrap_shared_ptr_as_tensor(
+                      res.first_indices, res.unique_count);
+                if (return_counts)
+                  wrap.counts_dlm = se::py::wrap_shared_ptr_as_tensor(
+                      res.counts, res.unique_count);
+              };
 
-            u_dlm = se::py::wrap_shared_ptr_as_tensor(res.unique_keys,
-                                                      res.unique_count);
-            inv_dlm = se::py::wrap_shared_ptr_as_tensor(res.inverse_indices,
-                                                        res.inverse_count);
-          }
+              auto dispatch = [&](auto dummy) {
+                using T = std::decay_t<decltype(dummy)>;
+                auto span =
+                    std::span<const T>(static_cast<const T *>(keys_data), n);
+                auto res = se::ops::unique_keys_inverse(
+                    span, return_first_indices, return_counts);
+                process_res(res);
+              };
 
-          return {u_dlm, inv_dlm};
-        },
-        [](nb::object future,
-           std::pair<DLManagedTensor *, DLManagedTensor *> result) {
-          auto [u_dlm, inv_dlm] = result;
-          future.attr("set_result")(
-              nb::make_tuple(se::py::wrap_output_tensor(u_dlm),
-                             se::py::wrap_output_tensor(inv_dlm)));
-        });
-  });
+              if (kdt == KeyDType::kInt32)
+                dispatch(int32_t{});
+              else if (kdt == KeyDType::kUInt32)
+                dispatch(uint32_t{});
+              else if (kdt == KeyDType::kInt64)
+                dispatch(int64_t{});
+              else
+                dispatch(uint64_t{});
+
+              return wrap;
+            },
+            [](nb::object future, ResultWrapper wrap) {
+              std::vector<nb::object> ret;
+              ret.push_back(se::py::wrap_output_tensor(wrap.u_dlm));
+              if (wrap.return_inverse)
+                ret.push_back(se::py::wrap_output_tensor(wrap.inv_dlm));
+              if (wrap.return_first_indices)
+                ret.push_back(se::py::wrap_output_tensor(wrap.first_dlm));
+              if (wrap.return_counts)
+                ret.push_back(se::py::wrap_output_tensor(wrap.counts_dlm));
+
+              nb::tuple res_tuple =
+                  nb::steal<nb::tuple>(PySequence_Tuple(nb::cast(ret).ptr()));
+              future.attr("set_result")(res_tuple);
+            });
+      },
+      nb::arg("keys"), nb::arg("return_inverse") = true,
+      nb::arg("return_first_indices") = false,
+      nb::arg("return_counts") = false);
 
   m.def("wake_fd", []() { return se::py::GetPythonWakeManager().fd(); });
   m.def("drain_wake_queue", []() { se::py::GetPythonWakeManager().Drain(); });

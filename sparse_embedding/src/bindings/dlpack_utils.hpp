@@ -52,6 +52,9 @@ template <> constexpr DLDataType to_dl_dtype<uint64_t>() {
 template <> constexpr DLDataType to_dl_dtype<int32_t>() {
   return {kDLInt, 32, 1};
 }
+template <> constexpr DLDataType to_dl_dtype<uint32_t>() {
+  return {kDLUInt, 32, 1};
+}
 template <> constexpr DLDataType to_dl_dtype<uint8_t>() {
   return {kDLUInt, 8, 1};
 }
