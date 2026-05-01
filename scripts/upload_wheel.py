@@ -36,12 +36,10 @@ class WheelBuilder:
                 ["bazel", "build", "//:sparse_embedding_wheel"],
                 cwd=self.project_dir,
                 check=True,
-                capture_output=True,
-                text=True,
             )
             logger.info("Bazel wheel build completed successfully.")
         except subprocess.CalledProcessError as e:
-            logger.error("Build failed. Stderr output:\n%s", e.stderr)
+            logger.error("Build failed. See output above for details.")
             raise RuntimeError("Build process encountered an error") from e
 
     def get_latest_wheel(self) -> Path:

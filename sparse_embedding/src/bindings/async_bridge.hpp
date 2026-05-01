@@ -70,6 +70,15 @@ struct AsyncPyObjectKeeper {
 inline nb::object create_asyncio_future() {
   nb::module_ asyncio = nb::module_::import_("asyncio");
   nb::object loop = asyncio.attr("get_running_loop")();
+
+  if (!nb::hasattr(loop, "__se_wake_registered__")) {
+    int fd = GetPythonWakeManager().fd();
+    nb::object drain =
+        nb::cpp_function([]() { GetPythonWakeManager().Drain(); });
+    loop.attr("add_reader")(fd, drain);
+    loop.attr("__se_wake_registered__") = nb::bool_(true);
+  }
+
   return loop.attr("create_future")();
 }
 
