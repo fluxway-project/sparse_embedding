@@ -21,6 +21,7 @@
 
 #include <dlpack/dlpack.h>
 
+#include <algorithm>
 #include <cstdint>
 #include <cstring>
 #include <memory>
@@ -969,7 +970,7 @@ NB_MODULE(_core, m) {
             dlm_keys->dl_tensor.byte_offset;
 
         static exec::static_thread_pool global_pool(
-            std::thread::hardware_concurrency());
+            std::max(1u, std::thread::hardware_concurrency()));
 
         struct ResultWrapper {
           DLManagedTensor *u_dlm = nullptr;
@@ -1006,31 +1007,23 @@ NB_MODULE(_core, m) {
                       res.counts, res.unique_count);
               };
 
-              if (kdt == KeyDType::kInt32) {
-                auto span = std::span<const int32_t>(
-                    static_cast<const int32_t *>(keys_data), n);
+              auto dispatch = [&](auto dummy) {
+                using T = std::decay_t<decltype(dummy)>;
+                auto span =
+                    std::span<const T>(static_cast<const T *>(keys_data), n);
                 auto res = se::ops::unique_keys_inverse(
                     span, return_first_indices, return_counts);
                 process_res(res);
-              } else if (kdt == KeyDType::kUInt32) {
-                auto span = std::span<const uint32_t>(
-                    static_cast<const uint32_t *>(keys_data), n);
-                auto res = se::ops::unique_keys_inverse(
-                    span, return_first_indices, return_counts);
-                process_res(res);
-              } else if (kdt == KeyDType::kInt64) {
-                auto span = std::span<const int64_t>(
-                    static_cast<const int64_t *>(keys_data), n);
-                auto res = se::ops::unique_keys_inverse(
-                    span, return_first_indices, return_counts);
-                process_res(res);
-              } else {
-                auto span = std::span<const uint64_t>(
-                    static_cast<const uint64_t *>(keys_data), n);
-                auto res = se::ops::unique_keys_inverse(
-                    span, return_first_indices, return_counts);
-                process_res(res);
-              }
+              };
+
+              if (kdt == KeyDType::kInt32)
+                dispatch(int32_t{});
+              else if (kdt == KeyDType::kUInt32)
+                dispatch(uint32_t{});
+              else if (kdt == KeyDType::kInt64)
+                dispatch(int64_t{});
+              else
+                dispatch(uint64_t{});
 
               return wrap;
             },
@@ -1044,8 +1037,9 @@ NB_MODULE(_core, m) {
               if (wrap.return_counts)
                 ret.push_back(se::py::wrap_output_tensor(wrap.counts_dlm));
 
-              nb::module_ builtins = nb::module_::import_("builtins");
-              future.attr("set_result")(builtins.attr("tuple")(nb::cast(ret)));
+              nb::tuple res_tuple =
+                  nb::steal<nb::tuple>(PySequence_Tuple(nb::cast(ret).ptr()));
+              future.attr("set_result")(res_tuple);
             });
       },
       nb::arg("keys"), nb::arg("return_inverse") = true,
