@@ -278,6 +278,13 @@ public:
     };
 
     dispatch_val(construct);
+
+    // Default to lance checkpoint
+    auto wf = pro::make_proxy<se::CheckpointWriterFacade,
+                              se::LanceCheckpointWriter>();
+    auto rf = pro::make_proxy<se::CheckpointReaderFacade,
+                              se::LanceCheckpointReader>();
+    set_checkpoint_factories(std::move(wf), std::move(rf));
   }
 
   // ---- Metadata ----

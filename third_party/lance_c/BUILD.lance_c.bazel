@@ -6,24 +6,26 @@ This BUILD exports the headers for compilation; the shared library must be
 linked separately (either prebuilt or via rules_rust cargo_build_script).
 """
 
+load("@crate_index//:defs.bzl", "aliases", "all_crate_deps")
 load("@rules_cc//cc:defs.bzl", "cc_library")
+load("@rules_rust//rust:defs.bzl", "rust_shared_library")
 
-genrule(
+rust_shared_library(
     name = "build_lance_c",
-    srcs = glob(["**/*"]) + ["@rules_rust//rust/toolchain:current_rustc_files"],
-    outs = ["liblance_c.so"],
-    cmd = """
-        export CARGO_HOME=$$PWD/.cargo
-        export RUSTUP_HOME=$$PWD/.rustup
-        CARGO_PATH=$$PWD/$(CARGO)
-        export PATH=$$(dirname $$CARGO_PATH):$$PATH
-        cd $$(dirname $(location Cargo.toml))
-        $$CARGO_PATH build --release --lib
-        cp target/release/liblance_c.so $$OLDPWD/$(@D)/liblance_c.so
-    """,
-    tags = ["requires-network"],
-    toolchains = ["@rules_rust//rust/toolchain:current_rust_toolchain"],
+    srcs = glob(["src/**/*.rs"]),
+    aliases = aliases(
+        package_name = "third_party/lance_c",
+    ),
+    edition = "2024",
+    proc_macro_deps = all_crate_deps(
+        package_name = "third_party/lance_c",
+        proc_macro = True,
+    ),
     visibility = ["//visibility:public"],
+    deps = all_crate_deps(
+        package_name = "third_party/lance_c",
+        normal = True,
+    ),
 )
 
 cc_library(

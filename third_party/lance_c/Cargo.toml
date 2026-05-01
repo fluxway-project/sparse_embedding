@@ -1,0 +1,64 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright The Lance Authors
+
+[package]
+name = "lance-c"
+version = "0.1.0"
+edition = "2024"
+authors = ["Lance Devs <dev@lance.org>"]
+license = "Apache-2.0"
+repository = "https://github.com/lance-format/lance-c"
+readme = "README.md"
+description = "C/C++ bindings for the Lance columnar data format"
+keywords = ["lance", "ffi", "c", "cpp", "arrow"]
+categories = ["database-implementations", "external-ffi-bindings"]
+rust-version = "1.91.0"
+
+[lib]
+crate-type = ["cdylib", "staticlib", "rlib"]
+path = "Cargo.toml"
+
+[dependencies]
+lance = { version = "4.0.1", features = ["substrait"] }
+lance-core = "4.0.1"
+lance-file = "4.0.1"
+lance-index = "4.0.1"
+lance-io = "4.0.1"
+lance-linalg = "4.0.1"
+arrow = { version = "57.0.0", features = ["prettyprint", "ffi"] }
+arrow-array = "57.0.0"
+arrow-schema = "57.0.0"
+half = "2"
+tokio = { version = "1", features = ["rt-multi-thread", "sync"] }
+futures = "0.3"
+log = "0.4"
+pin-project = "1.0"
+snafu = "0.9"
+
+[dev-dependencies]
+lance = { version = "4.0.1", features = ["substrait"] }
+lance-datafusion = { version = "4.0.1", features = ["substrait"] }
+lance-datagen = "4.0.1"
+lance-file = "4.0.1"
+lance-table = "4.0.1"
+datafusion = { version = "52.1.0", default-features = false }
+tokio = { version = "1", features = ["rt-multi-thread", "macros"] }
+arrow-array = "57.0.0"
+arrow-schema = "57.0.0"
+tempfile = "3"
+
+[profile.release]
+panic = "abort"
+
+[package.metadata.capi.header]
+subdirectory = "lance"
+generation = false  # we ship a hand-maintained header at include/lance/lance.h
+
+[package.metadata.capi.pkg_config]
+name = "lance-c"
+filename = "lance-c"
+description = "C/C++ bindings for the Lance columnar data format"
+
+[package.metadata.capi.library]
+name = "lance_c"
+versioning = false  # 0.x ABI is unstable; revisit at 1.0

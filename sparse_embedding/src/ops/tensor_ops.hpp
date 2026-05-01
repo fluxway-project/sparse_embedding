@@ -32,10 +32,10 @@ namespace ops {
 template <typename KeyT> struct UniqueResult {
   std::shared_ptr<KeyT[]> unique_keys;
   size_t unique_count;
-  std::shared_ptr<int64_t[]> inverse_indices;
+  std::shared_ptr<int32_t[]> inverse_indices;
   size_t inverse_count;
-  std::shared_ptr<int64_t[]> first_indices;
-  std::shared_ptr<int64_t[]> counts;
+  std::shared_ptr<int32_t[]> first_indices;
+  std::shared_ptr<int32_t[]> counts;
 };
 
 // High-performance Unique operator using ankerl::unordered_dense map.
@@ -50,21 +50,21 @@ UniqueResult<KeyT> unique_keys_inverse(std::span<const KeyT> keys,
                                        bool compute_counts = false) {
   size_t n = keys.size();
 
-  auto inverse = std::shared_ptr<int64_t[]>(new int64_t[n]);
-  std::shared_ptr<int64_t[]> first_indices =
-      compute_first_indices ? std::shared_ptr<int64_t[]>(new int64_t[n])
+  auto inverse = std::shared_ptr<int32_t[]>(new int32_t[n]);
+  std::shared_ptr<int32_t[]> first_indices =
+      compute_first_indices ? std::shared_ptr<int32_t[]>(new int32_t[n])
                             : nullptr;
-  std::shared_ptr<int64_t[]> counts =
-      compute_counts ? std::shared_ptr<int64_t[]>(new int64_t[n]) : nullptr;
+  std::shared_ptr<int32_t[]> counts =
+      compute_counts ? std::shared_ptr<int32_t[]>(new int32_t[n]) : nullptr;
 
   // Fast hash map to deduce uniqueness and contiguous IDs
-  ankerl::unordered_dense::map<KeyT, int64_t> unique_map;
+  ankerl::unordered_dense::map<KeyT, int32_t> unique_map;
   unique_map.reserve(n);
 
   for (size_t i = 0; i < n; ++i) {
     KeyT key = keys[i];
     auto [it, inserted] = unique_map.try_emplace(key, unique_map.size());
-    int64_t uid = it->second;
+    int32_t uid = it->second;
     inverse[i] = uid;
     if (inserted) {
       if (compute_first_indices)

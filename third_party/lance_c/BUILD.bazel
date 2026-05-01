@@ -1,1 +1,2 @@
 # Marker BUILD file for lance_c third-party package.
+exports_files(["aws-lc-sys.patch"])
