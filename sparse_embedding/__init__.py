@@ -12,6 +12,9 @@ from ._core import (
     Initializer,
     EmbeddingStore,
     async_unique,
+    Partitioner,
+    ModuloPartitioner,
+    HashPartitioner,
 )
 
 
@@ -25,4 +28,7 @@ __all__ = [
     "Initializer",
     "EmbeddingStore",
     "async_unique",
+    "Partitioner",
+    "ModuloPartitioner",
+    "HashPartitioner",
 ]

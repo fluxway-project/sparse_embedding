@@ -52,3 +52,34 @@ def test_async_unique_int32() -> None:
     assert u_dlm is not None
     assert first_dlm is not None
     assert counts_dlm is not None
+
+
+def test_partitioners() -> None:
+    keys = np.array([10, 11, 12, 13, 14, 15], dtype=np.uint64)
+
+    # Modulo Partitioner
+    modulo_part = sparse_embedding.ModuloPartitioner(num_shards=2)
+    shard_ids_dlm = modulo_part.partition(keys)
+    shard_ids = np.from_dlpack(shard_ids_dlm)
+    np.testing.assert_array_equal(
+        shard_ids, np.array([0, 1, 0, 1, 0, 1], dtype=np.uint32)
+    )
+
+    mask_dlm = modulo_part.filter(keys, target_shard=0)
+    mask = np.from_dlpack(mask_dlm)
+    np.testing.assert_array_equal(
+        mask, np.array([True, False, True, False, True, False])
+    )
+
+    # Hash Partitioner
+    hash_part = sparse_embedding.HashPartitioner(num_shards=4)
+    shard_ids_dlm2 = hash_part.partition(keys)
+    shard_ids2 = np.from_dlpack(shard_ids_dlm2)
+    assert len(shard_ids2) == 6
+    assert all(0 <= x < 4 for x in shard_ids2)
+
+    mask_dlm2 = hash_part.filter(keys, target_shard=1)
+    mask2 = np.from_dlpack(mask_dlm2)
+    assert len(mask2) == 6
+    # The mask should exactly correspond to the shard ids that are 1
+    np.testing.assert_array_equal(mask2, shard_ids2 == 1)

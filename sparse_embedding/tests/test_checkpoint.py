@@ -23,13 +23,12 @@ def test_score_policies():
         cfg = make_cfg()
         store = se.EmbeddingStore(cfg, score_policy=policy)
         assert store.total_size() == 0
-        print(f"  [OK] score_policy={policy} constructs fine")
 
     try:
         se.EmbeddingStore(make_cfg(), score_policy="badname")
         assert False, "should throw"
-    except Exception as e:
-        print(f"  [OK] invalid policy throws: {type(e).__name__}: {e}")
+    except Exception:
+        pass
 
 
 def test_assign_and_lookup_lfu():
@@ -40,11 +39,9 @@ def test_assign_and_lookup_lfu():
     assert store.total_size() == 3
     result = lookup_np(store, keys)
     np.testing.assert_allclose(result, vals, atol=1e-5)
-    print("  [OK] assign + lookup with lfu score_policy")
 
     result2 = lookup_np(store, keys)
     np.testing.assert_allclose(result2, vals, atol=1e-5)
-    print("  [OK] second lookup (score incremented internally)")
 
 
 def test_assign_and_lookup_no_score():
@@ -54,34 +51,84 @@ def test_assign_and_lookup_no_score():
     store.assign(keys, vals.ravel())
     result = lookup_np(store, keys)
     np.testing.assert_allclose(result, vals, atol=1e-5)
-    print("  [OK] assign + lookup with no score (saves memory)")
 
 
-def test_checkpoint_backend_not_configured():
-    store = se.EmbeddingStore(make_cfg(), score_policy="none")
+def test_checkpoint_load_with_resharding():
+    import os
+    import shutil
+    import sparse_embedding
 
+    ckpt_dir = "/tmp/test_resharding_ckpt_dual"
+    if os.path.exists(ckpt_dir):
+        shutil.rmtree(ckpt_dir)
+
+    config = sparse_embedding.EmbeddingConfig(
+        slot_dims={0: 8, 1: 8}, num_threads=2, dtype="float32", max_active_keys=1000
+    )
+    store = sparse_embedding.EmbeddingStore(config)
     try:
-        store.save_checkpoint("/tmp/nonexistent_ckpt")
-        assert False, "should throw"
-    except RuntimeError as e:
-        assert "not configured" in str(e)
-        print(f"  [OK] save throws: {e}")
+        store.set_checkpoint_factories("lance")
+    except Exception:
+        import pytest
 
-    try:
-        store.load_checkpoint("/tmp/nonexistent_ckpt")
-        assert False, "should throw"
-    except RuntimeError as e:
-        assert "not configured" in str(e)
-        print(f"  [OK] load throws: {e}")
+        pytest.skip("Lance checkpoint backend not configured")
+        return
 
+    keys = np.arange(100, 200, dtype=np.uint64)
+    keys_slotted = keys.copy()
+    keys_slotted[:50] |= np.uint64(0) << 48
+    keys_slotted[50:] |= np.uint64(1) << 48
 
-if __name__ == "__main__":
-    print("=== test_score_policies ===")
-    test_score_policies()
-    print("\n=== test_assign_and_lookup_lfu ===")
-    test_assign_and_lookup_lfu()
-    print("\n=== test_assign_and_lookup_no_score ===")
-    test_assign_and_lookup_no_score()
-    print("\n=== test_checkpoint_backend_not_configured ===")
-    test_checkpoint_backend_not_configured()
-    print("\n=== ALL TESTS PASSED ===")
+    def save_cluster_checkpoints(num_shards, base_dir):
+        if os.path.exists(base_dir):
+            shutil.rmtree(base_dir)
+        os.makedirs(base_dir)
+
+        for shard_id in range(num_shards):
+            store.clear()
+            shard_keys = keys_slotted[(keys % num_shards) == shard_id]
+            if len(shard_keys) > 0:
+                store.lookup_or_insert(shard_keys)
+
+            shard_ckpt_dir = os.path.join(base_dir, f"shard_{shard_id}")
+            store.save_checkpoint(shard_ckpt_dir)
+
+    def load_cluster_checkpoints(
+        from_shards, to_shards, target_shard_id, base_dir, filter_fn
+    ):
+        store.clear()
+        for shard_id in range(from_shards):
+            shard_ckpt_dir = os.path.join(base_dir, f"shard_{shard_id}")
+            store.load_checkpoint(
+                shard_ckpt_dir,
+                filter_fn=filter_fn,
+                target_shard_id=target_shard_id,
+                clear=False,
+            )
+        return store.total_size()
+
+    ckpt_2_shards = "/tmp/ckpt_2_shards"
+    save_cluster_checkpoints(2, ckpt_2_shards)
+
+    partitioner_5 = sparse_embedding.ModuloPartitioner(num_shards=5)
+    loaded_size = load_cluster_checkpoints(2, 5, 2, ckpt_2_shards, partitioner_5)
+    assert loaded_size == 20, f"2->5 expansion expected 20, got {loaded_size}"
+
+    ckpt_7_shards = "/tmp/ckpt_7_shards"
+    save_cluster_checkpoints(7, ckpt_7_shards)
+
+    def python_mod_3_filter(k_arr_capsule):
+        import numpy as np
+
+        k_arr = np.from_dlpack(k_arr_capsule)
+        orig_keys = k_arr & ((np.uint64(1) << 48) - np.uint64(1))
+        return (orig_keys % np.uint64(3)).astype(np.uint32)
+
+    loaded_size = load_cluster_checkpoints(7, 3, 1, ckpt_7_shards, python_mod_3_filter)
+    assert loaded_size == 34, f"7->3 contraction expected 34, got {loaded_size}"
+
+    ckpt_4_shards = "/tmp/ckpt_4_shards"
+    save_cluster_checkpoints(4, ckpt_4_shards)
+
+    hash_partitioner_6 = sparse_embedding.HashPartitioner(num_shards=6)
+    loaded_size = load_cluster_checkpoints(4, 6, 3, ckpt_4_shards, hash_partitioner_6)

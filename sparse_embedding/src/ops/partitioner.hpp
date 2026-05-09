@@ -1,0 +1,216 @@
+// Copyright 2026 The Fluxway Authors. All Rights Reserved.
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+// =============================================================================
+
+#pragma once
+
+#ifndef SPARSE_EMBEDDING_PARTITIONER_HPP_
+#define SPARSE_EMBEDDING_PARTITIONER_HPP_
+
+#include <cstdint>
+#include <memory>
+#include <span>
+
+#include <proxy/proxy.h>
+
+#if defined(__AVX512F__) && defined(__AVX512DQ__)
+#include <immintrin.h>
+#endif
+
+namespace se {
+namespace ops {
+
+PRO_DEF_MEM_DISPATCH(partition_span_dispatch, partition_span);
+PRO_DEF_MEM_DISPATCH(filter_span_dispatch, filter_span);
+
+struct PartitionerFacade
+    : pro::facade_builder ::add_convention<partition_span_dispatch,
+                                           void(std::span<const uint64_t>,
+                                                std::span<uint32_t>)>::
+          add_convention<filter_span_dispatch,
+                         void(std::span<const uint64_t>, uint32_t,
+                              std::span<bool>)>::build {};
+
+class ModuloPartitioner {
+  uint32_t num_shards_;
+
+public:
+  ModuloPartitioner(uint32_t num_shards) : num_shards_(num_shards) {}
+
+  void partition_span(std::span<const uint64_t> keys,
+                      std::span<uint32_t> out_shard_ids) {
+    size_t n = keys.size();
+    size_t i = 0;
+#if defined(__AVX512F__) && defined(__AVX512DQ__)
+    if ((num_shards_ & (num_shards_ - 1)) == 0) {
+      __m512i v_mask = _mm512_set1_epi64(num_shards_ - 1);
+      for (; i + 8 <= n; i += 8) {
+        __m512i v_keys =
+            _mm512_loadu_si512(reinterpret_cast<const void *>(&keys[i]));
+        __m512i v_mod = _mm512_and_si512(v_keys, v_mask);
+        uint64_t mods[8] __attribute__((aligned(64)));
+        _mm512_store_si512(mods, v_mod);
+        for (int j = 0; j < 8; ++j) {
+          out_shard_ids[i + j] = static_cast<uint32_t>(mods[j]);
+        }
+      }
+    }
+#endif
+    if ((num_shards_ & (num_shards_ - 1)) == 0) {
+      uint64_t mask = num_shards_ - 1;
+      for (; i < n; ++i) {
+        out_shard_ids[i] = static_cast<uint32_t>(keys[i] & mask);
+      }
+    } else {
+      for (; i < n; ++i) {
+        out_shard_ids[i] = static_cast<uint32_t>(keys[i] % num_shards_);
+      }
+    }
+  }
+
+  void filter_span(std::span<const uint64_t> keys, uint32_t target_shard,
+                   std::span<bool> out_mask) const {
+    size_t n = keys.size();
+    size_t i = 0;
+#if defined(__AVX512F__) && defined(__AVX512DQ__)
+    __m512i v_shard_id = _mm512_set1_epi64(target_shard);
+    if ((num_shards_ & (num_shards_ - 1)) == 0) {
+      __m512i v_mask = _mm512_set1_epi64(num_shards_ - 1);
+      for (; i + 8 <= n; i += 8) {
+        __m512i v_keys =
+            _mm512_loadu_si512(reinterpret_cast<const void *>(&keys[i]));
+        __m512i v_mod = _mm512_and_si512(v_keys, v_mask);
+        __mmask8 cmp = _mm512_cmpeq_epi64_mask(v_mod, v_shard_id);
+        for (int j = 0; j < 8; ++j) {
+          out_mask[i + j] = (cmp & (1 << j)) != 0;
+        }
+      }
+    }
+#endif
+    if ((num_shards_ & (num_shards_ - 1)) == 0) {
+      uint64_t mask = num_shards_ - 1;
+      for (; i < n; ++i) {
+        out_mask[i] = (keys[i] & mask) == target_shard;
+      }
+    } else {
+      for (; i < n; ++i) {
+        out_mask[i] = (keys[i] % num_shards_) == target_shard;
+      }
+    }
+  }
+};
+
+class HashPartitioner {
+  uint32_t num_shards_;
+
+  struct SplitMix64Hash {
+    size_t operator()(uint64_t x) const {
+      x ^= x >> 30;
+      x *= 0xbf58476d1ce4e5b9ull;
+      x ^= x >> 27;
+      x *= 0x94d049bb133111ebull;
+      x ^= x >> 31;
+      return x;
+    }
+
+#if defined(__AVX512F__) && defined(__AVX512DQ__)
+    __m512i simd_hash(__m512i x) const {
+      x = _mm512_xor_si512(x, _mm512_srli_epi64(x, 30));
+      __m512i c1 = _mm512_set1_epi64(0xbf58476d1ce4e5b9ull);
+      x = _mm512_mullo_epi64(x, c1);
+      x = _mm512_xor_si512(x, _mm512_srli_epi64(x, 27));
+      __m512i c2 = _mm512_set1_epi64(0x94d049bb133111ebull);
+      x = _mm512_mullo_epi64(x, c2);
+      x = _mm512_xor_si512(x, _mm512_srli_epi64(x, 31));
+      return x;
+    }
+#endif
+  };
+
+public:
+  HashPartitioner(uint32_t num_shards) : num_shards_(num_shards) {}
+
+  void partition_span(std::span<const uint64_t> keys,
+                      std::span<uint32_t> out_shard_ids) {
+    size_t n = keys.size();
+    size_t i = 0;
+    SplitMix64Hash hasher;
+
+#if defined(__AVX512F__) && defined(__AVX512DQ__)
+    if ((num_shards_ & (num_shards_ - 1)) == 0) {
+      __m512i v_mask = _mm512_set1_epi64(num_shards_ - 1);
+      for (; i + 8 <= n; i += 8) {
+        __m512i v_keys =
+            _mm512_loadu_si512(reinterpret_cast<const void *>(&keys[i]));
+        __m512i v_hash = hasher.simd_hash(v_keys);
+        __m512i v_mod = _mm512_and_si512(v_hash, v_mask);
+        uint64_t mods[8] __attribute__((aligned(64)));
+        _mm512_store_si512(mods, v_mod);
+        for (int j = 0; j < 8; ++j) {
+          out_shard_ids[i + j] = static_cast<uint32_t>(mods[j]);
+        }
+      }
+    }
+#endif
+    if ((num_shards_ & (num_shards_ - 1)) == 0) {
+      uint64_t mask = num_shards_ - 1;
+      for (; i < n; ++i) {
+        out_shard_ids[i] = static_cast<uint32_t>(hasher(keys[i]) & mask);
+      }
+    } else {
+      for (; i < n; ++i) {
+        out_shard_ids[i] = static_cast<uint32_t>(hasher(keys[i]) % num_shards_);
+      }
+    }
+  }
+
+  void filter_span(std::span<const uint64_t> keys, uint32_t target_shard,
+                   std::span<bool> out_mask) {
+    size_t n = keys.size();
+    size_t i = 0;
+    SplitMix64Hash hasher;
+
+#if defined(__AVX512F__) && defined(__AVX512DQ__)
+    __m512i v_shard_id = _mm512_set1_epi64(target_shard);
+    if ((num_shards_ & (num_shards_ - 1)) == 0) {
+      __m512i v_mask = _mm512_set1_epi64(num_shards_ - 1);
+      for (; i + 8 <= n; i += 8) {
+        __m512i v_keys =
+            _mm512_loadu_si512(reinterpret_cast<const void *>(&keys[i]));
+        __m512i v_hash = hasher.simd_hash(v_keys);
+        __m512i v_mod = _mm512_and_si512(v_hash, v_mask);
+        __mmask8 cmp = _mm512_cmpeq_epi64_mask(v_mod, v_shard_id);
+        for (int j = 0; j < 8; ++j) {
+          out_mask[i + j] = (cmp & (1 << j)) != 0;
+        }
+      }
+    }
+#endif
+    if ((num_shards_ & (num_shards_ - 1)) == 0) {
+      uint64_t mask = num_shards_ - 1;
+      for (; i < n; ++i) {
+        out_mask[i] = (hasher(keys[i]) & mask) == target_shard;
+      }
+    } else {
+      for (; i < n; ++i) {
+        out_mask[i] = (hasher(keys[i]) % num_shards_) == target_shard;
+      }
+    }
+  }
+};
+
+} // namespace ops
+} // namespace se
+
+#endif // SPARSE_EMBEDDING_PARTITIONER_HPP_

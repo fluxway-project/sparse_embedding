@@ -1,0 +1,97 @@
+name: Nightly Wheel Build and Release
+
+on:
+  push:
+    branches:
+      - main
+  schedule:
+    - cron: '0 0 * * *'
+  workflow_dispatch:
+
+jobs:
+  build_wheels:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        include:
+          - python-version: "3.11"
+            abi: "cp311"
+            copt: ""
+          - python-version: "3.12"
+            abi: "abi3"
+            copt: '--copt="-DPy_LIMITED_API=0x030C0000"'
+            
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+          
+      - name: Dynamically update Bazel Python Toolchain
+        run: |
+          python -c '
+          import re
+          with open("MODULE.bazel", "r") as f: data = f.read()
+          new_data = re.sub(r"python\.toolchain\(python_version\s*=\s*\"[^\"]+\"\)", "python.toolchain(python_version = \"${{ matrix.python-version }}\")", data)
+          with open("MODULE.bazel", "w") as f: f.write(new_data)
+          '
+          
+      - name: Setup Bazel
+        uses: bazel-contrib/setup-bazel@v3
+        with:
+          bazelisk-cache: true
+          disk-cache: true
+          repository-cache: true
+          
+      - name: Build Wheel
+        run: |
+          bazel build //:sparse_embedding_wheel ${{ matrix.copt }}
+          WHEEL_PATH=$(ls bazel-bin/*.whl | head -n 1)
+          
+          # Rename wheel to have proper ABI tags and dev0 version
+          PY_VER_STR=$(echo "${{ matrix.python-version }}" | tr -d '.')
+          NEW_WHEEL_NAME="sparse_embedding-0.0.0.dev0-cp${PY_VER_STR}-${{ matrix.abi }}-linux_x86_64.whl"
+          NEW_WHEEL_PATH="$(dirname $WHEEL_PATH)/$NEW_WHEEL_NAME"
+          mv $WHEEL_PATH $NEW_WHEEL_PATH
+          
+          echo "WHEEL_PATH=$NEW_WHEEL_PATH" >> $GITHUB_ENV
+
+      - name: Upload Artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: wheel-${{ matrix.python-version }}
+          path: ${{ env.WHEEL_PATH }}
+
+  release:
+    needs: build_wheels
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        
+      - name: Download all wheels
+        uses: actions/download-artifact@v4
+        with:
+          path: wheels/
+          merge-multiple: true
+
+      - name: Update Nightly Release
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git tag -f nightly
+          git push -f origin nightly
+          
+          if gh release view nightly > /dev/null 2>&1; then
+            gh release edit nightly --title "Nightly Build" --notes "Latest nightly build of sparse_embedding."
+            gh release upload nightly wheels/*.whl --clobber
+          else
+            gh release create nightly wheels/*.whl --title "Nightly Build" --notes "Latest nightly build of sparse_embedding." --prerelease
+          fi

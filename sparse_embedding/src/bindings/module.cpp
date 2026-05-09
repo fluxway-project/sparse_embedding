@@ -47,6 +47,7 @@
 #include "sparse_embedding/src/initializer/zeros_initializer.hpp"
 #include "sparse_embedding/src/interface/embedding_config.hpp"
 #include "sparse_embedding/src/interface/embedding_table_interface.hpp"
+#include "sparse_embedding/src/ops/partitioner.hpp"
 #include "sparse_embedding/src/ops/tensor_ops.hpp"
 #include "sparse_embedding/src/optimizer/adam_optimizer.hpp"
 #include "sparse_embedding/src/optimizer/optimizer_config.hpp"
@@ -109,6 +110,95 @@ struct PyOptimizer {
 
 struct PyInitializer {
   std::shared_ptr<pro::proxy<se::InitializerBuilderFacade>> builder;
+};
+
+struct PyPartitioner {
+  std::shared_ptr<pro::proxy<se::ops::PartitionerFacade>> facade;
+
+  nb::object partition(nb::object keys) {
+    auto [dlm_keys, cap_keys] = se::py::extract_dlpack_tensor(keys);
+    size_t n = dlm_keys->dl_tensor.shape[0];
+    auto keys_span = se::py::dlpack_to_span<const uint64_t>(dlm_keys);
+
+    DLManagedTensor *out_dlm = se::py::create_output_tensor<uint32_t>(
+        std::span<const int64_t>({static_cast<int64_t>(n)}));
+    auto out_span = se::py::dlpack_to_span<uint32_t>(out_dlm);
+
+    (*facade)->partition_span(keys_span, out_span);
+    return se::py::wrap_output_tensor(out_dlm);
+  }
+
+  nb::object async_partition(nb::object keys) {
+    auto [dlm_keys, cap_keys] = se::py::extract_dlpack_tensor(keys);
+    size_t n = dlm_keys->dl_tensor.shape[0];
+    const uint64_t *keys_data = reinterpret_cast<const uint64_t *>(
+        static_cast<const char *>(dlm_keys->dl_tensor.data) +
+        dlm_keys->dl_tensor.byte_offset);
+
+    static exec::static_thread_pool pool(
+        std::max(1u, std::thread::hardware_concurrency()));
+    auto facade_copy = facade;
+
+    return se::py::async_dispatch(
+        pool,
+        [facade_copy, n, keys_data,
+         keys_keeper = std::make_shared<se::py::AsyncPyObjectKeeper>(
+             cap_keys)]() -> DLManagedTensor * {
+          DLManagedTensor *out_dlm = se::py::create_output_tensor<uint32_t>(
+              std::span<const int64_t>({static_cast<int64_t>(n)}));
+          uint32_t *out_ptr =
+              reinterpret_cast<uint32_t *>(out_dlm->dl_tensor.data);
+          (*facade_copy)
+              ->partition_span(std::span<const uint64_t>(keys_data, n),
+                               std::span<uint32_t>(out_ptr, n));
+          return out_dlm;
+        },
+        [](nb::object future, DLManagedTensor *mask_dlm) {
+          future.attr("set_result")(se::py::wrap_output_tensor(mask_dlm));
+        });
+  }
+
+  nb::object filter(nb::object keys, uint32_t target_shard) {
+    auto [dlm_keys, cap_keys] = se::py::extract_dlpack_tensor(keys);
+    size_t n = dlm_keys->dl_tensor.shape[0];
+    auto keys_span = se::py::dlpack_to_span<const uint64_t>(dlm_keys);
+
+    DLManagedTensor *out_dlm = se::py::create_output_tensor<bool>(
+        std::span<const int64_t>({static_cast<int64_t>(n)}));
+    auto out_span = se::py::dlpack_to_span<bool>(out_dlm);
+
+    (*facade)->filter_span(keys_span, target_shard, out_span);
+    return se::py::wrap_output_tensor(out_dlm);
+  }
+
+  nb::object async_filter(nb::object keys, uint32_t target_shard) {
+    auto [dlm_keys, cap_keys] = se::py::extract_dlpack_tensor(keys);
+    size_t n = dlm_keys->dl_tensor.shape[0];
+    const uint64_t *keys_data = reinterpret_cast<const uint64_t *>(
+        static_cast<const char *>(dlm_keys->dl_tensor.data) +
+        dlm_keys->dl_tensor.byte_offset);
+
+    static exec::static_thread_pool pool(
+        std::max(1u, std::thread::hardware_concurrency()));
+    auto facade_copy = facade;
+
+    return se::py::async_dispatch(
+        pool,
+        [facade_copy, n, target_shard, keys_data,
+         keys_keeper = std::make_shared<se::py::AsyncPyObjectKeeper>(
+             cap_keys)]() -> DLManagedTensor * {
+          DLManagedTensor *out_dlm = se::py::create_output_tensor<bool>(
+              std::span<const int64_t>({static_cast<int64_t>(n)}));
+          bool *out_ptr = reinterpret_cast<bool *>(out_dlm->dl_tensor.data);
+          (*facade_copy)
+              ->filter_span(std::span<const uint64_t>(keys_data, n),
+                            target_shard, std::span<bool>(out_ptr, n));
+          return out_dlm;
+        },
+        [](nb::object future, DLManagedTensor *mask_dlm) {
+          future.attr("set_result")(se::py::wrap_output_tensor(mask_dlm));
+        });
+  }
 };
 
 template <template <typename> class OptT, typename ConfigT>
@@ -757,16 +847,27 @@ public:
   }
 
   void load_checkpoint(const std::string &uri, uint64_t version, bool clear,
-                       bool load_optimizer_state) {
+                       bool load_optimizer_state,
+                       nb::object filter_fn = nb::none(),
+                       uint32_t target_shard_id = 0,
+                       size_t batch_size = 65536) {
     se::CheckpointLoadOptions options;
     options.version = version;
     options.clear_before_load = clear;
     options.load_optimizer_state = load_optimizer_state;
+    options.batch_size = batch_size;
 
     auto reader = checkpoint_reader_factory_;
     if (!reader.has_value()) {
       throw std::runtime_error("checkpoint backend not configured");
     }
+
+    std::shared_ptr<pro::proxy<se::ops::PartitionerFacade>> cpp_partitioner =
+        nullptr;
+    if (!filter_fn.is_none() && nb::isinstance<PyPartitioner>(filter_fn)) {
+      cpp_partitioner = nb::cast<PyPartitioner>(filter_fn).facade;
+    }
+
     {
       nb::gil_scoped_release release;
       if (clear)
@@ -783,10 +884,87 @@ public:
           std::vector<std::byte> embs;
           std::vector<uint64_t> scores;
           std::vector<std::byte> opt_states;
+          std::unique_ptr<bool[]> cpp_mask;
+          size_t cpp_mask_capacity = 0;
 
           while (reader->read_batch(options.batch_size, keys, embs, scores,
                                     opt_states)) {
             size_t n = keys.size();
+            if (n == 0)
+              continue;
+
+            if (cpp_partitioner) {
+              if (n > cpp_mask_capacity) {
+                cpp_mask.reset(new bool[n]);
+                cpp_mask_capacity = n;
+              }
+              (*cpp_partitioner)
+                  ->filter_span(std::span<const uint64_t>(keys),
+                                target_shard_id,
+                                std::span<bool>(cpp_mask.get(), n));
+
+              size_t keep_idx = 0;
+              for (size_t i = 0; i < n; ++i) {
+                if (cpp_mask[i]) {
+                  keys[keep_idx] = keys[i];
+                  std::memcpy(embs.data() + keep_idx * dim * sizeof(ValT),
+                              embs.data() + i * dim * sizeof(ValT),
+                              dim * sizeof(ValT));
+                  if (!scores.empty())
+                    scores[keep_idx] = scores[i];
+                  keep_idx++;
+                }
+              }
+              keys.resize(keep_idx);
+              embs.resize(keep_idx * dim * sizeof(ValT));
+              if (!scores.empty())
+                scores.resize(keep_idx);
+              n = keep_idx;
+            } else if (!filter_fn.is_none()) {
+              nb::gil_scoped_acquire acquire;
+
+              DLManagedTensor *in_dlm =
+                  se::py::wrap_shared_ptr_as_tensor<uint64_t>(
+                      std::shared_ptr<uint64_t[]>(
+                          const_cast<uint64_t *>(keys.data()),
+                          [](uint64_t *) {}),
+                      n);
+              nb::object keys_arr = se::py::wrap_output_tensor(in_dlm);
+
+              nb::object shard_ids_obj = filter_fn(keys_arr);
+
+              auto [dlm, cap] = se::py::extract_dlpack_tensor(shard_ids_obj);
+              if (dlm->dl_tensor.ndim != 1 ||
+                  dlm->dl_tensor.shape[0] != static_cast<int64_t>(n)) {
+                throw std::runtime_error(
+                    "filter_fn returned dlpack tensor of incorrect size");
+              }
+              auto span = se::py::dlpack_to_span<uint32_t>(dlm);
+              const uint32_t *shard_ids_data = span.data();
+
+              size_t keep_idx = 0;
+              for (size_t i = 0; i < n; ++i) {
+                if (shard_ids_data[i] == target_shard_id) {
+                  keys[keep_idx] = keys[i];
+                  std::memcpy(embs.data() + keep_idx * dim * sizeof(ValT),
+                              embs.data() + i * dim * sizeof(ValT),
+                              dim * sizeof(ValT));
+                  if (!scores.empty()) {
+                    scores[keep_idx] = scores[i];
+                  }
+                  keep_idx++;
+                }
+              }
+              keys.resize(keep_idx);
+              embs.resize(keep_idx * dim * sizeof(ValT));
+              if (!scores.empty())
+                scores.resize(keep_idx);
+              n = keep_idx;
+            }
+
+            if (n == 0)
+              continue;
+
             auto vals = std::span<const ValT>(
                 reinterpret_cast<const ValT *>(embs.data()), n * dim);
             auto row_lengths = std::make_unique<int64_t[]>(n);
@@ -951,7 +1129,9 @@ NB_MODULE(_core, m) {
            nb::arg("use_compression") = false)
       .def("load_checkpoint", &EmbeddingStoreWrapper::load_checkpoint,
            nb::arg("uri"), nb::arg("version") = 0, nb::arg("clear") = true,
-           nb::arg("load_optimizer_state") = false)
+           nb::arg("load_optimizer_state") = false,
+           nb::arg("filter_fn") = nb::none(), nb::arg("target_shard_id") = 0,
+           nb::arg("batch_size") = 65536)
       .def("set_checkpoint_factories",
            [](EmbeddingStoreWrapper &self, const std::string &backend) {
              if (backend == "lance") {
@@ -1055,4 +1235,32 @@ NB_MODULE(_core, m) {
 
   m.def("wake_fd", []() { return se::py::GetPythonWakeManager().fd(); });
   m.def("drain_wake_queue", []() { se::py::GetPythonWakeManager().Drain(); });
+
+  nb::class_<PyPartitioner>(m, "Partitioner")
+      .def("partition", &PyPartitioner::partition, nb::arg("keys"))
+      .def("async_partition", &PyPartitioner::async_partition, nb::arg("keys"))
+      .def("filter", &PyPartitioner::filter, nb::arg("keys"),
+           nb::arg("target_shard"))
+      .def("async_filter", &PyPartitioner::async_filter, nb::arg("keys"),
+           nb::arg("target_shard"));
+
+  m.def(
+      "ModuloPartitioner",
+      [](uint32_t num_shards) -> PyPartitioner {
+        auto proxy = pro::make_proxy<se::ops::PartitionerFacade,
+                                     se::ops::ModuloPartitioner>(num_shards);
+        return PyPartitioner{
+            std::make_shared<decltype(proxy)>(std::move(proxy))};
+      },
+      nb::arg("num_shards"));
+
+  m.def(
+      "HashPartitioner",
+      [](uint32_t num_shards) -> PyPartitioner {
+        auto proxy = pro::make_proxy<se::ops::PartitionerFacade,
+                                     se::ops::HashPartitioner>(num_shards);
+        return PyPartitioner{
+            std::make_shared<decltype(proxy)>(std::move(proxy))};
+      },
+      nb::arg("num_shards"));
 }
