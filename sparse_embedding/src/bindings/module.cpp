@@ -942,19 +942,10 @@ public:
             if (n == 0)
               continue;
 
-            if (cpp_partitioner) {
-              if (n > cpp_mask_capacity) {
-                cpp_mask.reset(new bool[n]);
-                cpp_mask_capacity = n;
-              }
-              (*cpp_partitioner)
-                  ->filter_span(std::span<const uint64_t>(keys),
-                                target_shard_id,
-                                std::span<bool>(cpp_mask.get(), n));
-
+            auto compact_batch = [&](auto should_keep) {
               size_t keep_idx = 0;
               for (size_t i = 0; i < n; ++i) {
-                if (cpp_mask[i]) {
+                if (should_keep(i)) {
                   if (keep_idx != i) {
                     keys[keep_idx] = keys[i];
                     std::memcpy(embs.data() + keep_idx * dim * sizeof(ValT),
@@ -978,6 +969,19 @@ public:
               if (!opt_states.empty())
                 opt_states.resize(keep_idx * opt_dim);
               n = keep_idx;
+            };
+
+            if (cpp_partitioner) {
+              if (n > cpp_mask_capacity) {
+                cpp_mask.reset(new bool[n]);
+                cpp_mask_capacity = n;
+              }
+              (*cpp_partitioner)
+                  ->filter_span(std::span<const uint64_t>(keys),
+                                target_shard_id,
+                                std::span<bool>(cpp_mask.get(), n));
+
+              compact_batch([&](size_t i) { return cpp_mask[i]; });
             } else if (!filter_fn.is_none()) {
               nb::gil_scoped_acquire acquire;
 
@@ -1006,32 +1010,9 @@ public:
                     "or clone the tensor inside filter_fn.");
               }
 
-              size_t keep_idx = 0;
-              for (size_t i = 0; i < n; ++i) {
-                if (shard_ids_data[i] == target_shard_id) {
-                  if (keep_idx != i) {
-                    keys[keep_idx] = keys[i];
-                    std::memcpy(embs.data() + keep_idx * dim * sizeof(ValT),
-                                embs.data() + i * dim * sizeof(ValT),
-                                dim * sizeof(ValT));
-                    if (!scores.empty()) {
-                      scores[keep_idx] = scores[i];
-                    }
-                    if (!opt_states.empty()) {
-                      std::memcpy(opt_states.data() + keep_idx * opt_dim,
-                                  opt_states.data() + i * opt_dim, opt_dim);
-                    }
-                  }
-                  keep_idx++;
-                }
-              }
-              keys.resize(keep_idx);
-              embs.resize(keep_idx * dim * sizeof(ValT));
-              if (!scores.empty())
-                scores.resize(keep_idx);
-              if (!opt_states.empty())
-                opt_states.resize(keep_idx * opt_dim);
-              n = keep_idx;
+              compact_batch([&](size_t i) {
+                return shard_ids_data[i] == target_shard_id;
+              });
             }
 
             if (n == 0)

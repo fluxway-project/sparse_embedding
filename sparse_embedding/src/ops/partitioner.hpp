@@ -85,11 +85,9 @@ public:
           __m512i v_keys =
               _mm512_loadu_si512(reinterpret_cast<const void *>(&keys[i]));
           __m512i v_mod = _mm512_and_si512(v_keys, v_mask);
-          uint64_t mods[8] __attribute__((aligned(64)));
-          _mm512_store_si512(mods, v_mod);
-          for (int j = 0; j < 8; ++j) {
-            out_shard_ids[i + j] = static_cast<uint32_t>(mods[j]);
-          }
+          __m256i v_res = _mm512_cvtepi64_epi32(v_mod);
+          _mm256_storeu_si256(reinterpret_cast<__m256i *>(&out_shard_ids[i]),
+                              v_res);
         }
       } else {
         __m512i v_mask = _mm512_set1_epi32(num_shards_ - 1);
@@ -97,11 +95,8 @@ public:
           __m512i v_keys =
               _mm512_loadu_si512(reinterpret_cast<const void *>(&keys[i]));
           __m512i v_mod = _mm512_and_si512(v_keys, v_mask);
-          uint32_t mods[16] __attribute__((aligned(64)));
-          _mm512_store_si512(mods, v_mod);
-          for (int j = 0; j < 16; ++j) {
-            out_shard_ids[i + j] = mods[j];
-          }
+          _mm512_storeu_si512(reinterpret_cast<void *>(&out_shard_ids[i]),
+                              v_mod);
         }
       }
     }
@@ -220,11 +215,9 @@ public:
               _mm512_loadu_si512(reinterpret_cast<const void *>(&keys[i]));
           __m512i v_hash = hasher.simd_hash(v_keys);
           __m512i v_mod = _mm512_and_si512(v_hash, v_mask);
-          uint64_t mods[8] __attribute__((aligned(64)));
-          _mm512_store_si512(mods, v_mod);
-          for (int j = 0; j < 8; ++j) {
-            out_shard_ids[i + j] = static_cast<uint32_t>(mods[j]);
-          }
+          __m256i v_res = _mm512_cvtepi64_epi32(v_mod);
+          _mm256_storeu_si256(reinterpret_cast<__m256i *>(&out_shard_ids[i]),
+                              v_res);
         }
       } else {
         for (; i + 8 <= n; i += 8) {
@@ -238,11 +231,9 @@ public:
           }
           __m512i v_hash = hasher.simd_hash(v_keys);
           __m512i v_mod = _mm512_and_si512(v_hash, v_mask);
-          uint64_t mods[8] __attribute__((aligned(64)));
-          _mm512_store_si512(mods, v_mod);
-          for (int j = 0; j < 8; ++j) {
-            out_shard_ids[i + j] = static_cast<uint32_t>(mods[j]);
-          }
+          __m256i v_res = _mm512_cvtepi64_epi32(v_mod);
+          _mm256_storeu_si256(reinterpret_cast<__m256i *>(&out_shard_ids[i]),
+                              v_res);
         }
       }
     }
