@@ -19,7 +19,6 @@
 #define SPARSE_EMBEDDING_PARTITIONER_HPP_
 
 #include <cstdint>
-#include <memory>
 #include <span>
 
 #include <proxy/proxy.h>
@@ -38,74 +37,132 @@ struct PartitionerFacade
     : pro::facade_builder ::add_convention<partition_span_dispatch,
                                            void(std::span<const uint64_t>,
                                                 std::span<uint32_t>)>::
-          add_convention<filter_span_dispatch,
-                         void(std::span<const uint64_t>, uint32_t,
-                              std::span<bool>)>::build {};
+          add_convention<partition_span_dispatch,
+                         void(std::span<const int64_t>, std::span<uint32_t>)>::
+              add_convention<partition_span_dispatch,
+                             void(std::span<const uint32_t>,
+                                  std::span<uint32_t>)>::
+                  add_convention<partition_span_dispatch,
+                                 void(std::span<const int32_t>,
+                                      std::span<uint32_t>)>::
+                      add_convention<filter_span_dispatch,
+                                     void(std::span<const uint64_t>, uint32_t,
+                                          std::span<bool>)>::
+                          add_convention<filter_span_dispatch,
+                                         void(std::span<const int64_t>,
+                                              uint32_t, std::span<bool>)>::
+                              add_convention<filter_span_dispatch,
+                                             void(std::span<const uint32_t>,
+                                                  uint32_t, std::span<bool>)>::
+                                  add_convention<filter_span_dispatch,
+                                                 void(std::span<const int32_t>,
+                                                      uint32_t,
+                                                      std::span<bool>)>::build {
+};
 
 class ModuloPartitioner {
   uint32_t num_shards_;
+  bool is_power_of_two_;
 
 public:
-  ModuloPartitioner(uint32_t num_shards) : num_shards_(num_shards) {}
+  ModuloPartitioner(uint32_t num_shards) : num_shards_(num_shards) {
+    if (num_shards_ == 0) {
+      throw std::invalid_argument("num_shards must be > 0");
+    }
+    is_power_of_two_ = (num_shards_ & (num_shards_ - 1)) == 0;
+  }
 
-  void partition_span(std::span<const uint64_t> keys,
-                      std::span<uint32_t> out_shard_ids) {
+  template <typename KeyT>
+  void partition_span(std::span<const KeyT> keys,
+                      std::span<uint32_t> out_shard_ids) const {
     size_t n = keys.size();
     size_t i = 0;
 #if defined(__AVX512F__) && defined(__AVX512DQ__)
-    if ((num_shards_ & (num_shards_ - 1)) == 0) {
-      __m512i v_mask = _mm512_set1_epi64(num_shards_ - 1);
-      for (; i + 8 <= n; i += 8) {
-        __m512i v_keys =
-            _mm512_loadu_si512(reinterpret_cast<const void *>(&keys[i]));
-        __m512i v_mod = _mm512_and_si512(v_keys, v_mask);
-        uint64_t mods[8] __attribute__((aligned(64)));
-        _mm512_store_si512(mods, v_mod);
-        for (int j = 0; j < 8; ++j) {
-          out_shard_ids[i + j] = static_cast<uint32_t>(mods[j]);
+    if (is_power_of_two_) {
+      if constexpr (sizeof(KeyT) == 8) {
+        __m512i v_mask = _mm512_set1_epi64(num_shards_ - 1);
+        for (; i + 8 <= n; i += 8) {
+          __m512i v_keys =
+              _mm512_loadu_si512(reinterpret_cast<const void *>(&keys[i]));
+          __m512i v_mod = _mm512_and_si512(v_keys, v_mask);
+          uint64_t mods[8] __attribute__((aligned(64)));
+          _mm512_store_si512(mods, v_mod);
+          for (int j = 0; j < 8; ++j) {
+            out_shard_ids[i + j] = static_cast<uint32_t>(mods[j]);
+          }
+        }
+      } else {
+        __m512i v_mask = _mm512_set1_epi32(num_shards_ - 1);
+        for (; i + 16 <= n; i += 16) {
+          __m512i v_keys =
+              _mm512_loadu_si512(reinterpret_cast<const void *>(&keys[i]));
+          __m512i v_mod = _mm512_and_si512(v_keys, v_mask);
+          uint32_t mods[16] __attribute__((aligned(64)));
+          _mm512_store_si512(mods, v_mod);
+          for (int j = 0; j < 16; ++j) {
+            out_shard_ids[i + j] = mods[j];
+          }
         }
       }
     }
 #endif
-    if ((num_shards_ & (num_shards_ - 1)) == 0) {
+    if (is_power_of_two_) {
       uint64_t mask = num_shards_ - 1;
       for (; i < n; ++i) {
-        out_shard_ids[i] = static_cast<uint32_t>(keys[i] & mask);
+        out_shard_ids[i] =
+            static_cast<uint32_t>(static_cast<uint64_t>(keys[i]) & mask);
       }
     } else {
       for (; i < n; ++i) {
-        out_shard_ids[i] = static_cast<uint32_t>(keys[i] % num_shards_);
+        out_shard_ids[i] =
+            static_cast<uint32_t>(static_cast<uint64_t>(keys[i]) % num_shards_);
       }
     }
   }
 
-  void filter_span(std::span<const uint64_t> keys, uint32_t target_shard,
+  template <typename KeyT>
+  void filter_span(std::span<const KeyT> keys, uint32_t target_shard,
                    std::span<bool> out_mask) const {
     size_t n = keys.size();
     size_t i = 0;
 #if defined(__AVX512F__) && defined(__AVX512DQ__)
-    __m512i v_shard_id = _mm512_set1_epi64(target_shard);
-    if ((num_shards_ & (num_shards_ - 1)) == 0) {
-      __m512i v_mask = _mm512_set1_epi64(num_shards_ - 1);
-      for (; i + 8 <= n; i += 8) {
-        __m512i v_keys =
-            _mm512_loadu_si512(reinterpret_cast<const void *>(&keys[i]));
-        __m512i v_mod = _mm512_and_si512(v_keys, v_mask);
-        __mmask8 cmp = _mm512_cmpeq_epi64_mask(v_mod, v_shard_id);
-        for (int j = 0; j < 8; ++j) {
-          out_mask[i + j] = (cmp & (1 << j)) != 0;
+    if (is_power_of_two_) {
+      if constexpr (sizeof(KeyT) == 8) {
+        __m512i v_shard_id = _mm512_set1_epi64(target_shard);
+        __m512i v_mask = _mm512_set1_epi64(num_shards_ - 1);
+        for (; i + 8 <= n; i += 8) {
+          __m512i v_keys =
+              _mm512_loadu_si512(reinterpret_cast<const void *>(&keys[i]));
+          __m512i v_mod = _mm512_and_si512(v_keys, v_mask);
+          __mmask8 cmp = _mm512_cmpeq_epi64_mask(v_mod, v_shard_id);
+          for (int j = 0; j < 8; ++j) {
+            out_mask[i + j] = (cmp & (1 << j)) != 0;
+          }
+        }
+      } else {
+        __m512i v_shard_id = _mm512_set1_epi32(target_shard);
+        __m512i v_mask = _mm512_set1_epi32(num_shards_ - 1);
+        for (; i + 16 <= n; i += 16) {
+          __m512i v_keys =
+              _mm512_loadu_si512(reinterpret_cast<const void *>(&keys[i]));
+          __m512i v_mod = _mm512_and_si512(v_keys, v_mask);
+          __mmask16 cmp = _mm512_cmpeq_epi32_mask(v_mod, v_shard_id);
+          for (int j = 0; j < 16; ++j) {
+            out_mask[i + j] = (cmp & (1 << j)) != 0;
+          }
         }
       }
     }
 #endif
-    if ((num_shards_ & (num_shards_ - 1)) == 0) {
+    if (is_power_of_two_) {
       uint64_t mask = num_shards_ - 1;
       for (; i < n; ++i) {
-        out_mask[i] = (keys[i] & mask) == target_shard;
+        out_mask[i] = (static_cast<uint64_t>(keys[i]) & mask) == target_shard;
       }
     } else {
       for (; i < n; ++i) {
-        out_mask[i] = (keys[i] % num_shards_) == target_shard;
+        out_mask[i] =
+            (static_cast<uint64_t>(keys[i]) % num_shards_) == target_shard;
       }
     }
   }
@@ -113,6 +170,7 @@ public:
 
 class HashPartitioner {
   uint32_t num_shards_;
+  bool is_power_of_two_;
 
   struct SplitMix64Hash {
     size_t operator()(uint64_t x) const {
@@ -139,72 +197,122 @@ class HashPartitioner {
   };
 
 public:
-  HashPartitioner(uint32_t num_shards) : num_shards_(num_shards) {}
+  HashPartitioner(uint32_t num_shards) : num_shards_(num_shards) {
+    if (num_shards_ == 0) {
+      throw std::invalid_argument("num_shards must be > 0");
+    }
+    is_power_of_two_ = (num_shards_ & (num_shards_ - 1)) == 0;
+  }
 
-  void partition_span(std::span<const uint64_t> keys,
-                      std::span<uint32_t> out_shard_ids) {
+  template <typename KeyT>
+  void partition_span(std::span<const KeyT> keys,
+                      std::span<uint32_t> out_shard_ids) const {
     size_t n = keys.size();
     size_t i = 0;
     SplitMix64Hash hasher;
 
 #if defined(__AVX512F__) && defined(__AVX512DQ__)
-    if ((num_shards_ & (num_shards_ - 1)) == 0) {
+    if (is_power_of_two_) {
       __m512i v_mask = _mm512_set1_epi64(num_shards_ - 1);
-      for (; i + 8 <= n; i += 8) {
-        __m512i v_keys =
-            _mm512_loadu_si512(reinterpret_cast<const void *>(&keys[i]));
-        __m512i v_hash = hasher.simd_hash(v_keys);
-        __m512i v_mod = _mm512_and_si512(v_hash, v_mask);
-        uint64_t mods[8] __attribute__((aligned(64)));
-        _mm512_store_si512(mods, v_mod);
-        for (int j = 0; j < 8; ++j) {
-          out_shard_ids[i + j] = static_cast<uint32_t>(mods[j]);
+      if constexpr (sizeof(KeyT) == 8) {
+        for (; i + 8 <= n; i += 8) {
+          __m512i v_keys =
+              _mm512_loadu_si512(reinterpret_cast<const void *>(&keys[i]));
+          __m512i v_hash = hasher.simd_hash(v_keys);
+          __m512i v_mod = _mm512_and_si512(v_hash, v_mask);
+          uint64_t mods[8] __attribute__((aligned(64)));
+          _mm512_store_si512(mods, v_mod);
+          for (int j = 0; j < 8; ++j) {
+            out_shard_ids[i + j] = static_cast<uint32_t>(mods[j]);
+          }
+        }
+      } else {
+        for (; i + 8 <= n; i += 8) {
+          __m256i v_keys_half =
+              _mm256_loadu_si256(reinterpret_cast<const __m256i *>(&keys[i]));
+          __m512i v_keys;
+          if constexpr (std::is_signed_v<KeyT>) {
+            v_keys = _mm512_cvtepi32_epi64(v_keys_half);
+          } else {
+            v_keys = _mm512_cvtepu32_epi64(v_keys_half);
+          }
+          __m512i v_hash = hasher.simd_hash(v_keys);
+          __m512i v_mod = _mm512_and_si512(v_hash, v_mask);
+          uint64_t mods[8] __attribute__((aligned(64)));
+          _mm512_store_si512(mods, v_mod);
+          for (int j = 0; j < 8; ++j) {
+            out_shard_ids[i + j] = static_cast<uint32_t>(mods[j]);
+          }
         }
       }
     }
 #endif
-    if ((num_shards_ & (num_shards_ - 1)) == 0) {
+    if (is_power_of_two_) {
       uint64_t mask = num_shards_ - 1;
       for (; i < n; ++i) {
-        out_shard_ids[i] = static_cast<uint32_t>(hasher(keys[i]) & mask);
+        out_shard_ids[i] = static_cast<uint32_t>(
+            hasher(static_cast<uint64_t>(keys[i])) & mask);
       }
     } else {
       for (; i < n; ++i) {
-        out_shard_ids[i] = static_cast<uint32_t>(hasher(keys[i]) % num_shards_);
+        out_shard_ids[i] = static_cast<uint32_t>(
+            hasher(static_cast<uint64_t>(keys[i])) % num_shards_);
       }
     }
   }
 
-  void filter_span(std::span<const uint64_t> keys, uint32_t target_shard,
-                   std::span<bool> out_mask) {
+  template <typename KeyT>
+  void filter_span(std::span<const KeyT> keys, uint32_t target_shard,
+                   std::span<bool> out_mask) const {
     size_t n = keys.size();
     size_t i = 0;
     SplitMix64Hash hasher;
 
 #if defined(__AVX512F__) && defined(__AVX512DQ__)
     __m512i v_shard_id = _mm512_set1_epi64(target_shard);
-    if ((num_shards_ & (num_shards_ - 1)) == 0) {
+    if (is_power_of_two_) {
       __m512i v_mask = _mm512_set1_epi64(num_shards_ - 1);
-      for (; i + 8 <= n; i += 8) {
-        __m512i v_keys =
-            _mm512_loadu_si512(reinterpret_cast<const void *>(&keys[i]));
-        __m512i v_hash = hasher.simd_hash(v_keys);
-        __m512i v_mod = _mm512_and_si512(v_hash, v_mask);
-        __mmask8 cmp = _mm512_cmpeq_epi64_mask(v_mod, v_shard_id);
-        for (int j = 0; j < 8; ++j) {
-          out_mask[i + j] = (cmp & (1 << j)) != 0;
+      if constexpr (sizeof(KeyT) == 8) {
+        for (; i + 8 <= n; i += 8) {
+          __m512i v_keys =
+              _mm512_loadu_si512(reinterpret_cast<const void *>(&keys[i]));
+          __m512i v_hash = hasher.simd_hash(v_keys);
+          __m512i v_mod = _mm512_and_si512(v_hash, v_mask);
+          __mmask8 cmp = _mm512_cmpeq_epi64_mask(v_mod, v_shard_id);
+          for (int j = 0; j < 8; ++j) {
+            out_mask[i + j] = (cmp & (1 << j)) != 0;
+          }
+        }
+      } else {
+        for (; i + 8 <= n; i += 8) {
+          __m256i v_keys_half =
+              _mm256_loadu_si256(reinterpret_cast<const __m256i *>(&keys[i]));
+          __m512i v_keys;
+          if constexpr (std::is_signed_v<KeyT>) {
+            v_keys = _mm512_cvtepi32_epi64(v_keys_half);
+          } else {
+            v_keys = _mm512_cvtepu32_epi64(v_keys_half);
+          }
+          __m512i v_hash = hasher.simd_hash(v_keys);
+          __m512i v_mod = _mm512_and_si512(v_hash, v_mask);
+          __mmask8 cmp = _mm512_cmpeq_epi64_mask(v_mod, v_shard_id);
+          for (int j = 0; j < 8; ++j) {
+            out_mask[i + j] = (cmp & (1 << j)) != 0;
+          }
         }
       }
     }
 #endif
-    if ((num_shards_ & (num_shards_ - 1)) == 0) {
+    if (is_power_of_two_) {
       uint64_t mask = num_shards_ - 1;
       for (; i < n; ++i) {
-        out_mask[i] = (hasher(keys[i]) & mask) == target_shard;
+        out_mask[i] =
+            (hasher(static_cast<uint64_t>(keys[i])) & mask) == target_shard;
       }
     } else {
       for (; i < n; ++i) {
-        out_mask[i] = (hasher(keys[i]) % num_shards_) == target_shard;
+        out_mask[i] = (hasher(static_cast<uint64_t>(keys[i])) % num_shards_) ==
+                      target_shard;
       }
     }
   }

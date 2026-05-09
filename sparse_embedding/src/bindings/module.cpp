@@ -92,6 +92,18 @@ auto dispatch_on_key(const DLManagedTensor *dlm, Fn &&fn) {
   return fn(se::py::dlpack_to_span<const uint64_t>(dlm));
 }
 
+template <typename Fn>
+auto dispatch_partition_key(const DLManagedTensor *dlm, Fn &&fn) {
+  auto kdt = detect_key_dtype(dlm);
+  if (kdt == KeyDType::kInt32)
+    return fn(se::py::dlpack_to_span<const int32_t>(dlm));
+  if (kdt == KeyDType::kUInt32)
+    return fn(se::py::dlpack_to_span<const uint32_t>(dlm));
+  if (kdt == KeyDType::kInt64)
+    return fn(se::py::dlpack_to_span<const int64_t>(dlm));
+  return fn(se::py::dlpack_to_span<const uint64_t>(dlm));
+}
+
 inline size_t get_dlm_size(const DLManagedTensor *dlm) {
   size_t n = 1;
   for (int i = 0; i < dlm->dl_tensor.ndim; ++i) {
@@ -118,22 +130,24 @@ struct PyPartitioner {
   nb::object partition(nb::object keys) {
     auto [dlm_keys, cap_keys] = se::py::extract_dlpack_tensor(keys);
     size_t n = dlm_keys->dl_tensor.shape[0];
-    auto keys_span = se::py::dlpack_to_span<const uint64_t>(dlm_keys);
 
     DLManagedTensor *out_dlm = se::py::create_output_tensor<uint32_t>(
         std::span<const int64_t>({static_cast<int64_t>(n)}));
     auto out_span = se::py::dlpack_to_span<uint32_t>(out_dlm);
 
-    (*facade)->partition_span(keys_span, out_span);
+    dispatch_partition_key(dlm_keys, [&](auto keys_span) {
+      (*facade)->partition_span(keys_span, out_span);
+    });
     return se::py::wrap_output_tensor(out_dlm);
   }
 
   nb::object async_partition(nb::object keys) {
     auto [dlm_keys, cap_keys] = se::py::extract_dlpack_tensor(keys);
     size_t n = dlm_keys->dl_tensor.shape[0];
-    const uint64_t *keys_data = reinterpret_cast<const uint64_t *>(
-        static_cast<const char *>(dlm_keys->dl_tensor.data) +
-        dlm_keys->dl_tensor.byte_offset);
+    auto kdt = detect_key_dtype(dlm_keys);
+    const void *keys_data =
+        reinterpret_cast<const char *>(dlm_keys->dl_tensor.data) +
+        dlm_keys->dl_tensor.byte_offset;
 
     static exec::static_thread_pool pool(
         std::max(1u, std::thread::hardware_concurrency()));
@@ -141,16 +155,30 @@ struct PyPartitioner {
 
     return se::py::async_dispatch(
         pool,
-        [facade_copy, n, keys_data,
+        [facade_copy, n, kdt, keys_data,
          keys_keeper = std::make_shared<se::py::AsyncPyObjectKeeper>(
              cap_keys)]() -> DLManagedTensor * {
           DLManagedTensor *out_dlm = se::py::create_output_tensor<uint32_t>(
               std::span<const int64_t>({static_cast<int64_t>(n)}));
           uint32_t *out_ptr =
               reinterpret_cast<uint32_t *>(out_dlm->dl_tensor.data);
-          (*facade_copy)
-              ->partition_span(std::span<const uint64_t>(keys_data, n),
-                               std::span<uint32_t>(out_ptr, n));
+
+          auto do_partition = [&](auto ks) {
+            (*facade_copy)->partition_span(ks, std::span<uint32_t>(out_ptr, n));
+          };
+          if (kdt == KeyDType::kInt32)
+            do_partition(std::span<const int32_t>(
+                static_cast<const int32_t *>(keys_data), n));
+          else if (kdt == KeyDType::kUInt32)
+            do_partition(std::span<const uint32_t>(
+                static_cast<const uint32_t *>(keys_data), n));
+          else if (kdt == KeyDType::kInt64)
+            do_partition(std::span<const int64_t>(
+                static_cast<const int64_t *>(keys_data), n));
+          else
+            do_partition(std::span<const uint64_t>(
+                static_cast<const uint64_t *>(keys_data), n));
+
           return out_dlm;
         },
         [](nb::object future, DLManagedTensor *mask_dlm) {
@@ -161,22 +189,24 @@ struct PyPartitioner {
   nb::object filter(nb::object keys, uint32_t target_shard) {
     auto [dlm_keys, cap_keys] = se::py::extract_dlpack_tensor(keys);
     size_t n = dlm_keys->dl_tensor.shape[0];
-    auto keys_span = se::py::dlpack_to_span<const uint64_t>(dlm_keys);
 
     DLManagedTensor *out_dlm = se::py::create_output_tensor<bool>(
         std::span<const int64_t>({static_cast<int64_t>(n)}));
     auto out_span = se::py::dlpack_to_span<bool>(out_dlm);
 
-    (*facade)->filter_span(keys_span, target_shard, out_span);
+    dispatch_partition_key(dlm_keys, [&](auto keys_span) {
+      (*facade)->filter_span(keys_span, target_shard, out_span);
+    });
     return se::py::wrap_output_tensor(out_dlm);
   }
 
   nb::object async_filter(nb::object keys, uint32_t target_shard) {
     auto [dlm_keys, cap_keys] = se::py::extract_dlpack_tensor(keys);
     size_t n = dlm_keys->dl_tensor.shape[0];
-    const uint64_t *keys_data = reinterpret_cast<const uint64_t *>(
-        static_cast<const char *>(dlm_keys->dl_tensor.data) +
-        dlm_keys->dl_tensor.byte_offset);
+    auto kdt = detect_key_dtype(dlm_keys);
+    const void *keys_data =
+        reinterpret_cast<const char *>(dlm_keys->dl_tensor.data) +
+        dlm_keys->dl_tensor.byte_offset;
 
     static exec::static_thread_pool pool(
         std::max(1u, std::thread::hardware_concurrency()));
@@ -184,15 +214,30 @@ struct PyPartitioner {
 
     return se::py::async_dispatch(
         pool,
-        [facade_copy, n, target_shard, keys_data,
+        [facade_copy, n, target_shard, kdt, keys_data,
          keys_keeper = std::make_shared<se::py::AsyncPyObjectKeeper>(
              cap_keys)]() -> DLManagedTensor * {
           DLManagedTensor *out_dlm = se::py::create_output_tensor<bool>(
               std::span<const int64_t>({static_cast<int64_t>(n)}));
           bool *out_ptr = reinterpret_cast<bool *>(out_dlm->dl_tensor.data);
-          (*facade_copy)
-              ->filter_span(std::span<const uint64_t>(keys_data, n),
-                            target_shard, std::span<bool>(out_ptr, n));
+
+          auto do_filter = [&](auto ks) {
+            (*facade_copy)
+                ->filter_span(ks, target_shard, std::span<bool>(out_ptr, n));
+          };
+          if (kdt == KeyDType::kInt32)
+            do_filter(std::span<const int32_t>(
+                static_cast<const int32_t *>(keys_data), n));
+          else if (kdt == KeyDType::kUInt32)
+            do_filter(std::span<const uint32_t>(
+                static_cast<const uint32_t *>(keys_data), n));
+          else if (kdt == KeyDType::kInt64)
+            do_filter(std::span<const int64_t>(
+                static_cast<const int64_t *>(keys_data), n));
+          else
+            do_filter(std::span<const uint64_t>(
+                static_cast<const uint64_t *>(keys_data), n));
+
           return out_dlm;
         },
         [](nb::object future, DLManagedTensor *mask_dlm) {
@@ -890,6 +935,10 @@ public:
           while (reader->read_batch(options.batch_size, keys, embs, scores,
                                     opt_states)) {
             size_t n = keys.size();
+            size_t opt_dim = 0;
+            if (n > 0 && !opt_states.empty()) {
+              opt_dim = opt_states.size() / n;
+            }
             if (n == 0)
               continue;
 
@@ -906,12 +955,19 @@ public:
               size_t keep_idx = 0;
               for (size_t i = 0; i < n; ++i) {
                 if (cpp_mask[i]) {
-                  keys[keep_idx] = keys[i];
-                  std::memcpy(embs.data() + keep_idx * dim * sizeof(ValT),
-                              embs.data() + i * dim * sizeof(ValT),
-                              dim * sizeof(ValT));
-                  if (!scores.empty())
-                    scores[keep_idx] = scores[i];
+                  if (keep_idx != i) {
+                    keys[keep_idx] = keys[i];
+                    std::memcpy(embs.data() + keep_idx * dim * sizeof(ValT),
+                                embs.data() + i * dim * sizeof(ValT),
+                                dim * sizeof(ValT));
+                    if (!scores.empty()) {
+                      scores[keep_idx] = scores[i];
+                    }
+                    if (!opt_states.empty()) {
+                      std::memcpy(opt_states.data() + keep_idx * opt_dim,
+                                  opt_states.data() + i * opt_dim, opt_dim);
+                    }
+                  }
                   keep_idx++;
                 }
               }
@@ -919,19 +975,20 @@ public:
               embs.resize(keep_idx * dim * sizeof(ValT));
               if (!scores.empty())
                 scores.resize(keep_idx);
+              if (!opt_states.empty())
+                opt_states.resize(keep_idx * opt_dim);
               n = keep_idx;
             } else if (!filter_fn.is_none()) {
               nb::gil_scoped_acquire acquire;
 
+              auto keys_sp = std::shared_ptr<uint64_t[]>(
+                  const_cast<uint64_t *>(keys.data()), [](uint64_t *) {});
               DLManagedTensor *in_dlm =
-                  se::py::wrap_shared_ptr_as_tensor<uint64_t>(
-                      std::shared_ptr<uint64_t[]>(
-                          const_cast<uint64_t *>(keys.data()),
-                          [](uint64_t *) {}),
-                      n);
+                  se::py::wrap_shared_ptr_as_tensor<uint64_t>(keys_sp, n);
               nb::object keys_arr = se::py::wrap_output_tensor(in_dlm);
 
               nb::object shard_ids_obj = filter_fn(keys_arr);
+              keys_arr = nb::none();
 
               auto [dlm, cap] = se::py::extract_dlpack_tensor(shard_ids_obj);
               if (dlm->dl_tensor.ndim != 1 ||
@@ -942,15 +999,28 @@ public:
               auto span = se::py::dlpack_to_span<uint32_t>(dlm);
               const uint32_t *shard_ids_data = span.data();
 
+              if (keys_sp.use_count() > 1) {
+                throw std::runtime_error(
+                    "filter_fn retained a reference to the keys tensor, which "
+                    "violates zero-copy memory safety. Please explicitly copy "
+                    "or clone the tensor inside filter_fn.");
+              }
+
               size_t keep_idx = 0;
               for (size_t i = 0; i < n; ++i) {
                 if (shard_ids_data[i] == target_shard_id) {
-                  keys[keep_idx] = keys[i];
-                  std::memcpy(embs.data() + keep_idx * dim * sizeof(ValT),
-                              embs.data() + i * dim * sizeof(ValT),
-                              dim * sizeof(ValT));
-                  if (!scores.empty()) {
-                    scores[keep_idx] = scores[i];
+                  if (keep_idx != i) {
+                    keys[keep_idx] = keys[i];
+                    std::memcpy(embs.data() + keep_idx * dim * sizeof(ValT),
+                                embs.data() + i * dim * sizeof(ValT),
+                                dim * sizeof(ValT));
+                    if (!scores.empty()) {
+                      scores[keep_idx] = scores[i];
+                    }
+                    if (!opt_states.empty()) {
+                      std::memcpy(opt_states.data() + keep_idx * opt_dim,
+                                  opt_states.data() + i * opt_dim, opt_dim);
+                    }
                   }
                   keep_idx++;
                 }
@@ -959,6 +1029,8 @@ public:
               embs.resize(keep_idx * dim * sizeof(ValT));
               if (!scores.empty())
                 scores.resize(keep_idx);
+              if (!opt_states.empty())
+                opt_states.resize(keep_idx * opt_dim);
               n = keep_idx;
             }
 
