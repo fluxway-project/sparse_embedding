@@ -332,6 +332,38 @@ inline nb::object wrap_output_tensor(DLManagedTensor *dlm) {
   return nb::cast(DLPackCapsuleWrapper(std::move(capsule), dev));
 }
 
+// =============================================================================
+// span_to_dlpack_no_delete: zero-copy DLPack wrapper for a borrowed span.
+// The caller MUST guarantee the span's backing memory outlives the tensor.
+// Intended for synchronous callbacks where the C++ side holds the lock.
+// =============================================================================
+
+template <typename T>
+DLManagedTensor *span_to_dlpack_no_delete(std::span<const T> span) {
+  struct BorrowedCtx {
+    int64_t shape[1];
+  };
+
+  auto *ctx = new BorrowedCtx();
+  ctx->shape[0] = static_cast<int64_t>(span.size());
+
+  auto *dlm = new DLManagedTensor;
+  dlm->dl_tensor.data = const_cast<T *>(span.data());
+  dlm->dl_tensor.device = {kDLCPU, 0};
+  dlm->dl_tensor.ndim = 1;
+  dlm->dl_tensor.dtype = to_dl_dtype<T>();
+  dlm->dl_tensor.shape = ctx->shape;
+  dlm->dl_tensor.strides = nullptr;
+  dlm->dl_tensor.byte_offset = 0;
+  dlm->manager_ctx = ctx;
+  dlm->deleter = [](DLManagedTensor *self) {
+    delete static_cast<BorrowedCtx *>(self->manager_ctx);
+    delete self;
+  };
+
+  return dlm;
+}
+
 } // namespace se::py
 
 #endif // SPARSE_EMBEDDING_DLPACK_UTILS_HPP_

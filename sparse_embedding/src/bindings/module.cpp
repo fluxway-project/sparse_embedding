@@ -35,12 +35,16 @@
 #include <variant>
 
 #include "sparse_embedding/src/backend/hogwild/hogwild_embedding_store.hpp"
+#include "sparse_embedding/src/bindings/arrow_c_bridge.hpp"
 #include "sparse_embedding/src/bindings/async_bridge.hpp"
 #include "sparse_embedding/src/bindings/dlpack_utils.hpp"
 #include "sparse_embedding/src/bindings/python_wake_manager.hpp"
 #include "sparse_embedding/src/checkpoint/checkpoint_interface.hpp"
+#ifdef SE_ENABLE_LANCE_CHECKPOINTER
 #include "sparse_embedding/src/checkpoint/lance/lance_checkpoint.hpp"
+#endif
 #include "sparse_embedding/src/common/function.hpp"
+#include "sparse_embedding/src/common/slot_key_codec.hpp"
 #include "sparse_embedding/src/eviction/score_policy.hpp"
 #include "sparse_embedding/src/initializer/initializer_config.hpp"
 #include "sparse_embedding/src/initializer/uniform_initializer.hpp"
@@ -330,7 +334,7 @@ class EmbeddingStoreWrapper {
     size_t total = 0;
     for (size_t i = 0; i < ks.size(); ++i) {
       uint64_t key = static_cast<uint64_t>(ks[i]);
-      uint32_t slot_id = static_cast<uint32_t>((key >> 48) & 0xFFFF);
+      uint32_t slot_id = codec_.decode_slot(key);
       auto dim = static_cast<int64_t>(slot_dims_.at(slot_id));
       out_row_lengths[i] = dim;
       total += dim;
@@ -345,7 +349,8 @@ public:
       : async_pool_((emb_cfg.num_threads == 0)
                         ? std::max(1u, std::thread::hardware_concurrency())
                         : emb_cfg.num_threads),
-        slot_dims_(emb_cfg.slot_dims), dtype_(emb_cfg.dtype) {
+        slot_dims_(emb_cfg.slot_dims), dtype_(emb_cfg.dtype),
+        codec_(emb_cfg.slot_bits) {
     for (auto &[slot, dim] : slot_dims_) {
       if (dim > max_dim_)
         max_dim_ = dim;
@@ -395,7 +400,7 @@ public:
         using StoreType = se::HogwildEmbeddingStore<ValT, Policy>;
         store_ = pro::make_proxy<se::EmbeddingTableFacade<ValT>, StoreType>(
             slot_dims_, nt, std::move(init_proxy), emb_cfg.max_active_keys,
-            std::move(opt_factory), std::move(policy));
+            std::move(opt_factory), std::move(policy), emb_cfg.slot_bits);
       };
 
       if (score_policy_name == "none") {
@@ -413,13 +418,6 @@ public:
     };
 
     dispatch_val(construct);
-
-    // Default to lance checkpoint
-    auto wf = pro::make_proxy<se::CheckpointWriterFacade,
-                              se::LanceCheckpointWriter>();
-    auto rf = pro::make_proxy<se::CheckpointReaderFacade,
-                              se::LanceCheckpointReader>();
-    set_checkpoint_factories(std::move(wf), std::move(rf));
   }
 
   // ---- Metadata ----
@@ -436,6 +434,14 @@ public:
 
   size_t dim_for_slot(uint32_t slot_id) { return slot_dims_.at(slot_id); }
 
+  nb::list slot_ids() {
+    nb::list result;
+    for (auto &[id, _] : slot_dims_) {
+      result.append(id);
+    }
+    return result;
+  }
+
   // ---- get_dims ----
 
   nb::object get_dims(nb::object keys) {
@@ -449,7 +455,7 @@ public:
     dispatch_on_key(dlm_keys, [&](auto ks) {
       for (size_t i = 0; i < n; ++i) {
         uint64_t key = static_cast<uint64_t>(ks[i]);
-        uint32_t slot_id = static_cast<uint32_t>((key >> 48) & 0xFFFF);
+        uint32_t slot_id = codec_.decode_slot(key);
         out[i] = static_cast<int64_t>(slot_dims_.at(slot_id));
       }
     });
@@ -817,6 +823,7 @@ public:
     });
   }
 
+#ifdef SE_ENABLE_LANCE_CHECKPOINTER
   void save_checkpoint(const std::string &uri, const std::string &mode,
                        uint64_t min_score, bool include_optimizer_state,
                        bool use_compression) {
@@ -1035,16 +1042,159 @@ public:
       });
     }
   }
+#endif // SE_ENABLE_LANCE_CHECKPOINTER
 
+  void export_batches_dlpack(nb::callable visitor, size_t batch_size = 65536,
+                             bool include_optimizer_state = false) {
+    nb::gil_scoped_release release;
+    dispatch_val([&]<typename ValT>() {
+      auto &proxy = get_store<ValT>();
+
+      if (!include_optimizer_state) {
+        proxy->export_batch(
+            pro::make_proxy<se::FunctionFacade<bool(
+                std::span<const uint64_t>, std::span<const ValT>,
+                std::span<const uint64_t>)>>(
+                [&](std::span<const uint64_t> keys, std::span<const ValT> vals,
+                    std::span<const uint64_t>) -> bool {
+                  nb::gil_scoped_acquire acquire;
+                  auto keys_dlp = se::py::span_to_dlpack_no_delete(keys);
+                  auto vals_dlp = se::py::span_to_dlpack_no_delete(vals);
+                  visitor(se::py::wrap_output_tensor(keys_dlp),
+                          se::py::wrap_output_tensor(vals_dlp));
+                  return true;
+                }),
+            batch_size);
+      } else {
+        proxy->export_opt_state_batch(
+            pro::make_proxy<se::FunctionFacade<bool(std::span<const uint64_t>,
+                                                    std::span<const float>,
+                                                    std::span<const float>)>>(
+                [&](std::span<const uint64_t> keys, std::span<const float> vals,
+                    std::span<const float> opt_states) -> bool {
+                  nb::gil_scoped_acquire acquire;
+                  auto keys_dlp = se::py::span_to_dlpack_no_delete(keys);
+                  auto vals_dlp = se::py::span_to_dlpack_no_delete(vals);
+                  auto opt_dlp = se::py::span_to_dlpack_no_delete(opt_states);
+                  visitor(se::py::wrap_output_tensor(keys_dlp),
+                          se::py::wrap_output_tensor(vals_dlp),
+                          se::py::wrap_output_tensor(opt_dlp));
+                  return true;
+                }),
+            batch_size);
+      }
+    });
+  }
+
+  void export_batches_arrow(nb::callable visitor, size_t batch_size = 65536,
+                            bool include_optimizer_state = false) {
+    nb::gil_scoped_release release;
+    dispatch_val([&]<typename ValT>() {
+      auto &proxy = get_store<ValT>();
+
+      proxy->export_opt_state_batch_owned(
+          pro::make_proxy<se::FunctionFacade<bool(std::vector<uint64_t> &&,
+                                                  std::vector<float> &&,
+                                                  std::vector<float> &&)>>(
+              [&](std::vector<uint64_t> &&keys, std::vector<float> &&vals,
+                  std::vector<float> &&opt_states) -> bool {
+                auto pair = include_optimizer_state
+                                ? se::arrow::build_opt_state_batch(
+                                      std::move(keys), std::move(vals),
+                                      std::move(opt_states), codec_)
+                                : se::arrow::build_embedding_batch(
+                                      std::move(keys), std::move(vals), codec_);
+                auto array_addr = reinterpret_cast<uintptr_t>(&pair.array);
+                auto schema_addr = reinterpret_cast<uintptr_t>(&pair.schema);
+                nb::gil_scoped_acquire acquire;
+                visitor(array_addr, schema_addr);
+                return true;
+              }),
+          batch_size);
+    });
+  }
+
+  void assign_opt_state(int slot_id, nb::object keys_obj,
+                        nb::object opt_states_obj) {
+    if (slot_dims_.find(slot_id) == slot_dims_.end()) {
+      throw std::invalid_argument("invalid slot_id");
+    }
+    auto [dlm_keys, cap_keys] = se::py::extract_dlpack_tensor(keys_obj);
+    auto [dlm_opt, cap_opt] = se::py::extract_dlpack_tensor(opt_states_obj);
+
+    const uint64_t *keys =
+        static_cast<const uint64_t *>(dlm_keys->dl_tensor.data);
+    size_t n = dlm_keys->dl_tensor.shape[0];
+    const float *opt_flat = static_cast<const float *>(dlm_opt->dl_tensor.data);
+    size_t total_opt = static_cast<size_t>(dlm_opt->dl_tensor.shape[0]);
+
+    nb::gil_scoped_release release;
+    dispatch_val([&]<typename ValT>() {
+      get_store<ValT>()->assign_opt_states(
+          std::span<const uint64_t>(keys, n),
+          std::span<const float>(opt_flat, total_opt));
+    });
+  }
+
+  // ---- Slot-aware convenience API ----
+
+  uint8_t codec_slot_bits() const { return codec_.slot_bits(); }
+
+  nb::object encode_keys(uint32_t slot_id, nb::object raw_keys) {
+    auto [dlm_keys, cap_keys] = se::py::extract_dlpack_tensor(raw_keys);
+    size_t n = get_dlm_size(dlm_keys);
+    int64_t shape[1] = {static_cast<int64_t>(n)};
+    DLManagedTensor *out_dlm =
+        se::py::create_output_tensor<uint64_t>(std::span(shape));
+    auto *out = static_cast<uint64_t *>(out_dlm->dl_tensor.data);
+
+    dispatch_on_key(dlm_keys, [&](auto ks) {
+      for (size_t i = 0; i < n; ++i) {
+        out[i] = codec_.encode(slot_id, static_cast<uint64_t>(ks[i]));
+      }
+    });
+    return se::py::wrap_output_tensor(out_dlm);
+  }
+
+  nb::tuple lookup_slot(uint32_t slot_id, nb::object raw_keys) {
+    nb::object encoded = encode_keys(slot_id, raw_keys);
+    return lookup(encoded);
+  }
+
+  nb::tuple lookup_or_insert_slot(uint32_t slot_id, nb::object raw_keys) {
+    nb::object encoded = encode_keys(slot_id, raw_keys);
+    return lookup_or_insert(encoded);
+  }
+
+  void assign_slot(uint32_t slot_id, nb::object raw_keys, nb::object values) {
+    nb::object encoded = encode_keys(slot_id, raw_keys);
+    assign(encoded, values);
+  }
+
+  nb::object contains_slot(uint32_t slot_id, nb::object raw_keys) {
+    nb::object encoded = encode_keys(slot_id, raw_keys);
+    return contains(encoded);
+  }
+
+  void erase_slot(uint32_t slot_id, nb::object raw_keys) {
+    nb::object encoded = encode_keys(slot_id, raw_keys);
+    erase(encoded);
+  }
+
+#ifdef SE_ENABLE_LANCE_CHECKPOINTER
   void set_checkpoint_factories(se::CheckpointWriterFactory wf,
                                 se::CheckpointReaderFactory rf) {
     checkpoint_writer_factory_ = std::move(wf);
     checkpoint_reader_factory_ = std::move(rf);
   }
+#endif // SE_ENABLE_LANCE_CHECKPOINTER
 
 private:
+  se::SlotKeyCodec codec_;
+#ifdef SE_ENABLE_LANCE_CHECKPOINTER
   se::CheckpointWriterFactory checkpoint_writer_factory_;
   se::CheckpointReaderFactory checkpoint_reader_factory_;
+#endif
 };
 
 } // namespace
@@ -1058,13 +1208,15 @@ NB_MODULE(_core, m) {
 
   nb::class_<se::EmbeddingConfig>(m, "EmbeddingConfig")
       .def(nb::init<std::unordered_map<uint32_t, size_t>, size_t, std::string,
-                    size_t>(),
+                    size_t, uint8_t>(),
            nb::arg("slot_dims"), nb::arg("num_threads") = 0,
-           nb::arg("dtype") = "float32", nb::arg("max_active_keys") = 1 << 20)
+           nb::arg("dtype") = "float32", nb::arg("max_active_keys") = 1 << 20,
+           nb::arg("slot_bits") = 16)
       .def_rw("slot_dims", &se::EmbeddingConfig::slot_dims)
       .def_rw("num_threads", &se::EmbeddingConfig::num_threads)
       .def_rw("dtype", &se::EmbeddingConfig::dtype)
-      .def_rw("max_active_keys", &se::EmbeddingConfig::max_active_keys);
+      .def_rw("max_active_keys", &se::EmbeddingConfig::max_active_keys)
+      .def_rw("slot_bits", &se::EmbeddingConfig::slot_bits);
 
   nb::class_<PyInitializer>(m, "Initializer");
 
@@ -1153,6 +1305,7 @@ NB_MODULE(_core, m) {
       .def("total_size", &EmbeddingStoreWrapper::total_size)
       .def("max_dim", &EmbeddingStoreWrapper::max_dim)
       .def("num_slots", &EmbeddingStoreWrapper::num_slots)
+      .def("slot_ids", &EmbeddingStoreWrapper::slot_ids)
       .def("dim_for_slot", &EmbeddingStoreWrapper::dim_for_slot,
            nb::arg("slot_id"))
       .def("get_dims", &EmbeddingStoreWrapper::get_dims, nb::arg("keys"))
@@ -1176,6 +1329,34 @@ NB_MODULE(_core, m) {
       .def("async_assign", &EmbeddingStoreWrapper::async_assign,
            nb::arg("keys"), nb::arg("values"))
 
+      .def("export_batches_dlpack",
+           &EmbeddingStoreWrapper::export_batches_dlpack, nb::arg("visitor"),
+           nb::arg("batch_size") = 65536,
+           nb::arg("include_optimizer_state") = false)
+
+      .def("export_batches_arrow", &EmbeddingStoreWrapper::export_batches_arrow,
+           nb::arg("visitor"), nb::arg("batch_size") = 65536,
+           nb::arg("include_optimizer_state") = false)
+
+      .def("assign_opt_state", &EmbeddingStoreWrapper::assign_opt_state,
+           nb::arg("slot_id"), nb::arg("keys"), nb::arg("opt_states"))
+
+      .def("encode_keys", &EmbeddingStoreWrapper::encode_keys,
+           nb::arg("slot_id"), nb::arg("raw_keys"))
+      .def("lookup_slot", &EmbeddingStoreWrapper::lookup_slot,
+           nb::arg("slot_id"), nb::arg("raw_keys"))
+      .def("lookup_or_insert_slot",
+           &EmbeddingStoreWrapper::lookup_or_insert_slot, nb::arg("slot_id"),
+           nb::arg("raw_keys"))
+      .def("assign_slot", &EmbeddingStoreWrapper::assign_slot,
+           nb::arg("slot_id"), nb::arg("raw_keys"), nb::arg("values"))
+      .def("contains_slot", &EmbeddingStoreWrapper::contains_slot,
+           nb::arg("slot_id"), nb::arg("raw_keys"))
+      .def("erase_slot", &EmbeddingStoreWrapper::erase_slot, nb::arg("slot_id"),
+           nb::arg("raw_keys"))
+      .def_prop_ro("codec_slot_bits", &EmbeddingStoreWrapper::codec_slot_bits)
+
+#ifdef SE_ENABLE_LANCE_CHECKPOINTER
       .def("save_checkpoint", &EmbeddingStoreWrapper::save_checkpoint,
            nb::arg("uri"), nb::arg("mode") = "full", nb::arg("min_score") = 0,
            nb::arg("include_optimizer_state") = false,
@@ -1193,10 +1374,12 @@ NB_MODULE(_core, m) {
                auto rf = pro::make_proxy<se::CheckpointReaderFacade,
                                          se::LanceCheckpointReader>();
                self.set_checkpoint_factories(std::move(wf), std::move(rf));
-             } else {
-               throw std::runtime_error("Unsupported backend: " + backend);
+               return;
              }
-           });
+             throw std::runtime_error("Unsupported backend: " + backend);
+           })
+#endif // SE_ENABLE_LANCE_CHECKPOINTER
+      ;
 
   m.def(
       "async_unique",
@@ -1312,6 +1495,16 @@ NB_MODULE(_core, m) {
       [](uint32_t num_shards) -> PyPartitioner {
         auto proxy = pro::make_proxy<se::ops::PartitionerFacade,
                                      se::ops::HashPartitioner>(num_shards);
+        return PyPartitioner{
+            std::make_shared<decltype(proxy)>(std::move(proxy))};
+      },
+      nb::arg("num_shards"));
+
+  m.def(
+      "FastRangePartitioner",
+      [](uint32_t num_shards) -> PyPartitioner {
+        auto proxy = pro::make_proxy<se::ops::PartitionerFacade,
+                                     se::ops::FastRangePartitioner>(num_shards);
         return PyPartitioner{
             std::make_shared<decltype(proxy)>(std::move(proxy))};
       },

@@ -22,6 +22,7 @@
 #include <proxy/proxy.h>
 #include <span>
 #include <system_error>
+#include <vector>
 
 #include "sparse_embedding/src/common/function.hpp"
 
@@ -152,6 +153,10 @@ using WeakMemOptimizerStep = pro::weak_dispatch<MemOptimizerStep>;
           visitor,                                                             \
       std::size_t batch_size)
 
+PRO_DEF_MEM_DISPATCH(MemAssignOptStates, assign_opt_states);
+PRO_DEF_MEM_DISPATCH(MemExportOptStateBatch, export_opt_state_batch);
+PRO_DEF_MEM_DISPATCH(MemExportOptStateBatchOwned, export_opt_state_batch_owned);
+
 // clang-format off
 // NOLINTBEGIN(whitespace/indent_namespace)
 template <typename ValT>
@@ -217,6 +222,20 @@ struct EmbeddingTableFacade : pro::facade_builder
                    SE_ACCUMULATE_GRADIENTS_FACADE_SIG(int64_t), SE_ACCUMULATE_GRADIENTS_FACADE_SIG(uint64_t)>
   ::add_convention<WeakMemOptimizerStep,
                    std::error_code()>
+
+  // --- Optimizer state checkpoint -------------------------------------------
+  ::add_convention<pro::weak_dispatch<MemAssignOptStates>,
+                   void(std::span<const uint64_t>, std::span<const float>)>
+  ::add_convention<pro::weak_dispatch<MemExportOptStateBatch>,
+                   void(se::Function<bool(std::span<const uint64_t>,
+                                         std::span<const float>,
+                                         std::span<const float>)>,
+                        std::size_t)>
+  ::add_convention<pro::weak_dispatch<MemExportOptStateBatchOwned>,
+                   void(se::Function<bool(std::vector<uint64_t>&&,
+                                         std::vector<float>&&,
+                                         std::vector<float>&&)>,
+                        std::size_t)>
 
   ::build {};
 // NOLINTEND(whitespace/indent_namespace)

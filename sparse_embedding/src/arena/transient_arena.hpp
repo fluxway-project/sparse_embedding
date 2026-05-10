@@ -27,7 +27,7 @@
 #include <type_traits>
 
 #include <ankerl/unordered_dense.h>
-#include <tsl/robin_map.h>
+#include <vector>
 
 #include "sparse_embedding/src/simd/simd_ops.hpp"
 
@@ -36,21 +36,21 @@ namespace se {
 template <typename ValT> class TransientArena {
   static constexpr size_t kCacheLineSize = 64;
 
+  static constexpr size_t kChunkSize = 8192; // Number of elements per page
+
 public:
-  TransientArena(size_t dim, size_t max_active_keys)
-      : dim_(dim), capacity_(max_active_keys) {
+  TransientArena(size_t dim, size_t initial_capacity = kChunkSize) : dim_(dim) {
     grad_stride_ =
         (dim * sizeof(ValT) + kCacheLineSize - 1) & ~(kCacheLineSize - 1);
-    grad_buffer_ = static_cast<std::byte *>(
-        std::aligned_alloc(kCacheLineSize, capacity_ * grad_stride_));
-    if (!grad_buffer_) {
-      throw std::bad_alloc();
-    }
-    std::memset(grad_buffer_, 0, capacity_ * grad_stride_);
-    id_map_.reserve(capacity_ / 2);
+    allocate_chunk();
+    id_map_.reserve(initial_capacity);
   }
 
-  ~TransientArena() { std::free(grad_buffer_); }
+  ~TransientArena() {
+    for (auto *ptr : grad_chunks_) {
+      std::free(ptr);
+    }
+  }
 
   TransientArena(const TransientArena &) = delete;
   TransientArena &operator=(const TransientArena &) = delete;
@@ -59,7 +59,7 @@ public:
     auto [it_new, inserted] = id_map_.try_emplace(feature_id, next_slot_);
     if (inserted) {
       if (next_slot_ >= capacity_) {
-        throw std::overflow_error("transient arena capacity exceeded");
+        allocate_chunk();
       }
       std::memset(grad_data(next_slot_), 0, dim_ * sizeof(ValT));
       ++next_slot_;
@@ -96,21 +96,35 @@ public:
   size_t active_slots() const { return next_slot_; }
 
 private:
+  void allocate_chunk() {
+    std::byte *new_chunk = static_cast<std::byte *>(
+        std::aligned_alloc(kCacheLineSize, kChunkSize * grad_stride_));
+    if (!new_chunk) {
+      throw std::bad_alloc();
+    }
+    grad_chunks_.push_back(new_chunk);
+    capacity_ += kChunkSize;
+  }
+
   ValT *grad_data(uint32_t slot_index) {
-    return reinterpret_cast<ValT *>(grad_buffer_ + slot_index * grad_stride_);
+    size_t chunk_idx = slot_index / kChunkSize;
+    size_t offset = slot_index % kChunkSize;
+    return reinterpret_cast<ValT *>(grad_chunks_[chunk_idx] +
+                                    offset * grad_stride_);
   }
 
   const ValT *grad_data(uint32_t slot_index) const {
-    return reinterpret_cast<const ValT *>(grad_buffer_ +
-                                          slot_index * grad_stride_);
+    size_t chunk_idx = slot_index / kChunkSize;
+    size_t offset = slot_index % kChunkSize;
+    return reinterpret_cast<const ValT *>(grad_chunks_[chunk_idx] +
+                                          offset * grad_stride_);
   }
 
   size_t dim_;
-  size_t capacity_;
   size_t grad_stride_;
-  std::byte *grad_buffer_;
-  tsl::robin_map<uint64_t, uint32_t, ankerl::unordered_dense::hash<uint64_t>>
-      id_map_;
+  std::vector<std::byte *> grad_chunks_;
+  size_t capacity_{0};
+  ankerl::unordered_dense::map<uint64_t, uint32_t> id_map_;
   uint32_t next_slot_{0};
 };
 

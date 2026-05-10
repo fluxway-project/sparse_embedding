@@ -30,6 +30,7 @@ struct EmbeddingConfig {
   size_t num_threads = 0; // 0 means auto
   std::string dtype = "float32";
   size_t max_active_keys = 1048576; // 1 << 20
+  uint8_t slot_bits = 16;
 };
 
 } // namespace se

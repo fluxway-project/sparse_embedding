@@ -10,6 +10,7 @@ cc_library(
         "embedding_error.hpp",
         "function.hpp",
         "numeric_types.hpp",
+        "slot_key_codec.hpp",
     ],
     visibility = ["//visibility:public"],
     deps = [

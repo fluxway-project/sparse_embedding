@@ -54,6 +54,26 @@ public:
     v_state.clear();
   }
 
+  // Returns a pointer to a flat buffer [m[0..dim-1], v[0..dim-1]] for idx.
+  // Caller must copy the data before releasing any lock; the buffer is
+  // backed by two separate arenas so we materialise it into a thread-local.
+  const float *state_data(uint32_t idx) const {
+    size_t d = m_state.dim();
+    thread_local std::vector<float> buf;
+    buf.resize(d * 2);
+    std::copy_n(m_state.data(idx), d, buf.data());
+    std::copy_n(v_state.data(idx), d, buf.data() + d);
+    return buf.data();
+  }
+
+  size_t state_dim() const { return m_state.dim() * 2; }
+
+  void set_state(uint32_t idx, std::span<const float> state) {
+    size_t d = m_state.dim();
+    std::copy_n(state.data(), d, m_state.data(idx));
+    std::copy_n(state.data() + d, d, v_state.data(idx));
+  }
+
   void step(uint32_t idx, std::span<ValT> param_span,
             std::span<const ValT> grad_span, uint64_t global_step) {
     const float step_f = static_cast<float>(global_step);

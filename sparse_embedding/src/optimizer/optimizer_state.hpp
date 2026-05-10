@@ -85,6 +85,8 @@ public:
     return reinterpret_cast<const float *>(raw(index));
   }
 
+  size_t dim() const { return dim_; }
+
 private:
   std::byte *raw(uint32_t index) const {
     return pages_[index / kEntriesPerPage].get() +
