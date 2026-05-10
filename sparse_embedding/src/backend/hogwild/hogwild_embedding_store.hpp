@@ -263,6 +263,13 @@ public:
     }
     num_threads_ = p2;
 
+    if (codec_.max_slot_id() >= kMaxSlots) {
+      throw std::invalid_argument(
+          "slot_bits=" + std::to_string(slot_bits) +
+          " allows max_slot_id=" + std::to_string(codec_.max_slot_id()) +
+          " which exceeds kMaxSlots=" + std::to_string(kMaxSlots));
+    }
+
     bool enable_score = ScorePolicyT::kHasScore;
 
     if (slot_dims.empty()) {
@@ -905,6 +912,140 @@ private:
     return offsets;
   }
 
+  enum class ExportOwnership { kSpan, kMove };
+
+  template <ExportOwnership Policy, typename VisitorFn>
+  void export_with_opt_impl(VisitorFn &&visitor, size_t batch_size) {
+    for (uint32_t slot_id : slot_ids_) {
+      auto *slot = slots_[slot_id];
+      size_t emb_dim = slot->dim;
+      size_t opt_dim =
+          slot->optimizer.has_value() ? slot->optimizer->state_dim() : 0;
+      int num_workers = static_cast<int>(parlay::num_workers());
+
+      struct Buffer {
+        std::vector<uint64_t> keys;
+        std::vector<ValT> vals;
+        std::vector<float> opts;
+      };
+
+      std::vector<Buffer> local_bufs(num_workers);
+      for (int i = 0; i < num_workers; ++i) {
+        local_bufs[i].keys.reserve(256);
+        local_bufs[i].vals.reserve(256 * emb_dim);
+        if (opt_dim > 0)
+          local_bufs[i].opts.reserve(256 * opt_dim);
+      }
+
+      Buffer global_buf;
+      global_buf.keys.reserve(batch_size);
+      global_buf.vals.reserve(batch_size * emb_dim);
+      if (opt_dim > 0)
+        global_buf.opts.reserve(batch_size * opt_dim);
+
+      std::atomic<bool> stopped{false};
+      std::mutex merge_m;
+      std::mutex visitor_m;
+
+      auto flush_global = [&](Buffer &buf) -> bool {
+        if (buf.keys.empty())
+          return true;
+        if constexpr (Policy == ExportOwnership::kSpan) {
+          return visitor(std::span<const uint64_t>(buf.keys),
+                         std::span<const ValT>(buf.vals),
+                         std::span<const float>(buf.opts));
+        } else {
+          bool cont = visitor(std::move(buf.keys), std::move(buf.vals),
+                              std::move(buf.opts));
+          buf.keys.clear();
+          buf.vals.clear();
+          buf.opts.clear();
+          buf.keys.reserve(batch_size);
+          buf.vals.reserve(batch_size * emb_dim);
+          if (opt_dim > 0)
+            buf.opts.reserve(batch_size * opt_dim);
+          return cont;
+        }
+      };
+
+      slot->key_map.for_each([&](const auto &entry) {
+        if (stopped.load(std::memory_order_relaxed))
+          return;
+
+        int w = parlay::worker_id();
+        auto [key, idx] = entry.get_entry();
+        auto &lb = local_bufs[w];
+
+        lb.keys.push_back(key);
+        const ValT *src = slot->arena.data(idx);
+        lb.vals.insert(lb.vals.end(), src, src + emb_dim);
+        if (opt_dim > 0 && slot->optimizer.has_value()) {
+          const float *os = slot->optimizer->state_data(idx);
+          lb.opts.insert(lb.opts.end(), os, os + opt_dim);
+        }
+
+        if (lb.keys.size() >= 256) {
+          bool need_flush = false;
+          Buffer local_flush_buf;
+          {
+            std::lock_guard lock(merge_m);
+            if (stopped.load(std::memory_order_relaxed))
+              return;
+            global_buf.keys.insert(global_buf.keys.end(), lb.keys.begin(),
+                                   lb.keys.end());
+            global_buf.vals.insert(global_buf.vals.end(), lb.vals.begin(),
+                                   lb.vals.end());
+            if (opt_dim > 0) {
+              global_buf.opts.insert(global_buf.opts.end(), lb.opts.begin(),
+                                     lb.opts.end());
+            }
+            lb.keys.clear();
+            lb.vals.clear();
+            lb.opts.clear();
+
+            if (global_buf.keys.size() >= batch_size) {
+              local_flush_buf = std::move(global_buf);
+              global_buf.keys.reserve(batch_size);
+              global_buf.vals.reserve(batch_size * emb_dim);
+              if (opt_dim > 0)
+                global_buf.opts.reserve(batch_size * opt_dim);
+              need_flush = true;
+            }
+          }
+          if (need_flush) {
+            std::lock_guard vlock(visitor_m);
+            if (stopped.load(std::memory_order_relaxed))
+              return;
+            if (!flush_global(local_flush_buf))
+              stopped.store(true, std::memory_order_relaxed);
+          }
+        }
+      });
+
+      if (stopped.load(std::memory_order_relaxed))
+        break;
+
+      for (int w = 0; w < num_workers; ++w) {
+        auto &lb = local_bufs[w];
+        if (!lb.keys.empty()) {
+          global_buf.keys.insert(global_buf.keys.end(), lb.keys.begin(),
+                                 lb.keys.end());
+          global_buf.vals.insert(global_buf.vals.end(), lb.vals.begin(),
+                                 lb.vals.end());
+          if (opt_dim > 0) {
+            global_buf.opts.insert(global_buf.opts.end(), lb.opts.begin(),
+                                   lb.opts.end());
+          }
+        }
+      }
+
+      if (!stopped.load(std::memory_order_relaxed) &&
+          !global_buf.keys.empty()) {
+        flush_global(global_buf);
+      }
+    }
+  }
+
   static constexpr size_t kMaxSlots = 65536;
   std::array<SlotStore *, kMaxSlots> slots_{};
   std::vector<std::unique_ptr<SlotStore>> slot_storage_;
@@ -1088,150 +1229,48 @@ public:
     return {};
   }
 
-  // export_batch_with_opt — same as export_batch but additionally collects
-  // optimizer state (e.g. Adam m/v moments) alongside parameters.
-  // visitor signature: (keys, vals, opt_states) -> bool
-  // opt_states is a flat float32 buffer of length n * opt_dim;
-  // opt_dim == 0 when the optimizer has no state (e.g. plain SGD).
   template <typename VisitorFn>
   void export_batch_with_opt(VisitorFn &&visitor, size_t batch_size) {
-    for (uint32_t slot_id : slot_ids_) {
-      auto *slot = slots_[slot_id];
-      size_t emb_dim = slot->dim;
-      size_t opt_dim =
-          slot->optimizer.has_value() ? slot->optimizer->state_dim() : 0;
-
-      std::vector<uint64_t> key_buf;
-      std::vector<ValT> val_buf;
-      std::vector<float> opt_buf;
-      key_buf.reserve(batch_size);
-      val_buf.reserve(batch_size * emb_dim);
-      opt_buf.reserve(batch_size * opt_dim);
-
-      auto flush = [&]() -> bool {
-        if (key_buf.empty())
-          return true;
-        bool cont = visitor(std::span<const uint64_t>(key_buf),
-                            std::span<const ValT>(val_buf),
-                            std::span<const float>(opt_buf));
-        key_buf.clear();
-        val_buf.clear();
-        opt_buf.clear();
-        return cont;
-      };
-
-      bool stopped = false;
-      slot->key_map.for_each([&](const auto &entry) {
-        if (stopped)
-          return;
-        auto [key, idx] = entry.get_entry();
-        key_buf.push_back(key);
-        const ValT *src = slot->arena.data(idx);
-        val_buf.insert(val_buf.end(), src, src + emb_dim);
-        if (opt_dim > 0 && slot->optimizer.has_value()) {
-          const float *os = slot->optimizer->state_data(idx);
-          opt_buf.insert(opt_buf.end(), os, os + opt_dim);
-        }
-        if (key_buf.size() >= batch_size) {
-          if (!flush())
-            stopped = true;
-        }
-      });
-
-      if (!stopped)
-        flush();
-    }
+    export_with_opt_impl<ExportOwnership::kSpan>(
+        std::forward<VisitorFn>(visitor), batch_size);
   }
 
-  // export_batch_with_opt_owned — ownership-transferring variant.
-  // Visitor receives std::vector&& instead of std::span, enabling the
-  // consumer to take ownership of the heap buffers (e.g. for zero-copy
-  // Arrow C Data Interface construction).
   template <typename VisitorFn>
   void export_batch_with_opt_owned(VisitorFn &&visitor, size_t batch_size) {
-    for (uint32_t slot_id : slot_ids_) {
-      auto *slot = slots_[slot_id];
-      size_t emb_dim = slot->dim;
-      size_t opt_dim =
-          slot->optimizer.has_value() ? slot->optimizer->state_dim() : 0;
-
-      std::vector<uint64_t> key_buf;
-      std::vector<ValT> val_buf;
-      std::vector<float> opt_buf;
-      key_buf.reserve(batch_size);
-      val_buf.reserve(batch_size * emb_dim);
-      opt_buf.reserve(batch_size * opt_dim);
-
-      auto flush = [&]() -> bool {
-        if (key_buf.empty())
-          return true;
-        bool cont =
-            visitor(std::move(key_buf), std::move(val_buf), std::move(opt_buf));
-        key_buf.clear();
-        val_buf.clear();
-        opt_buf.clear();
-        key_buf.reserve(batch_size);
-        val_buf.reserve(batch_size * emb_dim);
-        opt_buf.reserve(batch_size * opt_dim);
-        return cont;
-      };
-
-      bool stopped = false;
-      slot->key_map.for_each([&](const auto &entry) {
-        if (stopped)
-          return;
-        auto [key, idx] = entry.get_entry();
-        key_buf.push_back(key);
-        const ValT *src = slot->arena.data(idx);
-        val_buf.insert(val_buf.end(), src, src + emb_dim);
-        if (opt_dim > 0 && slot->optimizer.has_value()) {
-          const float *os = slot->optimizer->state_data(idx);
-          opt_buf.insert(opt_buf.end(), os, os + opt_dim);
-        }
-        if (key_buf.size() >= batch_size) {
-          if (!flush())
-            stopped = true;
-        }
-      });
-
-      if (!stopped)
-        flush();
-    }
+    export_with_opt_impl<ExportOwnership::kMove>(
+        std::forward<VisitorFn>(visitor), batch_size);
   }
 
-  // assign_opt_states — restore optimizer state for a batch of existing keys.
-  // Keys must already exist in the store (i.e. assign() called first).
-  // opt_states is a flat float32 buffer of length n * opt_dim.
   void assign_opt_states(std::span<const uint64_t> keys,
                          std::span<const float> opt_states) {
     size_t n = keys.size();
     if (n == 0)
       return;
 
-    for (uint32_t sid : slot_ids_) {
-      auto *slot = slots_[sid];
-      if (!slot->optimizer.has_value())
-        continue;
-      size_t opt_dim = slot->optimizer->state_dim();
-      if (opt_dim == 0)
-        continue;
+    epoch::with_epoch([&] {
+      for (size_t i = 0; i < n; ++i) {
+        uint64_t key = keys[i];
+        uint32_t sid = extract_slot(key);
+        if (sid >= kMaxSlots || slots_[sid] == nullptr)
+          continue;
+        auto *slot = slots_[sid];
+        if (!slot->optimizer.has_value())
+          continue;
+        size_t opt_dim = slot->optimizer->state_dim();
+        if (opt_dim == 0)
+          continue;
 
-      epoch::with_epoch([&] {
-        for (size_t i = 0; i < n; ++i) {
-          uint64_t key = keys[i];
-          auto found =
-              slot->key_map.Find(Key::Entry::make_key(key), [](const auto &e) {
-                return e.get_entry().second;
-              });
-          if (!found.has_value())
-            continue;
-          uint32_t idx = *found;
+        auto found =
+            slot->key_map.Find(Key::Entry::make_key(key), [](const auto &e) {
+              return e.get_entry().second;
+            });
+        if (found.has_value()) {
           slot->optimizer->set_state(
-              idx,
+              *found,
               std::span<const float>(opt_states.data() + i * opt_dim, opt_dim));
         }
-      });
-    }
+      }
+    });
   }
 
   // export_opt_state_batch — type-erased facade-compatible wrapper.

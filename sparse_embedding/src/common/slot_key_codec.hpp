@@ -37,6 +37,8 @@ public:
   }
 
   uint64_t encode(uint32_t slot_id, uint64_t raw_key) const {
+    if (slot_bits_ == 0)
+      return raw_key;
     return (static_cast<uint64_t>(slot_id) << key_bits_) |
            (raw_key & key_mask_);
   }

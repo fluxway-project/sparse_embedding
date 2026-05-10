@@ -17,6 +17,7 @@ cc_library(
     name = "checkpoint_lance",
     srcs = ["lance/lance_checkpoint.cpp"],
     hdrs = ["lance/lance_checkpoint.hpp"],
+    tags = ["manual"],
     visibility = ["//visibility:public"],
     deps = [
         ":checkpoint",
