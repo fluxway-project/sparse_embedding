@@ -238,8 +238,8 @@ public:
           optimizer(opt_factory.has_value() ? (*opt_factory)(d) : nullptr),
           opt_factory(opt_factory) {
       for (size_t i = 0; i < num_threads; ++i) {
-        transient_shards.push_back(std::make_unique<TransientArena<ValT>>(
-            d, max_active_keys / num_threads + 1));
+        transient_shards.push_back(
+            std::make_unique<TransientArena<ValT>>(d));
       }
     }
   };
@@ -325,6 +325,11 @@ public:
     auto do_range = [&](size_t begin, size_t end) {
       epoch::with_epoch([&] {
         for (size_t i = begin; i < end; ++i) {
+          if (i + 16 < end) {
+            __builtin_prefetch(&keys[i + 16], 0, 1);
+            __builtin_prefetch(&row_lengths[i + 16], 0, 1);
+            __builtin_prefetch(out_flat_values.data() + offsets[i + 16], 1, 1);
+          }
           uint64_t key = static_cast<uint64_t>(keys[i]);
           uint32_t slot_id = extract_slot(key);
           auto &slot = *slots_[slot_id];
@@ -369,8 +374,10 @@ public:
 
     size_t num_shards = num_threads_;
 
-    std::vector<std::vector<uint32_t>> thread_counts(
-        num_shards, std::vector<uint32_t>(num_shards, 0));
+    auto thread_counts =
+        std::make_unique_for_overwrite<uint32_t[]>(num_shards * num_shards);
+    std::memset(thread_counts.get(), 0,
+                num_shards * num_shards * sizeof(uint32_t));
     SplitMix64Hash hasher;
 
     // 1. Parallel Count
@@ -392,40 +399,43 @@ public:
           _mm512_storeu_si512(extracted, v_shards);
 
           for (int j = 0; j < 8; ++j) {
-            thread_counts[t][extracted[j]]++;
+            thread_counts[t * num_shards + extracted[j]]++;
           }
         }
 #endif
         for (; i < end; ++i) {
           uint64_t key = static_cast<uint64_t>(keys[i]);
           uint32_t shard = hasher(key) & (num_shards - 1);
-          thread_counts[t][shard]++;
+          thread_counts[t * num_shards + shard]++;
         }
       }
     };
     dispatch_parallel(num_shards, do_count, 1);
 
     // 2. Prefix Sum (Sequential)
-    std::vector<std::vector<uint32_t>> thread_offsets(
-        num_shards, std::vector<uint32_t>(num_shards, 0));
+    auto thread_offsets =
+        std::make_unique_for_overwrite<uint32_t[]>(num_shards * num_shards);
     std::vector<uint32_t> shard_offsets(num_shards + 1, 0);
 
     for (size_t s = 0; s < num_shards; ++s) {
       uint32_t current_offset = shard_offsets[s];
       for (size_t t = 0; t < num_shards; ++t) {
-        thread_offsets[t][s] = current_offset;
-        current_offset += thread_counts[t][s];
+        thread_offsets[t * num_shards + s] = current_offset;
+        current_offset += thread_counts[t * num_shards + s];
       }
       shard_offsets[s + 1] = current_offset;
     }
 
     // 3. Parallel Scatter
-    thread_local std::vector<uint32_t> shuffled_indices_buf;
-    if (shuffled_indices_buf.capacity() > n * 2) {
-      shuffled_indices_buf.shrink_to_fit();
+    thread_local std::unique_ptr<uint32_t[]> shuffled_indices_buf;
+    thread_local size_t shuffled_indices_cap = 0;
+
+    if (n > shuffled_indices_cap) {
+      size_t new_cap = std::max(n, shuffled_indices_cap * 2);
+      shuffled_indices_buf = std::make_unique_for_overwrite<uint32_t[]>(new_cap);
+      shuffled_indices_cap = new_cap;
     }
-    shuffled_indices_buf.resize(n);
-    std::span<uint32_t> shuffled_indices(shuffled_indices_buf.data(), n);
+    std::span<uint32_t> shuffled_indices(shuffled_indices_buf.get(), n);
     auto do_scatter = [&](size_t t_begin, size_t t_end) {
       for (size_t t = t_begin; t < t_end; ++t) {
         size_t start = t * n / num_shards;
@@ -444,14 +454,14 @@ public:
           _mm512_store_si512(extracted, v_shards);
 
           for (int j = 0; j < 8; ++j) {
-            shuffled_indices[thread_offsets[t][extracted[j]]++] = i + j;
+            shuffled_indices[thread_offsets[t * num_shards + extracted[j]]++] = i + j;
           }
         }
 #endif
         for (; i < end; ++i) {
           uint64_t key = static_cast<uint64_t>(keys[i]);
           uint32_t shard = hasher(key) & (num_shards - 1);
-          shuffled_indices[thread_offsets[t][shard]++] = i;
+          shuffled_indices[thread_offsets[t * num_shards + shard]++] = i;
         }
       }
     };
@@ -462,6 +472,12 @@ public:
         size_t start = shard_offsets[shard_id];
         size_t end = shard_offsets[shard_id + 1];
         for (size_t idx = start; idx < end; ++idx) {
+          if (idx + 16 < end) {
+            __builtin_prefetch(&shuffled_indices[idx + 16], 0, 1);
+            uint32_t prefetch_i = shuffled_indices[idx + 16];
+            __builtin_prefetch(&keys[prefetch_i], 0, 1);
+            __builtin_prefetch(flat_grads.data() + offsets[prefetch_i], 0, 1);
+          }
           uint32_t i = shuffled_indices[idx];
           uint64_t key = static_cast<uint64_t>(keys[i]);
           uint32_t slot_id = extract_slot(key);
