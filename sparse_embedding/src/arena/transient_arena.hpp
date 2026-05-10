@@ -39,8 +39,7 @@ template <typename ValT> class TransientArena {
   static constexpr size_t kChunkSize = 8192; // Number of elements per page
 
 public:
-  TransientArena(size_t dim, size_t initial_capacity = kChunkSize)
-      : dim_(dim) {
+  TransientArena(size_t dim, size_t initial_capacity = kChunkSize) : dim_(dim) {
     grad_stride_ =
         (dim * sizeof(ValT) + kCacheLineSize - 1) & ~(kCacheLineSize - 1);
     allocate_chunk();
@@ -48,7 +47,7 @@ public:
   }
 
   ~TransientArena() {
-    for (auto* ptr : grad_chunks_) {
+    for (auto *ptr : grad_chunks_) {
       std::free(ptr);
     }
   }
@@ -110,7 +109,8 @@ private:
   ValT *grad_data(uint32_t slot_index) {
     size_t chunk_idx = slot_index / kChunkSize;
     size_t offset = slot_index % kChunkSize;
-    return reinterpret_cast<ValT *>(grad_chunks_[chunk_idx] + offset * grad_stride_);
+    return reinterpret_cast<ValT *>(grad_chunks_[chunk_idx] +
+                                    offset * grad_stride_);
   }
 
   const ValT *grad_data(uint32_t slot_index) const {

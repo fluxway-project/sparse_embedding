@@ -31,7 +31,8 @@ namespace se {
 namespace ops {
 
 inline uint32_t fast_range_64(uint64_t word, uint32_t p) {
-  return static_cast<uint32_t>((static_cast<unsigned __int128>(word) * p) >> 64);
+  return static_cast<uint32_t>((static_cast<unsigned __int128>(word) * p) >>
+                               64);
 }
 
 inline uint32_t fast_range_32(uint32_t word, uint32_t p) {
@@ -118,7 +119,7 @@ public:
     } else {
       for (; i < n; ++i) {
         out_shard_ids[i] =
-            fast_range_64(static_cast<uint64_t>(keys[i]), num_shards_);
+            static_cast<uint32_t>(static_cast<uint64_t>(keys[i]) % num_shards_);
       }
     }
   }
@@ -165,7 +166,48 @@ public:
     } else {
       for (; i < n; ++i) {
         out_mask[i] =
-            fast_range_64(static_cast<uint64_t>(keys[i]), num_shards_) == target_shard;
+            (static_cast<uint64_t>(keys[i]) % num_shards_) == target_shard;
+      }
+    }
+  }
+};
+
+class FastRangePartitioner {
+  uint32_t num_shards_;
+
+public:
+  FastRangePartitioner(uint32_t num_shards) : num_shards_(num_shards) {
+    if (num_shards_ == 0) {
+      throw std::invalid_argument("num_shards must be > 0");
+    }
+  }
+
+  template <typename KeyT>
+  void partition_span(std::span<const KeyT> keys,
+                      std::span<uint32_t> out_shard_ids) const {
+    size_t n = keys.size();
+    for (size_t i = 0; i < n; ++i) {
+      if constexpr (sizeof(KeyT) == 8) {
+        out_shard_ids[i] =
+            fast_range_64(static_cast<uint64_t>(keys[i]), num_shards_);
+      } else {
+        out_shard_ids[i] =
+            fast_range_32(static_cast<uint32_t>(keys[i]), num_shards_);
+      }
+    }
+  }
+
+  template <typename KeyT>
+  void filter_span(std::span<const KeyT> keys, uint32_t target_shard,
+                   std::span<bool> out_mask) const {
+    size_t n = keys.size();
+    for (size_t i = 0; i < n; ++i) {
+      if constexpr (sizeof(KeyT) == 8) {
+        out_mask[i] = fast_range_64(static_cast<uint64_t>(keys[i]),
+                                    num_shards_) == target_shard;
+      } else {
+        out_mask[i] = fast_range_32(static_cast<uint32_t>(keys[i]),
+                                    num_shards_) == target_shard;
       }
     }
   }
@@ -280,12 +322,12 @@ public:
     } else {
       for (; i < n; ++i) {
         if constexpr (sizeof(KeyT) == 8) {
-          out_shard_ids[i] =
-              fast_range_64(hasher(static_cast<uint64_t>(keys[i])), num_shards_);
+          out_shard_ids[i] = fast_range_64(
+              hasher(static_cast<uint64_t>(keys[i])), num_shards_);
         } else {
           Murmur32Hash hasher32;
-          out_shard_ids[i] =
-              fast_range_32(hasher32(static_cast<uint32_t>(keys[i])), num_shards_);
+          out_shard_ids[i] = fast_range_32(
+              hasher32(static_cast<uint32_t>(keys[i])), num_shards_);
         }
       }
     }
@@ -334,10 +376,12 @@ public:
       uint64_t mask = num_shards_ - 1;
       for (; i < n; ++i) {
         if constexpr (sizeof(KeyT) == 8) {
-          out_mask[i] = (hasher(static_cast<uint64_t>(keys[i])) & mask) == target_shard;
+          out_mask[i] =
+              (hasher(static_cast<uint64_t>(keys[i])) & mask) == target_shard;
         } else {
           Murmur32Hash hasher32;
-          out_mask[i] = (hasher32(static_cast<uint32_t>(keys[i])) & mask) == target_shard;
+          out_mask[i] =
+              (hasher32(static_cast<uint32_t>(keys[i])) & mask) == target_shard;
         }
       }
     } else {

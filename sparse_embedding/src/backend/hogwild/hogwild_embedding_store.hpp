@@ -238,8 +238,7 @@ public:
           optimizer(opt_factory.has_value() ? (*opt_factory)(d) : nullptr),
           opt_factory(opt_factory) {
       for (size_t i = 0; i < num_threads; ++i) {
-        transient_shards.push_back(
-            std::make_unique<TransientArena<ValT>>(d));
+        transient_shards.push_back(std::make_unique<TransientArena<ValT>>(d));
       }
     }
   };
@@ -339,6 +338,9 @@ public:
           }
           uint64_t key = static_cast<uint64_t>(keys[i]);
           uint32_t slot_id = extract_slot(key);
+          if (__builtin_expect(slots_[slot_id] == nullptr, 0)) {
+            throw std::runtime_error("invalid slot_id access");
+          }
           auto &slot = *slots_[slot_id];
           size_t dim = static_cast<size_t>(row_lengths[i]);
           ValT *out = out_flat_values.data() + offsets[i];
@@ -439,7 +441,8 @@ public:
 
     if (n > shuffled_indices_cap) {
       size_t new_cap = std::max(n, shuffled_indices_cap * 2);
-      shuffled_indices_buf = std::make_unique_for_overwrite<uint32_t[]>(new_cap);
+      shuffled_indices_buf =
+          std::make_unique_for_overwrite<uint32_t[]>(new_cap);
       shuffled_indices_cap = new_cap;
     }
     std::span<uint32_t> shuffled_indices(shuffled_indices_buf.get(), n);
@@ -461,7 +464,8 @@ public:
           _mm512_store_si512(extracted, v_shards);
 
           for (int j = 0; j < 8; ++j) {
-            shuffled_indices[thread_offsets[t * num_shards + extracted[j]]++] = i + j;
+            shuffled_indices[thread_offsets[t * num_shards + extracted[j]]++] =
+                i + j;
           }
         }
 #endif
@@ -488,6 +492,9 @@ public:
           uint32_t i = shuffled_indices[idx];
           uint64_t key = static_cast<uint64_t>(keys[i]);
           uint32_t slot_id = extract_slot(key);
+          if (__builtin_expect(slots_[slot_id] == nullptr, 0)) {
+            throw std::runtime_error("invalid slot_id access");
+          }
           auto &slot = *slots_[slot_id];
           const ValT *grad_src = flat_grads.data() + offsets[i];
           uint32_t t_idx =
@@ -595,6 +602,9 @@ public:
         for (size_t i = begin; i < end; ++i) {
           uint64_t key = static_cast<uint64_t>(keys[i]);
           uint32_t slot_id = extract_slot(key);
+          if (__builtin_expect(slots_[slot_id] == nullptr, 0)) {
+            throw std::runtime_error("invalid slot_id access");
+          }
           auto &slot = *slots_[slot_id];
           auto &free_slots = local_free_slots[slot_index_[slot_id]];
           const ValT *src = flat_values.data() + offsets[i];
@@ -669,6 +679,9 @@ public:
         for (size_t i = begin; i < end; ++i) {
           uint64_t key = static_cast<uint64_t>(keys[i]);
           uint32_t slot_id = extract_slot(key);
+          if (__builtin_expect(slots_[slot_id] == nullptr, 0)) {
+            throw std::runtime_error("invalid slot_id access");
+          }
           auto &slot = *slots_[slot_id];
           auto &free_slots = local_free_slots[slot_index_[slot_id]];
           size_t dim = slot.dim;
@@ -749,6 +762,9 @@ public:
         for (size_t i = begin; i < end; ++i) {
           uint64_t key = static_cast<uint64_t>(keys[i]);
           uint32_t slot_id = extract_slot(key);
+          if (__builtin_expect(slots_[slot_id] == nullptr, 0)) {
+            throw std::runtime_error("invalid slot_id access");
+          }
           auto &slot = *slots_[slot_id];
           out_exists[i] = slot.key_map
                               .Find(Key::Entry::make_key(key),
@@ -768,6 +784,9 @@ public:
         for (size_t i = begin; i < end; ++i) {
           uint64_t key = static_cast<uint64_t>(keys[i]);
           uint32_t slot_id = extract_slot(key);
+          if (__builtin_expect(slots_[slot_id] == nullptr, 0)) {
+            throw std::runtime_error("invalid slot_id access");
+          }
           auto &slot = *slots_[slot_id];
           slot.key_map.Remove(Key::Entry::make_key(key),
                               [](const auto &e) { return true; });
@@ -1285,12 +1304,16 @@ public:
     export_batch_with_opt(
         [&](std::span<const uint64_t> keys, std::span<const ValT> vals,
             std::span<const float> opt_states) -> bool {
-          thread_local std::vector<float> val_f32_buf;
-          val_f32_buf.resize(vals.size());
-          for (size_t i = 0; i < vals.size(); ++i)
-            val_f32_buf[i] = static_cast<float>(vals[i]);
-          return (*visitor)(keys, std::span<const float>(val_f32_buf),
-                            opt_states);
+          if constexpr (std::is_same_v<ValT, float>) {
+            return (*visitor)(keys, vals, opt_states);
+          } else {
+            thread_local std::vector<float> val_f32_buf;
+            val_f32_buf.resize(vals.size());
+            for (size_t i = 0; i < vals.size(); ++i)
+              val_f32_buf[i] = static_cast<float>(vals[i]);
+            return (*visitor)(keys, std::span<const float>(val_f32_buf),
+                              opt_states);
+          }
         },
         batch_size);
   }
@@ -1306,11 +1329,16 @@ public:
     export_batch_with_opt_owned(
         [&](std::vector<uint64_t> &&keys, std::vector<ValT> &&vals,
             std::vector<float> &&opt_states) -> bool {
-          std::vector<float> val_f32(vals.size());
-          for (size_t i = 0; i < vals.size(); ++i)
-            val_f32[i] = static_cast<float>(vals[i]);
-          return (*visitor)(std::move(keys), std::move(val_f32),
-                            std::move(opt_states));
+          if constexpr (std::is_same_v<ValT, float>) {
+            return (*visitor)(std::move(keys), std::move(vals),
+                              std::move(opt_states));
+          } else {
+            std::vector<float> val_f32(vals.size());
+            for (size_t i = 0; i < vals.size(); ++i)
+              val_f32[i] = static_cast<float>(vals[i]);
+            return (*visitor)(std::move(keys), std::move(val_f32),
+                              std::move(opt_states));
+          }
         },
         batch_size);
   }

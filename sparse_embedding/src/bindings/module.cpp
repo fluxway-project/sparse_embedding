@@ -1044,12 +1044,8 @@ public:
   }
 #endif // SE_ENABLE_LANCE_CHECKPOINTER
 
-  void export_batches_dlpack(int slot_id, nb::callable visitor,
-                             size_t batch_size = 65536,
+  void export_batches_dlpack(nb::callable visitor, size_t batch_size = 65536,
                              bool include_optimizer_state = false) {
-    if (slot_dims_.find(slot_id) == slot_dims_.end()) {
-      throw std::invalid_argument("invalid slot_id");
-    }
     nb::gil_scoped_release release;
     dispatch_val([&]<typename ValT>() {
       auto &proxy = get_store<ValT>();
@@ -1132,6 +1128,7 @@ public:
     const float *opt_flat = static_cast<const float *>(dlm_opt->dl_tensor.data);
     size_t total_opt = static_cast<size_t>(dlm_opt->dl_tensor.shape[0]);
 
+    nb::gil_scoped_release release;
     dispatch_val([&]<typename ValT>() {
       get_store<ValT>()->assign_opt_states(
           std::span<const uint64_t>(keys, n),
@@ -1333,8 +1330,8 @@ NB_MODULE(_core, m) {
            nb::arg("keys"), nb::arg("values"))
 
       .def("export_batches_dlpack",
-           &EmbeddingStoreWrapper::export_batches_dlpack, nb::arg("slot_id"),
-           nb::arg("visitor"), nb::arg("batch_size") = 65536,
+           &EmbeddingStoreWrapper::export_batches_dlpack, nb::arg("visitor"),
+           nb::arg("batch_size") = 65536,
            nb::arg("include_optimizer_state") = false)
 
       .def("export_batches_arrow", &EmbeddingStoreWrapper::export_batches_arrow,
@@ -1498,6 +1495,16 @@ NB_MODULE(_core, m) {
       [](uint32_t num_shards) -> PyPartitioner {
         auto proxy = pro::make_proxy<se::ops::PartitionerFacade,
                                      se::ops::HashPartitioner>(num_shards);
+        return PyPartitioner{
+            std::make_shared<decltype(proxy)>(std::move(proxy))};
+      },
+      nb::arg("num_shards"));
+
+  m.def(
+      "FastRangePartitioner",
+      [](uint32_t num_shards) -> PyPartitioner {
+        auto proxy = pro::make_proxy<se::ops::PartitionerFacade,
+                                     se::ops::FastRangePartitioner>(num_shards);
         return PyPartitioner{
             std::make_shared<decltype(proxy)>(std::move(proxy))};
       },

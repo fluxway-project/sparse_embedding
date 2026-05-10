@@ -309,10 +309,8 @@ build_embedding_batch(std::vector<uint64_t> &&keys, std::vector<float> &&vals,
   size_t n = keys.size();
   size_t dim = n > 0 ? vals.size() / n : 0;
 
-  std::vector<uint32_t> slot_ids(n);
-  for (size_t i = 0; i < n; ++i) {
-    slot_ids[i] = codec.decode_slot(keys[i]);
-  }
+  uint32_t sid = n > 0 ? codec.decode_slot(keys[0]) : 0;
+  std::vector<uint32_t> slot_ids(n, sid);
 
   std::vector<int32_t> offsets(n + 1);
   for (size_t i = 0; i <= n; ++i) {
@@ -333,10 +331,8 @@ build_opt_state_batch(std::vector<uint64_t> &&keys, std::vector<float> &&vals,
   size_t n = keys.size();
   size_t opt_dim = n > 0 ? opt_states.size() / n : 0;
 
-  std::vector<uint32_t> slot_ids(n);
-  for (size_t i = 0; i < n; ++i) {
-    slot_ids[i] = codec.decode_slot(keys[i]);
-  }
+  uint32_t sid = n > 0 ? codec.decode_slot(keys[0]) : 0;
+  std::vector<uint32_t> slot_ids(n, sid);
 
   std::vector<int32_t> offsets(n + 1);
   for (size_t i = 0; i <= n; ++i) {
