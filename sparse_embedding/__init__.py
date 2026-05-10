@@ -14,6 +14,7 @@ from ._core import (
     async_unique,
     Partitioner,
     ModuloPartitioner,
+    FastRangePartitioner,
     HashPartitioner,
 )
 
@@ -30,5 +31,6 @@ __all__ = [
     "async_unique",
     "Partitioner",
     "ModuloPartitioner",
+    "FastRangePartitioner",
     "HashPartitioner",
 ]
