@@ -1055,6 +1055,191 @@ public:
     return {};
   }
 
+  // export_batch_with_opt — same as export_batch but additionally collects
+  // optimizer state (e.g. Adam m/v moments) alongside parameters.
+  // visitor signature: (keys, vals, opt_states) -> bool
+  // opt_states is a flat float32 buffer of length n * opt_dim;
+  // opt_dim == 0 when the optimizer has no state (e.g. plain SGD).
+  template <typename VisitorFn>
+  void export_batch_with_opt(VisitorFn &&visitor, size_t batch_size) {
+    for (auto &[slot_id, slot] : slots_) {
+      size_t emb_dim = slot->dim;
+      size_t opt_dim =
+          slot->optimizer.has_value() ? slot->optimizer->state_dim() : 0;
+
+      std::vector<uint64_t> key_buf;
+      std::vector<ValT> val_buf;
+      std::vector<float> opt_buf;
+      key_buf.reserve(batch_size);
+      val_buf.reserve(batch_size * emb_dim);
+      opt_buf.reserve(batch_size * opt_dim);
+
+      auto flush = [&]() -> bool {
+        if (key_buf.empty())
+          return true;
+        bool cont = visitor(std::span<const uint64_t>(key_buf),
+                            std::span<const ValT>(val_buf),
+                            std::span<const float>(opt_buf));
+        key_buf.clear();
+        val_buf.clear();
+        opt_buf.clear();
+        return cont;
+      };
+
+      bool stopped = false;
+      slot->key_map.for_each([&](const auto &entry) {
+        if (stopped)
+          return;
+        auto [key, idx] = entry.get_entry();
+        key_buf.push_back(key);
+        const ValT *src = slot->arena.data(idx);
+        val_buf.insert(val_buf.end(), src, src + emb_dim);
+        if (opt_dim > 0 && slot->optimizer.has_value()) {
+          const float *os = slot->optimizer->state_data(idx);
+          opt_buf.insert(opt_buf.end(), os, os + opt_dim);
+        }
+        if (key_buf.size() >= batch_size) {
+          if (!flush())
+            stopped = true;
+        }
+      });
+
+      if (!stopped)
+        flush();
+    }
+  }
+
+  // export_batch_with_opt_owned — ownership-transferring variant.
+  // Visitor receives std::vector&& instead of std::span, enabling the
+  // consumer to take ownership of the heap buffers (e.g. for zero-copy
+  // Arrow C Data Interface construction).
+  template <typename VisitorFn>
+  void export_batch_with_opt_owned(VisitorFn &&visitor, size_t batch_size) {
+    for (auto &[slot_id, slot] : slots_) {
+      size_t emb_dim = slot->dim;
+      size_t opt_dim =
+          slot->optimizer.has_value() ? slot->optimizer->state_dim() : 0;
+
+      std::vector<uint64_t> key_buf;
+      std::vector<ValT> val_buf;
+      std::vector<float> opt_buf;
+      key_buf.reserve(batch_size);
+      val_buf.reserve(batch_size * emb_dim);
+      opt_buf.reserve(batch_size * opt_dim);
+
+      auto flush = [&]() -> bool {
+        if (key_buf.empty())
+          return true;
+        bool cont =
+            visitor(std::move(key_buf), std::move(val_buf), std::move(opt_buf));
+        key_buf.clear();
+        val_buf.clear();
+        opt_buf.clear();
+        key_buf.reserve(batch_size);
+        val_buf.reserve(batch_size * emb_dim);
+        opt_buf.reserve(batch_size * opt_dim);
+        return cont;
+      };
+
+      bool stopped = false;
+      slot->key_map.for_each([&](const auto &entry) {
+        if (stopped)
+          return;
+        auto [key, idx] = entry.get_entry();
+        key_buf.push_back(key);
+        const ValT *src = slot->arena.data(idx);
+        val_buf.insert(val_buf.end(), src, src + emb_dim);
+        if (opt_dim > 0 && slot->optimizer.has_value()) {
+          const float *os = slot->optimizer->state_data(idx);
+          opt_buf.insert(opt_buf.end(), os, os + opt_dim);
+        }
+        if (key_buf.size() >= batch_size) {
+          if (!flush())
+            stopped = true;
+        }
+      });
+
+      if (!stopped)
+        flush();
+    }
+  }
+
+  // assign_opt_states — restore optimizer state for a batch of existing keys.
+  // Keys must already exist in the store (i.e. assign() called first).
+  // opt_states is a flat float32 buffer of length n * opt_dim.
+  void assign_opt_states(std::span<const uint64_t> keys,
+                         std::span<const float> opt_states) {
+    size_t n = keys.size();
+    if (n == 0)
+      return;
+
+    for (auto &[sid, slot] : slots_) {
+      if (!slot->optimizer.has_value())
+        continue;
+      size_t opt_dim = slot->optimizer->state_dim();
+      if (opt_dim == 0)
+        continue;
+
+      epoch::with_epoch([&] {
+        for (size_t i = 0; i < n; ++i) {
+          uint64_t key = keys[i];
+          auto found =
+              slot->key_map.Find(Key::Entry::make_key(key), [](const auto &e) {
+                return e.get_entry().second;
+              });
+          if (!found.has_value())
+            continue;
+          uint32_t idx = *found;
+          slot->optimizer->set_state(
+              idx,
+              std::span<const float>(opt_states.data() + i * opt_dim, opt_dim));
+        }
+      });
+    }
+  }
+
+  // export_opt_state_batch — type-erased facade-compatible wrapper.
+  // Visitor receives (keys, flat_f32_vals, opt_states) for checkpointing.
+  // ValT values are widened to float32 to provide a uniform interface
+  // regardless of the store's native precision.
+  void export_opt_state_batch(
+      se::Function<bool(std::span<const uint64_t>, std::span<const float>,
+                        std::span<const float>)>
+          visitor,
+      size_t batch_size) {
+    export_batch_with_opt(
+        [&](std::span<const uint64_t> keys, std::span<const ValT> vals,
+            std::span<const float> opt_states) -> bool {
+          thread_local std::vector<float> val_f32_buf;
+          val_f32_buf.resize(vals.size());
+          for (size_t i = 0; i < vals.size(); ++i)
+            val_f32_buf[i] = static_cast<float>(vals[i]);
+          return (*visitor)(keys, std::span<const float>(val_f32_buf),
+                            opt_states);
+        },
+        batch_size);
+  }
+
+  // export_opt_state_batch_owned — ownership-transferring facade wrapper.
+  // Same as export_opt_state_batch but visitor receives std::vector&&
+  // for zero-copy Arrow C Data Interface construction.
+  void export_opt_state_batch_owned(
+      se::Function<bool(std::vector<uint64_t> &&, std::vector<float> &&,
+                        std::vector<float> &&)>
+          visitor,
+      size_t batch_size) {
+    export_batch_with_opt_owned(
+        [&](std::vector<uint64_t> &&keys, std::vector<ValT> &&vals,
+            std::vector<float> &&opt_states) -> bool {
+          std::vector<float> val_f32(vals.size());
+          for (size_t i = 0; i < vals.size(); ++i)
+            val_f32[i] = static_cast<float>(vals[i]);
+          return (*visitor)(std::move(keys), std::move(val_f32),
+                            std::move(opt_states));
+        },
+        batch_size);
+  }
+
   // =========================================================================
   // evict_by_score — GC operation, decoupled from insertion.
   //

@@ -35,6 +35,10 @@ public:
   void deallocate(uint32_t idx) {}
   void clear() {}
 
+  const float *state_data(uint32_t) const { return nullptr; }
+  size_t state_dim() const { return 0; }
+  void set_state(uint32_t, std::span<const float>) {}
+
   void step(uint32_t idx, std::span<ValT> param_span,
             std::span<const ValT> grad_span, uint64_t global_step) {
     size_t dim = param_span.size();

@@ -35,11 +35,14 @@
 #include <variant>
 
 #include "sparse_embedding/src/backend/hogwild/hogwild_embedding_store.hpp"
+#include "sparse_embedding/src/bindings/arrow_c_bridge.hpp"
 #include "sparse_embedding/src/bindings/async_bridge.hpp"
 #include "sparse_embedding/src/bindings/dlpack_utils.hpp"
 #include "sparse_embedding/src/bindings/python_wake_manager.hpp"
 #include "sparse_embedding/src/checkpoint/checkpoint_interface.hpp"
+#ifdef SE_ENABLE_LANCE_CHECKPOINTER
 #include "sparse_embedding/src/checkpoint/lance/lance_checkpoint.hpp"
+#endif
 #include "sparse_embedding/src/common/function.hpp"
 #include "sparse_embedding/src/eviction/score_policy.hpp"
 #include "sparse_embedding/src/initializer/initializer_config.hpp"
@@ -413,13 +416,6 @@ public:
     };
 
     dispatch_val(construct);
-
-    // Default to lance checkpoint
-    auto wf = pro::make_proxy<se::CheckpointWriterFacade,
-                              se::LanceCheckpointWriter>();
-    auto rf = pro::make_proxy<se::CheckpointReaderFacade,
-                              se::LanceCheckpointReader>();
-    set_checkpoint_factories(std::move(wf), std::move(rf));
   }
 
   // ---- Metadata ----
@@ -435,6 +431,14 @@ public:
   size_t num_slots() { return slot_dims_.size(); }
 
   size_t dim_for_slot(uint32_t slot_id) { return slot_dims_.at(slot_id); }
+
+  nb::list slot_ids() {
+    nb::list result;
+    for (auto &[id, _] : slot_dims_) {
+      result.append(id);
+    }
+    return result;
+  }
 
   // ---- get_dims ----
 
@@ -817,6 +821,7 @@ public:
     });
   }
 
+#ifdef SE_ENABLE_LANCE_CHECKPOINTER
   void save_checkpoint(const std::string &uri, const std::string &mode,
                        uint64_t min_score, bool include_optimizer_state,
                        bool use_compression) {
@@ -1035,16 +1040,116 @@ public:
       });
     }
   }
+#endif // SE_ENABLE_LANCE_CHECKPOINTER
 
+  void export_batches_dlpack(int slot_id, nb::callable visitor,
+                             size_t batch_size = 65536,
+                             bool include_optimizer_state = false) {
+    if (slot_dims_.find(slot_id) == slot_dims_.end()) {
+      throw std::invalid_argument("invalid slot_id");
+    }
+    nb::gil_scoped_release release;
+    dispatch_val([&]<typename ValT>() {
+      auto &proxy = get_store<ValT>();
+
+      if (!include_optimizer_state) {
+        proxy->export_batch(
+            pro::make_proxy<se::FunctionFacade<bool(
+                std::span<const uint64_t>, std::span<const ValT>,
+                std::span<const uint64_t>)>>(
+                [&](std::span<const uint64_t> keys, std::span<const ValT> vals,
+                    std::span<const uint64_t>) -> bool {
+                  nb::gil_scoped_acquire acquire;
+                  auto keys_dlp = se::py::span_to_dlpack_no_delete(keys);
+                  auto vals_dlp = se::py::span_to_dlpack_no_delete(vals);
+                  visitor(se::py::wrap_output_tensor(keys_dlp),
+                          se::py::wrap_output_tensor(vals_dlp));
+                  return true;
+                }),
+            batch_size);
+      } else {
+        proxy->export_opt_state_batch(
+            pro::make_proxy<se::FunctionFacade<bool(std::span<const uint64_t>,
+                                                    std::span<const float>,
+                                                    std::span<const float>)>>(
+                [&](std::span<const uint64_t> keys, std::span<const float> vals,
+                    std::span<const float> opt_states) -> bool {
+                  nb::gil_scoped_acquire acquire;
+                  auto keys_dlp = se::py::span_to_dlpack_no_delete(keys);
+                  auto vals_dlp = se::py::span_to_dlpack_no_delete(vals);
+                  auto opt_dlp = se::py::span_to_dlpack_no_delete(opt_states);
+                  visitor(se::py::wrap_output_tensor(keys_dlp),
+                          se::py::wrap_output_tensor(vals_dlp),
+                          se::py::wrap_output_tensor(opt_dlp));
+                  return true;
+                }),
+            batch_size);
+      }
+    });
+  }
+
+  void export_batches_arrow(nb::callable visitor, size_t batch_size = 65536,
+                            bool include_optimizer_state = false) {
+    nb::gil_scoped_release release;
+    dispatch_val([&]<typename ValT>() {
+      auto &proxy = get_store<ValT>();
+
+      proxy->export_opt_state_batch_owned(
+          pro::make_proxy<se::FunctionFacade<bool(std::vector<uint64_t> &&,
+                                                  std::vector<float> &&,
+                                                  std::vector<float> &&)>>(
+              [&](std::vector<uint64_t> &&keys, std::vector<float> &&vals,
+                  std::vector<float> &&opt_states) -> bool {
+                auto pair = include_optimizer_state
+                                ? se::arrow::build_opt_state_batch(
+                                      std::move(keys), std::move(vals),
+                                      std::move(opt_states))
+                                : se::arrow::build_embedding_batch(
+                                      std::move(keys), std::move(vals));
+                auto array_addr = reinterpret_cast<uintptr_t>(&pair.array);
+                auto schema_addr = reinterpret_cast<uintptr_t>(&pair.schema);
+                nb::gil_scoped_acquire acquire;
+                visitor(array_addr, schema_addr);
+                return true;
+              }),
+          batch_size);
+    });
+  }
+
+  void assign_opt_state(int slot_id, nb::object keys_obj,
+                        nb::object opt_states_obj) {
+    if (slot_dims_.find(slot_id) == slot_dims_.end()) {
+      throw std::invalid_argument("invalid slot_id");
+    }
+    auto [dlm_keys, cap_keys] = se::py::extract_dlpack_tensor(keys_obj);
+    auto [dlm_opt, cap_opt] = se::py::extract_dlpack_tensor(opt_states_obj);
+
+    const uint64_t *keys =
+        static_cast<const uint64_t *>(dlm_keys->dl_tensor.data);
+    size_t n = dlm_keys->dl_tensor.shape[0];
+    const float *opt_flat = static_cast<const float *>(dlm_opt->dl_tensor.data);
+    size_t total_opt = static_cast<size_t>(dlm_opt->dl_tensor.shape[0]);
+
+    dispatch_val([&]<typename ValT>() {
+      get_store<ValT>()->assign_opt_states(
+          std::span<const uint64_t>(keys, n),
+          std::span<const float>(opt_flat, total_opt));
+    });
+  }
+
+#ifdef SE_ENABLE_LANCE_CHECKPOINTER
   void set_checkpoint_factories(se::CheckpointWriterFactory wf,
                                 se::CheckpointReaderFactory rf) {
     checkpoint_writer_factory_ = std::move(wf);
     checkpoint_reader_factory_ = std::move(rf);
   }
+#endif // SE_ENABLE_LANCE_CHECKPOINTER
 
 private:
+#ifdef SE_ENABLE_LANCE_CHECKPOINTER
   se::CheckpointWriterFactory checkpoint_writer_factory_;
   se::CheckpointReaderFactory checkpoint_reader_factory_;
+#endif
 };
 
 } // namespace
@@ -1153,6 +1258,7 @@ NB_MODULE(_core, m) {
       .def("total_size", &EmbeddingStoreWrapper::total_size)
       .def("max_dim", &EmbeddingStoreWrapper::max_dim)
       .def("num_slots", &EmbeddingStoreWrapper::num_slots)
+      .def("slot_ids", &EmbeddingStoreWrapper::slot_ids)
       .def("dim_for_slot", &EmbeddingStoreWrapper::dim_for_slot,
            nb::arg("slot_id"))
       .def("get_dims", &EmbeddingStoreWrapper::get_dims, nb::arg("keys"))
@@ -1176,6 +1282,19 @@ NB_MODULE(_core, m) {
       .def("async_assign", &EmbeddingStoreWrapper::async_assign,
            nb::arg("keys"), nb::arg("values"))
 
+      .def("export_batches_dlpack",
+           &EmbeddingStoreWrapper::export_batches_dlpack, nb::arg("slot_id"),
+           nb::arg("visitor"), nb::arg("batch_size") = 65536,
+           nb::arg("include_optimizer_state") = false)
+
+      .def("export_batches_arrow", &EmbeddingStoreWrapper::export_batches_arrow,
+           nb::arg("visitor"), nb::arg("batch_size") = 65536,
+           nb::arg("include_optimizer_state") = false)
+
+      .def("assign_opt_state", &EmbeddingStoreWrapper::assign_opt_state,
+           nb::arg("slot_id"), nb::arg("keys"), nb::arg("opt_states"))
+
+#ifdef SE_ENABLE_LANCE_CHECKPOINTER
       .def("save_checkpoint", &EmbeddingStoreWrapper::save_checkpoint,
            nb::arg("uri"), nb::arg("mode") = "full", nb::arg("min_score") = 0,
            nb::arg("include_optimizer_state") = false,
@@ -1193,10 +1312,12 @@ NB_MODULE(_core, m) {
                auto rf = pro::make_proxy<se::CheckpointReaderFacade,
                                          se::LanceCheckpointReader>();
                self.set_checkpoint_factories(std::move(wf), std::move(rf));
-             } else {
-               throw std::runtime_error("Unsupported backend: " + backend);
+               return;
              }
-           });
+             throw std::runtime_error("Unsupported backend: " + backend);
+           })
+#endif // SE_ENABLE_LANCE_CHECKPOINTER
+      ;
 
   m.def(
       "async_unique",

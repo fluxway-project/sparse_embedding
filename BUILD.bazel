@@ -31,14 +31,7 @@ sh_binary(
     tags = ["manual"],
 )
 
-# ---- _core.so: unified Python extension module ----
-
-genrule(
-    name = "copy_liblance_c",
-    srcs = ["@lance_c//:build_lance_c"],
-    outs = ["sparse_embedding/liblance_c.so"],
-    cmd = "cp $< $@",
-)
+# ---- _core.so: default build (no lance-c dependency) ----
 
 cc_binary(
     name = "core_so",
@@ -51,7 +44,6 @@ cc_binary(
     deps = [
         "//sparse_embedding/src/backend/hogwild:hogwild_embedding_store",
         "//sparse_embedding/src/checkpoint",
-        "//sparse_embedding/src/checkpoint:checkpoint_lance",
         "//sparse_embedding/src/common",
         "//sparse_embedding/src/eviction",
         "//sparse_embedding/src/initializer",
@@ -70,14 +62,60 @@ genrule(
     cmd = "cp $< $@",
 )
 
+# ---- _core.so with lance-c: opt-in build ----
+
+genrule(
+    name = "copy_liblance_c",
+    srcs = ["@lance_c//:build_lance_c"],
+    outs = ["sparse_embedding/liblance_c.so"],
+    cmd = "cp $< $@",
+    tags = ["manual"],
+)
+
+cc_binary(
+    name = "core_so_with_lance",
+    srcs = [
+        "//sparse_embedding/src/bindings:srcs",
+        "//sparse_embedding/src/ops:srcs",
+    ],
+    copts = ["-DSE_ENABLE_LANCE_CHECKPOINTER"],
+    linkopts = ["-Wl,-rpath,$$ORIGIN"],
+    linkshared = True,
+    tags = ["manual"],
+    deps = [
+        "//sparse_embedding/src/backend/hogwild:hogwild_embedding_store",
+        "//sparse_embedding/src/checkpoint",
+        "//sparse_embedding/src/checkpoint:checkpoint_lance",
+        "//sparse_embedding/src/common",
+        "//sparse_embedding/src/eviction",
+        "//sparse_embedding/src/initializer",
+        "//sparse_embedding/src/interface",
+        "//sparse_embedding/src/optimizer",
+        "@dlpack",
+        "@nanobind",
+        "@proxy",
+    ],
+)
+
 py_library(
     name = "sparse_embedding_lib",
+    srcs = glob(["sparse_embedding/**/*.py"]),
+    data = [
+        ":copy_core_so",
+    ],
+    imports = ["."],
+    visibility = ["//visibility:public"],
+)
+
+py_library(
+    name = "sparse_embedding_lib_with_lance",
     srcs = glob(["sparse_embedding/**/*.py"]),
     data = [
         ":copy_core_so",
         ":copy_liblance_c",
     ],
     imports = ["."],
+    tags = ["manual"],
     visibility = ["//visibility:public"],
 )
 
@@ -89,7 +127,20 @@ py_wheel(
     version = "0.1.0",
     deps = [
         ":copy_core_so",
-        ":copy_liblance_c",
         ":sparse_embedding_lib",
+    ],
+)
+
+py_wheel(
+    name = "sparse_embedding_wheel_with_lance",
+    distribution = "sparse_embedding",
+    python_requires = ">=3.11",
+    python_tag = "py3",
+    tags = ["manual"],
+    version = "0.1.0",
+    deps = [
+        ":copy_core_so",
+        ":copy_liblance_c",
+        ":sparse_embedding_lib_with_lance",
     ],
 )

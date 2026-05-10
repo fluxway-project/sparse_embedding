@@ -1,0 +1,27 @@
+[build-system]
+requires = ["setuptools>=61.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "sparse_embedding"
+version = "0.1.0"
+description = "High-performance distributed sparse embedding table"
+readme = "README.md"
+requires-python = ">=3.11"
+license = { text = "Apache-2.0" }
+dependencies = [
+    "numpy>=1.24.0",
+    "pyarrow>=14.0.0",
+]
+
+[project.optional-dependencies]
+# Optional at runtime for lance checkpoint backend
+pylance = [
+    "pylance>=0.11.0",
+]
+
+[tool.setuptools.packages.find]
+include = ["sparse_embedding*"]
+
+[tool.pytest.ini_options]
+testpaths = ["sparse_embedding/tests"]

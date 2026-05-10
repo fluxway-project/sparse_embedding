@@ -31,6 +31,9 @@ PRO_DEF_MEM_DISPATCH(OptMemAllocate, allocate);
 PRO_DEF_MEM_DISPATCH(OptMemDeallocate, deallocate);
 PRO_DEF_MEM_DISPATCH(OptMemClear, clear);
 PRO_DEF_MEM_DISPATCH(OptMemStep, step);
+PRO_DEF_MEM_DISPATCH(OptMemStateData, state_data);
+PRO_DEF_MEM_DISPATCH(OptMemStateDim, state_dim);
+PRO_DEF_MEM_DISPATCH(OptMemSetState, set_state);
 
 template <typename ValT>
 struct OptimizerFacade
@@ -41,7 +44,15 @@ struct OptimizerFacade
                   add_convention<OptMemStep,
                                  void(uint32_t idx, std::span<ValT> param,
                                       std::span<const ValT> grad,
-                                      uint64_t global_step)>::build {};
+                                      uint64_t global_step)>::
+                      add_convention<pro::weak_dispatch<OptMemStateData>,
+                                     const float *(uint32_t idx) const>::
+                          add_convention<pro::weak_dispatch<OptMemStateDim>,
+                                         size_t() const>::
+                              add_convention<
+                                  pro::weak_dispatch<OptMemSetState>,
+                                  void(uint32_t idx,
+                                       std::span<const float> state)>::build {};
 
 PRO_DEF_MEM_DISPATCH(MemBuildOptF32, build_f32);
 PRO_DEF_MEM_DISPATCH(MemBuildOptF16, build_f16);
