@@ -44,6 +44,7 @@
 #include "sparse_embedding/src/checkpoint/lance/lance_checkpoint.hpp"
 #endif
 #include "sparse_embedding/src/common/function.hpp"
+#include "sparse_embedding/src/common/slot_key_codec.hpp"
 #include "sparse_embedding/src/eviction/score_policy.hpp"
 #include "sparse_embedding/src/initializer/initializer_config.hpp"
 #include "sparse_embedding/src/initializer/uniform_initializer.hpp"
@@ -333,7 +334,7 @@ class EmbeddingStoreWrapper {
     size_t total = 0;
     for (size_t i = 0; i < ks.size(); ++i) {
       uint64_t key = static_cast<uint64_t>(ks[i]);
-      uint32_t slot_id = static_cast<uint32_t>((key >> 48) & 0xFFFF);
+      uint32_t slot_id = codec_.decode_slot(key);
       auto dim = static_cast<int64_t>(slot_dims_.at(slot_id));
       out_row_lengths[i] = dim;
       total += dim;
@@ -348,7 +349,8 @@ public:
       : async_pool_((emb_cfg.num_threads == 0)
                         ? std::max(1u, std::thread::hardware_concurrency())
                         : emb_cfg.num_threads),
-        slot_dims_(emb_cfg.slot_dims), dtype_(emb_cfg.dtype) {
+        slot_dims_(emb_cfg.slot_dims), dtype_(emb_cfg.dtype),
+        codec_(emb_cfg.slot_bits) {
     for (auto &[slot, dim] : slot_dims_) {
       if (dim > max_dim_)
         max_dim_ = dim;
@@ -398,7 +400,7 @@ public:
         using StoreType = se::HogwildEmbeddingStore<ValT, Policy>;
         store_ = pro::make_proxy<se::EmbeddingTableFacade<ValT>, StoreType>(
             slot_dims_, nt, std::move(init_proxy), emb_cfg.max_active_keys,
-            std::move(opt_factory), std::move(policy));
+            std::move(opt_factory), std::move(policy), emb_cfg.slot_bits);
       };
 
       if (score_policy_name == "none") {
@@ -453,7 +455,7 @@ public:
     dispatch_on_key(dlm_keys, [&](auto ks) {
       for (size_t i = 0; i < n; ++i) {
         uint64_t key = static_cast<uint64_t>(ks[i]);
-        uint32_t slot_id = static_cast<uint32_t>((key >> 48) & 0xFFFF);
+        uint32_t slot_id = codec_.decode_slot(key);
         out[i] = static_cast<int64_t>(slot_dims_.at(slot_id));
       }
     });
@@ -1103,9 +1105,9 @@ public:
                 auto pair = include_optimizer_state
                                 ? se::arrow::build_opt_state_batch(
                                       std::move(keys), std::move(vals),
-                                      std::move(opt_states))
+                                      std::move(opt_states), codec_)
                                 : se::arrow::build_embedding_batch(
-                                      std::move(keys), std::move(vals));
+                                      std::move(keys), std::move(vals), codec_);
                 auto array_addr = reinterpret_cast<uintptr_t>(&pair.array);
                 auto schema_addr = reinterpret_cast<uintptr_t>(&pair.schema);
                 nb::gil_scoped_acquire acquire;
@@ -1137,6 +1139,51 @@ public:
     });
   }
 
+  // ---- Slot-aware convenience API ----
+
+  uint8_t codec_slot_bits() const { return codec_.slot_bits(); }
+
+  nb::object encode_keys(uint32_t slot_id, nb::object raw_keys) {
+    auto [dlm_keys, cap_keys] = se::py::extract_dlpack_tensor(raw_keys);
+    size_t n = get_dlm_size(dlm_keys);
+    int64_t shape[1] = {static_cast<int64_t>(n)};
+    DLManagedTensor *out_dlm =
+        se::py::create_output_tensor<uint64_t>(std::span(shape));
+    auto *out = static_cast<uint64_t *>(out_dlm->dl_tensor.data);
+
+    dispatch_on_key(dlm_keys, [&](auto ks) {
+      for (size_t i = 0; i < n; ++i) {
+        out[i] = codec_.encode(slot_id, static_cast<uint64_t>(ks[i]));
+      }
+    });
+    return se::py::wrap_output_tensor(out_dlm);
+  }
+
+  nb::tuple lookup_slot(uint32_t slot_id, nb::object raw_keys) {
+    nb::object encoded = encode_keys(slot_id, raw_keys);
+    return lookup(encoded);
+  }
+
+  nb::tuple lookup_or_insert_slot(uint32_t slot_id, nb::object raw_keys) {
+    nb::object encoded = encode_keys(slot_id, raw_keys);
+    return lookup_or_insert(encoded);
+  }
+
+  void assign_slot(uint32_t slot_id, nb::object raw_keys, nb::object values) {
+    nb::object encoded = encode_keys(slot_id, raw_keys);
+    assign(encoded, values);
+  }
+
+  nb::object contains_slot(uint32_t slot_id, nb::object raw_keys) {
+    nb::object encoded = encode_keys(slot_id, raw_keys);
+    return contains(encoded);
+  }
+
+  void erase_slot(uint32_t slot_id, nb::object raw_keys) {
+    nb::object encoded = encode_keys(slot_id, raw_keys);
+    erase(encoded);
+  }
+
 #ifdef SE_ENABLE_LANCE_CHECKPOINTER
   void set_checkpoint_factories(se::CheckpointWriterFactory wf,
                                 se::CheckpointReaderFactory rf) {
@@ -1146,6 +1193,7 @@ public:
 #endif // SE_ENABLE_LANCE_CHECKPOINTER
 
 private:
+  se::SlotKeyCodec codec_;
 #ifdef SE_ENABLE_LANCE_CHECKPOINTER
   se::CheckpointWriterFactory checkpoint_writer_factory_;
   se::CheckpointReaderFactory checkpoint_reader_factory_;
@@ -1163,13 +1211,15 @@ NB_MODULE(_core, m) {
 
   nb::class_<se::EmbeddingConfig>(m, "EmbeddingConfig")
       .def(nb::init<std::unordered_map<uint32_t, size_t>, size_t, std::string,
-                    size_t>(),
+                    size_t, uint8_t>(),
            nb::arg("slot_dims"), nb::arg("num_threads") = 0,
-           nb::arg("dtype") = "float32", nb::arg("max_active_keys") = 1 << 20)
+           nb::arg("dtype") = "float32", nb::arg("max_active_keys") = 1 << 20,
+           nb::arg("slot_bits") = 16)
       .def_rw("slot_dims", &se::EmbeddingConfig::slot_dims)
       .def_rw("num_threads", &se::EmbeddingConfig::num_threads)
       .def_rw("dtype", &se::EmbeddingConfig::dtype)
-      .def_rw("max_active_keys", &se::EmbeddingConfig::max_active_keys);
+      .def_rw("max_active_keys", &se::EmbeddingConfig::max_active_keys)
+      .def_rw("slot_bits", &se::EmbeddingConfig::slot_bits);
 
   nb::class_<PyInitializer>(m, "Initializer");
 
@@ -1293,6 +1343,21 @@ NB_MODULE(_core, m) {
 
       .def("assign_opt_state", &EmbeddingStoreWrapper::assign_opt_state,
            nb::arg("slot_id"), nb::arg("keys"), nb::arg("opt_states"))
+
+      .def("encode_keys", &EmbeddingStoreWrapper::encode_keys,
+           nb::arg("slot_id"), nb::arg("raw_keys"))
+      .def("lookup_slot", &EmbeddingStoreWrapper::lookup_slot,
+           nb::arg("slot_id"), nb::arg("raw_keys"))
+      .def("lookup_or_insert_slot",
+           &EmbeddingStoreWrapper::lookup_or_insert_slot, nb::arg("slot_id"),
+           nb::arg("raw_keys"))
+      .def("assign_slot", &EmbeddingStoreWrapper::assign_slot,
+           nb::arg("slot_id"), nb::arg("raw_keys"), nb::arg("values"))
+      .def("contains_slot", &EmbeddingStoreWrapper::contains_slot,
+           nb::arg("slot_id"), nb::arg("raw_keys"))
+      .def("erase_slot", &EmbeddingStoreWrapper::erase_slot, nb::arg("slot_id"),
+           nb::arg("raw_keys"))
+      .def_prop_ro("codec_slot_bits", &EmbeddingStoreWrapper::codec_slot_bits)
 
 #ifdef SE_ENABLE_LANCE_CHECKPOINTER
       .def("save_checkpoint", &EmbeddingStoreWrapper::save_checkpoint,

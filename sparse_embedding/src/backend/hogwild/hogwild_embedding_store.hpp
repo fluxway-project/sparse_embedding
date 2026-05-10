@@ -19,6 +19,7 @@
 #define SPARSE_EMBEDDING_HOGWILD_EMBEDDING_STORE_HPP_
 
 #include <algorithm>
+#include <array>
 #include <atomic>
 #include <cstdint>
 #include <cstdlib>
@@ -39,13 +40,11 @@
 #include <parlay_hash/unordered_map.h>
 
 #include "sparse_embedding/src/arena/transient_arena.hpp"
-#include "sparse_embedding/src/common/embedding_error.hpp"
 #include "sparse_embedding/src/common/function.hpp"
-#include "sparse_embedding/src/common/numeric_types.hpp"
+#include "sparse_embedding/src/common/slot_key_codec.hpp"
 #include "sparse_embedding/src/eviction/score_policy.hpp"
 #include "sparse_embedding/src/interface/initializer_interface.hpp"
 #include "sparse_embedding/src/interface/optimizer_interface.hpp"
-#include "sparse_embedding/src/optimizer/optimizer_state.hpp"
 #include "sparse_embedding/src/simd/simd_ops.hpp"
 
 namespace se {
@@ -250,13 +249,14 @@ public:
                                  Initializer initializer = {},
                                  size_t max_active_keys = 1 << 20,
                                  OptimizerFactory opt_factory = nullptr,
-                                 ScorePolicyT score_policy = {})
+                                 ScorePolicyT score_policy = {},
+                                 uint8_t slot_bits = 16)
       : num_threads_(num_threads > 0
                          ? num_threads
                          : std::max(1u, std::thread::hardware_concurrency())),
         pool_(static_cast<uint32_t>(num_threads_)),
         initializer_(std::move(initializer)),
-        score_policy_(std::move(score_policy)) {
+        score_policy_(std::move(score_policy)), codec_(slot_bits) {
     uint32_t p2 = 1;
     while (p2 < num_threads_) {
       p2 <<= 1;
@@ -268,35 +268,43 @@ public:
     if (slot_dims.empty()) {
       throw std::invalid_argument("slot_dims must not be empty");
     }
+    slots_.fill(nullptr);
+    slot_index_.fill(0);
+    uint16_t dense_idx = 0;
     for (auto &[slot_id, dim] : slot_dims) {
       if (dim == 0) {
         throw std::invalid_argument("dim must be > 0 for slot " +
                                     std::to_string(slot_id));
       }
-      slots_.emplace(slot_id, std::make_unique<SlotStore>(
-                                  dim, max_active_keys, opt_factory,
-                                  num_threads_, enable_score));
+      if (slot_id >= kMaxSlots) {
+        throw std::invalid_argument("slot_id must be < " +
+                                    std::to_string(kMaxSlots));
+      }
+      slot_storage_.push_back(std::make_unique<SlotStore>(
+          dim, max_active_keys, opt_factory, num_threads_, enable_score));
+      slots_[slot_id] = slot_storage_.back().get();
+      slot_ids_.push_back(slot_id);
+      slot_index_[slot_id] = dense_idx++;
       if (dim > max_dim_)
         max_dim_ = dim;
     }
   }
 
-  static uint32_t extract_slot(uint64_t key) {
-    return static_cast<uint32_t>((key >> 48) & 0xFFFF);
-  }
+  uint32_t extract_slot(uint64_t key) const { return codec_.decode_slot(key); }
+
+  const SlotKeyCodec &codec() const { return codec_; }
 
   size_t max_dim() const { return max_dim_; }
 
   size_t dim_for_slot(uint32_t slot_id) const {
-    auto it = slots_.find(slot_id);
-    if (it == slots_.end())
+    if (slot_id >= kMaxSlots || slots_[slot_id] == nullptr)
       throw std::invalid_argument("unknown slot " + std::to_string(slot_id));
-    return it->second->dim;
+    return slots_[slot_id]->dim;
   }
 
   size_t dim_for_key(uint64_t key) const {
     uint32_t slot_id = extract_slot(key);
-    return slots_.at(slot_id)->dim;
+    return slots_[slot_id]->dim;
   }
 
   std::string_view name() const { return "hogwild"; }
@@ -319,7 +327,7 @@ public:
         for (size_t i = begin; i < end; ++i) {
           uint64_t key = static_cast<uint64_t>(keys[i]);
           uint32_t slot_id = extract_slot(key);
-          auto &slot = *slots_.at(slot_id);
+          auto &slot = *slots_[slot_id];
           size_t dim = static_cast<size_t>(row_lengths[i]);
           ValT *out = out_flat_values.data() + offsets[i];
 
@@ -457,7 +465,7 @@ public:
           uint32_t i = shuffled_indices[idx];
           uint64_t key = static_cast<uint64_t>(keys[i]);
           uint32_t slot_id = extract_slot(key);
-          auto &slot = *slots_.at(slot_id);
+          auto &slot = *slots_[slot_id];
           const ValT *grad_src = flat_grads.data() + offsets[i];
           uint32_t t_idx =
               slot.transient_shards[shard_id]->get_or_allocate(key);
@@ -485,7 +493,8 @@ public:
   // =========================================================================
 
   std::error_code optimizer_step() {
-    for (auto &[_, slot] : slots_) {
+    for (uint32_t sid_ : slot_ids_) {
+      auto &slot = slot_storage_[slot_index_[sid_]];
       slot->global_step++;
     }
 
@@ -494,7 +503,8 @@ public:
     auto do_shard = [&](size_t shard_begin, size_t shard_end) {
       epoch::with_epoch([&] {
         for (size_t shard_id = shard_begin; shard_id < shard_end; ++shard_id) {
-          for (auto &[_, slot] : slots_) {
+          for (uint32_t sid_ : slot_ids_) {
+            auto *slot = slots_[sid_];
             auto &shard = slot->transient_shards[shard_id];
             shard->for_each_accumulated(
                 [&](uint64_t feature_id, const ValT *accumulated_grad) {
@@ -557,13 +567,13 @@ public:
     auto offsets = compute_offsets(row_lengths);
 
     auto do_range = [&](size_t begin, size_t end) {
-      std::unordered_map<uint32_t, std::vector<uint32_t>> local_free_slots;
+      std::vector<std::vector<uint32_t>> local_free_slots(slot_ids_.size());
       epoch::with_epoch([&] {
         for (size_t i = begin; i < end; ++i) {
           uint64_t key = static_cast<uint64_t>(keys[i]);
           uint32_t slot_id = extract_slot(key);
-          auto &slot = *slots_.at(slot_id);
-          auto &free_slots = local_free_slots[slot_id];
+          auto &slot = *slots_[slot_id];
+          auto &free_slots = local_free_slots[slot_index_[slot_id]];
           const ValT *src = flat_values.data() + offsets[i];
 
           std::optional<uint32_t> preallocated_idx = std::nullopt;
@@ -631,13 +641,13 @@ public:
     auto offsets = compute_offsets(row_lengths);
 
     auto do_range = [&](size_t begin, size_t end) {
-      std::unordered_map<uint32_t, std::vector<uint32_t>> local_free_slots;
+      std::vector<std::vector<uint32_t>> local_free_slots(slot_ids_.size());
       epoch::with_epoch([&] {
         for (size_t i = begin; i < end; ++i) {
           uint64_t key = static_cast<uint64_t>(keys[i]);
           uint32_t slot_id = extract_slot(key);
-          auto &slot = *slots_.at(slot_id);
-          auto &free_slots = local_free_slots[slot_id];
+          auto &slot = *slots_[slot_id];
+          auto &free_slots = local_free_slots[slot_index_[slot_id]];
           size_t dim = slot.dim;
           ValT *out = out_flat_values.data() + offsets[i];
 
@@ -716,7 +726,7 @@ public:
         for (size_t i = begin; i < end; ++i) {
           uint64_t key = static_cast<uint64_t>(keys[i]);
           uint32_t slot_id = extract_slot(key);
-          auto &slot = *slots_.at(slot_id);
+          auto &slot = *slots_[slot_id];
           out_exists[i] = slot.key_map
                               .Find(Key::Entry::make_key(key),
                                     [](const auto &e) { return true; })
@@ -735,7 +745,7 @@ public:
         for (size_t i = begin; i < end; ++i) {
           uint64_t key = static_cast<uint64_t>(keys[i]);
           uint32_t slot_id = extract_slot(key);
-          auto &slot = *slots_.at(slot_id);
+          auto &slot = *slots_[slot_id];
           slot.key_map.Remove(Key::Entry::make_key(key),
                               [](const auto &e) { return true; });
         }
@@ -746,7 +756,8 @@ public:
   }
 
   std::error_code clear() {
-    for (auto &[_, slot] : slots_) {
+    for (uint32_t sid : slot_ids_) {
+      auto *slot = slots_[sid];
       slot->key_map.clear();
       if (slot->optimizer.has_value()) {
         slot->optimizer->clear();
@@ -767,12 +778,12 @@ public:
     }
     size_t n = keys.size();
     auto do_range = [&](size_t begin, size_t end) {
-      std::unordered_map<uint32_t, std::vector<uint32_t>> local_free_slots;
+      std::vector<std::vector<uint32_t>> local_free_slots(slot_ids_.size());
       for (size_t i = begin; i < end; ++i) {
         uint64_t key = static_cast<uint64_t>(keys[i]);
         uint32_t slot_id = extract_slot(key);
-        auto &slot = *slots_.at(slot_id);
-        auto &free_slots = local_free_slots[slot_id];
+        auto &slot = *slots_[slot_id];
+        auto &free_slots = local_free_slots[slot_index_[slot_id]];
 
         epoch::with_epoch([&] {
           std::optional<uint32_t> preallocated_idx = std::nullopt;
@@ -836,13 +847,13 @@ public:
 
   size_t size() const {
     size_t s = 0;
-    for (auto &[_, slot] : slots_) {
-      s += slot->key_map.size();
+    for (uint32_t sid : slot_ids_) {
+      s += slots_[sid]->key_map.size();
     }
     return s;
   }
 
-  size_t num_slots() const { return slots_.size(); }
+  size_t num_slots() const { return slot_ids_.size(); }
 
 private:
   template <typename Fn>
@@ -878,12 +889,17 @@ private:
     return offsets;
   }
 
-  std::unordered_map<uint32_t, std::unique_ptr<SlotStore>> slots_;
+  static constexpr size_t kMaxSlots = 65536;
+  std::array<SlotStore *, kMaxSlots> slots_{};
+  std::vector<std::unique_ptr<SlotStore>> slot_storage_;
+  std::vector<uint32_t> slot_ids_;
+  std::array<uint16_t, kMaxSlots> slot_index_{};
   size_t num_threads_ = 0;
   exec::static_thread_pool pool_;
   Initializer initializer_;
   ScorePolicyT score_policy_;
   size_t max_dim_ = 0;
+  SlotKeyCodec codec_;
   static constexpr size_t kParallelThreshold = 64;
 
 public:
@@ -891,8 +907,8 @@ public:
 
   std::unordered_map<uint32_t, size_t> slot_dims() const {
     std::unordered_map<uint32_t, size_t> result;
-    for (auto &[id, slot] : slots_)
-      result[id] = slot->dim;
+    for (uint32_t id : slot_ids_)
+      result[id] = slots_[id]->dim;
     return result;
   }
 
@@ -913,7 +929,8 @@ public:
                size_t batch_size) {
     bool has_score = ScorePolicyT::kHasScore;
 
-    for (auto &[slot_id, slot] : slots_) {
+    for (uint32_t slot_id : slot_ids_) {
+      auto *slot = slots_[slot_id];
       size_t dim = slot->dim;
       int num_workers = static_cast<int>(parlay::num_workers());
 
@@ -1062,7 +1079,8 @@ public:
   // opt_dim == 0 when the optimizer has no state (e.g. plain SGD).
   template <typename VisitorFn>
   void export_batch_with_opt(VisitorFn &&visitor, size_t batch_size) {
-    for (auto &[slot_id, slot] : slots_) {
+    for (uint32_t slot_id : slot_ids_) {
+      auto *slot = slots_[slot_id];
       size_t emb_dim = slot->dim;
       size_t opt_dim =
           slot->optimizer.has_value() ? slot->optimizer->state_dim() : 0;
@@ -1115,7 +1133,8 @@ public:
   // Arrow C Data Interface construction).
   template <typename VisitorFn>
   void export_batch_with_opt_owned(VisitorFn &&visitor, size_t batch_size) {
-    for (auto &[slot_id, slot] : slots_) {
+    for (uint32_t slot_id : slot_ids_) {
+      auto *slot = slots_[slot_id];
       size_t emb_dim = slot->dim;
       size_t opt_dim =
           slot->optimizer.has_value() ? slot->optimizer->state_dim() : 0;
@@ -1173,7 +1192,8 @@ public:
     if (n == 0)
       return;
 
-    for (auto &[sid, slot] : slots_) {
+    for (uint32_t sid : slot_ids_) {
+      auto *slot = slots_[sid];
       if (!slot->optimizer.has_value())
         continue;
       size_t opt_dim = slot->optimizer->state_dim();
@@ -1258,7 +1278,8 @@ public:
 
     out_evicted_count = 0;
 
-    for (auto &[slot_id, slot] : slots_) {
+    for (uint32_t slot_id : slot_ids_) {
+      auto *slot = slots_[slot_id];
       if (out_evicted_count >= max_evict_count)
         break;
 

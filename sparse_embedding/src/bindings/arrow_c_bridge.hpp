@@ -28,10 +28,10 @@
 
 #include <cstdint>
 #include <cstring>
-#include <memory>
-#include <string>
 #include <utility>
 #include <vector>
+
+#include "sparse_embedding/src/common/slot_key_codec.hpp"
 
 // ============================================================================
 // Arrow C Data Interface struct definitions (from the Arrow spec).
@@ -303,14 +303,15 @@ struct ArrowBatchPair {
   ArrowSchema schema;
 };
 
-inline ArrowBatchPair build_embedding_batch(std::vector<uint64_t> &&keys,
-                                            std::vector<float> &&vals) {
+inline ArrowBatchPair
+build_embedding_batch(std::vector<uint64_t> &&keys, std::vector<float> &&vals,
+                      const SlotKeyCodec &codec = SlotKeyCodec{}) {
   size_t n = keys.size();
   size_t dim = n > 0 ? vals.size() / n : 0;
 
   std::vector<uint32_t> slot_ids(n);
   for (size_t i = 0; i < n; ++i) {
-    slot_ids[i] = static_cast<uint32_t>((keys[i] >> 48) & 0xFFFF);
+    slot_ids[i] = codec.decode_slot(keys[i]);
   }
 
   std::vector<int32_t> offsets(n + 1);
@@ -325,15 +326,16 @@ inline ArrowBatchPair build_embedding_batch(std::vector<uint64_t> &&keys,
   return pair;
 }
 
-inline ArrowBatchPair build_opt_state_batch(std::vector<uint64_t> &&keys,
-                                            std::vector<float> &&vals,
-                                            std::vector<float> &&opt_states) {
+inline ArrowBatchPair
+build_opt_state_batch(std::vector<uint64_t> &&keys, std::vector<float> &&vals,
+                      std::vector<float> &&opt_states,
+                      const SlotKeyCodec &codec = SlotKeyCodec{}) {
   size_t n = keys.size();
   size_t opt_dim = n > 0 ? opt_states.size() / n : 0;
 
   std::vector<uint32_t> slot_ids(n);
   for (size_t i = 0; i < n; ++i) {
-    slot_ids[i] = static_cast<uint32_t>((keys[i] >> 48) & 0xFFFF);
+    slot_ids[i] = codec.decode_slot(keys[i]);
   }
 
   std::vector<int32_t> offsets(n + 1);
@@ -345,8 +347,6 @@ inline ArrowBatchPair build_opt_state_batch(std::vector<uint64_t> &&keys,
   build_record_batch_schema(&pair.schema, "opt_state");
   build_record_batch_array(&pair.array, std::move(slot_ids), std::move(keys),
                            std::move(offsets), std::move(opt_states));
-  // vals is intentionally ignored — opt_state path only serializes optimizer
-  // state
   (void)vals;
   return pair;
 }
