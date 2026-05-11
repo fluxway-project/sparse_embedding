@@ -9,7 +9,8 @@
 - **Hogwild! 梯度累积**：分片 TransientArena 实现无锁梯度聚合，避免跨线程同步
 - **C++26 标准并发**：基于 NVIDIA `stdexec` + `exec::static_thread_pool` 实现标准 Sender/Receiver 任务调度
 - **Epoch 内存安全**：通过 `epoch::with_epoch` 批次保护并发哈希表读写，避免 ABA 问题
-- **高性能 Checkpoint**：基于 Lance-C 的零拷贝二进制大对象（Blob）数据传输，实现高效存储与恢复
+- **分布式 Lance Checkpoint**：支持分布式两阶段提交 (Two-Phase Commit) 的 Lance 存储后端，通过零拷贝 PyArrow 导出直接写入 Lance Dataset，解耦 embedding 与优化器状态，支持百 GB 级极速存储与加载。
+- **动态分片与路由 (Partitioner OP)**：新增底层 C++ Partitioner OPs (`ModuloPartitioner`, `HashPartitioner`, `FastRangePartitioner`)，支持多路特征高效路由，支持在 Checkpoint 加载阶段进行灵活的集群弹性扩缩容（Resharding）。
 - **驱逐与内存管理**：高效的打分策略（如 LFU），使用线程安全的 `std::atomic_ref` 实现无锁并发状态更新
 
 ## 系统依赖
@@ -64,7 +65,7 @@
 
 | 操作 | 1T | 4T | 8T | 16T | 32T | 64T |
 |------|----|----|----|-----|-----|-----|
-| forward_lookup | 3.26 Mops/s (1.67 GB/s) | 8.26 Mops/s (4.23 GB/s) | 11.21 Mops/s (5.74 GB/s) | 11.70 Mops/s (5.99 GB/s) | 13.56 Mops/s (6.94 GB/s) | 12.41 Mops/s (6.36 GB/s) |
+| forward_lookup | 3.39 Mops/s (1.73 GB/s) | 8.24 Mops/s (4.22 GB/s) | 9.91 Mops/s (5.07 GB/s) | 11.66 Mops/s (5.97 GB/s) | 13.14 Mops/s (6.73 GB/s) | 11.76 Mops/s (6.02 GB/s) |
 
 `forward_lookup` 在 16-32T 时趋于饱和，实测峰值 6.94 GB/s。
 
@@ -78,7 +79,7 @@
 
 | 操作 | 1T | 4T | 8T | 16T | 32T | 64T |
 |------|----|----|----|-----|-----|-----|
-| lookup_or_insert | 1.64 Mops/s | 3.39 Mops/s | 5.85 Mops/s | 6.03 Mops/s | 6.29 Mops/s | 6.03 Mops/s |
+| lookup_or_insert | 1.70 Mops/s | 3.33 Mops/s | 5.18 Mops/s | 5.49 Mops/s | 5.51 Mops/s | 5.32 Mops/s |
 
 1→8T 呈现 3.6x 线性加速；8T 后受 parlayhash CAS 竞争与 DRAM 写带宽限制趋于饱和。
 
@@ -86,13 +87,13 @@
 
 | 操作 | 1T | 4T | 8T | 16T | 32T | 64T |
 |------|----|----|----|-----|-----|-----|
-| assign | 1.60 Mops/s (0.82 GB/s) | 4.19 Mops/s (2.14 GB/s) | 5.53 Mops/s (2.83 GB/s) | 7.39 Mops/s (3.78 GB/s) | 7.76 Mops/s (3.97 GB/s) | 7.21 Mops/s (3.69 GB/s) |
+| assign | 1.60 Mops/s (0.82 GB/s) | 4.23 Mops/s (2.17 GB/s) | 5.73 Mops/s (2.93 GB/s) | 7.30 Mops/s (3.74 GB/s) | 7.63 Mops/s (3.90 GB/s) | 7.30 Mops/s (3.74 GB/s) |
 
 #### `accumulate_gradients`（梯度累积，反向传播）
 
 | 操作 | 1T | 4T | 8T | 16T | 32T | 64T |
 |------|----|----|----|-----|-----|-----|
-| accumulate_gradients | 3.09 Mops/s | 8.18 Mops/s | 9.00 Mops/s | 10.62 Mops/s | 10.34 Mops/s | 9.07 Mops/s |
+| accumulate_gradients | 2.17 Mops/s | 5.86 Mops/s | 7.24 Mops/s | 9.77 Mops/s | 10.64 Mops/s | 10.26 Mops/s |
 
 注：`accumulate_gradients` 使用 AVX-512 SIMD 分片 Scatter-Reduce；在修复了线程池调度阈值与使用 thread-local 缓存复用后，在 16-32T 呈现出完美的扩展性。
 
@@ -100,7 +101,7 @@
 
 | 操作 | 1T | 4T | 8T | 16T | 32T | 64T |
 |------|----|----|----|-----|-----|-----|
-| optimizer_step | 4.75 Mops/s (4.87 GB/s) | 14.23 Mops/s (14.57 GB/s) | 18.57 Mops/s (19.02 GB/s) | 22.64 Mops/s (23.18 GB/s) | **24.47 Mops/s (25.06 GB/s)** | 21.96 Mops/s (22.49 GB/s) |
+| optimizer_step | 5.85 Mops/s (5.99 GB/s) | 13.04 Mops/s (13.35 GB/s) | 18.59 Mops/s (19.03 GB/s) | 26.01 Mops/s (26.63 GB/s) | **27.48 Mops/s (28.14 GB/s)** | 27.12 Mops/s (27.77 GB/s) |
 
 注：`optimizer_step` 处理的是已累积的 unique key 集合（约 252K）。在修正了并行调度并移除了 Data Race 后，在 32T 时展现了惊人的 25.06 GB/s 内存带宽利用率，扩展效率绝佳。
 
@@ -108,7 +109,7 @@
 
 | 操作 | 1T | 4T | 8T | 16T | 32T | 64T |
 |------|----|----|----|-----|-----|-----|
-| contains | 8.83 Mops/s | 15.95 Mops/s | 20.58 Mops/s | 22.31 Mops/s | 23.52 Mops/s | 22.84 Mops/s |
+| contains | 8.83 Mops/s | 17.57 Mops/s | 19.10 Mops/s | 22.09 Mops/s | 23.29 Mops/s | 22.95 Mops/s |
 
 纯哈希查找无 embedding 拷贝，受 CPU 和哈希表 bucket 访问延迟限制，8T 后接近饱和。
 
@@ -116,7 +117,7 @@
 
 | 操作 | 1T | 4T | 8T | 16T | 32T | 64T |
 |------|----|----|----|-----|-----|-----|
-| erase (6553 keys) | 11.58 Mops/s | 36.27 Mops/s | 64.49 Mops/s | 58.06 Mops/s | 39.33 Mops/s | 24.53 Mops/s |
+| erase (6553 keys) | 13.62 Mops/s | 50.43 Mops/s | 63.84 Mops/s | 61.27 Mops/s | 41.52 Mops/s | 23.85 Mops/s |
 
 `erase` 在 8T 时达到峰值（64.49 Mops/s），超线程后因 NUMA 跨 socket 竞争开始下降。
 
@@ -160,7 +161,19 @@ HogwildEmbeddingStore
 
 ---
 
-## 构建
+## 构建与安装
+
+本库现已集成标准的 Python packaging 流程，在底层自动调用 Bazel 完成 C++ 扩展的构建：
+
+```bash
+# 从源码编译并安装 wheel
+pip install .
+
+# 推荐在开发时使用 editable mode
+pip install -e .
+```
+
+当然，如果您只需运行 C++ 二进制或单独测试：
 
 ```bash
 bazel build -c opt //sparse_embedding/...

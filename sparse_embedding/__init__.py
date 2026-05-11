@@ -16,6 +16,8 @@ from ._core import (
     ModuloPartitioner,
     FastRangePartitioner,
     HashPartitioner,
+    wake_fd,
+    drain_wake_queue,
 )
 
 
@@ -33,4 +35,6 @@ __all__ = [
     "ModuloPartitioner",
     "FastRangePartitioner",
     "HashPartitioner",
+    "wake_fd",
+    "drain_wake_queue",
 ]
