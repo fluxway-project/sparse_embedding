@@ -128,12 +128,12 @@ The following throughputs were measured by calling the corresponding interfaces 
 | API | Throughput (Mops/s) | Description |
 |-----|---------------------|-------------|
 | `async_unique` | ~25.00 Mops/s | Async fetch of unique keys, ultra-fast hashing |
-| `lookup_or_insert` | ~4.57 Mops/s | Sync insert and lookup, returning zero-copy tensors |
+| `async_lookup_or_insert` | ~4.57 Mops/s | Async insert and lookup, returning zero-copy tensors |
 | `async_lookup` | ~11.19 Mops/s | Async forward lookup without blocking the event loop |
-| `accumulate_gradients` | ~13.38 Mops/s | Sync gradient accumulation |
-| **End-to-End Step** | **~3.61 Mops/s** | Full training step: `lookup` + `accumulate` + `optimizer_step` |
+| `async_accumulate_gradients` | ~13.38 Mops/s | Async gradient accumulation without blocking the event loop |
+| **End-to-End Step** | **~3.61 Mops/s** | Full training step using full asyncio ops |
 
-Thanks to DLPack and lock-free `eventfd` asyncio integration, the Python invocation overhead is minimized, easily sustaining millions of operations per second.
+All `EmbeddingStore` methods (e.g. `lookup_or_insert`, `assign`, `contains`, `erase`, `clear`, `assign_scores`, `accumulate_gradients`, `optimizer_step`) have high-performance, edge-triggered `async_*` variants. Thanks to DLPack and lock-free `eventfd` asyncio integration, the Python invocation overhead is minimized, easily sustaining millions of operations per second.
 
 ---
 

@@ -128,12 +128,12 @@
 | API | 吞吐量 (Mops/s) | 说明 |
 |-----|----------------|------|
 | `async_unique` | ~25.00 Mops/s | 异步获取 unique keys，极速哈希去重 |
-| `lookup_or_insert` | ~4.57 Mops/s | 同步的插入及查找，零拷贝张量返回 |
-| `async_lookup` | ~11.19 Mops/s | 异步的前向查询，无阻滞事件循环 |
-| `accumulate_gradients` | ~13.38 Mops/s | 同步的梯度累积操作 |
-| **端到端 Step** | **~3.61 Mops/s** | `lookup` + `accumulate` + `optimizer_step` 的完整训练步 |
+| `async_lookup_or_insert` | ~4.57 Mops/s | 异步插入及查找，零拷贝张量返回 |
+| `async_lookup` | ~11.19 Mops/s | 异步前向查询，无阻滞事件循环 |
+| `async_accumulate_gradients` | ~13.38 Mops/s | 异步梯度累积，无阻滞事件循环 |
+| **端到端 Step** | **~3.61 Mops/s** | 全链路 asyncio 训练步 |
 
-得益于 DLPack 和 eventfd 无锁 asyncio 挂载，Python 端的调用开销被降到最低，依然保持了数以百万计的吞吐率。
+所有 `EmbeddingStore` 方法（如 `lookup_or_insert`, `assign`, `contains`, `erase`, `clear`, `assign_scores`, `accumulate_gradients`, `optimizer_step`）均已提供高性能、边缘触发的 `async_*` 异步变体。得益于 DLPack 和 eventfd 无锁 asyncio 挂载，Python 端的调用开销被降到最低，依然保持了数以百万计的吞吐率。
 
 ---
 
