@@ -91,10 +91,30 @@ class EmbeddingTableBenchmark:
                 self.store.assign(keys, values)
             runner.run(lambda: self.store.assign(keys, values), batch_size)
 
+    def benchmark_end_to_end(self, batch_sizes: list[int], iters: int = 10):
+        print(f"\n=== End-to-End Step Benchmark [Threads: {self.num_threads}] ===")
+        for batch_size in batch_sizes:
+            runner = BenchmarkRunner("E2E Step", iters=iters)
+            keys = np.random.randint(
+                0, batch_size * 10, size=batch_size, dtype=np.int64
+            )
+            values = np.random.rand(batch_size, self.dim).astype(np.float32)
+            # Warmup
+            self.store.lookup_or_insert(keys)
+            self.store.accumulate_gradients(keys, values)
+            self.store.optimizer_step()
+
+            def e2e_step():
+                self.store.lookup(keys)
+                self.store.accumulate_gradients(keys, values)
+                self.store.optimizer_step()
+
+            runner.run(e2e_step, batch_size)
+
 
 def main():
-    thread_counts = [1, 2, 4, 8, 16]
-    batch_sizes = [10000, 100000, 1000000]
+    thread_counts = [8, 16, 32]
+    batch_sizes = [65536, 131072]
 
     for num_threads in thread_counts:
         print("\n\n===============================================")
@@ -104,6 +124,7 @@ def main():
         benchmark.benchmark_assign(batch_sizes, iters=10)
         benchmark.benchmark_insertion(batch_sizes, iters=10)
         benchmark.benchmark_query(batch_sizes, iters=10)
+        benchmark.benchmark_end_to_end(batch_sizes, iters=10)
 
 
 if __name__ == "__main__":

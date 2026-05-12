@@ -38,14 +38,28 @@
 #if __has_include(<stdfloat>) && __cplusplus >= 202002L
 #include <stdfloat>
 namespace se {
+#if defined(__STDCPP_FLOAT16_T__)
 using float16_t = std::float16_t;
+#elif defined(__FLT16_MAX__) && (defined(__GNUC__) || defined(__clang__))
+using float16_t = _Float16;
+#else
+#error "float16_t not supported"
+#endif
+
+#if defined(__STDCPP_BFLOAT16_T__)
 using bfloat16_t = std::bfloat16_t;
+#elif (defined(__BFLT16_MAX__) || defined(__AVX512BF16__)) &&                  \
+    (defined(__GNUC__) || defined(__clang__))
+using bfloat16_t = __bf16;
+#else
+#error "bfloat16_t not supported by this compiler; upgrade to GCC≥12 / Clang≥15"
+#endif
 } // namespace se
 
 #elif defined(__FLT16_MAX__) && (defined(__GNUC__) || defined(__clang__))
 namespace se {
 using float16_t = _Float16;
-#if defined(__BFLT16_MAX__)
+#if defined(__BFLT16_MAX__) || defined(__AVX512BF16__)
 using bfloat16_t = __bf16;
 #else
 #error "bfloat16 not supported by this compiler; upgrade to GCC≥12 / Clang≥15"

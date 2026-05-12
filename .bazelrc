@@ -1,3 +1,37 @@
 build --cxxopt=-std=c++2b
-build --cxxopt=-march=native
 build --enable_runfiles=false
+
+# Enable AVX512_BF16 extension to support bfloat16 at the hardware/compiler level.
+build --copt=-mavx512bf16
+
+# Set default compilation mode to release (opt) for maximum performance out of the box.
+build --compilation_mode=opt
+
+# ==============================================================================
+# Release Configuration (Opt)
+# ==============================================================================
+# Usage: bazel build //... (default) or bazel build -c opt //...
+# Action: Forces the use of GCC with Full Link Time Optimization (LTO).
+
+build:opt --copt=-O3
+build:opt --copt=-DNDEBUG
+build:opt --copt=-fno-strict-aliasing
+build:opt --features=thin_lto
+# build:opt --linkopt=-flto
+build:opt --copt=-DNDEBUG
+build:opt --copt=-march=native
+build:opt --copt=-mtune=native
+
+# ==============================================================================
+# Debug Configuration (Dbg)
+# ==============================================================================
+# Usage: bazel build -c dbg //...
+# Action: Forces the use of Clang. Disables optimizations and retains full
+# debugging symbols to provide a superior debugging experience.
+
+build:dbg --repo_env=CC=clang
+build:dbg --repo_env=CXX=clang++
+build:dbg --copt=-O0
+build:dbg --copt=-g
+build:dbg --copt=-DDEBUG
+build:dbg --strip=never

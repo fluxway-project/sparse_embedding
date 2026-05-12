@@ -31,15 +31,13 @@ sh_binary(
     tags = ["manual"],
 )
 
-# ---- _core.so: default build (no lance-c dependency) ----
-
 cc_binary(
-    name = "core_so",
+    name = "_core.so",
     srcs = [
         "//sparse_embedding/src/bindings:srcs",
         "//sparse_embedding/src/ops:srcs",
     ],
-    linkopts = ["-Wl,-rpath,$$ORIGIN"],
+    copts = ["-fvisibility=hidden"],
     linkshared = True,
     deps = [
         "//sparse_embedding/src/backend/hogwild:hogwild_embedding_store",
@@ -57,7 +55,7 @@ cc_binary(
 
 genrule(
     name = "copy_core_so",
-    srcs = [":core_so"],
+    srcs = [":_core.so"],
     outs = ["sparse_embedding/_core.so"],
     cmd = "cp $< $@",
 )
@@ -78,7 +76,10 @@ cc_binary(
         "//sparse_embedding/src/bindings:srcs",
         "//sparse_embedding/src/ops:srcs",
     ],
-    copts = ["-DSE_ENABLE_LANCE_CHECKPOINTER"],
+    copts = [
+        "-DSE_ENABLE_LANCE_CHECKPOINTER",
+        "-fvisibility=hidden",
+    ],
     linkopts = ["-Wl,-rpath,$$ORIGIN"],
     linkshared = True,
     tags = ["manual"],
@@ -121,9 +122,11 @@ py_library(
 
 py_wheel(
     name = "sparse_embedding_wheel",
+    abi = "cp312",
     distribution = "sparse_embedding",
+    platform = "manylinux2014_x86_64",
     python_requires = ">=3.11",
-    python_tag = "py3",
+    python_tag = "cp312",
     version = "0.1.0",
     deps = [
         ":copy_core_so",
@@ -133,9 +136,11 @@ py_wheel(
 
 py_wheel(
     name = "sparse_embedding_wheel_with_lance",
+    abi = "cp312",
     distribution = "sparse_embedding",
+    platform = "manylinux2014_x86_64",
     python_requires = ">=3.11",
-    python_tag = "py3",
+    python_tag = "cp312",
     tags = ["manual"],
     version = "0.1.0",
     deps = [

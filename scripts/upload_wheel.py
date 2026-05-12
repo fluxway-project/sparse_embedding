@@ -30,14 +30,24 @@ class WheelBuilder:
         self.bazel_bin_dir = self.project_dir / "bazel-bin"
 
     def build(self) -> None:
-        logger.info("Starting wheel build using Bazel...")
+        logger.info("Starting wheel build using standard Python tooling (setup.py)...")
         try:
+            # We use pip wheel to automatically determine correct ABI tags
             subprocess.run(
-                ["bazel", "build", "//:sparse_embedding_wheel"],
+                [
+                    sys.executable,
+                    "-m",
+                    "pip",
+                    "wheel",
+                    ".",
+                    "--no-deps",
+                    "-w",
+                    str(self.bazel_bin_dir),
+                ],
                 cwd=self.project_dir,
                 check=True,
             )
-            logger.info("Bazel wheel build completed successfully.")
+            logger.info("Wheel build completed successfully.")
         except subprocess.CalledProcessError as e:
             logger.error("Build failed. See output above for details.")
             raise RuntimeError("Build process encountered an error") from e
