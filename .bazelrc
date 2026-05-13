@@ -18,7 +18,6 @@ build:opt --copt=-DNDEBUG
 build:opt --copt=-fno-strict-aliasing
 build:opt --features=thin_lto
 # build:opt --linkopt=-flto
-build:opt --copt=-DNDEBUG
 build:opt --copt=-march=native
 build:opt --copt=-mtune=native
 

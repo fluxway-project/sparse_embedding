@@ -2,10 +2,10 @@ import json
 import logging
 from typing import List
 
+import lance
 import pyarrow as pa
 import pyarrow.compute as pc
-import lance
-from lance.fragment import write_fragments, FragmentMetadata
+from lance.fragment import FragmentMetadata, write_fragments
 
 from .base import DistributedCheckpointBackend
 

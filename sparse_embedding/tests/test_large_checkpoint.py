@@ -2,10 +2,11 @@
 """Verify large-scale checkpoint save and load using the Lance backend."""
 
 import os
-import numpy as np
 import tempfile
 from time import perf_counter
 
+import numpy as np
+import pytest
 import sparse_embedding._core as se
 
 
@@ -18,6 +19,10 @@ def make_cfg(dim=4, threads=4, max_keys=100000):
     )
 
 
+@pytest.mark.skipif(
+    not hasattr(se.EmbeddingStore, "set_checkpoint_factories"),
+    reason="Lance Checkpointer not enabled",
+)
 def test_large_checkpoint_lance():
     print("Preparing large scale data (50,000 entries)...")
     dim = 64

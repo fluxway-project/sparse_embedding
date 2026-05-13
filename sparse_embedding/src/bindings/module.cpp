@@ -568,15 +568,17 @@ public:
           auto val_span = se::py::dlpack_to_span<const ValT>(dlm_values);
           if (dlm_values->dl_tensor.ndim == 2) {
             size_t dim = dlm_values->dl_tensor.shape[1];
-            auto row_lengths = std::make_unique_for_overwrite<int64_t[]>(n);
-            std::fill_n(row_lengths.get(), n, dim);
-            ec =
-                get_store<ValT>()->assign(ks, val_span, {row_lengths.get(), n});
+            thread_local std::vector<int64_t> tls_row_lengths;
+            tls_row_lengths.resize(n);
+            int64_t *row_lengths = tls_row_lengths.data();
+            std::fill_n(row_lengths, n, dim);
+            ec = get_store<ValT>()->assign(ks, val_span, {row_lengths, n});
           } else if (dlm_values->dl_tensor.ndim == 1) {
-            auto row_lengths = std::make_unique_for_overwrite<int64_t[]>(n);
-            compute_output_size(ks, {row_lengths.get(), n});
-            ec =
-                get_store<ValT>()->assign(ks, val_span, {row_lengths.get(), n});
+            thread_local std::vector<int64_t> tls_row_lengths;
+            tls_row_lengths.resize(n);
+            int64_t *row_lengths = tls_row_lengths.data();
+            compute_output_size(ks, {row_lengths, n});
+            ec = get_store<ValT>()->assign(ks, val_span, {row_lengths, n});
           } else {
             throw std::invalid_argument("values must be 1D (ragged) or 2D");
           }
@@ -623,10 +625,12 @@ public:
       dispatch_val([&]<typename ValT>() {
         auto grads_span = se::py::dlpack_to_span<const ValT>(dlm_grads);
         dispatch_on_key(dlm_keys, [&](auto ks) {
-          auto row_lengths = std::make_unique_for_overwrite<int64_t[]>(n);
-          compute_output_size(ks, {row_lengths.get(), n});
+          thread_local std::vector<int64_t> tls_row_lengths;
+          tls_row_lengths.resize(n);
+          int64_t *row_lengths = tls_row_lengths.data();
+          compute_output_size(ks, {row_lengths, n});
           ec = get_store<ValT>()->accumulate_gradients(ks, grads_span,
-                                                       {row_lengths.get(), n});
+                                                       {row_lengths, n});
         });
       });
     }
@@ -784,24 +788,26 @@ public:
                cap_values)]() -> std::error_code {
             auto do_assign = [&](auto ks) -> std::error_code {
               if (val_ndim == 2) {
-                auto row_lengths = std::make_unique_for_overwrite<int64_t[]>(n);
-                std::fill_n(row_lengths.get(), n, val_dim1);
+                thread_local std::vector<int64_t> tls_row_lengths;
+                tls_row_lengths.resize(n);
+                int64_t *row_lengths = tls_row_lengths.data();
+                std::fill_n(row_lengths, n, val_dim1);
                 return wrapper_ptr->get_store<ValT>()->assign(
                     ks,
                     std::span<const ValT>(
                         static_cast<const ValT *>(values_data), n * val_dim1),
-                    {row_lengths.get(), n});
+                    {row_lengths, n});
               }
-              auto row_lengths = std::make_unique_for_overwrite<int64_t[]>(n);
-              wrapper_ptr->compute_output_size(ks, {row_lengths.get(), n});
-              size_t total = 0;
-              for (size_t i = 0; i < n; ++i)
-                total += row_lengths[i];
+              thread_local std::vector<int64_t> tls_row_lengths;
+              tls_row_lengths.resize(n);
+              int64_t *row_lengths = tls_row_lengths.data();
+              size_t total =
+                  wrapper_ptr->compute_output_size(ks, {row_lengths, n});
               return wrapper_ptr->get_store<ValT>()->assign(
                   ks,
                   std::span<const ValT>(static_cast<const ValT *>(values_data),
                                         total),
-                  {row_lengths.get(), n});
+                  {row_lengths, n});
             };
 
             if (kdt == KeyDType::kInt64) {
@@ -931,16 +937,16 @@ public:
            grads_keeper = std::make_shared<se::py::AsyncPyObjectKeeper>(
                cap_grads)]() -> std::error_code {
             auto do_acc = [&](auto ks) -> std::error_code {
-              auto row_lengths = std::make_unique_for_overwrite<int64_t[]>(n);
-              wrapper_ptr->compute_output_size(ks, {row_lengths.get(), n});
-              size_t total = 0;
-              for (size_t i = 0; i < n; ++i)
-                total += row_lengths[i];
+              thread_local std::vector<int64_t> tls_row_lengths;
+              tls_row_lengths.resize(n);
+              int64_t *row_lengths = tls_row_lengths.data();
+              size_t total =
+                  wrapper_ptr->compute_output_size(ks, {row_lengths, n});
               return wrapper_ptr->get_store<ValT>()->accumulate_gradients(
                   ks,
                   std::span<const ValT>(static_cast<const ValT *>(grads_data),
                                         total),
-                  {row_lengths.get(), n});
+                  {row_lengths, n});
             };
 
             if (kdt == KeyDType::kInt64) {
@@ -1359,11 +1365,12 @@ public:
 
             auto vals = std::span<const ValT>(
                 reinterpret_cast<const ValT *>(embs.data()), n * dim);
-            auto row_lengths = std::make_unique<int64_t[]>(n);
-            std::fill_n(row_lengths.get(), n, static_cast<int64_t>(dim));
-            get_store<ValT>()->assign(
-                std::span<const uint64_t>(keys), vals,
-                std::span<const int64_t>(row_lengths.get(), n));
+            thread_local std::vector<int64_t> tls_row_lengths;
+            tls_row_lengths.resize(n);
+            int64_t *row_lengths = tls_row_lengths.data();
+            std::fill_n(row_lengths, n, static_cast<int64_t>(dim));
+            get_store<ValT>()->assign(std::span<const uint64_t>(keys), vals,
+                                      std::span<const int64_t>(row_lengths, n));
             if (has_score && !scores.empty()) {
               get_store<ValT>()->assign_scores(
                   std::span<const uint64_t>(keys),

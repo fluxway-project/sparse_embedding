@@ -1,6 +1,7 @@
 import asyncio
-import numpy as np
 import time
+
+import numpy as np
 
 import sparse_embedding
 

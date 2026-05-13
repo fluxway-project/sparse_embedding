@@ -30,6 +30,18 @@ _PROJECT_DIR = Path(__file__).resolve().parent
 _PKG_DIR = _PROJECT_DIR / "sparse_embedding"
 
 
+def _bazel_bin_dir() -> Path:
+    """Ask Bazel for the canonical bazel-bin path, bypassing symlink issues."""
+    result = subprocess.run(
+        ["bazel", "info", "bazel-bin"],
+        cwd=_PROJECT_DIR,
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    return Path(result.stdout.strip())
+
+
 def _invoke_bazel(with_lance: bool) -> Path:
     """Run Bazel and return the path to the compiled _core.so."""
     if with_lance:
@@ -51,11 +63,12 @@ def _invoke_bazel(with_lance: bool) -> Path:
         check=True,
     )
 
-    candidates = list((_PROJECT_DIR / "bazel-bin").rglob(so_glob))
+    bazel_bin = _bazel_bin_dir()
+    candidates = list(bazel_bin.rglob(so_glob))
     if not candidates:
         raise FileNotFoundError(
             f"Bazel target {bazel_target!r} produced no file matching {so_glob!r}"
-            f" under bazel-bin/"
+            f" under {bazel_bin}"
         )
     return max(candidates, key=lambda p: p.stat().st_mtime)
 

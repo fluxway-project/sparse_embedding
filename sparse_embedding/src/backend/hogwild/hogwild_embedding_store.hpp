@@ -383,10 +383,8 @@ public:
 
     size_t num_shards = num_threads_;
 
-    auto thread_counts =
-        std::make_unique_for_overwrite<uint32_t[]>(num_shards * num_shards);
-    std::memset(thread_counts.get(), 0,
-                num_shards * num_shards * sizeof(uint32_t));
+    thread_local std::vector<uint32_t> thread_counts;
+    thread_counts.assign(num_shards * num_shards, 0);
     SplitMix64Hash hasher;
 
     // 1. Parallel Count
@@ -422,8 +420,8 @@ public:
     dispatch_parallel(num_shards, do_count, 1);
 
     // 2. Prefix Sum (Sequential)
-    auto thread_offsets =
-        std::make_unique_for_overwrite<uint32_t[]>(num_shards * num_shards);
+    thread_local std::vector<uint32_t> thread_offsets;
+    thread_offsets.resize(num_shards * num_shards);
     std::vector<uint32_t> shard_offsets(num_shards + 1, 0);
 
     for (size_t s = 0; s < num_shards; ++s) {

@@ -1,5 +1,7 @@
 import time
+
 import numpy as np
+
 import sparse_embedding
 
 
