@@ -12,7 +12,7 @@ import sparse_embedding._core as se
 
 def make_cfg(dim=4, threads=4, max_keys=100000):
     return se.EmbeddingConfig(
-        slot_dims={0: dim},
+        dims=[dim],
         num_threads=threads,
         dtype="float32",
         max_active_keys=max_keys,

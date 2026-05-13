@@ -56,7 +56,7 @@ struct CheckpointVersion {
 };
 
 struct CheckpointMetadata {
-  std::unordered_map<uint32_t, size_t> slot_dims;
+  std::vector<size_t> table_dims;
   uint64_t global_step = 0;
   uint64_t timestamp_ms = 0;
   std::string score_policy;
@@ -76,9 +76,9 @@ PRO_DEF_MEM_DISPATCH(MemCkptCommit, commit);
 
 struct CheckpointWriterFacade
     : pro::facade_builder ::add_convention<
-          MemCkptWriterBegin, void(std::string_view uri, uint32_t slot_id,
-                                   size_t optimizer_state_dim, bool has_score,
-                                   CheckpointExportOptions options)>::
+          MemCkptWriterBegin,
+          void(std::string_view uri, size_t dim, size_t optimizer_state_dim,
+               bool has_score, CheckpointExportOptions options)>::
           add_convention<
               MemCkptWriteBatch,
               void(std::span<const uint64_t> keys, const void *embeddings,
@@ -97,7 +97,7 @@ PRO_DEF_MEM_DISPATCH(MemCkptVersionInfo, version_info);
 
 struct CheckpointReaderFacade
     : pro::facade_builder ::add_convention<
-          MemCkptReaderOpen, void(std::string_view uri, uint32_t slot_id,
+          MemCkptReaderOpen, void(std::string_view uri, size_t dim,
                                   uint64_t version, int64_t batch_size)>::
           add_convention<MemCkptReadBatch,
                          bool(size_t max_n, std::vector<uint64_t> &out_keys,

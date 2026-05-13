@@ -13,7 +13,7 @@ logger = logging.getLogger(__name__)
 
 EMBEDDING_SCHEMA = pa.schema(
     [
-        pa.field("slot_id", pa.uint32()),
+        pa.field("dim", pa.uint32()),
         pa.field("key", pa.uint64()),
         pa.field("embedding", pa.list_(pa.float32())),
     ]
@@ -21,7 +21,7 @@ EMBEDDING_SCHEMA = pa.schema(
 
 OPT_STATE_SCHEMA = pa.schema(
     [
-        pa.field("slot_id", pa.uint32()),
+        pa.field("dim", pa.uint32()),
         pa.field("key", pa.uint64()),
         pa.field("opt_state", pa.list_(pa.float32())),
     ]
@@ -200,8 +200,8 @@ def _apply_filter(keys_arr: pa.Array, filter_fn, target_shard_id: int):
 
 def _load_embeddings(store, uri: str, filter_fn, target_shard_id: int):
     ds = lance.dataset(uri)
-    for slot_id in store.slot_ids():
-        scanner = ds.scanner(filter=f"slot_id = {slot_id}")
+    for dim in store.table_dims():
+        scanner = ds.scanner(filter=f"dim = {dim}")
         for batch in scanner.to_batches():
             keys_arr = batch["key"]
             if len(keys_arr) == 0:
@@ -223,8 +223,8 @@ def _load_embeddings(store, uri: str, filter_fn, target_shard_id: int):
 
 def _load_opt_states(store, uri: str, filter_fn, target_shard_id: int):
     ds = lance.dataset(uri)
-    for slot_id in store.slot_ids():
-        scanner = ds.scanner(filter=f"slot_id = {slot_id}")
+    for dim in store.table_dims():
+        scanner = ds.scanner(filter=f"dim = {dim}")
         for batch in scanner.to_batches():
             keys_arr = batch["key"]
             if len(keys_arr) == 0:
@@ -241,4 +241,4 @@ def _load_opt_states(store, uri: str, filter_fn, target_shard_id: int):
                 continue
 
             flat_opt = pc.list_flatten(opt_arr)
-            store.assign_opt_state(slot_id, keys_arr, flat_opt)
+            store.assign_opt_state(keys_arr, flat_opt)

@@ -35,7 +35,7 @@ async def worker_lookup(store, keys, batch_size):
         batch_keys = keys[start:end]
 
         # The C++ extension returns an asyncio.Future directly
-        future = store.async_lookup(batch_keys)
+        future = store.async_lookup(batch_keys, dim=128)
         tasks.append(future)
 
     await asyncio.gather(*tasks)
@@ -46,7 +46,7 @@ async def run_benchmark():
     num_queries = 2000000  # 2 million queries
     vocab_size = 500000  # 500k vocabulary
     a = 1.2  # Zipfian parameter (the smaller, the heavier the tail/collision)
-    slot_dims = {0: 128}
+    dims = [128]
 
     print("Generating Zipfian keys...")
     raw_keys = np.random.zipf(a, size=num_queries).astype(np.int64)
@@ -55,9 +55,7 @@ async def run_benchmark():
     values = np.random.rand(num_queries, 128).astype(np.float32)
 
     store = se.EmbeddingStore(
-        embedding_config=se.EmbeddingConfig(
-            slot_dims=slot_dims, num_threads=8, dtype="float32"
-        ),
+        embedding_config=se.EmbeddingConfig(dims=dims, num_threads=8, dtype="float32"),
         initializer_config=se.Zeros(),
         optimizer_config=se.Adam(lr=0.01),
     )

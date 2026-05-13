@@ -243,7 +243,7 @@ public:
     }
   };
 
-  explicit HogwildEmbeddingStore(std::unordered_map<uint32_t, size_t> slot_dims,
+  explicit HogwildEmbeddingStore(const std::vector<size_t> &table_dims,
                                  size_t num_threads = 0,
                                  Initializer initializer = {},
                                  size_t max_active_keys = 1 << 20,
@@ -255,63 +255,43 @@ public:
                          : std::max(1u, std::thread::hardware_concurrency())),
         pool_(static_cast<uint32_t>(num_threads_)),
         initializer_(std::move(initializer)),
-        score_policy_(std::move(score_policy)), codec_(slot_bits) {
+        score_policy_(std::move(score_policy)) {
     uint32_t p2 = 1;
     while (p2 < num_threads_) {
       p2 <<= 1;
     }
     num_threads_ = p2;
 
-    if (codec_.max_slot_id() >= kMaxSlots) {
-      throw std::invalid_argument(
-          "slot_bits=" + std::to_string(slot_bits) +
-          " allows max_slot_id=" + std::to_string(codec_.max_slot_id()) +
-          " which exceeds kMaxSlots=" + std::to_string(kMaxSlots));
-    }
-
     bool enable_score = ScorePolicyT::kHasScore;
 
-    if (slot_dims.empty()) {
-      throw std::invalid_argument("slot_dims must not be empty");
+    if (table_dims.empty()) {
+      throw std::invalid_argument("table_dims must not be empty");
     }
-    slots_.fill(nullptr);
-    slot_index_.fill(0);
-    uint16_t dense_idx = 0;
-    for (auto &[slot_id, dim] : slot_dims) {
+
+    size_t max_d = 0;
+    for (size_t dim : table_dims) {
+      if (dim > max_d)
+        max_d = dim;
+    }
+    if (max_d > 1048576) {
+      throw std::invalid_argument("dim is too large (max 1048576)");
+    }
+    max_dim_ = max_d;
+    dim_to_slot_.resize(max_dim_ + 1, nullptr);
+
+    for (size_t dim : table_dims) {
       if (dim == 0) {
-        throw std::invalid_argument("dim must be > 0 for slot " +
-                                    std::to_string(slot_id));
+        throw std::invalid_argument("dim must be > 0");
       }
-      if (slot_id >= kMaxSlots) {
-        throw std::invalid_argument("slot_id must be < " +
-                                    std::to_string(kMaxSlots));
+      if (dim_to_slot_[dim] == nullptr) {
+        slot_storage_.push_back(std::make_unique<SlotStore>(
+            dim, max_active_keys, opt_factory, num_threads_, enable_score));
+        dim_to_slot_[dim] = slot_storage_.back().get();
       }
-      slot_storage_.push_back(std::make_unique<SlotStore>(
-          dim, max_active_keys, opt_factory, num_threads_, enable_score));
-      slots_[slot_id] = slot_storage_.back().get();
-      slot_ids_.push_back(slot_id);
-      slot_index_[slot_id] = dense_idx++;
-      if (dim > max_dim_)
-        max_dim_ = dim;
     }
   }
-
-  uint32_t extract_slot(uint64_t key) const { return codec_.decode_slot(key); }
-
-  const SlotKeyCodec &codec() const { return codec_; }
 
   size_t max_dim() const { return max_dim_; }
-
-  size_t dim_for_slot(uint32_t slot_id) const {
-    if (slot_id >= kMaxSlots || slots_[slot_id] == nullptr)
-      throw std::invalid_argument("unknown slot " + std::to_string(slot_id));
-    return slots_[slot_id]->dim;
-  }
-
-  size_t dim_for_key(uint64_t key) const {
-    uint32_t slot_id = extract_slot(key);
-    return slots_[slot_id]->dim;
-  }
 
   std::string_view name() const { return "hogwild"; }
 
@@ -337,12 +317,15 @@ public:
             __builtin_prefetch(out_flat_values.data() + offsets[i + 16], 1, 1);
           }
           uint64_t key = static_cast<uint64_t>(keys[i]);
-          uint32_t slot_id = extract_slot(key);
-          if (__builtin_expect(slots_[slot_id] == nullptr, 0)) {
-            throw std::runtime_error("invalid slot_id access");
-          }
-          auto &slot = *slots_[slot_id];
           size_t dim = static_cast<size_t>(row_lengths[i]);
+          if (__builtin_expect(dim >= dim_to_slot_.size() ||
+                                   dim_to_slot_[dim] == nullptr,
+                               0)) {
+            throw std::runtime_error(
+                "invalid dim access: no physical table for dim " +
+                std::to_string(dim));
+          }
+          auto &slot = *dim_to_slot_[dim];
           ValT *out = out_flat_values.data() + offsets[i];
 
           auto found =
@@ -383,8 +366,10 @@ public:
 
     size_t num_shards = num_threads_;
 
-    thread_local std::vector<uint32_t> thread_counts;
-    thread_counts.assign(num_shards * num_shards, 0);
+    // NOTE: These buffers are NOT thread_local because they are written by
+    // worker threads (via dispatch_parallel) and read on the main thread.
+    // Using thread_local here would silently read wrong data.
+    std::vector<uint32_t> thread_counts(num_shards * num_shards, 0);
     SplitMix64Hash hasher;
 
     // 1. Parallel Count
@@ -420,8 +405,7 @@ public:
     dispatch_parallel(num_shards, do_count, 1);
 
     // 2. Prefix Sum (Sequential)
-    thread_local std::vector<uint32_t> thread_offsets;
-    thread_offsets.resize(num_shards * num_shards);
+    std::vector<uint32_t> thread_offsets(num_shards * num_shards);
     std::vector<uint32_t> shard_offsets(num_shards + 1, 0);
 
     for (size_t s = 0; s < num_shards; ++s) {
@@ -439,10 +423,10 @@ public:
 
     if (n > shuffled_indices_cap) {
       size_t new_cap = std::max(n, shuffled_indices_cap * 2);
-      shuffled_indices_buf =
-          std::make_unique_for_overwrite<uint32_t[]>(new_cap);
+      shuffled_indices_buf = std::unique_ptr<uint32_t[]>(new uint32_t[new_cap]);
       shuffled_indices_cap = new_cap;
     }
+
     std::span<uint32_t> shuffled_indices(shuffled_indices_buf.get(), n);
     auto do_scatter = [&](size_t t_begin, size_t t_end) {
       for (size_t t = t_begin; t < t_end; ++t) {
@@ -489,11 +473,15 @@ public:
           }
           uint32_t i = shuffled_indices[idx];
           uint64_t key = static_cast<uint64_t>(keys[i]);
-          uint32_t slot_id = extract_slot(key);
-          if (__builtin_expect(slots_[slot_id] == nullptr, 0)) {
-            throw std::runtime_error("invalid slot_id access");
+          size_t dim = static_cast<size_t>(row_lengths[i]);
+          if (__builtin_expect(dim >= dim_to_slot_.size() ||
+                                   dim_to_slot_[dim] == nullptr,
+                               0)) {
+            throw std::runtime_error(
+                "invalid dim access: no physical table for dim " +
+                std::to_string(dim));
           }
-          auto &slot = *slots_[slot_id];
+          auto &slot = *dim_to_slot_[dim];
           const ValT *grad_src = flat_grads.data() + offsets[i];
           uint32_t t_idx =
               slot.transient_shards[shard_id]->get_or_allocate(key);
@@ -521,9 +509,11 @@ public:
   // =========================================================================
 
   std::error_code optimizer_step() {
-    for (uint32_t sid_ : slot_ids_) {
-      auto &slot = slot_storage_[slot_index_[sid_]];
-      slot->global_step++;
+    for (const auto &slot_ptr : slot_storage_) {
+      auto *slot = slot_ptr.get();
+      if (slot->optimizer.has_value()) {
+        slot->global_step++;
+      }
     }
 
     size_t num_shards = num_threads_;
@@ -531,8 +521,8 @@ public:
     auto do_shard = [&](size_t shard_begin, size_t shard_end) {
       epoch::with_epoch([&] {
         for (size_t shard_id = shard_begin; shard_id < shard_end; ++shard_id) {
-          for (uint32_t sid_ : slot_ids_) {
-            auto *slot = slots_[sid_];
+          for (const auto &slot_ptr : slot_storage_) {
+            auto *slot = slot_ptr.get();
             auto &shard = slot->transient_shards[shard_id];
             shard->for_each_accumulated(
                 [&](uint64_t feature_id, const ValT *accumulated_grad) {
@@ -575,19 +565,6 @@ public:
   }
 
   template <typename KeyT>
-  size_t compute_output_size(std::span<const KeyT> keys,
-                             std::span<int64_t> out_row_lengths) const {
-    size_t total = 0;
-    for (size_t i = 0; i < keys.size(); ++i) {
-      uint64_t key = static_cast<uint64_t>(keys[i]);
-      auto dim = static_cast<int64_t>(dim_for_key(key));
-      out_row_lengths[i] = dim;
-      total += dim;
-    }
-    return total;
-  }
-
-  template <typename KeyT>
   std::error_code assign(std::span<const KeyT> keys,
                          std::span<const ValT> flat_values,
                          std::span<const int64_t> row_lengths) {
@@ -595,16 +572,18 @@ public:
     auto offsets = compute_offsets(row_lengths);
 
     auto do_range = [&](size_t begin, size_t end) {
-      std::vector<std::vector<uint32_t>> local_free_slots(slot_ids_.size());
+      std::vector<std::vector<uint32_t>> local_free_slots(max_dim_ + 1);
       epoch::with_epoch([&] {
         for (size_t i = begin; i < end; ++i) {
           uint64_t key = static_cast<uint64_t>(keys[i]);
-          uint32_t slot_id = extract_slot(key);
-          if (__builtin_expect(slots_[slot_id] == nullptr, 0)) {
-            throw std::runtime_error("invalid slot_id access");
+          size_t dim = static_cast<size_t>(row_lengths[i]);
+          if (__builtin_expect(dim >= dim_to_slot_.size() ||
+                                   dim_to_slot_[dim] == nullptr,
+                               0)) {
+            throw std::runtime_error("invalid dim access");
           }
-          auto &slot = *slots_[slot_id];
-          auto &free_slots = local_free_slots[slot_index_[slot_id]];
+          auto &slot = *dim_to_slot_[dim];
+          auto &free_slots = local_free_slots[dim];
           const ValT *src = flat_values.data() + offsets[i];
 
           std::optional<uint32_t> preallocated_idx = std::nullopt;
@@ -672,17 +651,18 @@ public:
     auto offsets = compute_offsets(row_lengths);
 
     auto do_range = [&](size_t begin, size_t end) {
-      std::vector<std::vector<uint32_t>> local_free_slots(slot_ids_.size());
+      std::vector<std::vector<uint32_t>> local_free_slots(max_dim_ + 1);
       epoch::with_epoch([&] {
         for (size_t i = begin; i < end; ++i) {
           uint64_t key = static_cast<uint64_t>(keys[i]);
-          uint32_t slot_id = extract_slot(key);
-          if (__builtin_expect(slots_[slot_id] == nullptr, 0)) {
-            throw std::runtime_error("invalid slot_id access");
+          size_t dim = static_cast<size_t>(row_lengths[i]);
+          if (__builtin_expect(dim >= dim_to_slot_.size() ||
+                                   dim_to_slot_[dim] == nullptr,
+                               0)) {
+            throw std::runtime_error("invalid dim access");
           }
-          auto &slot = *slots_[slot_id];
-          auto &free_slots = local_free_slots[slot_index_[slot_id]];
-          size_t dim = slot.dim;
+          auto &slot = *dim_to_slot_[dim];
+          auto &free_slots = local_free_slots[dim];
           ValT *out = out_flat_values.data() + offsets[i];
 
           std::optional<uint32_t> preallocated_idx = std::nullopt;
@@ -759,15 +739,17 @@ public:
       epoch::with_epoch([&] {
         for (size_t i = begin; i < end; ++i) {
           uint64_t key = static_cast<uint64_t>(keys[i]);
-          uint32_t slot_id = extract_slot(key);
-          if (__builtin_expect(slots_[slot_id] == nullptr, 0)) {
-            throw std::runtime_error("invalid slot_id access");
+          bool found = false;
+          for (const auto &slot_ptr : slot_storage_) {
+            if (slot_ptr->key_map
+                    .Find(Key::Entry::make_key(key),
+                          [](const auto &) { return true; })
+                    .has_value()) {
+              found = true;
+              break;
+            }
           }
-          auto &slot = *slots_[slot_id];
-          out_exists[i] = slot.key_map
-                              .Find(Key::Entry::make_key(key),
-                                    [](const auto &e) { return true; })
-                              .has_value();
+          out_exists[i] = found;
         }
       });
     };
@@ -781,13 +763,10 @@ public:
       epoch::with_epoch([&] {
         for (size_t i = begin; i < end; ++i) {
           uint64_t key = static_cast<uint64_t>(keys[i]);
-          uint32_t slot_id = extract_slot(key);
-          if (__builtin_expect(slots_[slot_id] == nullptr, 0)) {
-            throw std::runtime_error("invalid slot_id access");
+          for (const auto &slot_ptr : slot_storage_) {
+            slot_ptr->key_map.Remove(Key::Entry::make_key(key),
+                                     [](const auto &) { return true; });
           }
-          auto &slot = *slots_[slot_id];
-          slot.key_map.Remove(Key::Entry::make_key(key),
-                              [](const auto &e) { return true; });
         }
       });
     };
@@ -796,8 +775,8 @@ public:
   }
 
   std::error_code clear() {
-    for (uint32_t sid : slot_ids_) {
-      auto *slot = slots_[sid];
+    for (const auto &slot_ptr : slot_storage_) {
+      auto *slot = slot_ptr.get();
       slot->key_map.clear();
       if (slot->optimizer.has_value()) {
         slot->optimizer->clear();
@@ -818,67 +797,23 @@ public:
     }
     size_t n = keys.size();
     auto do_range = [&](size_t begin, size_t end) {
-      std::vector<std::vector<uint32_t>> local_free_slots(slot_ids_.size());
       for (size_t i = begin; i < end; ++i) {
         uint64_t key = static_cast<uint64_t>(keys[i]);
-        uint32_t slot_id = extract_slot(key);
-        auto &slot = *slots_[slot_id];
-        auto &free_slots = local_free_slots[slot_index_[slot_id]];
 
-        epoch::with_epoch([&] {
-          std::optional<uint32_t> preallocated_idx = std::nullopt;
-          bool was_inserted = false;
+        for (const auto &slot_ptr : slot_storage_) {
+          auto *slot = slot_ptr.get();
+          auto found =
+              slot->key_map.Find(Key::Entry::make_key(key), [](const auto &e) {
+                return e.get_entry().second;
+              });
 
-          auto g = [&](std::optional<typename Key::Entry> opt_e)
-              -> std::pair<uint64_t, uint32_t> {
-            was_inserted = false;
-            uint32_t idx;
-            if (opt_e.has_value()) {
-              idx = opt_e->get_entry().second;
-            } else {
-              was_inserted = true;
-              if (preallocated_idx.has_value()) {
-                idx = *preallocated_idx;
-              } else if (!free_slots.empty()) {
-                idx = free_slots.back();
-                free_slots.pop_back();
-                preallocated_idx = idx;
-                if (initializer_.has_value()) {
-                  initializer_->initialize(
-                      std::span<ValT>(slot.arena.data(idx), slot.dim), key);
-                } else {
-                  std::fill_n(slot.arena.data(idx), slot.dim, ValT{0});
-                }
-              } else {
-                idx = slot.arena.allocate();
-                if (slot.optimizer.has_value())
-                  slot.optimizer->allocate();
-                preallocated_idx = idx;
-                if (initializer_.has_value()) {
-                  initializer_->initialize(
-                      std::span<ValT>(slot.arena.data(idx), slot.dim), key);
-                } else {
-                  std::fill_n(slot.arena.data(idx), slot.dim, ValT{0});
-                }
-              }
-            }
-            std::atomic_ref<uint64_t>(slot.arena.score_raw(idx))
+          if (found.has_value()) {
+            uint32_t idx = *found;
+            std::atomic_ref<uint64_t>(slot->arena.score_raw(idx))
                 .store(scores[i], std::memory_order_relaxed);
-            return std::make_pair(key, idx);
-          };
-          auto constr = [&](const auto &e) {
-            return e.has_value()
-                       ? slot.entries.make_entry(Key::Entry::make_key(key),
-                                                 g(e))
-                       : slot.entries.make_entry(Key::Entry::make_key(key),
-                                                 g(std::nullopt));
-          };
-          slot.key_map.Upsert(Key::Entry::make_key(key), constr, g);
-
-          if (preallocated_idx.has_value() && !was_inserted) {
-            free_slots.push_back(*preallocated_idx);
+            break; // Key found and updated, proceed to next key
           }
-        });
+        }
       }
     };
     dispatch_parallel(n, do_range);
@@ -887,13 +822,13 @@ public:
 
   size_t size() const {
     size_t s = 0;
-    for (uint32_t sid : slot_ids_) {
-      s += slots_[sid]->key_map.size();
+    for (const auto &slot_ptr : slot_storage_) {
+      s += slot_ptr->key_map.size();
     }
     return s;
   }
 
-  size_t num_slots() const { return slot_ids_.size(); }
+  size_t num_slots() const { return slot_storage_.size(); }
 
 private:
   template <typename Fn>
@@ -933,8 +868,8 @@ private:
 
   template <ExportOwnership Policy, typename VisitorFn>
   void export_with_opt_impl(VisitorFn &&visitor, size_t batch_size) {
-    for (uint32_t slot_id : slot_ids_) {
-      auto *slot = slots_[slot_id];
+    for (const auto &slot_ptr : slot_storage_) {
+      auto *slot = slot_ptr.get();
       size_t emb_dim = slot->dim;
       size_t opt_dim =
           slot->optimizer.has_value() ? slot->optimizer->state_dim() : 0;
@@ -968,11 +903,11 @@ private:
         if (buf.keys.empty())
           return true;
         if constexpr (Policy == ExportOwnership::kSpan) {
-          return visitor(std::span<const uint64_t>(buf.keys),
+          return visitor(emb_dim, std::span<const uint64_t>(buf.keys),
                          std::span<const ValT>(buf.vals),
                          std::span<const float>(buf.opts));
         } else {
-          bool cont = visitor(std::move(buf.keys), std::move(buf.vals),
+          bool cont = visitor(emb_dim, std::move(buf.keys), std::move(buf.vals),
                               std::move(buf.opts));
           buf.keys.clear();
           buf.vals.clear();
@@ -1063,26 +998,23 @@ private:
     }
   }
 
-  static constexpr size_t kMaxSlots = 65536;
-  std::array<SlotStore *, kMaxSlots> slots_{};
+  std::vector<SlotStore *> dim_to_slot_;
   std::vector<std::unique_ptr<SlotStore>> slot_storage_;
-  std::vector<uint32_t> slot_ids_;
-  std::array<uint16_t, kMaxSlots> slot_index_{};
   size_t num_threads_ = 0;
   exec::static_thread_pool pool_;
   Initializer initializer_;
   ScorePolicyT score_policy_;
   size_t max_dim_ = 0;
-  SlotKeyCodec codec_;
   static constexpr size_t kParallelThreshold = 64;
 
 public:
   bool has_score_policy() const { return ScorePolicyT::kHasScore; }
 
-  std::unordered_map<uint32_t, size_t> slot_dims() const {
-    std::unordered_map<uint32_t, size_t> result;
-    for (uint32_t id : slot_ids_)
-      result[id] = slots_[id]->dim;
+  std::vector<size_t> table_dims() const {
+    std::vector<size_t> result;
+    for (const auto &slot : slot_storage_) {
+      result.push_back(slot->dim);
+    }
     return result;
   }
 
@@ -1096,15 +1028,15 @@ public:
   // =========================================================================
 
   template <typename KeyT>
-  std::error_code
-  export_batch(se::Function<bool(std::span<const KeyT>, std::span<const ValT>,
-                                 std::span<const uint64_t>)>
-                   visitor,
-               size_t batch_size) {
+  std::error_code export_batch(
+      se::Function<bool(size_t, std::span<const KeyT>, std::span<const ValT>,
+                        std::span<const uint64_t>)>
+          visitor,
+      size_t batch_size) {
     bool has_score = ScorePolicyT::kHasScore;
 
-    for (uint32_t slot_id : slot_ids_) {
-      auto *slot = slots_[slot_id];
+    for (const auto &slot_ptr : slot_storage_) {
+      auto *slot = slot_ptr.get();
       size_t dim = slot->dim;
       int num_workers = static_cast<int>(parlay::num_workers());
 
@@ -1141,7 +1073,7 @@ public:
       auto flush_global = [&](GlobalBuffer &buf) -> bool {
         if (buf.keys.empty())
           return true;
-        bool cont = (*visitor)(std::span<const KeyT>(buf.keys),
+        bool cont = (*visitor)(dim, std::span<const KeyT>(buf.keys),
                                std::span<const ValT>(buf.vals),
                                std::span<const uint64_t>(buf.scores));
         return cont;
@@ -1267,24 +1199,24 @@ public:
     epoch::with_epoch([&] {
       for (size_t i = 0; i < n; ++i) {
         uint64_t key = keys[i];
-        uint32_t sid = extract_slot(key);
-        if (sid >= kMaxSlots || slots_[sid] == nullptr)
-          continue;
-        auto *slot = slots_[sid];
-        if (!slot->optimizer.has_value())
-          continue;
-        size_t opt_dim = slot->optimizer->state_dim();
-        if (opt_dim == 0)
-          continue;
+        for (const auto &slot_ptr : slot_storage_) {
+          auto *slot = slot_ptr.get();
+          if (!slot->optimizer.has_value())
+            continue;
+          size_t opt_dim = slot->optimizer->state_dim();
+          if (opt_dim == 0)
+            continue;
 
-        auto found =
-            slot->key_map.Find(Key::Entry::make_key(key), [](const auto &e) {
-              return e.get_entry().second;
-            });
-        if (found.has_value()) {
-          slot->optimizer->set_state(
-              *found,
-              std::span<const float>(opt_states.data() + i * opt_dim, opt_dim));
+          auto found =
+              slot->key_map.Find(Key::Entry::make_key(key), [](const auto &e) {
+                return e.get_entry().second;
+              });
+          if (found.has_value()) {
+            slot->optimizer->set_state(
+                *found, std::span<const float>(opt_states.data() + i * opt_dim,
+                                               opt_dim));
+            break; // Key found and updated, proceed to next key
+          }
         }
       }
     });
@@ -1295,21 +1227,22 @@ public:
   // ValT values are widened to float32 to provide a uniform interface
   // regardless of the store's native precision.
   void export_opt_state_batch(
-      se::Function<bool(std::span<const uint64_t>, std::span<const float>,
-                        std::span<const float>)>
+      se::Function<bool(size_t, std::span<const uint64_t>,
+                        std::span<const float>, std::span<const float>)>
           visitor,
       size_t batch_size) {
     export_batch_with_opt(
-        [&](std::span<const uint64_t> keys, std::span<const ValT> vals,
+        [&](size_t dim, std::span<const uint64_t> keys,
+            std::span<const ValT> vals,
             std::span<const float> opt_states) -> bool {
           if constexpr (std::is_same_v<ValT, float>) {
-            return (*visitor)(keys, vals, opt_states);
+            return (*visitor)(dim, keys, vals, opt_states);
           } else {
             thread_local std::vector<float> val_f32_buf;
             val_f32_buf.resize(vals.size());
             for (size_t i = 0; i < vals.size(); ++i)
               val_f32_buf[i] = static_cast<float>(vals[i]);
-            return (*visitor)(keys, std::span<const float>(val_f32_buf),
+            return (*visitor)(dim, keys, std::span<const float>(val_f32_buf),
                               opt_states);
           }
         },
@@ -1320,21 +1253,21 @@ public:
   // Same as export_opt_state_batch but visitor receives std::vector&&
   // for zero-copy Arrow C Data Interface construction.
   void export_opt_state_batch_owned(
-      se::Function<bool(std::vector<uint64_t> &&, std::vector<float> &&,
+      se::Function<bool(size_t, std::vector<uint64_t> &&, std::vector<float> &&,
                         std::vector<float> &&)>
           visitor,
       size_t batch_size) {
     export_batch_with_opt_owned(
-        [&](std::vector<uint64_t> &&keys, std::vector<ValT> &&vals,
+        [&](size_t dim, std::vector<uint64_t> &&keys, std::vector<ValT> &&vals,
             std::vector<float> &&opt_states) -> bool {
           if constexpr (std::is_same_v<ValT, float>) {
-            return (*visitor)(std::move(keys), std::move(vals),
+            return (*visitor)(dim, std::move(keys), std::move(vals),
                               std::move(opt_states));
           } else {
             std::vector<float> val_f32(vals.size());
             for (size_t i = 0; i < vals.size(); ++i)
               val_f32[i] = static_cast<float>(vals[i]);
-            return (*visitor)(std::move(keys), std::move(val_f32),
+            return (*visitor)(dim, std::move(keys), std::move(val_f32),
                               std::move(opt_states));
           }
         },
@@ -1359,8 +1292,8 @@ public:
 
     out_evicted_count = 0;
 
-    for (uint32_t slot_id : slot_ids_) {
-      auto *slot = slots_[slot_id];
+    for (const auto &slot_ptr : slot_storage_) {
+      auto *slot = slot_ptr.get();
       if (out_evicted_count >= max_evict_count)
         break;
 

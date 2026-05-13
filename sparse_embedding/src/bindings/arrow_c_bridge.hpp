@@ -132,8 +132,8 @@ inline ArrowSchema *make_list_schema(const char *name) {
 
 inline void build_record_batch_schema(ArrowSchema *out,
                                       const char *list_col_name) {
-  auto *slot_id = detail::make_leaf_schema("I", "slot_id"); // uint32
-  auto *key = detail::make_leaf_schema("L", "key");         // uint64
+  auto *dim = detail::make_leaf_schema("I", "dim"); // uint32
+  auto *key = detail::make_leaf_schema("L", "key"); // uint64
   auto *list_col = detail::make_list_schema(list_col_name);
 
   out->format = "+s"; // struct (record batch)
@@ -141,7 +141,7 @@ inline void build_record_batch_schema(ArrowSchema *out,
   out->metadata = nullptr;
   out->flags = kArrowFlagNullable;
   out->n_children = 3;
-  out->children = new ArrowSchema *[3] { slot_id, key, list_col };
+  out->children = new ArrowSchema *[3] { dim, key, list_col };
   out->dictionary = nullptr;
   out->private_data = nullptr;
   out->release = [](ArrowSchema *self) {
@@ -258,19 +258,19 @@ inline ArrowArray *make_list_array(std::vector<int32_t> &&offsets,
 // ============================================================================
 
 inline void build_record_batch_array(ArrowArray *out,
-                                     std::vector<uint32_t> &&slot_ids,
+                                     std::vector<uint32_t> &&dims,
                                      std::vector<uint64_t> &&keys,
                                      std::vector<int32_t> &&offsets,
                                      std::vector<float> &&flat_values) {
   int64_t n = static_cast<int64_t>(keys.size());
 
-  auto *slot_arr = detail::make_leaf_array(std::move(slot_ids));
+  auto *dim_arr = detail::make_leaf_array(std::move(dims));
   auto *key_arr = detail::make_leaf_array(std::move(keys));
   auto *val_child = detail::make_leaf_array(std::move(flat_values));
   auto *list_arr = detail::make_list_array(std::move(offsets), val_child);
 
   auto *ctx = new detail::RecordBatchCtx();
-  ctx->children[0] = slot_arr;
+  ctx->children[0] = dim_arr;
   ctx->children[1] = key_arr;
   ctx->children[2] = list_arr;
 
@@ -311,14 +311,13 @@ struct ArrowBatchPair {
   ArrowSchema schema;
 };
 
-inline ArrowBatchPair
-build_embedding_batch(std::vector<uint64_t> &&keys, std::vector<float> &&vals,
-                      const SlotKeyCodec &codec = SlotKeyCodec{}) {
+inline ArrowBatchPair build_embedding_batch(size_t emb_dim,
+                                            std::vector<uint64_t> &&keys,
+                                            std::vector<float> &&vals) {
   size_t n = keys.size();
   size_t dim = n > 0 ? vals.size() / n : 0;
 
-  uint32_t sid = n > 0 ? codec.decode_slot(keys[0]) : 0;
-  std::vector<uint32_t> slot_ids(n, sid);
+  std::vector<uint32_t> dims(n, static_cast<uint32_t>(emb_dim));
 
   std::vector<int32_t> offsets(n + 1);
   for (size_t i = 0; i <= n; ++i) {
@@ -327,20 +326,19 @@ build_embedding_batch(std::vector<uint64_t> &&keys, std::vector<float> &&vals,
 
   ArrowBatchPair pair;
   build_record_batch_schema(&pair.schema, "embedding");
-  build_record_batch_array(&pair.array, std::move(slot_ids), std::move(keys),
+  build_record_batch_array(&pair.array, std::move(dims), std::move(keys),
                            std::move(offsets), std::move(vals));
   return pair;
 }
 
-inline ArrowBatchPair
-build_opt_state_batch(std::vector<uint64_t> &&keys, std::vector<float> &&vals,
-                      std::vector<float> &&opt_states,
-                      const SlotKeyCodec &codec = SlotKeyCodec{}) {
+inline ArrowBatchPair build_opt_state_batch(size_t emb_dim,
+                                            std::vector<uint64_t> &&keys,
+                                            std::vector<float> &&vals,
+                                            std::vector<float> &&opt_states) {
   size_t n = keys.size();
   size_t opt_dim = n > 0 ? opt_states.size() / n : 0;
 
-  uint32_t sid = n > 0 ? codec.decode_slot(keys[0]) : 0;
-  std::vector<uint32_t> slot_ids(n, sid);
+  std::vector<uint32_t> dims(n, static_cast<uint32_t>(emb_dim));
 
   std::vector<int32_t> offsets(n + 1);
   for (size_t i = 0; i <= n; ++i) {
@@ -349,7 +347,7 @@ build_opt_state_batch(std::vector<uint64_t> &&keys, std::vector<float> &&vals,
 
   ArrowBatchPair pair;
   build_record_batch_schema(&pair.schema, "opt_state");
-  build_record_batch_array(&pair.array, std::move(slot_ids), std::move(keys),
+  build_record_batch_array(&pair.array, std::move(dims), std::move(keys),
                            std::move(offsets), std::move(opt_states));
   (void)vals;
   return pair;

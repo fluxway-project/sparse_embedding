@@ -18,8 +18,8 @@
 #ifndef SPARSE_EMBEDDING_EMBEDDING_TABLE_INTERFACE_HPP_
 #define SPARSE_EMBEDDING_EMBEDDING_TABLE_INTERFACE_HPP_
 
-#include <functional>
 #include <proxy/proxy.h>
+
 #include <span>
 #include <system_error>
 #include <vector>
@@ -148,8 +148,8 @@ using WeakMemOptimizerStep = pro::weak_dispatch<MemOptimizerStep>;
 // batch_size controls the maximum number of entries per visitor call.
 #define SE_EXPORT_BATCH_FACADE_SIG(key_t)                                      \
   std::error_code(                                                             \
-      se::Function<bool(std::span<const key_t>, std::span<const ValT>,         \
-                        std::span<const uint64_t>)>                            \
+      se::Function<bool(std::size_t, std::span<const key_t>,                   \
+                        std::span<const ValT>, std::span<const uint64_t>)>     \
           visitor,                                                             \
       std::size_t batch_size)
 
@@ -227,12 +227,12 @@ struct EmbeddingTableFacade : pro::facade_builder
   ::add_convention<pro::weak_dispatch<MemAssignOptStates>,
                    void(std::span<const uint64_t>, std::span<const float>)>
   ::add_convention<pro::weak_dispatch<MemExportOptStateBatch>,
-                   void(se::Function<bool(std::span<const uint64_t>,
+                   void(se::Function<bool(std::size_t, std::span<const uint64_t>,
                                          std::span<const float>,
                                          std::span<const float>)>,
                         std::size_t)>
   ::add_convention<pro::weak_dispatch<MemExportOptStateBatchOwned>,
-                   void(se::Function<bool(std::vector<uint64_t>&&,
+                   void(se::Function<bool(std::size_t, std::vector<uint64_t>&&,
                                          std::vector<float>&&,
                                          std::vector<float>&&)>,
                         std::size_t)>

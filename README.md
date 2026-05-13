@@ -65,7 +65,7 @@ Simulating realistic recommendation system training scenarios:
 
 | Operation | 1T | 4T | 8T | 16T | 32T | 64T |
 |------|----|----|----|-----|-----|-----|
-| forward_lookup | 3.25 Mops/s (1.66 GB/s) | 7.29 Mops/s (3.73 GB/s) | 11.14 Mops/s (5.70 GB/s) | 13.87 Mops/s (7.10 GB/s) | 13.51 Mops/s (6.92 GB/s) | 12.58 Mops/s (6.44 GB/s) |
+| forward_lookup | 3.24 Mops/s (1.66 GB/s) | 7.37 Mops/s (3.77 GB/s) | 11.23 Mops/s (5.75 GB/s) | 12.54 Mops/s (6.42 GB/s) | 15.08 Mops/s (7.72 GB/s) | 12.91 Mops/s (6.61 GB/s) |
 
 `forward_lookup` saturates around 16-32T, with an observed peak of 6.94 GB/s.
 
@@ -79,7 +79,7 @@ Simulating realistic recommendation system training scenarios:
 
 | Operation | 1T | 4T | 8T | 16T | 32T | 64T |
 |------|----|----|----|-----|-----|-----|
-| lookup_or_insert | 1.50 Mops/s | 2.66 Mops/s | 4.09 Mops/s | 4.73 Mops/s | 5.04 Mops/s | 4.88 Mops/s |
+| lookup_or_insert | 1.48 Mops/s | 2.60 Mops/s | 4.02 Mops/s | 4.88 Mops/s | 5.06 Mops/s | 5.17 Mops/s |
 
 1→8T shows a 3.6x linear speedup; post-8T, it saturates due to parlayhash CAS contention and DRAM write bandwidth limits.
 
@@ -87,13 +87,13 @@ Simulating realistic recommendation system training scenarios:
 
 | Operation | 1T | 4T | 8T | 16T | 32T | 64T |
 |------|----|----|----|-----|-----|-----|
-| assign | 1.50 Mops/s (0.77 GB/s) | 3.22 Mops/s (1.65 GB/s) | 4.95 Mops/s (2.53 GB/s) | 7.02 Mops/s (3.60 GB/s) | 6.77 Mops/s (3.47 GB/s) | 6.64 Mops/s (3.40 GB/s) |
+| assign | 1.49 Mops/s (0.76 GB/s) | 3.19 Mops/s (1.63 GB/s) | 4.93 Mops/s (2.52 GB/s) | 5.90 Mops/s (3.02 GB/s) | 6.15 Mops/s (3.15 GB/s) | 6.28 Mops/s (3.21 GB/s) |
 
 #### `accumulate_gradients` (Gradient Accumulation, Backward Pass)
 
 | Operation | 1T | 4T | 8T | 16T | 32T | 64T |
 |------|----|----|----|-----|-----|-----|
-| accumulate_gradients | 2.07 Mops/s | 5.73 Mops/s | 8.74 Mops/s | 10.81 Mops/s | 11.77 Mops/s | 10.90 Mops/s |
+| accumulate_gradients | 2.11 Mops/s | 5.76 Mops/s | 8.81 Mops/s | 11.33 Mops/s | 11.06 Mops/s | 10.66 Mops/s |
 
 Note: `accumulate_gradients` uses AVX-512 SIMD sharded Scatter-Reduce. With the fixed thread-pool threshold and thread-local buffers, the throughput scales efficiently up to 16-32 threads.
 
@@ -101,7 +101,7 @@ Note: `accumulate_gradients` uses AVX-512 SIMD sharded Scatter-Reduce. With the 
 
 | Operation | 1T | 4T | 8T | 16T | 32T | 64T |
 |------|----|----|----|-----|-----|-----|
-| optimizer_step | 5.70 Mops/s (5.83 GB/s) | 13.05 Mops/s (13.36 GB/s) | 19.76 Mops/s (20.23 GB/s) | 28.15 Mops/s (28.82 GB/s) | **34.19 Mops/s (35.01 GB/s)** | 28.52 Mops/s (29.20 GB/s) |
+| optimizer_step | 5.67 Mops/s (5.80 GB/s) | 12.99 Mops/s (13.30 GB/s) | 19.82 Mops/s (20.30 GB/s) | 30.73 Mops/s (31.47 GB/s) | **31.15 Mops/s (31.90 GB/s)** | 28.95 Mops/s (29.65 GB/s) |
 
 Note: `optimizer_step` processes the accumulated unique key set (approx. 252K). With proper parallel dispatch and removal of data races, the update scales impressively to 25.06 GB/s at 32 threads.
 
@@ -109,7 +109,7 @@ Note: `optimizer_step` processes the accumulated unique key set (approx. 252K). 
 
 | Operation | 1T | 4T | 8T | 16T | 32T | 64T |
 |------|----|----|----|-----|-----|-----|
-| contains | 9.49 Mops/s | 16.75 Mops/s | 20.84 Mops/s | 22.16 Mops/s | 23.38 Mops/s | 22.41 Mops/s |
+| contains | 9.40 Mops/s | 16.57 Mops/s | 20.69 Mops/s | 22.48 Mops/s | 23.64 Mops/s | 22.65 Mops/s |
 
 Pure hash lookup without embedding copies, limited by CPU and hash table bucket access latency, nears saturation after 8T.
 
@@ -117,7 +117,7 @@ Pure hash lookup without embedding copies, limited by CPU and hash table bucket 
 
 | Operation | 1T | 4T | 8T | 16T | 32T | 64T |
 |------|----|----|----|-----|-----|-----|
-| erase (6553 keys) | 11.99 Mops/s | 35.53 Mops/s | 58.05 Mops/s | 59.42 Mops/s | 43.31 Mops/s | 26.63 Mops/s |
+| erase (10% batch) | 12.39 Mops/s | 34.61 Mops/s | 63.85 Mops/s | 61.76 Mops/s | 49.25 Mops/s | 27.92 Mops/s |
 
 `erase` reaches its peak at 8T (64.49 Mops/s), and begins to decline due to NUMA cross-socket contention under Hyper-Threading.
 
@@ -127,11 +127,11 @@ The following throughputs were measured by calling the corresponding interfaces 
 
 | API | Throughput (Mops/s) | Description |
 |-----|---------------------|-------------|
-| `async_unique` | ~25.00 Mops/s | Async fetch of unique keys, ultra-fast hashing |
-| `async_lookup_or_insert` | ~4.57 Mops/s | Async insert and lookup, returning zero-copy tensors |
-| `async_lookup` | ~11.19 Mops/s | Async forward lookup without blocking the event loop |
-| `async_accumulate_gradients` | ~13.38 Mops/s | Async gradient accumulation without blocking the event loop |
-| **End-to-End Step** | **~3.61 Mops/s** | Full training step using full asyncio ops |
+| `async_unique` | ~25.58 Mops/s | Async fetch of unique keys, ultra-fast hashing |
+| `async_lookup_or_insert` | ~22.72 Mops/s | Async insert and lookup, returning zero-copy tensors |
+| `async_lookup` | ~27.40 Mops/s | Async forward lookup without blocking the event loop |
+| `async_assign` (Zipfian) | ~2.85 Mops/s | Async assignment under heavy power-law distribution |
+| **End-to-End Step** | **~3.87 Mops/s** | Full training step using full asyncio ops |
 
 All `EmbeddingStore` methods (e.g. `lookup_or_insert`, `assign`, `contains`, `erase`, `clear`, `assign_scores`, `accumulate_gradients`, `optimizer_step`) have high-performance, edge-triggered `async_*` variants. Thanks to DLPack and lock-free `eventfd` asyncio integration, the Python invocation overhead is minimized, easily sustaining millions of operations per second.
 

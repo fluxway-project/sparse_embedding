@@ -92,12 +92,12 @@ void make_child_array(ArrowArray *child, int64_t length, const void *buf0,
   child->private_data = nullptr;
 }
 
-std::string slot_uri(std::string_view base, uint32_t slot_id) {
+std::string dim_uri(std::string_view base, size_t dim) {
   std::ostringstream oss;
   oss << base;
   if (!base.empty() && base.back() != '/')
     oss << '/';
-  oss << "slot_" << std::setw(4) << std::setfill('0') << slot_id;
+  oss << "dim_" << std::setw(4) << std::setfill('0') << dim;
   return oss.str();
 }
 
@@ -126,11 +126,11 @@ const char *get_zstd_metadata() {
 // LanceCheckpointWriter
 // =============================================================================
 
-void LanceCheckpointWriter::begin(std::string_view uri, uint32_t slot_id,
+void LanceCheckpointWriter::begin(std::string_view uri, size_t dim,
                                   size_t optimizer_state_dim, bool has_score,
                                   CheckpointExportOptions options) {
-  uri_ = slot_uri(uri, slot_id);
-  slot_id_ = slot_id;
+  uri_ = dim_uri(uri, dim);
+  dim_ = dim;
   opt_state_dim_ = optimizer_state_dim;
   has_score_ = has_score;
   options_ = options;
@@ -386,11 +386,11 @@ void LanceCheckpointReader::close_stream() {
   stream_open_ = false;
 }
 
-void LanceCheckpointReader::open(std::string_view uri, uint32_t slot_id,
+void LanceCheckpointReader::open(std::string_view uri, size_t dim,
                                  uint64_t version, int64_t batch_size) {
   close_stream();
-  uri_ = slot_uri(uri, slot_id);
-  slot_id_ = slot_id;
+  uri_ = dim_uri(uri, dim);
+  dim_ = dim;
   version_ = version;
   batch_size_ = batch_size > 0 ? batch_size : 65536;
 

@@ -34,7 +34,7 @@ namespace se {
 // Plain struct — satisfies CheckpointWriterFacade via duck typing (no virtual).
 class LanceCheckpointWriter {
   std::string uri_;
-  uint32_t slot_id_ = 0;
+  size_t dim_ = 0;
   size_t opt_state_dim_ = 0;
   bool has_score_ = false;
   CheckpointExportOptions options_;
@@ -65,7 +65,7 @@ class LanceCheckpointWriter {
   static void release_array(ArrowArray *array);
 
 public:
-  void begin(std::string_view uri, uint32_t slot_id, size_t optimizer_state_dim,
+  void begin(std::string_view uri, size_t dim, size_t optimizer_state_dim,
              bool has_score, CheckpointExportOptions options);
 
   void write_batch(std::span<const uint64_t> keys, const void *embeddings,
@@ -78,14 +78,13 @@ public:
 // Plain struct — satisfies CheckpointReaderFacade via duck typing (no virtual).
 class LanceCheckpointReader {
   std::string uri_;
-  uint32_t slot_id_ = 0;
+  size_t dim_ = 0;
   uint64_t version_ = 0;
   CheckpointVersion version_info_{};
 
   ArrowArrayStream stream_{};
   ArrowSchema schema_{};
   bool stream_open_ = false;
-  size_t dim_ = 0;
   size_t opt_state_dim_ = 0;
   bool has_score_ = false;
   int64_t batch_size_ = 65536;
@@ -95,7 +94,7 @@ class LanceCheckpointReader {
 public:
   ~LanceCheckpointReader();
 
-  void open(std::string_view uri, uint32_t slot_id, uint64_t version,
+  void open(std::string_view uri, size_t dim, uint64_t version,
             int64_t batch_size = 65536);
 
   bool read_batch(size_t max_n, std::vector<uint64_t> &out_keys,

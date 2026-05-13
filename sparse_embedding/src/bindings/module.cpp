@@ -312,9 +312,8 @@ class EmbeddingStoreWrapper {
                    pro::proxy<se::EmbeddingTableFacade<se::bfloat16_t>>>;
   StoreProxyVariant store_;
   exec::static_thread_pool async_pool_;
-  std::unordered_map<uint32_t, size_t> slot_dims_;
-  size_t max_dim_ = 0;
   std::string dtype_;
+  std::vector<size_t> dims_; // physical table dims, indexed by slot index
 
   template <typename ValT> auto &get_store() {
     return std::get<pro::proxy<se::EmbeddingTableFacade<ValT>>>(store_);
@@ -330,16 +329,8 @@ class EmbeddingStoreWrapper {
     throw std::invalid_argument("unsupported dtype: " + dtype_);
   }
 
-  size_t compute_output_size(auto ks, std::span<int64_t> out_row_lengths) {
-    size_t total = 0;
-    for (size_t i = 0; i < ks.size(); ++i) {
-      uint64_t key = static_cast<uint64_t>(ks[i]);
-      uint32_t slot_id = codec_.decode_slot(key);
-      auto dim = static_cast<int64_t>(slot_dims_.at(slot_id));
-      out_row_lengths[i] = dim;
-      total += dim;
-    }
-    return total;
+  static void fill_uniform_row_lengths(std::span<int64_t> out, int64_t dim) {
+    std::fill(out.begin(), out.end(), dim);
   }
 
 public:
@@ -349,12 +340,11 @@ public:
       : async_pool_((emb_cfg.num_threads == 0)
                         ? std::max(1u, std::thread::hardware_concurrency())
                         : emb_cfg.num_threads),
-        slot_dims_(emb_cfg.slot_dims), dtype_(emb_cfg.dtype),
-        codec_(emb_cfg.slot_bits) {
-    for (auto &[slot, dim] : slot_dims_) {
-      if (dim > max_dim_)
-        max_dim_ = dim;
-    }
+        dtype_(emb_cfg.dtype) {
+
+    dims_ = emb_cfg.dims;
+    if (dims_.empty())
+      throw std::invalid_argument("dims must not be empty");
 
     size_t nt = (emb_cfg.num_threads == 0)
                     ? std::max(1u, std::thread::hardware_concurrency())
@@ -399,8 +389,8 @@ public:
       auto construct_with_policy = [&]<typename Policy>(Policy policy) {
         using StoreType = se::HogwildEmbeddingStore<ValT, Policy>;
         store_ = pro::make_proxy<se::EmbeddingTableFacade<ValT>, StoreType>(
-            slot_dims_, nt, std::move(init_proxy), emb_cfg.max_active_keys,
-            std::move(opt_factory), std::move(policy), emb_cfg.slot_bits);
+            dims_, nt, std::move(init_proxy), emb_cfg.max_active_keys,
+            std::move(opt_factory), std::move(policy));
       };
 
       if (score_policy_name == "none") {
@@ -428,44 +418,21 @@ public:
     return sz;
   }
 
-  size_t max_dim() { return max_dim_; }
-
-  size_t num_slots() { return slot_dims_.size(); }
-
-  size_t dim_for_slot(uint32_t slot_id) { return slot_dims_.at(slot_id); }
-
-  nb::list slot_ids() {
-    nb::list result;
-    for (auto &[id, _] : slot_dims_) {
-      result.append(id);
-    }
-    return result;
+  size_t max_dim() const {
+    if (dims_.empty())
+      return 0;
+    return *std::max_element(dims_.begin(), dims_.end());
   }
 
-  // ---- get_dims ----
+  size_t num_slots() const { return dims_.size(); }
 
-  nb::object get_dims(nb::object keys) {
-    auto [dlm_keys, cap_keys] = se::py::extract_dlpack_tensor(keys);
-    size_t n = get_dlm_size(dlm_keys);
-    int64_t shape[1] = {static_cast<int64_t>(n)};
-    DLManagedTensor *dlm =
-        se::py::create_output_tensor<int64_t>(std::span(shape));
-    auto *out = static_cast<int64_t *>(dlm->dl_tensor.data);
-
-    dispatch_on_key(dlm_keys, [&](auto ks) {
-      for (size_t i = 0; i < n; ++i) {
-        uint64_t key = static_cast<uint64_t>(ks[i]);
-        uint32_t slot_id = codec_.decode_slot(key);
-        out[i] = static_cast<int64_t>(slot_dims_.at(slot_id));
-      }
-    });
-
-    return se::py::wrap_output_tensor(dlm);
-  }
+  std::vector<size_t> table_dims() const { return dims_; }
 
   // ---- Sync Lookup ----
 
-  nb::tuple lookup(nb::object keys) {
+  nb::tuple lookup(nb::object keys, int64_t dim) {
+    if (dim <= 0)
+      throw std::invalid_argument("dim must be > 0");
     auto [dlm_keys, cap_keys] = se::py::extract_dlpack_tensor(keys);
     size_t n = get_dlm_size(dlm_keys);
     DLManagedTensor *vals_dlm = nullptr;
@@ -476,8 +443,9 @@ public:
       nb::gil_scoped_release release;
       dispatch_val([&]<typename ValT>() {
         dispatch_on_key(dlm_keys, [&](auto ks) {
-          auto row_lengths = std::make_unique_for_overwrite<int64_t[]>(n);
-          size_t total = compute_output_size(ks, {row_lengths.get(), n});
+          size_t total = static_cast<size_t>(dim) * n;
+          auto row_lengths = std::make_unique<int64_t[]>(n);
+          fill_uniform_row_lengths({row_lengths.get(), n}, dim);
 
           int64_t vals_shape[] = {static_cast<int64_t>(total)};
           vals_dlm = se::py::create_output_tensor<ValT>(vals_shape);
@@ -500,14 +468,15 @@ public:
         lens_dlm->deleter(lens_dlm);
       throw std::runtime_error(ec.message());
     }
-
     return nb::make_tuple(se::py::wrap_output_tensor(vals_dlm),
                           se::py::wrap_output_tensor(lens_dlm));
   }
 
   // ---- Sync lookup_or_insert ----
 
-  nb::tuple lookup_or_insert(nb::object keys) {
+  nb::tuple lookup_or_insert(nb::object keys, int64_t dim) {
+    if (dim <= 0)
+      throw std::invalid_argument("dim must be > 0");
     auto [dlm_keys, cap_keys] = se::py::extract_dlpack_tensor(keys);
     size_t n = get_dlm_size(dlm_keys);
     DLManagedTensor *vals_dlm = nullptr;
@@ -519,10 +488,14 @@ public:
       nb::gil_scoped_release release;
       dispatch_val([&]<typename ValT>() {
         dispatch_on_key(dlm_keys, [&](auto ks) {
+          size_t total = static_cast<size_t>(dim) * n;
+          auto row_lengths_buf = std::make_unique<int64_t[]>(n);
+          fill_uniform_row_lengths({row_lengths_buf.get(), n}, dim);
+
           int64_t lens_shape[] = {static_cast<int64_t>(n)};
-          lens_dlm = se::py::create_output_tensor<int64_t>(lens_shape);
+          lens_dlm =
+              se::py::wrap_unique_ptr_as_tensor(std::move(row_lengths_buf), n);
           auto *lens_out = static_cast<int64_t *>(lens_dlm->dl_tensor.data);
-          size_t total = compute_output_size(ks, {lens_out, n});
 
           int64_t vals_shape[] = {static_cast<int64_t>(total)};
           vals_dlm = se::py::create_output_tensor<ValT>(vals_shape);
@@ -531,7 +504,6 @@ public:
 
           auto vals_span = std::span<ValT>(
               static_cast<ValT *>(vals_dlm->dl_tensor.data), total);
-
           auto *mask_out = static_cast<uint8_t *>(mask_dlm->dl_tensor.data);
           ec = get_store<ValT>()->lookup_or_insert(
               ks, vals_span, {lens_out, n}, std::span<uint8_t>(mask_out, n));
@@ -548,13 +520,13 @@ public:
         mask_dlm->deleter(mask_dlm);
       throw std::runtime_error(ec.message());
     }
-
     return nb::make_tuple(se::py::wrap_output_tensor(vals_dlm),
                           se::py::wrap_output_tensor(lens_dlm),
                           se::py::wrap_output_tensor(mask_dlm));
   }
 
   // ---- Sync assign ----
+  // values must be a 2D tensor of shape (n, dim)
 
   void assign(nb::object keys, nb::object values) {
     auto [dlm_keys, cap_keys] = se::py::extract_dlpack_tensor(keys);
@@ -566,22 +538,28 @@ public:
       dispatch_val([&]<typename ValT>() {
         dispatch_on_key(dlm_keys, [&](auto ks) {
           auto val_span = se::py::dlpack_to_span<const ValT>(dlm_values);
+          int64_t dim = 0;
           if (dlm_values->dl_tensor.ndim == 2) {
-            size_t dim = dlm_values->dl_tensor.shape[1];
-            thread_local std::vector<int64_t> tls_row_lengths;
-            tls_row_lengths.resize(n);
-            int64_t *row_lengths = tls_row_lengths.data();
-            std::fill_n(row_lengths, n, dim);
-            ec = get_store<ValT>()->assign(ks, val_span, {row_lengths, n});
+            if (dlm_values->dl_tensor.shape[0] != static_cast<int64_t>(n)) {
+              throw std::invalid_argument(
+                  "values shape[0] must match keys length");
+            }
+            dim = dlm_values->dl_tensor.shape[1];
           } else if (dlm_values->dl_tensor.ndim == 1) {
-            thread_local std::vector<int64_t> tls_row_lengths;
-            tls_row_lengths.resize(n);
-            int64_t *row_lengths = tls_row_lengths.data();
-            compute_output_size(ks, {row_lengths, n});
-            ec = get_store<ValT>()->assign(ks, val_span, {row_lengths, n});
+            if (n > 0) {
+              if (dlm_values->dl_tensor.shape[0] % n != 0) {
+                throw std::invalid_argument(
+                    "1D values length must be a multiple of keys length");
+              }
+              dim = dlm_values->dl_tensor.shape[0] / n;
+            }
           } else {
-            throw std::invalid_argument("values must be 1D (ragged) or 2D");
+            throw std::invalid_argument("values must be a 1D or 2D tensor");
           }
+          thread_local std::vector<int64_t> tls_row_lengths;
+          tls_row_lengths.resize(n);
+          fill_uniform_row_lengths(tls_row_lengths, dim);
+          ec = get_store<ValT>()->assign(ks, val_span, tls_row_lengths);
         });
       });
     }
@@ -618,6 +596,23 @@ public:
     auto [dlm_keys, cap_keys] = se::py::extract_dlpack_tensor(keys);
     auto [dlm_grads, cap_grads] = se::py::extract_dlpack_tensor(grads);
     size_t n = get_dlm_size(dlm_keys);
+    int64_t dim = 0;
+    if (dlm_grads->dl_tensor.ndim == 2) {
+      if (dlm_grads->dl_tensor.shape[0] != static_cast<int64_t>(n)) {
+        throw std::invalid_argument("grads shape[0] must match keys length");
+      }
+      dim = dlm_grads->dl_tensor.shape[1];
+    } else if (dlm_grads->dl_tensor.ndim == 1) {
+      if (n > 0) {
+        if (dlm_grads->dl_tensor.shape[0] % n != 0) {
+          throw std::invalid_argument(
+              "1D grads length must be a multiple of keys length");
+        }
+        dim = dlm_grads->dl_tensor.shape[0] / n;
+      }
+    } else {
+      throw std::invalid_argument("grads must be a 1D or 2D tensor");
+    }
 
     std::error_code ec;
     {
@@ -627,10 +622,9 @@ public:
         dispatch_on_key(dlm_keys, [&](auto ks) {
           thread_local std::vector<int64_t> tls_row_lengths;
           tls_row_lengths.resize(n);
-          int64_t *row_lengths = tls_row_lengths.data();
-          compute_output_size(ks, {row_lengths, n});
+          fill_uniform_row_lengths(tls_row_lengths, dim);
           ec = get_store<ValT>()->accumulate_gradients(ks, grads_span,
-                                                       {row_lengths, n});
+                                                       tls_row_lengths);
         });
       });
     }
@@ -689,37 +683,33 @@ public:
 
   // ---- Async lookup ----
 
-  nb::object async_lookup(nb::object keys) {
+  nb::object async_lookup(nb::object keys, int64_t dim) {
+    if (dim <= 0)
+      throw std::invalid_argument("dim must be > 0");
     auto [dlm_keys, cap_keys] = se::py::extract_dlpack_tensor(keys);
     size_t n = get_dlm_size(dlm_keys);
     auto kdt = detect_key_dtype(dlm_keys);
-
     const void *keys_data =
         reinterpret_cast<const char *>(dlm_keys->dl_tensor.data) +
         dlm_keys->dl_tensor.byte_offset;
-
     auto wrapper_ptr = this;
-
     return dispatch_val([&]<typename ValT>() -> nb::object {
       return se::py::async_dispatch(
           async_pool_,
-          [wrapper_ptr, n, kdt, keys_data,
+          [wrapper_ptr, n, kdt, keys_data, dim,
            keys_keeper = std::make_shared<se::py::AsyncPyObjectKeeper>(
                cap_keys)]() -> std::pair<DLManagedTensor *, DLManagedTensor *> {
             DLManagedTensor *vals_dlm = nullptr;
             DLManagedTensor *lens_dlm = nullptr;
-
             try {
               auto do_lookup = [&](auto ks) {
-                auto row_lengths = std::make_unique_for_overwrite<int64_t[]>(n);
-                size_t total = wrapper_ptr->compute_output_size(
-                    ks, {row_lengths.get(), n});
-
+                size_t total = static_cast<size_t>(dim) * n;
+                auto row_lengths = std::make_unique<int64_t[]>(n);
+                fill_uniform_row_lengths({row_lengths.get(), n}, dim);
                 int64_t vals_shape[] = {static_cast<int64_t>(total)};
                 vals_dlm = se::py::create_output_tensor<ValT>(vals_shape);
                 lens_dlm = se::py::wrap_unique_ptr_as_tensor(
                     std::move(row_lengths), n);
-
                 auto vals_span = std::span<ValT>(
                     static_cast<ValT *>(vals_dlm->dl_tensor.data), total);
                 auto ec = wrapper_ptr->get_store<ValT>()->forward_lookup(
@@ -729,16 +719,12 @@ public:
                 if (ec)
                   throw std::runtime_error(ec.message());
               };
-
-              if (kdt == KeyDType::kInt64) {
-                auto ks = std::span<const int64_t>(
-                    static_cast<const int64_t *>(keys_data), n);
-                do_lookup(ks);
-              } else {
-                auto ks = std::span<const uint64_t>(
-                    static_cast<const uint64_t *>(keys_data), n);
-                do_lookup(ks);
-              }
+              if (kdt == KeyDType::kInt64)
+                do_lookup(std::span<const int64_t>(
+                    static_cast<const int64_t *>(keys_data), n));
+              else
+                do_lookup(std::span<const uint64_t>(
+                    static_cast<const uint64_t *>(keys_data), n));
             } catch (...) {
               if (vals_dlm)
                 vals_dlm->deleter(vals_dlm);
@@ -764,130 +750,116 @@ public:
     auto [dlm_keys, cap_keys] = se::py::extract_dlpack_tensor(keys);
     auto [dlm_values, cap_values] = se::py::extract_dlpack_tensor(values);
     size_t n = get_dlm_size(dlm_keys);
+    int64_t val_dim = 0;
+    if (dlm_values->dl_tensor.ndim == 2) {
+      if (dlm_values->dl_tensor.shape[0] != static_cast<int64_t>(n)) {
+        throw std::invalid_argument("values shape[0] must match keys length");
+      }
+      val_dim = dlm_values->dl_tensor.shape[1];
+    } else if (dlm_values->dl_tensor.ndim == 1) {
+      if (n > 0) {
+        if (dlm_values->dl_tensor.shape[0] % n != 0) {
+          throw std::invalid_argument(
+              "1D values length must be a multiple of keys length");
+        }
+        val_dim = dlm_values->dl_tensor.shape[0] / n;
+      }
+    } else {
+      throw std::invalid_argument("values must be a 1D or 2D tensor");
+    }
     auto kdt = detect_key_dtype(dlm_keys);
-    auto val_ndim = dlm_values->dl_tensor.ndim;
-    auto val_dim1 =
-        (val_ndim == 2) ? dlm_values->dl_tensor.shape[1] : size_t(0);
-
     const void *keys_data =
         reinterpret_cast<const char *>(dlm_keys->dl_tensor.data) +
         dlm_keys->dl_tensor.byte_offset;
     const void *values_data =
         reinterpret_cast<const char *>(dlm_values->dl_tensor.data) +
         dlm_values->dl_tensor.byte_offset;
-
     auto wrapper_ptr = this;
-
     return dispatch_val([&]<typename ValT>() -> nb::object {
       return se::py::async_dispatch(
           async_pool_,
-          [wrapper_ptr, n, kdt, keys_data, values_data, val_ndim, val_dim1,
+          [wrapper_ptr, n, kdt, keys_data, values_data, val_dim,
            keys_keeper =
                std::make_shared<se::py::AsyncPyObjectKeeper>(cap_keys),
            values_keeper = std::make_shared<se::py::AsyncPyObjectKeeper>(
                cap_values)]() -> std::error_code {
             auto do_assign = [&](auto ks) -> std::error_code {
-              if (val_ndim == 2) {
-                thread_local std::vector<int64_t> tls_row_lengths;
-                tls_row_lengths.resize(n);
-                int64_t *row_lengths = tls_row_lengths.data();
-                std::fill_n(row_lengths, n, val_dim1);
-                return wrapper_ptr->get_store<ValT>()->assign(
-                    ks,
-                    std::span<const ValT>(
-                        static_cast<const ValT *>(values_data), n * val_dim1),
-                    {row_lengths, n});
-              }
               thread_local std::vector<int64_t> tls_row_lengths;
               tls_row_lengths.resize(n);
-              int64_t *row_lengths = tls_row_lengths.data();
-              size_t total =
-                  wrapper_ptr->compute_output_size(ks, {row_lengths, n});
+              fill_uniform_row_lengths(tls_row_lengths, val_dim);
               return wrapper_ptr->get_store<ValT>()->assign(
                   ks,
                   std::span<const ValT>(static_cast<const ValT *>(values_data),
-                                        total),
-                  {row_lengths, n});
+                                        n * val_dim),
+                  tls_row_lengths);
             };
-
-            if (kdt == KeyDType::kInt64) {
+            if (kdt == KeyDType::kInt64)
               return do_assign(std::span<const int64_t>(
                   static_cast<const int64_t *>(keys_data), n));
-            }
             return do_assign(std::span<const uint64_t>(
                 static_cast<const uint64_t *>(keys_data), n));
           },
           [](nb::object future, std::error_code ec) {
-            if (!ec) {
+            if (!ec)
               future.attr("set_result")(nb::none());
-            } else {
-              nb::module_ builtins = nb::module_::import_("builtins");
+            else
               future.attr("set_exception")(
-                  builtins.attr("RuntimeError")(ec.message()));
-            }
+                  nb::module_::import_("builtins")
+                      .attr("RuntimeError")(ec.message()));
           });
     });
   }
 
   // ---- Async lookup_or_insert ----
 
-  nb::object async_lookup_or_insert(nb::object keys) {
+  nb::object async_lookup_or_insert(nb::object keys, int64_t dim) {
+    if (dim <= 0)
+      throw std::invalid_argument("dim must be > 0");
     auto [dlm_keys, cap_keys] = se::py::extract_dlpack_tensor(keys);
     size_t n = get_dlm_size(dlm_keys);
     auto kdt = detect_key_dtype(dlm_keys);
-
     const void *keys_data =
         reinterpret_cast<const char *>(dlm_keys->dl_tensor.data) +
         dlm_keys->dl_tensor.byte_offset;
-
     auto wrapper_ptr = this;
-
     return dispatch_val([&]<typename ValT>() -> nb::object {
       return se::py::async_dispatch(
           async_pool_,
-          [wrapper_ptr, n, kdt, keys_data,
+          [wrapper_ptr, n, kdt, keys_data, dim,
            keys_keeper = std::make_shared<se::py::AsyncPyObjectKeeper>(
                cap_keys)]() -> std::tuple<DLManagedTensor *, DLManagedTensor *,
                                           DLManagedTensor *> {
-            DLManagedTensor *vals_dlm = nullptr;
-            DLManagedTensor *lens_dlm = nullptr;
-            DLManagedTensor *mask_dlm = nullptr;
-
+            DLManagedTensor *vals_dlm = nullptr, *lens_dlm = nullptr,
+                            *mask_dlm = nullptr;
             try {
               auto do_loi = [&](auto ks) {
-                int64_t lens_shape[] = {static_cast<int64_t>(n)};
-                lens_dlm = se::py::create_output_tensor<int64_t>(lens_shape);
+                size_t total = static_cast<size_t>(dim) * n;
+                auto row_lengths = std::make_unique<int64_t[]>(n);
+                fill_uniform_row_lengths({row_lengths.get(), n}, dim);
+                lens_dlm = se::py::wrap_unique_ptr_as_tensor(
+                    std::move(row_lengths), n);
                 auto *lens_out =
                     static_cast<int64_t *>(lens_dlm->dl_tensor.data);
-                size_t total =
-                    wrapper_ptr->compute_output_size(ks, {lens_out, n});
-
                 int64_t vals_shape[] = {static_cast<int64_t>(total)};
                 vals_dlm = se::py::create_output_tensor<ValT>(vals_shape);
                 int64_t mask_shape[] = {static_cast<int64_t>(n)};
                 mask_dlm = se::py::create_output_tensor<uint8_t>(mask_shape);
-
                 auto vals_span = std::span<ValT>(
                     static_cast<ValT *>(vals_dlm->dl_tensor.data), total);
                 auto *mask_out =
                     static_cast<uint8_t *>(mask_dlm->dl_tensor.data);
-
                 auto ec = wrapper_ptr->get_store<ValT>()->lookup_or_insert(
                     ks, vals_span, {lens_out, n},
                     std::span<uint8_t>(mask_out, n));
                 if (ec)
                   throw std::runtime_error(ec.message());
               };
-
-              if (kdt == KeyDType::kInt64) {
-                auto ks = std::span<const int64_t>(
-                    static_cast<const int64_t *>(keys_data), n);
-                do_loi(ks);
-              } else {
-                auto ks = std::span<const uint64_t>(
-                    static_cast<const uint64_t *>(keys_data), n);
-                do_loi(ks);
-              }
+              if (kdt == KeyDType::kInt64)
+                do_loi(std::span<const int64_t>(
+                    static_cast<const int64_t *>(keys_data), n));
+              else
+                do_loi(std::span<const uint64_t>(
+                    static_cast<const uint64_t *>(keys_data), n));
             } catch (...) {
               if (vals_dlm)
                 vals_dlm->deleter(vals_dlm);
@@ -902,11 +874,10 @@ public:
           [](nb::object future,
              std::tuple<DLManagedTensor *, DLManagedTensor *, DLManagedTensor *>
                  result) {
-            auto [vals_dlm, lens_dlm, mask_dlm] = result;
-            future.attr("set_result")(
-                nb::make_tuple(se::py::wrap_output_tensor(vals_dlm),
-                               se::py::wrap_output_tensor(lens_dlm),
-                               se::py::wrap_output_tensor(mask_dlm)));
+            auto [v, l, m] = result;
+            future.attr("set_result")(nb::make_tuple(
+                se::py::wrap_output_tensor(v), se::py::wrap_output_tensor(l),
+                se::py::wrap_output_tensor(m)));
           });
     });
   }
@@ -917,21 +888,35 @@ public:
     auto [dlm_keys, cap_keys] = se::py::extract_dlpack_tensor(keys);
     auto [dlm_grads, cap_grads] = se::py::extract_dlpack_tensor(grads);
     size_t n = get_dlm_size(dlm_keys);
+    int64_t dim = 0;
+    if (dlm_grads->dl_tensor.ndim == 2) {
+      if (dlm_grads->dl_tensor.shape[0] != static_cast<int64_t>(n)) {
+        throw std::invalid_argument("grads shape[0] must match keys length");
+      }
+      dim = dlm_grads->dl_tensor.shape[1];
+    } else if (dlm_grads->dl_tensor.ndim == 1) {
+      if (n > 0) {
+        if (dlm_grads->dl_tensor.shape[0] % n != 0) {
+          throw std::invalid_argument(
+              "1D grads length must be a multiple of keys length");
+        }
+        dim = dlm_grads->dl_tensor.shape[0] / n;
+      }
+    } else {
+      throw std::invalid_argument("grads must be a 1D or 2D tensor");
+    }
     auto kdt = detect_key_dtype(dlm_keys);
-
     const void *keys_data =
         reinterpret_cast<const char *>(dlm_keys->dl_tensor.data) +
         dlm_keys->dl_tensor.byte_offset;
     const void *grads_data =
         reinterpret_cast<const char *>(dlm_grads->dl_tensor.data) +
         dlm_grads->dl_tensor.byte_offset;
-
     auto wrapper_ptr = this;
-
     return dispatch_val([&]<typename ValT>() -> nb::object {
       return se::py::async_dispatch(
           async_pool_,
-          [wrapper_ptr, n, kdt, keys_data, grads_data,
+          [wrapper_ptr, n, kdt, keys_data, grads_data, dim,
            keys_keeper =
                std::make_shared<se::py::AsyncPyObjectKeeper>(cap_keys),
            grads_keeper = std::make_shared<se::py::AsyncPyObjectKeeper>(
@@ -939,31 +924,26 @@ public:
             auto do_acc = [&](auto ks) -> std::error_code {
               thread_local std::vector<int64_t> tls_row_lengths;
               tls_row_lengths.resize(n);
-              int64_t *row_lengths = tls_row_lengths.data();
-              size_t total =
-                  wrapper_ptr->compute_output_size(ks, {row_lengths, n});
+              fill_uniform_row_lengths(tls_row_lengths, dim);
               return wrapper_ptr->get_store<ValT>()->accumulate_gradients(
                   ks,
                   std::span<const ValT>(static_cast<const ValT *>(grads_data),
-                                        total),
-                  {row_lengths, n});
+                                        n * dim),
+                  tls_row_lengths);
             };
-
-            if (kdt == KeyDType::kInt64) {
+            if (kdt == KeyDType::kInt64)
               return do_acc(std::span<const int64_t>(
                   static_cast<const int64_t *>(keys_data), n));
-            }
             return do_acc(std::span<const uint64_t>(
                 static_cast<const uint64_t *>(keys_data), n));
           },
           [](nb::object future, std::error_code ec) {
-            if (!ec) {
+            if (!ec)
               future.attr("set_result")(nb::none());
-            } else {
-              nb::module_ builtins = nb::module_::import_("builtins");
+            else
               future.attr("set_exception")(
-                  builtins.attr("RuntimeError")(ec.message()));
-            }
+                  nb::module_::import_("builtins")
+                      .attr("RuntimeError")(ec.message()));
           });
     });
   }
@@ -1174,9 +1154,8 @@ public:
     options.use_compression = use_compression;
 
     auto writer = checkpoint_writer_factory_;
-    if (!writer.has_value()) {
+    if (!writer.has_value())
       throw std::runtime_error("checkpoint backend not configured");
-    }
     bool has_score_policy = false;
     dispatch_val([&]<typename ValT>() {
       has_score_policy = get_store<ValT>()->has_score_policy();
@@ -1185,12 +1164,11 @@ public:
     {
       nb::gil_scoped_release release;
       dispatch_val([&]<typename ValT>() {
-        writer->begin(uri, 0, 0, has_score_policy, options);
-
-        for (auto &[slot_id, dim] : slot_dims_) {
-          // begin this slot
-          writer->begin(uri, static_cast<uint32_t>(slot_id), 0,
-                        has_score_policy, options);
+        auto dims = get_store<ValT>()->table_dims();
+        for (size_t table_idx = 0; table_idx < dims.size(); ++table_idx) {
+          size_t dim = dims[table_idx];
+          writer->begin(uri, static_cast<uint32_t>(dim), 0, has_score_policy,
+                        options);
 
           get_store<ValT>()->export_batch(
               pro::make_proxy<se::FunctionFacade<bool(
@@ -1199,7 +1177,6 @@ public:
                   [&](std::span<const uint64_t> keys,
                       std::span<const ValT> vals,
                       std::span<const uint64_t> scores) -> bool {
-                    // Filter by min_score for incremental mode
                     if (options.mode ==
                             se::CheckpointExportOptions::Mode::kIncremental &&
                         has_score_policy) {
@@ -1265,9 +1242,11 @@ public:
 
       dispatch_val([&]<typename ValT>() {
         bool has_score = get_store<ValT>()->has_score_policy();
+        auto dims = get_store<ValT>()->table_dims();
 
-        for (auto &[slot_id, dim] : slot_dims_) {
-          reader->open(uri, static_cast<uint32_t>(slot_id), version,
+        for (size_t table_idx = 0; table_idx < dims.size(); ++table_idx) {
+          size_t dim = dims[table_idx];
+          reader->open(uri, static_cast<uint32_t>(dim), version,
                        static_cast<int64_t>(options.batch_size));
 
           std::vector<uint64_t> keys;
@@ -1280,10 +1259,8 @@ public:
           while (reader->read_batch(options.batch_size, keys, embs, scores,
                                     opt_states)) {
             size_t n = keys.size();
-            size_t opt_dim = 0;
-            if (n > 0 && !opt_states.empty()) {
-              opt_dim = opt_states.size() / n;
-            }
+            size_t opt_dim =
+                (n > 0 && !opt_states.empty()) ? opt_states.size() / n : 0;
             if (n == 0)
               continue;
 
@@ -1296,13 +1273,11 @@ public:
                     std::memcpy(embs.data() + keep_idx * dim * sizeof(ValT),
                                 embs.data() + i * dim * sizeof(ValT),
                                 dim * sizeof(ValT));
-                    if (!scores.empty()) {
+                    if (!scores.empty())
                       scores[keep_idx] = scores[i];
-                    }
-                    if (!opt_states.empty()) {
+                    if (!opt_states.empty())
                       std::memcpy(opt_states.data() + keep_idx * opt_dim,
                                   opt_states.data() + i * opt_dim, opt_dim);
-                    }
                   }
                   keep_idx++;
                 }
@@ -1325,36 +1300,27 @@ public:
                   ->filter_span(std::span<const uint64_t>(keys),
                                 target_shard_id,
                                 std::span<bool>(cpp_mask.get(), n));
-
               compact_batch([&](size_t i) { return cpp_mask[i]; });
             } else if (!filter_fn.is_none()) {
               nb::gil_scoped_acquire acquire;
-
               auto keys_sp = std::shared_ptr<uint64_t[]>(
                   const_cast<uint64_t *>(keys.data()), [](uint64_t *) {});
               DLManagedTensor *in_dlm =
                   se::py::wrap_shared_ptr_as_tensor<uint64_t>(keys_sp, n);
               nb::object keys_arr = se::py::wrap_output_tensor(in_dlm);
-
               nb::object shard_ids_obj = filter_fn(keys_arr);
               keys_arr = nb::none();
-
               auto [dlm, cap] = se::py::extract_dlpack_tensor(shard_ids_obj);
               if (dlm->dl_tensor.ndim != 1 ||
-                  dlm->dl_tensor.shape[0] != static_cast<int64_t>(n)) {
+                  dlm->dl_tensor.shape[0] != static_cast<int64_t>(n))
                 throw std::runtime_error(
                     "filter_fn returned dlpack tensor of incorrect size");
-              }
               auto span = se::py::dlpack_to_span<uint32_t>(dlm);
               const uint32_t *shard_ids_data = span.data();
-
-              if (keys_sp.use_count() > 1) {
+              if (keys_sp.use_count() > 1)
                 throw std::runtime_error(
                     "filter_fn retained a reference to the keys tensor, which "
-                    "violates zero-copy memory safety. Please explicitly copy "
-                    "or clone the tensor inside filter_fn.");
-              }
-
+                    "violates zero-copy memory safety.");
               compact_batch([&](size_t i) {
                 return shard_ids_data[i] == target_shard_id;
               });
@@ -1367,15 +1333,14 @@ public:
                 reinterpret_cast<const ValT *>(embs.data()), n * dim);
             thread_local std::vector<int64_t> tls_row_lengths;
             tls_row_lengths.resize(n);
-            int64_t *row_lengths = tls_row_lengths.data();
-            std::fill_n(row_lengths, n, static_cast<int64_t>(dim));
+            fill_uniform_row_lengths(tls_row_lengths,
+                                     static_cast<int64_t>(dim));
             get_store<ValT>()->assign(std::span<const uint64_t>(keys), vals,
-                                      std::span<const int64_t>(row_lengths, n));
-            if (has_score && !scores.empty()) {
+                                      tls_row_lengths);
+            if (has_score && !scores.empty())
               get_store<ValT>()->assign_scores(
                   std::span<const uint64_t>(keys),
                   std::span<const uint64_t>(scores));
-            }
           }
         }
       });
@@ -1390,32 +1355,34 @@ public:
       auto &proxy = get_store<ValT>();
 
       if (!include_optimizer_state) {
-        proxy->export_batch(
+        get_store<ValT>()->export_batch(
             pro::make_proxy<se::FunctionFacade<bool(
-                std::span<const uint64_t>, std::span<const ValT>,
+                size_t, std::span<const uint64_t>, std::span<const ValT>,
                 std::span<const uint64_t>)>>(
-                [&](std::span<const uint64_t> keys, std::span<const ValT> vals,
+                [&](size_t dim, std::span<const uint64_t> keys,
+                    std::span<const ValT> vals,
                     std::span<const uint64_t>) -> bool {
                   nb::gil_scoped_acquire acquire;
                   auto keys_dlp = se::py::span_to_dlpack_no_delete(keys);
                   auto vals_dlp = se::py::span_to_dlpack_no_delete(vals);
-                  visitor(se::py::wrap_output_tensor(keys_dlp),
+                  visitor(dim, se::py::wrap_output_tensor(keys_dlp),
                           se::py::wrap_output_tensor(vals_dlp));
                   return true;
                 }),
             batch_size);
       } else {
-        proxy->export_opt_state_batch(
-            pro::make_proxy<se::FunctionFacade<bool(std::span<const uint64_t>,
-                                                    std::span<const float>,
-                                                    std::span<const float>)>>(
-                [&](std::span<const uint64_t> keys, std::span<const float> vals,
+        get_store<ValT>()->export_opt_state_batch(
+            pro::make_proxy<se::FunctionFacade<bool(
+                size_t, std::span<const uint64_t>, std::span<const float>,
+                std::span<const float>)>>(
+                [&](size_t dim, std::span<const uint64_t> keys,
+                    std::span<const float> vals,
                     std::span<const float> opt_states) -> bool {
                   nb::gil_scoped_acquire acquire;
                   auto keys_dlp = se::py::span_to_dlpack_no_delete(keys);
                   auto vals_dlp = se::py::span_to_dlpack_no_delete(vals);
                   auto opt_dlp = se::py::span_to_dlpack_no_delete(opt_states);
-                  visitor(se::py::wrap_output_tensor(keys_dlp),
+                  visitor(dim, se::py::wrap_output_tensor(keys_dlp),
                           se::py::wrap_output_tensor(vals_dlp),
                           se::py::wrap_output_tensor(opt_dlp));
                   return true;
@@ -1429,20 +1396,19 @@ public:
                             bool include_optimizer_state = false) {
     nb::gil_scoped_release release;
     dispatch_val([&]<typename ValT>() {
-      auto &proxy = get_store<ValT>();
-
-      proxy->export_opt_state_batch_owned(
-          pro::make_proxy<se::FunctionFacade<bool(std::vector<uint64_t> &&,
-                                                  std::vector<float> &&,
-                                                  std::vector<float> &&)>>(
-              [&](std::vector<uint64_t> &&keys, std::vector<float> &&vals,
+      get_store<ValT>()->export_opt_state_batch_owned(
+          pro::make_proxy<se::FunctionFacade<bool(
+              size_t, std::vector<uint64_t> &&, std::vector<float> &&,
+              std::vector<float> &&)>>(
+              [&](size_t dim, std::vector<uint64_t> &&keys,
+                  std::vector<float> &&vals,
                   std::vector<float> &&opt_states) -> bool {
                 auto pair = include_optimizer_state
                                 ? se::arrow::build_opt_state_batch(
-                                      std::move(keys), std::move(vals),
-                                      std::move(opt_states), codec_)
+                                      dim, std::move(keys), std::move(vals),
+                                      std::move(opt_states))
                                 : se::arrow::build_embedding_batch(
-                                      std::move(keys), std::move(vals), codec_);
+                                      dim, std::move(keys), std::move(vals));
                 auto array_addr = reinterpret_cast<uintptr_t>(&pair.array);
                 auto schema_addr = reinterpret_cast<uintptr_t>(&pair.schema);
                 nb::gil_scoped_acquire acquire;
@@ -1453,71 +1419,20 @@ public:
     });
   }
 
-  void assign_opt_state(int slot_id, nb::object keys_obj,
-                        nb::object opt_states_obj) {
-    if (slot_dims_.find(slot_id) == slot_dims_.end()) {
-      throw std::invalid_argument("invalid slot_id");
-    }
+  void assign_opt_state(nb::object keys_obj, nb::object opt_states_obj) {
     auto [dlm_keys, cap_keys] = se::py::extract_dlpack_tensor(keys_obj);
     auto [dlm_opt, cap_opt] = se::py::extract_dlpack_tensor(opt_states_obj);
-
     const uint64_t *keys =
         static_cast<const uint64_t *>(dlm_keys->dl_tensor.data);
     size_t n = dlm_keys->dl_tensor.shape[0];
     const float *opt_flat = static_cast<const float *>(dlm_opt->dl_tensor.data);
     size_t total_opt = static_cast<size_t>(dlm_opt->dl_tensor.shape[0]);
-
     nb::gil_scoped_release release;
     dispatch_val([&]<typename ValT>() {
       get_store<ValT>()->assign_opt_states(
           std::span<const uint64_t>(keys, n),
           std::span<const float>(opt_flat, total_opt));
     });
-  }
-
-  // ---- Slot-aware convenience API ----
-
-  uint8_t codec_slot_bits() const { return codec_.slot_bits(); }
-
-  nb::object encode_keys(uint32_t slot_id, nb::object raw_keys) {
-    auto [dlm_keys, cap_keys] = se::py::extract_dlpack_tensor(raw_keys);
-    size_t n = get_dlm_size(dlm_keys);
-    int64_t shape[1] = {static_cast<int64_t>(n)};
-    DLManagedTensor *out_dlm =
-        se::py::create_output_tensor<uint64_t>(std::span(shape));
-    auto *out = static_cast<uint64_t *>(out_dlm->dl_tensor.data);
-
-    dispatch_on_key(dlm_keys, [&](auto ks) {
-      for (size_t i = 0; i < n; ++i) {
-        out[i] = codec_.encode(slot_id, static_cast<uint64_t>(ks[i]));
-      }
-    });
-    return se::py::wrap_output_tensor(out_dlm);
-  }
-
-  nb::tuple lookup_slot(uint32_t slot_id, nb::object raw_keys) {
-    nb::object encoded = encode_keys(slot_id, raw_keys);
-    return lookup(encoded);
-  }
-
-  nb::tuple lookup_or_insert_slot(uint32_t slot_id, nb::object raw_keys) {
-    nb::object encoded = encode_keys(slot_id, raw_keys);
-    return lookup_or_insert(encoded);
-  }
-
-  void assign_slot(uint32_t slot_id, nb::object raw_keys, nb::object values) {
-    nb::object encoded = encode_keys(slot_id, raw_keys);
-    assign(encoded, values);
-  }
-
-  nb::object contains_slot(uint32_t slot_id, nb::object raw_keys) {
-    nb::object encoded = encode_keys(slot_id, raw_keys);
-    return contains(encoded);
-  }
-
-  void erase_slot(uint32_t slot_id, nb::object raw_keys) {
-    nb::object encoded = encode_keys(slot_id, raw_keys);
-    erase(encoded);
   }
 
 #ifdef SE_ENABLE_LANCE_CHECKPOINTER
@@ -1529,7 +1444,6 @@ public:
 #endif // SE_ENABLE_LANCE_CHECKPOINTER
 
 private:
-  se::SlotKeyCodec codec_;
 #ifdef SE_ENABLE_LANCE_CHECKPOINTER
   se::CheckpointWriterFactory checkpoint_writer_factory_;
   se::CheckpointReaderFactory checkpoint_reader_factory_;
@@ -1546,16 +1460,13 @@ NB_MODULE(_core, m) {
   m.doc() = "sparse_embedding C++ backend";
 
   nb::class_<se::EmbeddingConfig>(m, "EmbeddingConfig")
-      .def(nb::init<std::unordered_map<uint32_t, size_t>, size_t, std::string,
-                    size_t, uint8_t>(),
-           nb::arg("slot_dims"), nb::arg("num_threads") = 0,
-           nb::arg("dtype") = "float32", nb::arg("max_active_keys") = 1 << 20,
-           nb::arg("slot_bits") = 16)
-      .def_rw("slot_dims", &se::EmbeddingConfig::slot_dims)
+      .def(nb::init<std::vector<size_t>, size_t, std::string, size_t>(),
+           nb::arg("dims"), nb::arg("num_threads") = 0,
+           nb::arg("dtype") = "float32", nb::arg("max_active_keys") = 1 << 20)
+      .def_rw("dims", &se::EmbeddingConfig::dims)
       .def_rw("num_threads", &se::EmbeddingConfig::num_threads)
       .def_rw("dtype", &se::EmbeddingConfig::dtype)
-      .def_rw("max_active_keys", &se::EmbeddingConfig::max_active_keys)
-      .def_rw("slot_bits", &se::EmbeddingConfig::slot_bits);
+      .def_rw("max_active_keys", &se::EmbeddingConfig::max_active_keys);
 
   nb::class_<PyInitializer>(m, "Initializer");
 
@@ -1644,14 +1555,12 @@ NB_MODULE(_core, m) {
       .def("total_size", &EmbeddingStoreWrapper::total_size)
       .def("max_dim", &EmbeddingStoreWrapper::max_dim)
       .def("num_slots", &EmbeddingStoreWrapper::num_slots)
-      .def("slot_ids", &EmbeddingStoreWrapper::slot_ids)
-      .def("dim_for_slot", &EmbeddingStoreWrapper::dim_for_slot,
-           nb::arg("slot_id"))
-      .def("get_dims", &EmbeddingStoreWrapper::get_dims, nb::arg("keys"))
+      .def("table_dims", &EmbeddingStoreWrapper::table_dims)
 
-      .def("lookup", &EmbeddingStoreWrapper::lookup, nb::arg("keys"))
+      .def("lookup", &EmbeddingStoreWrapper::lookup, nb::arg("keys"),
+           nb::arg("dim"))
       .def("lookup_or_insert", &EmbeddingStoreWrapper::lookup_or_insert,
-           nb::arg("keys"))
+           nb::arg("keys"), nb::arg("dim"))
       .def("assign", &EmbeddingStoreWrapper::assign, nb::arg("keys"),
            nb::arg("values"))
       .def("contains", &EmbeddingStoreWrapper::contains, nb::arg("keys"))
@@ -1664,11 +1573,12 @@ NB_MODULE(_core, m) {
       .def("optimizer_step", &EmbeddingStoreWrapper::optimizer_step)
 
       .def("async_lookup", &EmbeddingStoreWrapper::async_lookup,
-           nb::arg("keys"))
+           nb::arg("keys"), nb::arg("dim"))
       .def("async_assign", &EmbeddingStoreWrapper::async_assign,
            nb::arg("keys"), nb::arg("values"))
       .def("async_lookup_or_insert",
-           &EmbeddingStoreWrapper::async_lookup_or_insert, nb::arg("keys"))
+           &EmbeddingStoreWrapper::async_lookup_or_insert, nb::arg("keys"),
+           nb::arg("dim"))
       .def("async_accumulate_gradients",
            &EmbeddingStoreWrapper::async_accumulate_gradients, nb::arg("keys"),
            nb::arg("grads"))
@@ -1684,28 +1594,11 @@ NB_MODULE(_core, m) {
            &EmbeddingStoreWrapper::export_batches_dlpack, nb::arg("visitor"),
            nb::arg("batch_size") = 65536,
            nb::arg("include_optimizer_state") = false)
-
       .def("export_batches_arrow", &EmbeddingStoreWrapper::export_batches_arrow,
            nb::arg("visitor"), nb::arg("batch_size") = 65536,
            nb::arg("include_optimizer_state") = false)
-
       .def("assign_opt_state", &EmbeddingStoreWrapper::assign_opt_state,
-           nb::arg("slot_id"), nb::arg("keys"), nb::arg("opt_states"))
-
-      .def("encode_keys", &EmbeddingStoreWrapper::encode_keys,
-           nb::arg("slot_id"), nb::arg("raw_keys"))
-      .def("lookup_slot", &EmbeddingStoreWrapper::lookup_slot,
-           nb::arg("slot_id"), nb::arg("raw_keys"))
-      .def("lookup_or_insert_slot",
-           &EmbeddingStoreWrapper::lookup_or_insert_slot, nb::arg("slot_id"),
-           nb::arg("raw_keys"))
-      .def("assign_slot", &EmbeddingStoreWrapper::assign_slot,
-           nb::arg("slot_id"), nb::arg("raw_keys"), nb::arg("values"))
-      .def("contains_slot", &EmbeddingStoreWrapper::contains_slot,
-           nb::arg("slot_id"), nb::arg("raw_keys"))
-      .def("erase_slot", &EmbeddingStoreWrapper::erase_slot, nb::arg("slot_id"),
-           nb::arg("raw_keys"))
-      .def_prop_ro("codec_slot_bits", &EmbeddingStoreWrapper::codec_slot_bits)
+           nb::arg("keys"), nb::arg("opt_states"))
 
 #ifdef SE_ENABLE_LANCE_CHECKPOINTER
       .def("save_checkpoint", &EmbeddingStoreWrapper::save_checkpoint,
@@ -1860,4 +1753,117 @@ NB_MODULE(_core, m) {
             std::make_shared<decltype(proxy)>(std::move(proxy))};
       },
       nb::arg("num_shards"));
+
+  // ---------------------------------------------------------------------------
+  // Key codec utilities
+  //
+  // Slot bits are packed into the most-significant bits of the uint64 key.
+  // Layout (slot_bits = 16):
+  //   [63..48] slot_id   [47..0] raw_key
+  //
+  // These are pure compute functions with no store state.  They are
+  // intentionally separate from EmbeddingStore so the store remains fully
+  // schema-agnostic.
+  // ---------------------------------------------------------------------------
+
+  m.def(
+      "encode_keys",
+      [](nb::object raw_keys_obj, uint32_t slot_id,
+         int slot_bits) -> nb::object {
+        if (slot_bits <= 0 || slot_bits >= 64)
+          throw std::invalid_argument("slot_bits must be in [1, 63]");
+        if (slot_id >= (1ULL << slot_bits))
+          throw std::invalid_argument(
+              "slot_id is too large for the given slot_bits");
+
+        auto [dlm, cap] = se::py::extract_dlpack_tensor(raw_keys_obj);
+        size_t n = static_cast<size_t>(dlm->dl_tensor.shape[0]);
+        const uint64_t slot_prefix = static_cast<uint64_t>(slot_id)
+                                     << (64 - slot_bits);
+        const uint64_t raw_mask = (slot_bits == 64)
+                                      ? ~uint64_t{0}
+                                      : ((uint64_t{1} << (64 - slot_bits)) - 1);
+
+        const void *src_data =
+            reinterpret_cast<const char *>(dlm->dl_tensor.data) +
+            dlm->dl_tensor.byte_offset;
+
+        auto out_dlm = se::py::create_output_tensor<uint64_t>(
+            std::array<int64_t, 1>{static_cast<int64_t>(n)});
+        uint64_t *out = static_cast<uint64_t *>(out_dlm->dl_tensor.data);
+
+        // Detect input dtype
+        bool is_signed = (dlm->dl_tensor.dtype.code == kDLInt);
+        const uint64_t *src = static_cast<const uint64_t *>(src_data);
+
+        size_t i = 0;
+#if defined(__AVX512F__) && defined(__AVX512DQ__)
+        __m512i v_prefix = _mm512_set1_epi64(static_cast<int64_t>(slot_prefix));
+        __m512i v_mask = _mm512_set1_epi64(static_cast<int64_t>(raw_mask));
+        for (; i + 8 <= n; i += 8) {
+          __m512i v_raw = _mm512_loadu_si512(src + i);
+          __m512i v_enc =
+              _mm512_or_si512(v_prefix, _mm512_and_si512(v_raw, v_mask));
+          _mm512_storeu_si512(out + i, v_enc);
+        }
+#endif
+        for (; i < n; ++i)
+          out[i] = slot_prefix | (src[i] & raw_mask);
+
+        return se::py::wrap_output_tensor(out_dlm);
+      },
+      nb::arg("raw_keys"), nb::arg("slot_id"), nb::arg("slot_bits") = 16,
+      "Encode raw keys by packing slot_id into the top slot_bits bits.\n"
+      "Returns a uint64 tensor of the same length.");
+
+  m.def(
+      "decode_keys",
+      [](nb::object encoded_keys_obj, int slot_bits) -> nb::object {
+        if (slot_bits <= 0 || slot_bits >= 64)
+          throw std::invalid_argument("slot_bits must be in [1, 63]");
+
+        auto [dlm, cap] = se::py::extract_dlpack_tensor(encoded_keys_obj);
+        size_t n = static_cast<size_t>(dlm->dl_tensor.shape[0]);
+        const uint64_t raw_mask = (slot_bits == 64)
+                                      ? ~uint64_t{0}
+                                      : ((uint64_t{1} << (64 - slot_bits)) - 1);
+        const int shift = 64 - slot_bits;
+
+        const uint64_t *src = reinterpret_cast<const uint64_t *>(
+            reinterpret_cast<const char *>(dlm->dl_tensor.data) +
+            dlm->dl_tensor.byte_offset);
+
+        auto raw_dlm = se::py::create_output_tensor<uint64_t>(
+            std::array<int64_t, 1>{static_cast<int64_t>(n)});
+        auto slot_dlm = se::py::create_output_tensor<uint32_t>(
+            std::array<int64_t, 1>{static_cast<int64_t>(n)});
+        uint64_t *raw_out = static_cast<uint64_t *>(raw_dlm->dl_tensor.data);
+        uint32_t *slot_out = static_cast<uint32_t *>(slot_dlm->dl_tensor.data);
+
+        size_t i = 0;
+#if defined(__AVX512F__) && defined(__AVX512DQ__)
+        __m512i v_mask = _mm512_set1_epi64(static_cast<int64_t>(raw_mask));
+        for (; i + 8 <= n; i += 8) {
+          __m512i v_enc = _mm512_loadu_si512(src + i);
+          __m512i v_raw = _mm512_and_si512(v_enc, v_mask);
+          __m512i v_slot = _mm512_srli_epi64(v_enc, shift);
+          _mm512_storeu_si512(raw_out + i, v_raw);
+          // compress 8×uint64 slot_ids down to 8×uint32
+          uint64_t tmp[8];
+          _mm512_storeu_si512(tmp, v_slot);
+          for (int j = 0; j < 8; ++j)
+            slot_out[i + j] = static_cast<uint32_t>(tmp[j]);
+        }
+#endif
+        for (; i < n; ++i) {
+          raw_out[i] = src[i] & raw_mask;
+          slot_out[i] = static_cast<uint32_t>(src[i] >> shift);
+        }
+
+        return nb::make_tuple(se::py::wrap_output_tensor(raw_dlm),
+                              se::py::wrap_output_tensor(slot_dlm));
+      },
+      nb::arg("encoded_keys"), nb::arg("slot_bits") = 16,
+      "Decode encoded keys into (raw_keys: uint64, slot_ids: uint32).\n"
+      "Inverse of encode_keys.");
 }

@@ -21,16 +21,16 @@
 #include <cstddef>
 #include <cstdint>
 #include <string>
-#include <unordered_map>
+#include <vector>
 
 namespace se {
 
 struct EmbeddingConfig {
-  std::unordered_map<uint32_t, size_t> slot_dims;
+  std::vector<size_t>
+      dims; // physical table dims, each unique value creates one SlotStore
   size_t num_threads = 0; // 0 means auto
   std::string dtype = "float32";
   size_t max_active_keys = 1048576; // 1 << 20
-  uint8_t slot_bits = 16;
 };
 
 } // namespace se

@@ -119,8 +119,7 @@ int main() {
               << std::string(56, '-') << "\n";
 
     HogwildEmbeddingStore<float, NoScorePolicy> store(
-        {{0, kDim}}, num_threads, {}, kMaxActiveKeys, opt_factory,
-        NoScorePolicy{});
+        {kDim}, num_threads, {}, kMaxActiveKeys, opt_factory, NoScorePolicy{});
 
     std::mt19937_64 gen(42);
     Timer timer;

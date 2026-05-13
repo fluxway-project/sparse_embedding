@@ -16,7 +16,9 @@ from ._core import (
     Uniform,
     Zeros,
     async_unique,
+    decode_keys,
     drain_wake_queue,
+    encode_keys,
     wake_fd,
 )
 
@@ -30,6 +32,8 @@ __all__ = [
     "Initializer",
     "EmbeddingStore",
     "async_unique",
+    "encode_keys",
+    "decode_keys",
     "Partitioner",
     "ModuloPartitioner",
     "FastRangePartitioner",

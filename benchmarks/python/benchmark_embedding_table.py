@@ -38,9 +38,8 @@ class EmbeddingTableBenchmark:
         self.store = self._create_store()
 
     def _create_store(self) -> sparse_embedding.EmbeddingStore:
-        slot_dims = {0: self.dim}
         config = sparse_embedding.EmbeddingConfig(
-            slot_dims=slot_dims, num_threads=self.num_threads, dtype="float32"
+            dims=[self.dim], num_threads=self.num_threads, dtype="float32"
         )
         initializer = sparse_embedding.Zeros()
         return sparse_embedding.EmbeddingStore(
@@ -58,8 +57,10 @@ class EmbeddingTableBenchmark:
             )
             # Warmup to ensure JIT/OS pages are ready
             for _ in range(3):
-                self.store.lookup_or_insert(keys)
-            runner.run(lambda: self.store.lookup_or_insert(keys), batch_size)
+                self.store.lookup_or_insert(keys, dim=self.dim)
+            runner.run(
+                lambda: self.store.lookup_or_insert(keys, dim=self.dim), batch_size
+            )
 
     def benchmark_query(self, batch_sizes: list[int], iters: int = 10):
         print(f"\n=== Query Benchmark (lookup) [Threads: {self.num_threads}] ===")
@@ -75,8 +76,8 @@ class EmbeddingTableBenchmark:
             keys = np.random.randint(0, num_keys, size=batch_size, dtype=np.int64)
             # Warmup
             for _ in range(3):
-                self.store.lookup(keys)
-            runner.run(lambda: self.store.lookup(keys), batch_size)
+                self.store.lookup(keys, dim=self.dim)
+            runner.run(lambda: self.store.lookup(keys, dim=self.dim), batch_size)
 
     def benchmark_assign(self, batch_sizes: list[int], iters: int = 10):
         print(
@@ -102,12 +103,12 @@ class EmbeddingTableBenchmark:
             )
             values = np.random.rand(batch_size, self.dim).astype(np.float32)
             # Warmup
-            self.store.lookup_or_insert(keys)
+            self.store.lookup_or_insert(keys, dim=self.dim)
             self.store.accumulate_gradients(keys, values)
             self.store.optimizer_step()
 
             def e2e_step():
-                self.store.lookup(keys)
+                self.store.lookup(keys, dim=self.dim)
                 self.store.accumulate_gradients(keys, values)
                 self.store.optimizer_step()
 

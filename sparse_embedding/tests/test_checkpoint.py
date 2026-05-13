@@ -21,12 +21,15 @@ from sparse_embedding.checkpoint import get_backend
 
 LANCE_URI = "/tmp/test_lance_distributed_ckpt"
 NUM_ORIG_KEYS = 1000
-DIMS = {0: 8, 1: 16}
+# Two feature groups with distinct dims; group 0 uses dim=8, group 1 uses dim=16.
+# Keys for group 1 are namespace-separated by embedding slot bits into high bits.
+DIMS = {0: 8, 1: 16}  # slot_id -> dim, for test bookkeeping only
+UNIQUE_DIMS = sorted(set(DIMS.values()))  # [8, 16] — what the store actually needs
 
 
-def make_cfg(slot_dims: dict, threads: int = 4, max_keys: int = 65536):
+def make_cfg(dims, threads: int = 4, max_keys: int = 65536):
     return se.EmbeddingConfig(
-        slot_dims=slot_dims,
+        dims=dims if isinstance(dims, list) else sorted(set(dims.values())),
         num_threads=threads,
         dtype="float32",
         max_active_keys=max_keys,
@@ -34,7 +37,7 @@ def make_cfg(slot_dims: dict, threads: int = 4, max_keys: int = 65536):
 
 
 def lookup_np(store, keys: np.ndarray, dim: int) -> np.ndarray:
-    vals_dlp, _ = store.lookup(keys)
+    vals_dlp, _ = store.lookup(keys, dim=dim)
     return np.from_dlpack(vals_dlp).reshape(-1, dim)
 
 
@@ -63,7 +66,7 @@ def verify_shard_contents(store, truth, dims, partitioner, shard_id):
         if len(expected_keys) == 0:
             continue
 
-        vals_dlp, _ = store.lookup(expected_keys)
+        vals_dlp, _ = store.lookup(expected_keys, dim=dim)
         got = np.from_dlpack(vals_dlp).reshape(-1, dim)
         np.testing.assert_allclose(
             got,
@@ -82,32 +85,29 @@ async def distributed_save(
     uri: str,
     num_shards: int,
     truth: dict,
-    dims: dict,
+    slot_id_to_dim: dict,  # {slot_id: dim}, used only for test bookkeeping
     backend,
     optimizer_config=None,
 ):
     partitioner = se.ModuloPartitioner(num_shards=num_shards)
+    store_dims = sorted(set(slot_id_to_dim.values()))
 
-    init_store = se.EmbeddingStore(make_cfg(dims))
+    init_store = se.EmbeddingStore(make_cfg(store_dims))
     await asyncio.to_thread(backend.init_dataset, init_store, uri)
 
     async def worker_export(shard_id: int) -> list:
-        cfg = make_cfg(dims)
         store = se.EmbeddingStore(
-            cfg, **({"optimizer_config": optimizer_config} if optimizer_config else {})
+            make_cfg(store_dims),
+            **({"optimizer_config": optimizer_config} if optimizer_config else {}),
         )
-
-        assigns = []
-        for slot_id, (s_keys, embeds) in truth.items():
-            mask = np.from_dlpack(partitioner.filter(s_keys, shard_id))
-            my_keys = s_keys[mask]
-            my_embeds = embeds[mask]
-            if len(my_keys) > 0:
-                assigns.append(store.async_assign(my_keys, my_embeds.ravel()))
-
+        assigns = [
+            store.async_assign(s_keys[mask], embeds[mask])
+            for slot_id, (s_keys, embeds) in truth.items()
+            if len(mask := np.from_dlpack(partitioner.filter(s_keys, shard_id))) > 0
+            and mask.any()
+        ]
         if assigns:
             await asyncio.gather(*assigns)
-
         return await asyncio.to_thread(backend.export_fragments, store, uri)
 
     all_metas = await asyncio.gather(*[worker_export(s) for s in range(num_shards)])
@@ -119,12 +119,12 @@ async def load_shard(
     shard_id: int,
     partitioner,
     backend,
-    dims: dict = DIMS,
+    dims: list = UNIQUE_DIMS,
     optimizer_config=None,
 ) -> se.EmbeddingStore:
-    cfg = make_cfg(dims)
     store = se.EmbeddingStore(
-        cfg, **({"optimizer_config": optimizer_config} if optimizer_config else {})
+        make_cfg(dims),
+        **({"optimizer_config": optimizer_config} if optimizer_config else {}),
     )
     await asyncio.to_thread(
         backend.load, store, uri, filter_fn=partitioner, target_shard_id=shard_id
@@ -204,7 +204,7 @@ def test_assign_and_lookup_lfu():
     store = se.EmbeddingStore(make_cfg({0: 4}), score_policy="lfu")
     keys = np.array([0, 1, 2], dtype=np.uint64)
     vals = np.array([[1, 2, 3, 4], [5, 6, 7, 8], [9, 10, 11, 12]], dtype=np.float32)
-    store.assign(keys, vals.ravel())
+    store.assign(keys, vals)
     assert store.total_size() == 3
     result = lookup_np(store, keys, 4)
     np.testing.assert_allclose(result, vals, atol=1e-5)
@@ -216,7 +216,7 @@ def test_assign_and_lookup_no_score():
     store = se.EmbeddingStore(make_cfg({0: 4}), score_policy="none")
     keys = np.array([0, 1, 2], dtype=np.uint64)
     vals = np.array([[1, 2, 3, 4], [5, 6, 7, 8], [9, 10, 11, 12]], dtype=np.float32)
-    store.assign(keys, vals.ravel())
+    store.assign(keys, vals)
     result = lookup_np(store, keys, 4)
     np.testing.assert_allclose(result, vals, atol=1e-5)
 
@@ -227,7 +227,7 @@ def test_checkpoint_load_with_resharding():
         shutil.rmtree(ckpt_dir)
 
     config = sparse_embedding.EmbeddingConfig(
-        slot_dims={0: 8, 1: 8}, num_threads=2, dtype="float32", max_active_keys=1000
+        dims=[8], num_threads=2, dtype="float32", max_active_keys=1000
     )
     store = sparse_embedding.EmbeddingStore(config)
     try:
@@ -249,7 +249,7 @@ def test_checkpoint_load_with_resharding():
             store.clear()
             shard_keys = keys_slotted[(keys % num_shards) == shard_id]
             if len(shard_keys) > 0:
-                store.lookup_or_insert(shard_keys)
+                store.lookup_or_insert(shard_keys, dim=8)
             shard_ckpt_dir = os.path.join(base_dir, f"shard_{shard_id}")
             store.save_checkpoint(shard_ckpt_dir)
 
@@ -298,7 +298,7 @@ def test_checkpoint_load_with_resharding():
 
 def test_async_assign_and_lookup_correctness():
     async def run():
-        cfg = make_cfg({0: 4, 1: 8})
+        cfg = make_cfg([4, 8])
         store = se.EmbeddingStore(cfg)
         rng = np.random.default_rng(7)
 
@@ -308,15 +308,15 @@ def test_async_assign_and_lookup_correctness():
         vals1 = rng.standard_normal((500, 8)).astype(np.float32)
 
         await asyncio.gather(
-            store.async_assign(keys0, vals0.ravel()),
-            store.async_assign(keys1, vals1.ravel()),
+            store.async_assign(keys0, vals0),
+            store.async_assign(keys1, vals1),
         )
 
         assert store.total_size() == 1000
 
         res0_dlp, res1_dlp = await asyncio.gather(
-            store.async_lookup(keys0),
-            store.async_lookup(keys1),
+            store.async_lookup(keys0, dim=4),
+            store.async_lookup(keys1, dim=8),
         )
         got0 = np.from_dlpack(res0_dlp[0]).reshape(-1, 4)
         got1 = np.from_dlpack(res1_dlp[0]).reshape(-1, 8)
@@ -370,7 +370,7 @@ def test_single_shard_roundtrip_value_correctness(lance_tmp_uri):
 
     for slot_id, (s_keys, embeds) in truth.items():
         dim = DIMS[slot_id]
-        vals_dlp, _ = store.lookup(s_keys)
+        vals_dlp, _ = store.lookup(s_keys, dim=dim)
         got = np.from_dlpack(vals_dlp).reshape(-1, dim)
         np.testing.assert_allclose(
             got, embeds, atol=1e-5, err_msg=f"slot {slot_id} value mismatch"
@@ -410,31 +410,29 @@ def test_optimizer_state_save_and_load_single_node(lance_tmp_uri):
     rng = np.random.default_rng(99)
 
     adam = se.Adam(lr=1e-2)
-    slot_dims = {0: 4, 1: 8}
-    cfg = make_cfg(slot_dims)
-
-    store1 = se.EmbeddingStore(cfg, optimizer_config=adam)
+    dim_map = {0: 4, 1: 8}
+    store1 = se.EmbeddingStore(make_cfg([4, 8]), optimizer_config=adam)
     keys0 = np.arange(50, dtype=np.uint64)
-    vals0 = rng.standard_normal((50, slot_dims[0])).astype(np.float32)
+    vals0 = rng.standard_normal((50, dim_map[0])).astype(np.float32)
     keys1 = slotted(np.arange(50, dtype=np.uint64), 1)
-    vals1 = rng.standard_normal((50, slot_dims[1])).astype(np.float32)
+    vals1 = rng.standard_normal((50, dim_map[1])).astype(np.float32)
 
-    store1.assign(keys0, vals0.ravel())
-    store1.assign(keys1, vals1.ravel())
+    store1.assign(keys0, vals0)
+    store1.assign(keys1, vals1)
     assert store1.total_size() == 100
 
     backend.save(store1, uri)
 
-    store2 = se.EmbeddingStore(cfg, optimizer_config=adam)
+    store2 = se.EmbeddingStore(make_cfg([4, 8]), optimizer_config=adam)
     backend.load(store2, uri)
     assert store2.total_size() == 100
 
     for slot_keys, dim, ref_vals in [
-        (keys0, slot_dims[0], vals0),
-        (keys1, slot_dims[1], vals1),
+        (keys0, dim_map[0], vals0),
+        (keys1, dim_map[1], vals1),
     ]:
-        v1_dlp, _ = store1.lookup(slot_keys)
-        v2_dlp, _ = store2.lookup(slot_keys)
+        v1_dlp, _ = store1.lookup(slot_keys, dim=dim)
+        v2_dlp, _ = store2.lookup(slot_keys, dim=dim)
         got1 = np.from_dlpack(v1_dlp).reshape(-1, dim)
         got2 = np.from_dlpack(v2_dlp).reshape(-1, dim)
         np.testing.assert_allclose(
@@ -461,11 +459,11 @@ def test_optimizer_state_distributed_resharding(
     rng = np.random.default_rng(42)
 
     adam = se.Adam(lr=1e-2)
-    slot_dims = {0: 4, 1: 8}
+    dim_map = {0: 4, 1: 8}
 
     num_keys = 500
     truth = {}
-    for slot_id, dim in slot_dims.items():
+    for slot_id, dim in dim_map.items():
         raw_keys = np.arange(num_keys, dtype=np.uint64)
         s_keys = slotted(raw_keys, slot_id)
         embeds = rng.standard_normal((num_keys, dim)).astype(np.float32)
@@ -473,7 +471,7 @@ def test_optimizer_state_distributed_resharding(
 
     asyncio.run(
         distributed_save(
-            uri, save_shards, truth, slot_dims, backend, optimizer_config=adam
+            uri, save_shards, truth, dim_map, backend, optimizer_config=adam
         )
     )
 
@@ -485,17 +483,17 @@ def test_optimizer_state_distributed_resharding(
             shard_id,
             new_partitioner,
             backend,
-            dims=slot_dims,
+            dims=sorted(set(dim_map.values())),
             optimizer_config=adam,
         )
         for slot_id, (s_keys, embeds) in truth.items():
-            dim = slot_dims[slot_id]
+            dim = dim_map[slot_id]
             mask = np.from_dlpack(new_partitioner.filter(s_keys, shard_id))
             my_keys = s_keys[mask]
             my_embeds = embeds[mask]
             if len(my_keys) == 0:
                 continue
-            vals_dlp, _ = store.lookup(my_keys)
+            vals_dlp, _ = store.lookup(my_keys, dim=dim)
             got = np.from_dlpack(vals_dlp).reshape(-1, dim)
             np.testing.assert_allclose(
                 got,
@@ -511,3 +509,29 @@ def test_optimizer_state_distributed_resharding(
         await asyncio.gather(*[load_and_verify(s) for s in range(load_shards)])
 
     asyncio.run(run_all())
+
+
+def test_checkpoint_schema_agnostic_dim_reorder(lance_tmp_uri):
+    uri, backend = lance_tmp_uri
+    # Save with dims [128, 64]
+    store1 = se.EmbeddingStore(se.EmbeddingConfig(dims=[128, 64], num_threads=2))
+    keys_128 = np.array([1, 2], dtype=np.uint64)
+    vals_128 = np.ones((2, 128), dtype=np.float32)
+    store1.assign(keys_128, vals_128)
+
+    keys_64 = np.array([3, 4], dtype=np.uint64)
+    vals_64 = np.ones((2, 64), dtype=np.float32) * 2
+    store1.assign(keys_64, vals_64)
+
+    backend.save(store1, uri)
+
+    # Load with dims [64, 128]
+    store2 = se.EmbeddingStore(se.EmbeddingConfig(dims=[64, 128], num_threads=2))
+    backend.load(store2, uri)
+
+    # Verify data is loaded into correct dimensions
+    res_64, _ = store2.lookup(keys_64, dim=64)
+    assert np.allclose(np.from_dlpack(res_64).reshape(-1, 64), vals_64)
+
+    res_128, _ = store2.lookup(keys_128, dim=128)
+    assert np.allclose(np.from_dlpack(res_128).reshape(-1, 128), vals_128)
