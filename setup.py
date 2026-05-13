@@ -24,9 +24,22 @@ from pathlib import Path
 
 from setuptools import setup
 from setuptools.command.build_py import build_py
+from setuptools.dist import Distribution
 
 _PROJECT_DIR = Path(__file__).resolve().parent
 _PKG_DIR = _PROJECT_DIR / "sparse_embedding"
+
+
+def _bazel_bin_dir() -> Path:
+    """Ask Bazel for the canonical bazel-bin path, bypassing symlink issues."""
+    result = subprocess.run(
+        ["bazel", "info", "bazel-bin"],
+        cwd=_PROJECT_DIR,
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    return Path(result.stdout.strip())
 
 
 def _invoke_bazel(with_lance: bool) -> Path:
@@ -38,17 +51,24 @@ def _invoke_bazel(with_lance: bool) -> Path:
         bazel_target = "//:copy_core_so"
         so_glob = "_core.so"
 
+    cmd = ["bazel", "build", bazel_target]
+    if "BAZEL_COPTS" in os.environ:
+        import shlex
+
+        cmd.extend(shlex.split(os.environ["BAZEL_COPTS"]))
+
     subprocess.run(
-        ["bazel", "build", bazel_target],
+        cmd,
         cwd=_PROJECT_DIR,
         check=True,
     )
 
-    candidates = list((_PROJECT_DIR / "bazel-bin").rglob(so_glob))
+    bazel_bin = _bazel_bin_dir()
+    candidates = list(bazel_bin.rglob(so_glob))
     if not candidates:
         raise FileNotFoundError(
             f"Bazel target {bazel_target!r} produced no file matching {so_glob!r}"
-            f" under bazel-bin/"
+            f" under {bazel_bin}"
         )
     return max(candidates, key=lambda p: p.stat().st_mtime)
 
@@ -70,26 +90,37 @@ class BazelAwareBuildPy(build_py):
             )
             so_src = _invoke_bazel(with_lance)
             so_dst = _PKG_DIR / "_core.so"
+            if so_dst.exists():
+                so_dst.unlink()
             shutil.copy2(so_src, so_dst)
             print(f"[setup.py] Copied {so_src.name} -> {so_dst}", file=sys.stderr)
 
             if with_lance:
                 lance_so = _PKG_DIR / "liblance_c.so"
-                if not lance_so.exists():
-                    bazel_lance = (
-                        _PROJECT_DIR
-                        / "bazel-bin"
-                        / "sparse_embedding"
-                        / "liblance_c.so"
+                bazel_lance = (
+                    _PROJECT_DIR / "bazel-bin" / "sparse_embedding" / "liblance_c.so"
+                )
+                if bazel_lance.exists():
+                    if lance_so.exists():
+                        lance_so.unlink()
+                    shutil.copy2(bazel_lance, lance_so)
+                    print(
+                        f"[setup.py] Copied liblance_c.so -> {lance_so}",
+                        file=sys.stderr,
                     )
-                    if bazel_lance.exists():
-                        shutil.copy2(bazel_lance, lance_so)
-                        print(
-                            f"[setup.py] Copied liblance_c.so -> {lance_so}",
-                            file=sys.stderr,
-                        )
 
         super().run()
 
 
-setup(cmdclass={"build_py": BazelAwareBuildPy})
+class BinaryDistribution(Distribution):
+    """Distribution which forces a binary package with platform name"""
+
+    def has_ext_modules(self):
+        return True
+
+
+setup(
+    distclass=BinaryDistribution,
+    cmdclass={"build_py": BazelAwareBuildPy},
+    package_data={"sparse_embedding": ["*.so"]},
+)

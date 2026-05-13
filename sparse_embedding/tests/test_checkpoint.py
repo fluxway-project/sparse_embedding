@@ -10,11 +10,10 @@ import shutil
 
 import numpy as np
 import pytest
+import sparse_embedding._core as se
 
 import sparse_embedding
-import sparse_embedding._core as se
 from sparse_embedding.checkpoint import get_backend
-
 
 # ---------------------------------------------------------------------------
 # Helpers

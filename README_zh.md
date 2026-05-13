@@ -65,7 +65,7 @@
 
 | 操作 | 1T | 4T | 8T | 16T | 32T | 64T |
 |------|----|----|----|-----|-----|-----|
-| forward_lookup | 3.39 Mops/s (1.73 GB/s) | 8.24 Mops/s (4.22 GB/s) | 9.91 Mops/s (5.07 GB/s) | 11.66 Mops/s (5.97 GB/s) | 13.14 Mops/s (6.73 GB/s) | 11.76 Mops/s (6.02 GB/s) |
+| forward_lookup | 3.25 Mops/s (1.66 GB/s) | 7.29 Mops/s (3.73 GB/s) | 11.14 Mops/s (5.70 GB/s) | 13.87 Mops/s (7.10 GB/s) | 13.51 Mops/s (6.92 GB/s) | 12.58 Mops/s (6.44 GB/s) |
 
 `forward_lookup` 在 16-32T 时趋于饱和，实测峰值 6.94 GB/s。
 
@@ -79,7 +79,7 @@
 
 | 操作 | 1T | 4T | 8T | 16T | 32T | 64T |
 |------|----|----|----|-----|-----|-----|
-| lookup_or_insert | 1.70 Mops/s | 3.33 Mops/s | 5.18 Mops/s | 5.49 Mops/s | 5.51 Mops/s | 5.32 Mops/s |
+| lookup_or_insert | 1.50 Mops/s | 2.66 Mops/s | 4.09 Mops/s | 4.73 Mops/s | 5.04 Mops/s | 4.88 Mops/s |
 
 1→8T 呈现 3.6x 线性加速；8T 后受 parlayhash CAS 竞争与 DRAM 写带宽限制趋于饱和。
 
@@ -87,13 +87,13 @@
 
 | 操作 | 1T | 4T | 8T | 16T | 32T | 64T |
 |------|----|----|----|-----|-----|-----|
-| assign | 1.60 Mops/s (0.82 GB/s) | 4.23 Mops/s (2.17 GB/s) | 5.73 Mops/s (2.93 GB/s) | 7.30 Mops/s (3.74 GB/s) | 7.63 Mops/s (3.90 GB/s) | 7.30 Mops/s (3.74 GB/s) |
+| assign | 1.50 Mops/s (0.77 GB/s) | 3.22 Mops/s (1.65 GB/s) | 4.95 Mops/s (2.53 GB/s) | 7.02 Mops/s (3.60 GB/s) | 6.77 Mops/s (3.47 GB/s) | 6.64 Mops/s (3.40 GB/s) |
 
 #### `accumulate_gradients`（梯度累积，反向传播）
 
 | 操作 | 1T | 4T | 8T | 16T | 32T | 64T |
 |------|----|----|----|-----|-----|-----|
-| accumulate_gradients | 2.17 Mops/s | 5.86 Mops/s | 7.24 Mops/s | 9.77 Mops/s | 10.64 Mops/s | 10.26 Mops/s |
+| accumulate_gradients | 2.07 Mops/s | 5.73 Mops/s | 8.74 Mops/s | 10.81 Mops/s | 11.77 Mops/s | 10.90 Mops/s |
 
 注：`accumulate_gradients` 使用 AVX-512 SIMD 分片 Scatter-Reduce；在修复了线程池调度阈值与使用 thread-local 缓存复用后，在 16-32T 呈现出完美的扩展性。
 
@@ -101,7 +101,7 @@
 
 | 操作 | 1T | 4T | 8T | 16T | 32T | 64T |
 |------|----|----|----|-----|-----|-----|
-| optimizer_step | 5.85 Mops/s (5.99 GB/s) | 13.04 Mops/s (13.35 GB/s) | 18.59 Mops/s (19.03 GB/s) | 26.01 Mops/s (26.63 GB/s) | **27.48 Mops/s (28.14 GB/s)** | 27.12 Mops/s (27.77 GB/s) |
+| optimizer_step | 5.70 Mops/s (5.83 GB/s) | 13.05 Mops/s (13.36 GB/s) | 19.76 Mops/s (20.23 GB/s) | 28.15 Mops/s (28.82 GB/s) | **34.19 Mops/s (35.01 GB/s)** | 28.52 Mops/s (29.20 GB/s) |
 
 注：`optimizer_step` 处理的是已累积的 unique key 集合（约 252K）。在修正了并行调度并移除了 Data Race 后，在 32T 时展现了惊人的 25.06 GB/s 内存带宽利用率，扩展效率绝佳。
 
@@ -109,7 +109,7 @@
 
 | 操作 | 1T | 4T | 8T | 16T | 32T | 64T |
 |------|----|----|----|-----|-----|-----|
-| contains | 8.83 Mops/s | 17.57 Mops/s | 19.10 Mops/s | 22.09 Mops/s | 23.29 Mops/s | 22.95 Mops/s |
+| contains | 9.49 Mops/s | 16.75 Mops/s | 20.84 Mops/s | 22.16 Mops/s | 23.38 Mops/s | 22.41 Mops/s |
 
 纯哈希查找无 embedding 拷贝，受 CPU 和哈希表 bucket 访问延迟限制，8T 后接近饱和。
 
@@ -117,7 +117,7 @@
 
 | 操作 | 1T | 4T | 8T | 16T | 32T | 64T |
 |------|----|----|----|-----|-----|-----|
-| erase (6553 keys) | 13.62 Mops/s | 50.43 Mops/s | 63.84 Mops/s | 61.27 Mops/s | 41.52 Mops/s | 23.85 Mops/s |
+| erase (6553 keys) | 11.99 Mops/s | 35.53 Mops/s | 58.05 Mops/s | 59.42 Mops/s | 43.31 Mops/s | 26.63 Mops/s |
 
 `erase` 在 8T 时达到峰值（64.49 Mops/s），超线程后因 NUMA 跨 socket 竞争开始下降。
 
@@ -127,13 +127,13 @@
 
 | API | 吞吐量 (Mops/s) | 说明 |
 |-----|----------------|------|
-| `async_unique` | ~16.48 Mops/s | 异步获取 unique keys，极速哈希去重 |
-| `lookup_or_insert` | ~9.65 Mops/s | 同步的插入及查找，零拷贝张量返回 |
-| `async_lookup` | ~11.11 Mops/s | 异步的前向查询，无阻滞事件循环 |
-| `accumulate_gradients` | ~10.50 Mops/s | 同步的梯度累积操作 |
-| **端到端 Step** | **~5.20 Mops/s** | `lookup` + `accumulate` + `optimizer_step` 的完整训练步 |
+| `async_unique` | ~25.00 Mops/s | 异步获取 unique keys，极速哈希去重 |
+| `async_lookup_or_insert` | ~4.57 Mops/s | 异步插入及查找，零拷贝张量返回 |
+| `async_lookup` | ~11.19 Mops/s | 异步前向查询，无阻滞事件循环 |
+| `async_accumulate_gradients` | ~13.38 Mops/s | 异步梯度累积，无阻滞事件循环 |
+| **端到端 Step** | **~3.61 Mops/s** | 全链路 asyncio 训练步 |
 
-得益于 DLPack 和 eventfd 无锁 asyncio 挂载，Python 端的调用开销被降到最低，依然保持了数以百万计的吞吐率。
+所有 `EmbeddingStore` 方法（如 `lookup_or_insert`, `assign`, `contains`, `erase`, `clear`, `assign_scores`, `accumulate_gradients`, `optimizer_step`）均已提供高性能、边缘触发的 `async_*` 异步变体。得益于 DLPack 和 eventfd 无锁 asyncio 挂载，Python 端的调用开销被降到最低，依然保持了数以百万计的吞吐率。
 
 ---
 
