@@ -8,18 +8,28 @@ build --copt=-mavx512bf16
 build --compilation_mode=opt
 
 # ==============================================================================
-# Release Configuration (Opt)
+# Release Configuration (Opt) — defaults to GCC
 # ==============================================================================
-# Usage: bazel build //... (default) or bazel build -c opt //...
-# Action: Forces the use of GCC with Full Link Time Optimization (LTO).
+# Usage: bazel build //...
+# Default opt uses GCC's -flto. 
+# For Clang, use: bazel build --config=opt_clang //...
 
 build:opt --copt=-O3
 build:opt --copt=-DNDEBUG
 build:opt --copt=-fno-strict-aliasing
-build:opt --features=thin_lto
-# build:opt --linkopt=-flto
+build:opt --linkopt=-flto
 build:opt --copt=-march=native
 build:opt --copt=-mtune=native
+
+# ==============================================================================
+# LTO Variants — optional overrides
+# ==============================================================================
+# Clang ThinLTO: bazel build --config=opt_clang //...
+build:opt_clang --config=opt
+build:opt_clang --repo_env=CC=clang
+build:opt_clang --repo_env=CXX=clang++
+build:opt_clang --features=thin_lto
+build:opt_clang --linkopt=-Wl,-mllvm,-import-instr-limit=100
 
 # ==============================================================================
 # Debug Configuration (Dbg)

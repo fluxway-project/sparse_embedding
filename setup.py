@@ -119,4 +119,8 @@ class BinaryDistribution(Distribution):
         return True
 
 
-setup(distclass=BinaryDistribution, cmdclass={"build_py": BazelAwareBuildPy})
+setup(
+    distclass=BinaryDistribution,
+    cmdclass={"build_py": BazelAwareBuildPy},
+    package_data={"sparse_embedding": ["*.so"]},
+)
