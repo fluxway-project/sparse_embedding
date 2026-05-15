@@ -14,6 +14,7 @@
 // =============================================================================
 
 #include <nanobind/nanobind.h>
+#include <nanobind/stl/optional.h>
 #include <nanobind/stl/string.h>
 #include <nanobind/stl/unordered_map.h>
 #include <nanobind/stl/variant.h>
@@ -25,6 +26,7 @@
 #include <cstdint>
 #include <cstring>
 #include <memory>
+#include <optional>
 #include <span>
 #include <stdexcept>
 #include <string>
@@ -335,12 +337,25 @@ class EmbeddingStoreWrapper {
 
 public:
   EmbeddingStoreWrapper(const se::EmbeddingConfig &emb_cfg,
-                        PyInitializer init_cfg, PyOptimizer opt_cfg,
+                        std::optional<PyInitializer> init_cfg_opt,
+                        std::optional<PyOptimizer> opt_cfg_opt,
                         std::string score_policy_name)
       : async_pool_((emb_cfg.num_threads == 0)
                         ? std::max(1u, std::thread::hardware_concurrency())
                         : emb_cfg.num_threads),
         dtype_(emb_cfg.dtype) {
+
+    PyInitializer init_cfg = init_cfg_opt.value_or(PyInitializer{
+        std::make_shared<pro::proxy<se::InitializerBuilderFacade>>(
+            pro::make_proxy<se::InitializerBuilderFacade,
+                            UniformInitializerBuilder>(-0.05f, 0.05f))});
+
+    PyOptimizer opt_cfg = opt_cfg_opt.value_or(
+        PyOptimizer{std::make_shared<pro::proxy<se::OptimizerBuilderFacade>>(
+            pro::make_proxy<
+                se::OptimizerBuilderFacade,
+                DefaultOptimizerBuilder<se::AdamOptimizer, se::AdamConfig>>(
+                se::AdamConfig{}))});
 
     dims_ = emb_cfg.dims;
     if (dims_.empty())
@@ -1533,24 +1548,12 @@ NB_MODULE(_core, m) {
       .def("__dlpack_device__", &se::py::DLPackCapsuleWrapper::dlpack_device);
 
   nb::class_<EmbeddingStoreWrapper>(m, "EmbeddingStore")
-      .def(
-          nb::init<const se::EmbeddingConfig &, PyInitializer, PyOptimizer,
-                   std::string>(),
-          nb::arg("embedding_config"),
-          nb::arg("initializer_config") =
-              PyInitializer{
-                  std::make_shared<pro::proxy<se::InitializerBuilderFacade>>(
-                      pro::make_proxy<se::InitializerBuilderFacade,
-                                      UniformInitializerBuilder>(-0.05f,
-                                                                 0.05f))},
-          nb::arg("optimizer_config") =
-              PyOptimizer{
-                  std::make_shared<pro::proxy<se::OptimizerBuilderFacade>>(
-                      pro::make_proxy<se::OptimizerBuilderFacade,
-                                      DefaultOptimizerBuilder<se::AdamOptimizer,
-                                                              se::AdamConfig>>(
-                          se::AdamConfig{}))},
-          nb::arg("score_policy") = "none")
+      .def(nb::init<const se::EmbeddingConfig &, std::optional<PyInitializer>,
+                    std::optional<PyOptimizer>, std::string>(),
+           nb::arg("embedding_config"),
+           nb::arg("initializer_config") = nb::none(),
+           nb::arg("optimizer_config") = nb::none(),
+           nb::arg("score_policy") = "none")
 
       .def("total_size", &EmbeddingStoreWrapper::total_size)
       .def("max_dim", &EmbeddingStoreWrapper::max_dim)
@@ -1715,6 +1718,9 @@ NB_MODULE(_core, m) {
 
   m.def("wake_fd", []() { return se::py::GetPythonWakeManager().fd(); });
   m.def("drain_wake_queue", []() { se::py::GetPythonWakeManager().Drain(); });
+  m.def("_clear_wake_queue", []() { se::py::GetPythonWakeManager().Clear(); });
+  m.def("set_leak_warnings",
+        [](bool enable) { nb::set_leak_warnings(enable); });
 
   nb::class_<PyPartitioner>(m, "Partitioner")
       .def("partition", &PyPartitioner::partition, nb::arg("keys"))

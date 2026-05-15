@@ -2,6 +2,8 @@
 Sparse Embedding Package
 """
 
+import atexit
+
 from ._core import (
     Adam,
     EmbeddingConfig,
@@ -15,12 +17,15 @@ from ._core import (
     Sgd,
     Uniform,
     Zeros,
+    _clear_wake_queue,
     async_unique,
     decode_keys,
     drain_wake_queue,
     encode_keys,
     wake_fd,
 )
+
+atexit.register(_clear_wake_queue)
 
 __all__ = [
     "Adam",

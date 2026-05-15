@@ -84,6 +84,16 @@ public:
     }
   }
 
+  void Clear() {
+    std::vector<se::Function<void()>> tasks;
+    {
+      std::lock_guard lock(mutex_);
+      std::swap(tasks, pending_);
+    }
+    // Destruction of tasks will decref the captured PyObjects.
+    // Must be called with the GIL held.
+  }
+
   int fd() const noexcept { return event_fd_; }
 
 private:
