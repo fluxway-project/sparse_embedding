@@ -181,22 +181,27 @@ struct EmbeddingTableFacade : pro::facade_builder
 
   // --- Lookup ---------------------------------------------------------------
   ::add_convention<WeakMemLookup,
+                   SE_LOOKUP_FACADE_SIG(int32_t), SE_LOOKUP_FACADE_SIG(uint32_t),
                    SE_LOOKUP_FACADE_SIG(int64_t), SE_LOOKUP_FACADE_SIG(uint64_t)>
 
   // --- Lookup-or-insert -----------------------------------------------------
   ::add_convention<WeakMemLookupOrInsert,
+                   SE_LOOKUP_OR_INSERT_FACADE_SIG(int32_t), SE_LOOKUP_OR_INSERT_FACADE_SIG(uint32_t),
                    SE_LOOKUP_OR_INSERT_FACADE_SIG(int64_t), SE_LOOKUP_OR_INSERT_FACADE_SIG(uint64_t)>
 
   // --- Assign ---------------------------------------------------------------
   ::add_convention<WeakMemAssign,
+                   SE_ASSIGN_FACADE_SIG(int32_t), SE_ASSIGN_FACADE_SIG(uint32_t),
                    SE_ASSIGN_FACADE_SIG(int64_t), SE_ASSIGN_FACADE_SIG(uint64_t)>
 
   // --- Contains -------------------------------------------------------------
   ::add_convention<WeakMemContains,
+                   SE_CONTAINS_FACADE_SIG(int32_t), SE_CONTAINS_FACADE_SIG(uint32_t),
                    SE_CONTAINS_FACADE_SIG(int64_t), SE_CONTAINS_FACADE_SIG(uint64_t)>
 
   // --- Erase / clear --------------------------------------------------------
   ::add_convention<WeakMemErase,
+                   SE_ERASE_FACADE_SIG(int32_t), SE_ERASE_FACADE_SIG(uint32_t),
                    SE_ERASE_FACADE_SIG(int64_t), SE_ERASE_FACADE_SIG(uint64_t)>
   ::add_convention<WeakMemClear,
                    std::error_code()>
@@ -205,20 +210,25 @@ struct EmbeddingTableFacade : pro::facade_builder
   ::add_convention<WeakMemHasScorePolicy,
                    bool() const>
   ::add_convention<WeakMemAssignScores,
+                   SE_ASSIGN_SCORES_FACADE_SIG(int32_t), SE_ASSIGN_SCORES_FACADE_SIG(uint32_t),
                    SE_ASSIGN_SCORES_FACADE_SIG(int64_t), SE_ASSIGN_SCORES_FACADE_SIG(uint64_t)>
   ::add_convention<WeakMemEvictByScore,
+                   SE_EVICT_BY_SCORE_FACADE_SIG(int32_t), SE_EVICT_BY_SCORE_FACADE_SIG(uint32_t),
                    SE_EVICT_BY_SCORE_FACADE_SIG(int64_t), SE_EVICT_BY_SCORE_FACADE_SIG(uint64_t)>
 
   // --- Export / snapshot ----------------------------------------------------
   ::add_convention<WeakMemExportBatch,
+                   SE_EXPORT_BATCH_FACADE_SIG(int32_t), SE_EXPORT_BATCH_FACADE_SIG(uint32_t),
                    SE_EXPORT_BATCH_FACADE_SIG(int64_t), SE_EXPORT_BATCH_FACADE_SIG(uint64_t)>
 
   // --- Training: Forward ----------------------------------------------------
   ::add_convention<WeakMemForwardLookup,
+                   SE_FORWARD_LOOKUP_FACADE_SIG(int32_t), SE_FORWARD_LOOKUP_FACADE_SIG(uint32_t),
                    SE_FORWARD_LOOKUP_FACADE_SIG(int64_t), SE_FORWARD_LOOKUP_FACADE_SIG(uint64_t)>
 
   // --- Training: Backward ---------------------------------------------------
   ::add_convention<WeakMemAccumulateGradients,
+                   SE_ACCUMULATE_GRADIENTS_FACADE_SIG(int32_t), SE_ACCUMULATE_GRADIENTS_FACADE_SIG(uint32_t),
                    SE_ACCUMULATE_GRADIENTS_FACADE_SIG(int64_t), SE_ACCUMULATE_GRADIENTS_FACADE_SIG(uint64_t)>
   ::add_convention<WeakMemOptimizerStep,
                    std::error_code()>

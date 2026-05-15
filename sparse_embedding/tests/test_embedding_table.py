@@ -47,6 +47,34 @@ def test_embedding_table_assign():
     assert np.allclose(vals_np, 1.0)
 
 
+def test_embedding_table_32bit_keys():
+    store = sparse_embedding.EmbeddingStore(
+        embedding_config=sparse_embedding.EmbeddingConfig(
+            dims=[128], num_threads=4, dtype="float32"
+        ),
+        initializer_config=sparse_embedding.Zeros(),
+    )
+
+    keys_int32 = np.array([1, 2, 3], dtype=np.int32)
+    keys_uint32 = np.array([4, 5, 6], dtype=np.uint32)
+
+    # Test int32
+    vals, lens, mask = store.lookup_or_insert(keys_int32, dim=128)
+    assert vals is not None
+    assert lens is not None
+    assert mask is not None
+    mask_np = np.from_dlpack(mask)
+    assert mask_np.shape[0] == 3
+
+    # Test uint32
+    vals, lens, mask = store.lookup_or_insert(keys_uint32, dim=128)
+    assert vals is not None
+    assert lens is not None
+    assert mask is not None
+    mask_np = np.from_dlpack(mask)
+    assert mask_np.shape[0] == 3
+
+
 @pytest.mark.asyncio
 async def test_embedding_table_async():
     store = sparse_embedding.EmbeddingStore(

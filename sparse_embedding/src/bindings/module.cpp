@@ -90,9 +90,10 @@ inline KeyDType detect_key_dtype(const DLManagedTensor *dlm) {
 template <typename Fn>
 auto dispatch_on_key(const DLManagedTensor *dlm, Fn &&fn) {
   auto kdt = detect_key_dtype(dlm);
-  if (kdt == KeyDType::kInt32 || kdt == KeyDType::kUInt32)
-    throw std::invalid_argument(
-        "embedding table operations only support 64-bit keys");
+  if (kdt == KeyDType::kInt32)
+    return fn(se::py::dlpack_to_span<const int32_t>(dlm));
+  if (kdt == KeyDType::kUInt32)
+    return fn(se::py::dlpack_to_span<const uint32_t>(dlm));
   if (kdt == KeyDType::kInt64)
     return fn(se::py::dlpack_to_span<const int64_t>(dlm));
   return fn(se::py::dlpack_to_span<const uint64_t>(dlm));
