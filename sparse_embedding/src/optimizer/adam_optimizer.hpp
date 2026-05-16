@@ -33,7 +33,10 @@ namespace se {
 template <typename ValT> class AdamOptimizer {
   OptimizerStateArena<float> m_state;
   OptimizerStateArena<float> v_state;
-  OptimizerStateArena<uint64_t> step_state;
+  OptimizerStateArena<uint64_t>
+      step_state; // Ensure initialized to 0 per Rule 7
+  static_assert(sizeof(uint64_t) == 2 * sizeof(float),
+                "uint64_t must be exactly 2 floats in size");
   AdamConfig config;
 
 public:
@@ -58,6 +61,10 @@ public:
     step_state.clear();
   }
 
+  // Warning: Returns a pointer to a thread-local buffer.
+  // The pointer is only valid until the next call to state_data on the same
+  // thread. It is NOT safe to store or alias this pointer across multiple
+  // calls.
   const float *state_data(uint32_t idx) const {
     size_t d = m_state.dim();
     thread_local std::vector<float> buf;
@@ -73,19 +80,18 @@ public:
 
   void set_state(uint32_t idx, std::span<const float> state) {
     size_t d = m_state.dim();
+    if (state.size() < d * 2 + 2) {
+      throw std::invalid_argument(
+          "Input state span is too small. Expected at least 2*d+2 elements.");
+    }
     std::copy_n(state.data(), d, m_state.data(idx));
     std::copy_n(state.data() + d, d, v_state.data(idx));
-    if (state.size() >= d * 2 + 2) {
-      uint64_t step;
-      std::memcpy(&step, state.data() + d * 2, sizeof(uint64_t));
-      *step_state.data(idx) = step;
-    } else {
-      *step_state.data(idx) = 0;
-    }
+    std::memcpy(step_state.data(idx), state.data() + 2 * d, sizeof(uint64_t));
   }
 
   void step(uint32_t idx, std::span<ValT> param_span,
-            std::span<const ValT> grad_span, uint64_t global_step) {
+            std::span<const ValT> grad_span,
+            [[maybe_unused]] uint64_t global_step) {
     uint64_t &id_step = *step_state.data(idx);
     id_step++;
     const float step_f = static_cast<float>(id_step);

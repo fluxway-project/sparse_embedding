@@ -59,10 +59,11 @@ template <typename StoreT>
 static MemBuffer capture_export(StoreT &store, size_t batch_size = 65536) {
   MemBuffer buf;
   store.template export_batch<uint64_t>(
-      pro::make_proxy<se::FunctionFacade<bool(std::span<const uint64_t>,
+      pro::make_proxy<se::FunctionFacade<bool(size_t, std::span<const uint64_t>,
                                               std::span<const float>,
                                               std::span<const uint64_t>)>>(
-          [&](std::span<const uint64_t> keys, std::span<const float> vals,
+          [&](size_t dim, std::span<const uint64_t> keys,
+              std::span<const float> vals,
               std::span<const uint64_t> scores) -> bool {
             buf.keys.insert(buf.keys.end(), keys.begin(), keys.end());
             buf.values.insert(buf.values.end(), vals.begin(), vals.end());
@@ -255,11 +256,11 @@ static void test_incremental_export() {
   constexpr uint64_t kMinScore = 3;
   MemBuffer buf;
   store.template export_batch<uint64_t>(
-      pro::make_proxy<se::FunctionFacade<bool(std::span<const uint64_t>,
+      pro::make_proxy<se::FunctionFacade<bool(size_t, std::span<const uint64_t>,
                                               std::span<const float>,
                                               std::span<const uint64_t>)>>(
-          [&](std::span<const uint64_t> ks, std::span<const float> vs,
-              std::span<const uint64_t> ss) -> bool {
+          [&](size_t dim, std::span<const uint64_t> ks,
+              std::span<const float> vs, std::span<const uint64_t> ss) -> bool {
             for (size_t i = 0; i < ks.size(); ++i) {
               if (ss[i] >= kMinScore) {
                 buf.keys.push_back(ks[i]);
