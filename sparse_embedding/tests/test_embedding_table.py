@@ -128,3 +128,43 @@ async def test_embedding_table_async():
     contains_mask = await store.async_contains(keys)
     contains_np = np.from_dlpack(contains_mask)
     assert np.all(contains_np == 0)
+
+
+def test_optimizer_per_id_step():
+    """Verify that optimizer tracks steps per-ID for bias correction."""
+    store = sparse_embedding.EmbeddingStore(
+        embedding_config=sparse_embedding.EmbeddingConfig(
+            dims=[128], num_threads=1, dtype="float32"
+        ),
+        initializer_config=sparse_embedding.Zeros(),
+        optimizer_config=sparse_embedding.Adam(
+            lr=0.001, beta1=0.9, beta2=0.999, eps=1e-8, weight_decay=0.0
+        ),
+    )
+
+    # 1. Update ID 0 at step 1
+    keys_0 = np.array([0], dtype=np.uint64)
+    grads_0 = np.ones((1, 128), dtype=np.float32)
+    store.lookup_or_insert(keys_0, dim=128)
+    store.accumulate_gradients(keys_0, grads_0)
+    store.optimizer_step()
+
+    val_0_step1 = np.from_dlpack(store.lookup(keys_0, dim=128)[0]).copy()
+
+    # 2. Step the optimizer globally 100 times using ID 0
+    for _ in range(100):
+        store.accumulate_gradients(keys_0, grads_0)
+        store.optimizer_step()
+
+    # 3. Update ID 1 for the very first time, but at global step > 100
+    keys_1 = np.array([1], dtype=np.uint64)
+    grads_1 = np.ones((1, 128), dtype=np.float32)
+    store.lookup_or_insert(keys_1, dim=128)
+    store.accumulate_gradients(keys_1, grads_1)
+    store.optimizer_step()
+
+    val_1_step1 = np.from_dlpack(store.lookup(keys_1, dim=128)[0]).copy()
+
+    # 4. Check that the first update size is identical for ID 0 and ID 1,
+    # meaning bias correction correctly used step=1 for ID 1.
+    np.testing.assert_allclose(val_0_step1, val_1_step1, atol=1e-6)

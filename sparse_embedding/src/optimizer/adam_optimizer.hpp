@@ -31,52 +31,64 @@
 namespace se {
 
 template <typename ValT> class AdamOptimizer {
-  OptimizerStateArena m_state;
-  OptimizerStateArena v_state;
+  OptimizerStateArena<float> m_state;
+  OptimizerStateArena<float> v_state;
+  OptimizerStateArena<uint64_t> step_state;
   AdamConfig config;
 
 public:
   explicit AdamOptimizer(size_t dim, const AdamConfig &cfg)
-      : m_state(dim), v_state(dim), config(cfg) {}
+      : m_state(dim), v_state(dim), step_state(1), config(cfg) {}
 
   void allocate() {
     m_state.allocate();
     v_state.allocate();
+    step_state.allocate();
   }
 
   void deallocate(uint32_t idx) {
     m_state.deallocate(idx);
     v_state.deallocate(idx);
+    step_state.deallocate(idx);
   }
 
   void clear() {
     m_state.clear();
     v_state.clear();
+    step_state.clear();
   }
 
-  // Returns a pointer to a flat buffer [m[0..dim-1], v[0..dim-1]] for idx.
-  // Caller must copy the data before releasing any lock; the buffer is
-  // backed by two separate arenas so we materialise it into a thread-local.
   const float *state_data(uint32_t idx) const {
     size_t d = m_state.dim();
     thread_local std::vector<float> buf;
-    buf.resize(d * 2);
+    buf.resize(d * 2 + 2);
     std::copy_n(m_state.data(idx), d, buf.data());
     std::copy_n(v_state.data(idx), d, buf.data() + d);
+    uint64_t step = *step_state.data(idx);
+    std::memcpy(buf.data() + d * 2, &step, sizeof(uint64_t));
     return buf.data();
   }
 
-  size_t state_dim() const { return m_state.dim() * 2; }
+  size_t state_dim() const { return m_state.dim() * 2 + 2; }
 
   void set_state(uint32_t idx, std::span<const float> state) {
     size_t d = m_state.dim();
     std::copy_n(state.data(), d, m_state.data(idx));
     std::copy_n(state.data() + d, d, v_state.data(idx));
+    if (state.size() >= d * 2 + 2) {
+      uint64_t step;
+      std::memcpy(&step, state.data() + d * 2, sizeof(uint64_t));
+      *step_state.data(idx) = step;
+    } else {
+      *step_state.data(idx) = 0;
+    }
   }
 
   void step(uint32_t idx, std::span<ValT> param_span,
             std::span<const ValT> grad_span, uint64_t global_step) {
-    const float step_f = static_cast<float>(global_step);
+    uint64_t &id_step = *step_state.data(idx);
+    id_step++;
+    const float step_f = static_cast<float>(id_step);
     const float bc1 = 1.0f / (1.0f - std::pow(config.beta1, step_f));
     const float bc2 = 1.0f / (1.0f - std::pow(config.beta2, step_f));
 
