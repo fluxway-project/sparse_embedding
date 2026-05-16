@@ -20,38 +20,56 @@
 
 #include <cstdint>
 #include <span>
+#include <type_traits>
 
 #include "sparse_embedding/src/optimizer/optimizer_config.hpp"
 
 namespace se {
 
-template <typename ValT> class SgdOptimizer {
+template <typename ParamT, typename OptT> class SgdOptimizer {
   SgdConfig config;
 
 public:
-  explicit SgdOptimizer(size_t dim, const SgdConfig &cfg) : config(cfg) {}
+  explicit SgdOptimizer(size_t dim, const SgdConfig &cfg) : config(cfg) {
+    (void)dim;
+  }
 
   void allocate() {}
   void deallocate(uint32_t idx) {}
   void clear() {}
 
-  const float *state_data(uint32_t) const { return nullptr; }
+  void state_data(uint32_t idx, std::span<OptT> out) const {
+    (void)idx;
+    (void)out;
+  }
+
   size_t state_dim() const { return 0; }
-  void set_state(uint32_t, std::span<const float>) {}
 
-  void step(uint32_t idx, std::span<ValT> param_span,
-            std::span<const ValT> grad_span, uint64_t global_step) {
+  void set_state(uint32_t idx, std::span<const OptT> state) {
+    (void)idx;
+    (void)state;
+  }
+
+  void step(uint32_t idx, std::span<ParamT> param_span,
+            std::span<const ParamT> grad_span,
+            [[maybe_unused]] uint64_t global_step) {
     size_t dim = param_span.size();
-    ValT *param = param_span.data();
-    const ValT *accumulated_grad = grad_span.data();
+    ParamT *param = param_span.data();
+    const ParamT *accumulated_grad = grad_span.data();
 
-    for (size_t d = 0; d < dim; ++d) {
-      float g = static_cast<float>(accumulated_grad[d]);
+    // In SGD, we can just use simd_adam_update? No, we should use a simpler
+    // simd operation. For now, simple fallback.
+    for (size_t i = 0; i < dim; ++i) {
+      float g = static_cast<float>(accumulated_grad[i]);
+      float p_val = static_cast<float>(param[i]);
       if (config.weight_decay > 0.0f) {
-        g += config.weight_decay * static_cast<float>(param[d]);
+        g += config.weight_decay * p_val;
       }
-      param[d] =
-          static_cast<ValT>(static_cast<float>(param[d]) - config.lr * g);
+      if constexpr (std::is_same_v<ParamT, float>) {
+        param[i] = p_val - config.lr * g;
+      } else {
+        param[i] = static_cast<ParamT>(p_val - config.lr * g);
+      }
     }
   }
 };

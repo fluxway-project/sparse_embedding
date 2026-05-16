@@ -16,6 +16,7 @@
 #include "sparse_embedding/src/backend/hogwild/hogwild_embedding_store.hpp"
 #include "sparse_embedding/src/optimizer/adam_optimizer.hpp"
 #include "sparse_embedding/src/optimizer/sgd_optimizer.hpp"
+#include <cstdint>
 
 namespace se {
 
@@ -27,16 +28,28 @@ template class TransientArena<float>;
 template class TransientArena<float16_t>;
 template class TransientArena<bfloat16_t>;
 
-template class AdamOptimizer<float>;
-template class AdamOptimizer<float16_t>;
-template class AdamOptimizer<bfloat16_t>;
+#define INSTANTIATE_STORE(KEY_T, PARAM_T, OPT_T)                               \
+  template class HogwildEmbeddingStore<KEY_T, PARAM_T, OPT_T, NoScorePolicy>;  \
+  template class HogwildEmbeddingStore<KEY_T, PARAM_T, OPT_T, LfuScorePolicy>; \
+  template class HogwildEmbeddingStore<KEY_T, PARAM_T, OPT_T, LruScorePolicy>; \
+  template class HogwildEmbeddingStore<KEY_T, PARAM_T, OPT_T,                  \
+                                       ManualScorePolicy>;
 
-template class SgdOptimizer<float>;
-template class SgdOptimizer<float16_t>;
-template class SgdOptimizer<bfloat16_t>;
+#define INSTANTIATE_OPT_PAIR(PARAM_T, OPT_T)                                   \
+  template class AdamOptimizer<PARAM_T, OPT_T>;                                \
+  template class SgdOptimizer<PARAM_T, OPT_T>;                                 \
+  INSTANTIATE_STORE(uint64_t, PARAM_T, OPT_T)                                  \
+  INSTANTIATE_STORE(int64_t, PARAM_T, OPT_T)                                   \
+  INSTANTIATE_STORE(uint32_t, PARAM_T, OPT_T)                                  \
+  INSTANTIATE_STORE(int32_t, PARAM_T, OPT_T)
 
-template class HogwildEmbeddingStore<float>;
-template class HogwildEmbeddingStore<float16_t>;
-template class HogwildEmbeddingStore<bfloat16_t>;
+#define INSTANTIATE_ALL_OPTS(PARAM_T)                                          \
+  INSTANTIATE_OPT_PAIR(PARAM_T, float)                                         \
+  INSTANTIATE_OPT_PAIR(PARAM_T, float16_t)                                     \
+  INSTANTIATE_OPT_PAIR(PARAM_T, bfloat16_t)
+
+INSTANTIATE_ALL_OPTS(float)
+INSTANTIATE_ALL_OPTS(float16_t)
+INSTANTIATE_ALL_OPTS(bfloat16_t)
 
 } // namespace se

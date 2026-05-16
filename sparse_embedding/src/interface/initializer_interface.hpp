@@ -31,21 +31,24 @@ PRO_DEF_MEM_DISPATCH(MemInitialize, initialize);
 
 template <typename ValT>
 struct InitializerFacade
-    : pro::facade_builder ::add_convention<
-          MemInitialize, void(std::span<ValT> param, uint64_t key)>::build {};
+    : pro::facade_builder //
+      ::add_convention<MemInitialize,
+                       void(std::span<ValT> param, uint64_t key)> //
+      ::build {};
 
 PRO_DEF_MEM_DISPATCH(MemBuildInitF32, build_f32);
 PRO_DEF_MEM_DISPATCH(MemBuildInitF16, build_f16);
 PRO_DEF_MEM_DISPATCH(MemBuildInitBF16, build_bf16);
 
 struct InitializerBuilderFacade
-    : pro::facade_builder ::add_convention<
-          MemBuildInitF32, pro::proxy<InitializerFacade<float>>()>::
-          add_convention<MemBuildInitF16,
-                         pro::proxy<InitializerFacade<se::float16_t>>()>::
-              add_convention<
-                  MemBuildInitBF16,
-                  pro::proxy<InitializerFacade<se::bfloat16_t>>()>::build {};
+    : pro::facade_builder //
+      ::add_convention<MemBuildInitF32,
+                       pro::proxy<InitializerFacade<float>>()> //
+      ::add_convention<MemBuildInitF16,
+                       pro::proxy<InitializerFacade<se::float16_t>>()> //
+      ::add_convention<MemBuildInitBF16,
+                       pro::proxy<InitializerFacade<se::bfloat16_t>>()> //
+      ::build {};
 
 } // namespace se
 

@@ -43,31 +43,26 @@ PRO_DEF_MEM_DISPATCH(partition_span_dispatch, partition_span);
 PRO_DEF_MEM_DISPATCH(filter_span_dispatch, filter_span);
 
 struct PartitionerFacade
-    : pro::facade_builder ::add_convention<partition_span_dispatch,
-                                           void(std::span<const uint64_t>,
-                                                std::span<uint32_t>)>::
-          add_convention<partition_span_dispatch,
-                         void(std::span<const int64_t>, std::span<uint32_t>)>::
-              add_convention<partition_span_dispatch,
-                             void(std::span<const uint32_t>,
-                                  std::span<uint32_t>)>::
-                  add_convention<partition_span_dispatch,
-                                 void(std::span<const int32_t>,
-                                      std::span<uint32_t>)>::
-                      add_convention<filter_span_dispatch,
-                                     void(std::span<const uint64_t>, uint32_t,
-                                          std::span<bool>)>::
-                          add_convention<filter_span_dispatch,
-                                         void(std::span<const int64_t>,
-                                              uint32_t, std::span<bool>)>::
-                              add_convention<filter_span_dispatch,
-                                             void(std::span<const uint32_t>,
-                                                  uint32_t, std::span<bool>)>::
-                                  add_convention<filter_span_dispatch,
-                                                 void(std::span<const int32_t>,
-                                                      uint32_t,
-                                                      std::span<bool>)>::build {
-};
+    : pro::facade_builder //
+      ::add_convention<partition_span_dispatch, void(std::span<const uint64_t>,
+                                                     std::span<uint32_t>)> //
+      ::add_convention<partition_span_dispatch,
+                       void(std::span<const int64_t>, std::span<uint32_t>)> //
+      ::add_convention<partition_span_dispatch, void(std::span<const uint32_t>,
+                                                     std::span<uint32_t>)> //
+      ::add_convention<partition_span_dispatch, void(std::span<const int32_t>,
+                                                     std::span<uint32_t>)> //
+      ::add_convention<filter_span_dispatch,
+                       void(std::span<const uint64_t>, uint32_t,
+                            std::span<bool>)> //
+      ::add_convention<filter_span_dispatch, void(std::span<const int64_t>,
+                                                  uint32_t, std::span<bool>)> //
+      ::add_convention<filter_span_dispatch, void(std::span<const uint32_t>,
+                                                  uint32_t, std::span<bool>)> //
+      ::add_convention<filter_span_dispatch,
+                       void(std::span<const int32_t>, uint32_t,
+                            std::span<bool>)> //
+      ::build {};
 
 class ModuloPartitioner {
   uint32_t num_shards_;
