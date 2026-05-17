@@ -235,16 +235,21 @@ struct EmbeddingTableFacade : pro::facade_builder //
 
   // --- Optimizer state checkpoint -------------------------------------------
   ::add_convention<pro::weak_dispatch<MemAssignOptStates>,
-                   void(std::span<const uint64_t>, std::span<const OptT>)> //
+                   void(std::span<const uint64_t>, std::span<const OptT>,
+                        std::span<const uint32_t>)> //
   ::add_convention<pro::weak_dispatch<MemExportOptStateBatch>,
                    void(se::Function<bool(std::size_t, std::span<const uint64_t>,
                                          std::span<const ParamT>,
-                                         std::span<const OptT>)>,
+                                         std::span<const uint64_t>,
+                                         std::span<const OptT>,
+                                         std::span<const uint32_t>)>,
                         std::size_t)> //
   ::add_convention<pro::weak_dispatch<MemExportOptStateBatchOwned>,
                    void(se::Function<bool(std::size_t, std::vector<uint64_t>&&,
                                          std::vector<ParamT>&&,
-                                         std::vector<OptT>&&)>,
+                                         std::vector<uint64_t>&&,
+                                         std::vector<OptT>&&,
+                                         std::vector<uint32_t>&&)>,
                         std::size_t)> //
 
   ::build {};

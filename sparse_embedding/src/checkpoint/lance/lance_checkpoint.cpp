@@ -141,6 +141,7 @@ void LanceCheckpointWriter::begin(std::string_view uri, size_t dim,
   buf_embeddings_.clear();
   buf_scores_.clear();
   buf_opt_states_.clear();
+  buf_steps_.clear();
 }
 
 void LanceCheckpointWriter::write_batch(std::span<const uint64_t> keys,
@@ -148,7 +149,8 @@ void LanceCheckpointWriter::write_batch(std::span<const uint64_t> keys,
                                         size_t embedding_bytes,
                                         std::span<const uint64_t> scores,
                                         const void *optimizer_states,
-                                        size_t opt_state_bytes) {
+                                        size_t opt_state_bytes,
+                                        std::span<const uint32_t> steps) {
   buf_keys_.assign(keys.begin(), keys.end());
 
   buf_embeddings_.resize(embedding_bytes);
@@ -167,6 +169,12 @@ void LanceCheckpointWriter::write_batch(std::span<const uint64_t> keys,
     buf_opt_states_.clear();
   }
 
+  if (!steps.empty()) {
+    buf_steps_.assign(steps.begin(), steps.end());
+  } else {
+    buf_steps_.clear();
+  }
+
   flush_to_lance();
 }
 
@@ -175,6 +183,8 @@ void LanceCheckpointWriter::build_schema(ArrowSchema *out) const {
   if (has_score_)
     ++n_cols;
   if (opt_state_dim_ > 0)
+    ++n_cols;
+  if (!buf_steps_.empty())
     ++n_cols;
 
   std::memset(out, 0, sizeof(*out));
@@ -222,6 +232,13 @@ void LanceCheckpointWriter::build_schema(ArrowSchema *out) const {
     }
     ++col;
   }
+
+  // step: uint32
+  if (!buf_steps_.empty()) {
+    out->children[col] = new ArrowSchema();
+    make_child_schema(out->children[col], "step", "I");
+    ++col;
+  }
 }
 
 void LanceCheckpointWriter::build_array(ArrowArray *out) const {
@@ -230,6 +247,8 @@ void LanceCheckpointWriter::build_array(ArrowArray *out) const {
   if (has_score_)
     ++n_cols;
   if (opt_state_dim_ > 0)
+    ++n_cols;
+  if (!buf_steps_.empty())
     ++n_cols;
 
   std::memset(out, 0, sizeof(*out));
@@ -262,6 +281,12 @@ void LanceCheckpointWriter::build_array(ArrowArray *out) const {
   if (opt_state_dim_ > 0) {
     out->children[col] = new ArrowArray();
     make_child_array(out->children[col], n, nullptr, buf_opt_states_.data());
+    ++col;
+  }
+
+  if (!buf_steps_.empty()) {
+    out->children[col] = new ArrowArray();
+    make_child_array(out->children[col], n, nullptr, buf_steps_.data());
     ++col;
   }
 }
@@ -366,6 +391,7 @@ void LanceCheckpointWriter::flush_to_lance() {
   buf_embeddings_.clear();
   buf_scores_.clear();
   buf_opt_states_.clear();
+  buf_steps_.clear();
 }
 
 uint64_t LanceCheckpointWriter::commit() { return committed_version_; }
@@ -454,6 +480,8 @@ void LanceCheckpointReader::open(std::string_view uri, size_t dim,
         size_t bytes = std::stoul(child->format + 2);
         opt_state_dim_ = bytes;
       }
+    } else if (std::strcmp(child->name, "step") == 0) {
+      has_step_ = true;
     }
   }
 
@@ -464,7 +492,8 @@ void LanceCheckpointReader::open(std::string_view uri, size_t dim,
 bool LanceCheckpointReader::read_batch(
     size_t max_n, std::vector<uint64_t> &out_keys,
     std::vector<std::byte> &out_embeddings, std::vector<uint64_t> &out_scores,
-    std::vector<std::byte> &out_optimizer_states) {
+    std::vector<std::byte> &out_optimizer_states,
+    std::vector<uint32_t> &out_steps) {
   if (!stream_open_)
     return false;
 
@@ -522,6 +551,16 @@ bool LanceCheckpointReader::read_batch(
     ++col;
   } else {
     out_optimizer_states.clear();
+  }
+
+  // step column (optional)
+  if (has_step_ && col < batch.n_children) {
+    auto *child = batch.children[col];
+    auto *data = static_cast<const uint32_t *>(child->buffers[1]);
+    out_steps.assign(data + child->offset, data + child->offset + n);
+    ++col;
+  } else {
+    out_steps.clear();
   }
 
   if (batch.release)

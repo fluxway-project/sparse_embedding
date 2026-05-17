@@ -34,6 +34,8 @@ PRO_DEF_MEM_DISPATCH(OptMemStep, step);
 PRO_DEF_MEM_DISPATCH(OptMemStateData, state_data);
 PRO_DEF_MEM_DISPATCH(OptMemStateDim, state_dim);
 PRO_DEF_MEM_DISPATCH(OptMemSetState, set_state);
+PRO_DEF_MEM_DISPATCH(OptMemStepData, step_data);
+PRO_DEF_MEM_DISPATCH(OptMemSetStep, set_step);
 
 template <typename ParamT, typename OptT>
 struct OptimizerFacade
@@ -51,6 +53,10 @@ struct OptimizerFacade
                        size_t() const> //
       ::add_convention<pro::weak_dispatch<OptMemSetState>,
                        void(uint32_t idx, std::span<const OptT> state)> //
+      ::add_convention<pro::weak_dispatch<OptMemStepData>,
+                       uint32_t(uint32_t idx) const> //
+      ::add_convention<pro::weak_dispatch<OptMemSetStep>,
+                       void(uint32_t idx, uint32_t step)> //
       ::build {};
 
 PRO_DEF_MEM_DISPATCH(MemBuildOpt_f32_f32, build_f32_f32);

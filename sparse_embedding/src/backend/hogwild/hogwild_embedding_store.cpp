@@ -13,6 +13,7 @@
 // limitations under the License.
 // =============================================================================
 
+#define HOGWILD_EXPLICIT_INSTANTIATION
 #include "sparse_embedding/src/backend/hogwild/hogwild_embedding_store.hpp"
 #include "sparse_embedding/src/optimizer/adam_optimizer.hpp"
 #include "sparse_embedding/src/optimizer/sgd_optimizer.hpp"

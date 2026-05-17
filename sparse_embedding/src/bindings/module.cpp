@@ -24,1536 +24,198 @@
 
 #include <algorithm>
 #include <cstdint>
-#include <cstring>
 #include <memory>
-#include <optional>
 #include <span>
 #include <stdexcept>
 #include <string>
-#include <system_error>
 #include <thread>
-#include <unordered_map>
-#include <utility>
-#include <variant>
 
-#include "sparse_embedding/src/backend/hogwild/hogwild_embedding_store.hpp"
-#include "sparse_embedding/src/bindings/arrow_c_bridge.hpp"
 #include "sparse_embedding/src/bindings/async_bridge.hpp"
 #include "sparse_embedding/src/bindings/dlpack_utils.hpp"
-#include "sparse_embedding/src/bindings/python_wake_manager.hpp"
-#include "sparse_embedding/src/checkpoint/checkpoint_interface.hpp"
+#include "sparse_embedding/src/bindings/module_wrapper.hpp"
+#include "sparse_embedding/src/common/slot_key_codec.hpp"
+#include "sparse_embedding/src/ops/partitioner.hpp"
+#include "sparse_embedding/src/ops/tensor_ops.hpp"
 #ifdef SE_ENABLE_LANCE_CHECKPOINTER
 #include "sparse_embedding/src/checkpoint/lance/lance_checkpoint.hpp"
 #endif
-#include "sparse_embedding/src/common/function.hpp"
-#include "sparse_embedding/src/common/slot_key_codec.hpp"
-#include "sparse_embedding/src/eviction/score_policy.hpp"
-#include "sparse_embedding/src/initializer/initializer_config.hpp"
-#include "sparse_embedding/src/initializer/uniform_initializer.hpp"
-#include "sparse_embedding/src/initializer/zeros_initializer.hpp"
-#include "sparse_embedding/src/interface/embedding_config.hpp"
-#include "sparse_embedding/src/interface/embedding_table_interface.hpp"
-#include "sparse_embedding/src/ops/partitioner.hpp"
-#include "sparse_embedding/src/ops/tensor_ops.hpp"
-#include "sparse_embedding/src/optimizer/adam_optimizer.hpp"
-#include "sparse_embedding/src/optimizer/optimizer_config.hpp"
-#include "sparse_embedding/src/optimizer/sgd_optimizer.hpp"
 
 namespace nb = nanobind;
 
-namespace {
-
-inline void check_error(std::error_code ec) {
-  if (ec)
-    throw std::runtime_error(ec.message());
-}
-
-// KeyDType detection
-// =============================================================================
-
-enum class KeyDType { kInt32, kUInt32, kInt64, kUInt64 };
-
-inline KeyDType detect_key_dtype(const DLManagedTensor *dlm) {
-  auto code = dlm->dl_tensor.dtype.code;
-  auto bits = dlm->dl_tensor.dtype.bits;
-  if (code == static_cast<uint8_t>(kDLInt) && bits == 32)
-    return KeyDType::kInt32;
-  if (code == static_cast<uint8_t>(kDLUInt) && bits == 32)
-    return KeyDType::kUInt32;
-  if (code == static_cast<uint8_t>(kDLInt) && bits == 64)
-    return KeyDType::kInt64;
-  if (code == static_cast<uint8_t>(kDLUInt) && bits == 64)
-    return KeyDType::kUInt64;
-  throw std::invalid_argument("keys must be int32, uint32, int64 or uint64");
-}
-
-template <typename Fn>
-auto dispatch_on_key(const DLManagedTensor *dlm,
-                     const std::string &expected_key_dtype, Fn &&fn) {
-  auto kdt = detect_key_dtype(dlm);
-
-  if (kdt == KeyDType::kInt32 && expected_key_dtype != "int32")
-    throw std::invalid_argument("key_dtype mismatch: expected " +
-                                expected_key_dtype + " but got int32");
-  if (kdt == KeyDType::kUInt32 && expected_key_dtype != "uint32")
-    throw std::invalid_argument("key_dtype mismatch: expected " +
-                                expected_key_dtype + " but got uint32");
-  if (kdt == KeyDType::kInt64 && expected_key_dtype != "int64")
-    throw std::invalid_argument("key_dtype mismatch: expected " +
-                                expected_key_dtype + " but got int64");
-  if (kdt == KeyDType::kUInt64 && expected_key_dtype != "uint64")
-    throw std::invalid_argument("key_dtype mismatch: expected " +
-                                expected_key_dtype + " but got uint64");
-
-  if (kdt == KeyDType::kInt32)
-    return fn(se::py::dlpack_to_span<const int32_t>(dlm));
-  if (kdt == KeyDType::kUInt32)
-    return fn(se::py::dlpack_to_span<const uint32_t>(dlm));
-  if (kdt == KeyDType::kInt64)
-    return fn(se::py::dlpack_to_span<const int64_t>(dlm));
-  return fn(se::py::dlpack_to_span<const uint64_t>(dlm));
-}
-
-template <typename Fn>
-auto dispatch_partition_key(const DLManagedTensor *dlm, Fn &&fn) {
-  auto kdt = detect_key_dtype(dlm);
-  if (kdt == KeyDType::kInt32)
-    return fn(se::py::dlpack_to_span<const int32_t>(dlm));
-  if (kdt == KeyDType::kUInt32)
-    return fn(se::py::dlpack_to_span<const uint32_t>(dlm));
-  if (kdt == KeyDType::kInt64)
-    return fn(se::py::dlpack_to_span<const int64_t>(dlm));
-  return fn(se::py::dlpack_to_span<const uint64_t>(dlm));
-}
-
-inline size_t get_dlm_size(const DLManagedTensor *dlm) {
-  size_t n = 1;
-  for (int i = 0; i < dlm->dl_tensor.ndim; ++i) {
-    n *= static_cast<size_t>(dlm->dl_tensor.shape[i]);
-  }
-  return n;
-}
+using namespace se::py::detail;
 
 // =============================================================================
-// Builder Proxies for Initializers and Optimizers
+// EmbeddingStoreWrapper constructor (out-of-line to avoid cross-TU
+// instantiation of ConstructOpsImpl in every .inl translation unit)
 // =============================================================================
 
-struct PyOptimizer {
-  std::shared_ptr<pro::proxy<se::OptimizerBuilderFacade>> builder;
-};
+namespace se::py::detail {
 
-struct PyInitializer {
-  std::shared_ptr<pro::proxy<se::InitializerBuilderFacade>> builder;
-};
+EmbeddingStoreWrapper::EmbeddingStoreWrapper(
+    const se::EmbeddingConfig &emb_cfg,
+    std::optional<PyInitializer> init_cfg_opt,
+    std::optional<PyOptimizer> opt_cfg_opt, std::string score_policy_name)
+    : async_pool_((emb_cfg.num_threads == 0)
+                      ? std::max(1u, std::thread::hardware_concurrency())
+                      : emb_cfg.num_threads),
+      dtype_(emb_cfg.dtype),
+      opt_dtype_(emb_cfg.opt_dtype.empty() ? emb_cfg.dtype : emb_cfg.opt_dtype),
+      key_dtype_(emb_cfg.key_dtype) {
 
-struct PyPartitioner {
-  std::shared_ptr<pro::proxy<se::ops::PartitionerFacade>> facade;
+  PyInitializer init_cfg = init_cfg_opt.value_or(
+      PyInitializer{std::make_shared<pro::proxy<se::InitializerBuilderFacade>>(
+          pro::make_proxy<se::InitializerBuilderFacade,
+                          UniformInitializerBuilder>(-0.05f, 0.05f))});
 
-  nb::object partition(nb::object keys) {
-    auto [dlm_keys, cap_keys] = se::py::extract_dlpack_tensor(keys);
-    size_t n = dlm_keys->dl_tensor.shape[0];
+  PyOptimizer opt_cfg = opt_cfg_opt.value_or(
+      PyOptimizer{std::make_shared<pro::proxy<se::OptimizerBuilderFacade>>(
+          pro::make_proxy<
+              se::OptimizerBuilderFacade,
+              DefaultOptimizerBuilder<se::AdamOptimizer, se::AdamConfig>>(
+              se::AdamConfig{}))});
 
-    DLManagedTensor *out_dlm = se::py::create_output_tensor<uint32_t>(
-        std::span<const int64_t>({static_cast<int64_t>(n)}));
-    auto out_span = se::py::dlpack_to_span<uint32_t>(out_dlm);
+  dims_ = emb_cfg.dims;
+  if (dims_.empty())
+    throw std::invalid_argument("dims must not be empty");
 
-    dispatch_partition_key(dlm_keys, [&](auto keys_span) {
-      (*facade)->partition_span(keys_span, out_span);
-    });
-    return se::py::wrap_output_tensor(out_dlm);
-  }
+  size_t nt = (emb_cfg.num_threads == 0)
+                  ? std::max(1u, std::thread::hardware_concurrency())
+                  : emb_cfg.num_threads;
 
-  nb::object async_partition(nb::object keys) {
-    auto [dlm_keys, cap_keys] = se::py::extract_dlpack_tensor(keys);
-    size_t n = dlm_keys->dl_tensor.shape[0];
-    auto kdt = detect_key_dtype(dlm_keys);
-    const void *keys_data =
-        reinterpret_cast<const char *>(dlm_keys->dl_tensor.data) +
-        dlm_keys->dl_tensor.byte_offset;
+  dispatch_types([&]<typename P, typename O>() {
+    ConstructOpsImpl<P, O>::construct(*this, init_cfg, opt_cfg,
+                                      score_policy_name, nt,
+                                      emb_cfg.max_active_keys);
+  });
+}
 
-    static exec::static_thread_pool pool(
-        std::max(1u, std::thread::hardware_concurrency()));
-    auto facade_copy = facade;
-
-    return se::py::async_dispatch(
-        pool,
-        [facade_copy, n, kdt, keys_data,
-         keys_keeper = std::make_shared<se::py::AsyncPyObjectKeeper>(
-             cap_keys)]() -> DLManagedTensor * {
-          DLManagedTensor *out_dlm = se::py::create_output_tensor<uint32_t>(
-              std::span<const int64_t>({static_cast<int64_t>(n)}));
-          uint32_t *out_ptr =
-              reinterpret_cast<uint32_t *>(out_dlm->dl_tensor.data);
-
-          auto do_partition = [&](auto ks) {
-            (*facade_copy)->partition_span(ks, std::span<uint32_t>(out_ptr, n));
-          };
-          if (kdt == KeyDType::kInt32)
-            do_partition(std::span<const int32_t>(
-                static_cast<const int32_t *>(keys_data), n));
-          else if (kdt == KeyDType::kUInt32)
-            do_partition(std::span<const uint32_t>(
-                static_cast<const uint32_t *>(keys_data), n));
-          else if (kdt == KeyDType::kInt64)
-            do_partition(std::span<const int64_t>(
-                static_cast<const int64_t *>(keys_data), n));
-          else
-            do_partition(std::span<const uint64_t>(
-                static_cast<const uint64_t *>(keys_data), n));
-
-          return out_dlm;
-        },
-        [](nb::object future, DLManagedTensor *mask_dlm) {
-          future.attr("set_result")(se::py::wrap_output_tensor(mask_dlm));
-        });
-  }
-
-  nb::object filter(nb::object keys, uint32_t target_shard) {
-    auto [dlm_keys, cap_keys] = se::py::extract_dlpack_tensor(keys);
-    size_t n = dlm_keys->dl_tensor.shape[0];
-
-    DLManagedTensor *out_dlm = se::py::create_output_tensor<bool>(
-        std::span<const int64_t>({static_cast<int64_t>(n)}));
-    auto out_span = se::py::dlpack_to_span<bool>(out_dlm);
-
-    dispatch_partition_key(dlm_keys, [&](auto keys_span) {
-      (*facade)->filter_span(keys_span, target_shard, out_span);
-    });
-    return se::py::wrap_output_tensor(out_dlm);
-  }
-
-  nb::object async_filter(nb::object keys, uint32_t target_shard) {
-    auto [dlm_keys, cap_keys] = se::py::extract_dlpack_tensor(keys);
-    size_t n = dlm_keys->dl_tensor.shape[0];
-    auto kdt = detect_key_dtype(dlm_keys);
-    const void *keys_data =
-        reinterpret_cast<const char *>(dlm_keys->dl_tensor.data) +
-        dlm_keys->dl_tensor.byte_offset;
-
-    static exec::static_thread_pool pool(
-        std::max(1u, std::thread::hardware_concurrency()));
-    auto facade_copy = facade;
-
-    return se::py::async_dispatch(
-        pool,
-        [facade_copy, n, target_shard, kdt, keys_data,
-         keys_keeper = std::make_shared<se::py::AsyncPyObjectKeeper>(
-             cap_keys)]() -> DLManagedTensor * {
-          DLManagedTensor *out_dlm = se::py::create_output_tensor<bool>(
-              std::span<const int64_t>({static_cast<int64_t>(n)}));
-          bool *out_ptr = reinterpret_cast<bool *>(out_dlm->dl_tensor.data);
-
-          auto do_filter = [&](auto ks) {
-            (*facade_copy)
-                ->filter_span(ks, target_shard, std::span<bool>(out_ptr, n));
-          };
-          if (kdt == KeyDType::kInt32)
-            do_filter(std::span<const int32_t>(
-                static_cast<const int32_t *>(keys_data), n));
-          else if (kdt == KeyDType::kUInt32)
-            do_filter(std::span<const uint32_t>(
-                static_cast<const uint32_t *>(keys_data), n));
-          else if (kdt == KeyDType::kInt64)
-            do_filter(std::span<const int64_t>(
-                static_cast<const int64_t *>(keys_data), n));
-          else
-            do_filter(std::span<const uint64_t>(
-                static_cast<const uint64_t *>(keys_data), n));
-
-          return out_dlm;
-        },
-        [](nb::object future, DLManagedTensor *mask_dlm) {
-          future.attr("set_result")(se::py::wrap_output_tensor(mask_dlm));
-        });
-  }
-};
-
-template <template <typename, typename> class OptT, typename ConfigT>
-struct DefaultOptimizerBuilder {
-  ConfigT config;
-
-  pro::proxy<se::OptimizerFacade<float, float>> build_f32_f32(size_t dim) {
-    return pro::make_proxy<se::OptimizerFacade<float, float>,
-                           OptT<float, float>>(dim, config);
-  }
-  pro::proxy<se::OptimizerFacade<float, se::float16_t>>
-  build_f32_f16(size_t dim) {
-    return pro::make_proxy<se::OptimizerFacade<float, se::float16_t>,
-                           OptT<float, se::float16_t>>(dim, config);
-  }
-  pro::proxy<se::OptimizerFacade<float, se::bfloat16_t>>
-  build_f32_bf16(size_t dim) {
-    return pro::make_proxy<se::OptimizerFacade<float, se::bfloat16_t>,
-                           OptT<float, se::bfloat16_t>>(dim, config);
-  }
-
-  pro::proxy<se::OptimizerFacade<se::float16_t, float>>
-  build_f16_f32(size_t dim) {
-    return pro::make_proxy<se::OptimizerFacade<se::float16_t, float>,
-                           OptT<se::float16_t, float>>(dim, config);
-  }
-  pro::proxy<se::OptimizerFacade<se::float16_t, se::float16_t>>
-  build_f16_f16(size_t dim) {
-    return pro::make_proxy<se::OptimizerFacade<se::float16_t, se::float16_t>,
-                           OptT<se::float16_t, se::float16_t>>(dim, config);
-  }
-  pro::proxy<se::OptimizerFacade<se::float16_t, se::bfloat16_t>>
-  build_f16_bf16(size_t dim) {
-    return pro::make_proxy<se::OptimizerFacade<se::float16_t, se::bfloat16_t>,
-                           OptT<se::float16_t, se::bfloat16_t>>(dim, config);
-  }
-
-  pro::proxy<se::OptimizerFacade<se::bfloat16_t, float>>
-  build_bf16_f32(size_t dim) {
-    return pro::make_proxy<se::OptimizerFacade<se::bfloat16_t, float>,
-                           OptT<se::bfloat16_t, float>>(dim, config);
-  }
-  pro::proxy<se::OptimizerFacade<se::bfloat16_t, se::float16_t>>
-  build_bf16_f16(size_t dim) {
-    return pro::make_proxy<se::OptimizerFacade<se::bfloat16_t, se::float16_t>,
-                           OptT<se::bfloat16_t, se::float16_t>>(dim, config);
-  }
-  pro::proxy<se::OptimizerFacade<se::bfloat16_t, se::bfloat16_t>>
-  build_bf16_bf16(size_t dim) {
-    return pro::make_proxy<se::OptimizerFacade<se::bfloat16_t, se::bfloat16_t>,
-                           OptT<se::bfloat16_t, se::bfloat16_t>>(dim, config);
-  }
-};
-
-struct ZerosInitializerBuilder {
-  pro::proxy<se::InitializerFacade<float>> build_f32() {
-    return pro::make_proxy<se::InitializerFacade<float>,
-                           se::ZerosInitializer<float>>();
-  }
-  pro::proxy<se::InitializerFacade<se::float16_t>> build_f16() {
-    return pro::make_proxy<se::InitializerFacade<se::float16_t>,
-                           se::ZerosInitializer<se::float16_t>>();
-  }
-  pro::proxy<se::InitializerFacade<se::bfloat16_t>> build_bf16() {
-    return pro::make_proxy<se::InitializerFacade<se::bfloat16_t>,
-                           se::ZerosInitializer<se::bfloat16_t>>();
-  }
-};
-
-struct UniformInitializerBuilder {
-  float min_val, max_val;
-  pro::proxy<se::InitializerFacade<float>> build_f32() {
-    return pro::make_proxy<se::InitializerFacade<float>,
-                           se::UniformInitializer<float>>(min_val, max_val);
-  }
-  pro::proxy<se::InitializerFacade<se::float16_t>> build_f16() {
-    return pro::make_proxy<se::InitializerFacade<se::float16_t>,
-                           se::UniformInitializer<se::float16_t>>(min_val,
-                                                                  max_val);
-  }
-  pro::proxy<se::InitializerFacade<se::bfloat16_t>> build_bf16() {
-    return pro::make_proxy<se::InitializerFacade<se::bfloat16_t>,
-                           se::UniformInitializer<se::bfloat16_t>>(min_val,
-                                                                   max_val);
-  }
-};
+} // namespace se::py::detail
 
 // =============================================================================
-// EmbeddingStoreWrapper: proxy wrapper for orthogonality
+// PyPartitioner method implementations
 // =============================================================================
 
-class EmbeddingStoreWrapper {
-  using StoreProxyVariant = std::variant<
-      pro::proxy<se::EmbeddingTableFacade<float, float>>,
-      pro::proxy<se::EmbeddingTableFacade<float, se::float16_t>>,
-      pro::proxy<se::EmbeddingTableFacade<float, se::bfloat16_t>>,
-      pro::proxy<se::EmbeddingTableFacade<se::float16_t, float>>,
-      pro::proxy<se::EmbeddingTableFacade<se::float16_t, se::float16_t>>,
-      pro::proxy<se::EmbeddingTableFacade<se::float16_t, se::bfloat16_t>>,
-      pro::proxy<se::EmbeddingTableFacade<se::bfloat16_t, float>>,
-      pro::proxy<se::EmbeddingTableFacade<se::bfloat16_t, se::float16_t>>,
-      pro::proxy<se::EmbeddingTableFacade<se::bfloat16_t, se::bfloat16_t>>>;
-  StoreProxyVariant store_;
-  exec::static_thread_pool async_pool_;
-  std::string dtype_;
-  std::string opt_dtype_;
-  std::string key_dtype_;
-  std::vector<size_t> dims_; // physical table dims, indexed by slot index
+namespace se::py::detail {
 
-  template <typename ParamT, typename OptT> auto &get_store() {
-    return std::get<pro::proxy<se::EmbeddingTableFacade<ParamT, OptT>>>(store_);
-  }
+nb::object PyPartitioner::partition(nb::object keys) {
+  auto [dlm_keys, cap_keys] = se::py::extract_dlpack_tensor(keys);
+  size_t n = dlm_keys->dl_tensor.shape[0];
 
-  template <typename Fn> auto dispatch_val(Fn &&fn) {
-    if (dtype_ == "float32" || dtype_ == "f32")
-      return fn.template operator()<float>();
-    if (dtype_ == "float16" || dtype_ == "f16")
-      return fn.template operator()<se::float16_t>();
-    if (dtype_ == "bfloat16" || dtype_ == "bf16")
-      return fn.template operator()<se::bfloat16_t>();
-    throw std::invalid_argument("unsupported dtype: " + dtype_);
-  }
+  DLManagedTensor *out_dlm = se::py::create_output_tensor<uint32_t>(
+      std::span<const int64_t>({static_cast<int64_t>(n)}));
+  auto out_span = se::py::dlpack_to_span<uint32_t>(out_dlm);
 
-  static void fill_uniform_row_lengths(std::span<int64_t> out, int64_t dim) {
-    std::fill(out.begin(), out.end(), dim);
-  }
+  dispatch_partition_key(dlm_keys, [&](auto keys_span) {
+    (*facade)->partition_span(keys_span, out_span);
+  });
+  return se::py::wrap_output_tensor(out_dlm);
+}
 
-public:
-  EmbeddingStoreWrapper(const se::EmbeddingConfig &emb_cfg,
-                        std::optional<PyInitializer> init_cfg_opt,
-                        std::optional<PyOptimizer> opt_cfg_opt,
-                        std::string score_policy_name)
-      : async_pool_((emb_cfg.num_threads == 0)
-                        ? std::max(1u, std::thread::hardware_concurrency())
-                        : emb_cfg.num_threads),
-        dtype_(emb_cfg.dtype),
-        opt_dtype_(emb_cfg.opt_dtype.empty() ? emb_cfg.dtype
-                                             : emb_cfg.opt_dtype),
-        key_dtype_(emb_cfg.key_dtype) {
+nb::object PyPartitioner::async_partition(nb::object keys) {
+  auto [dlm_keys, cap_keys] = se::py::extract_dlpack_tensor(keys);
+  size_t n = dlm_keys->dl_tensor.shape[0];
+  auto kdt = detect_key_dtype(dlm_keys);
+  const void *keys_data =
+      reinterpret_cast<const char *>(dlm_keys->dl_tensor.data) +
+      dlm_keys->dl_tensor.byte_offset;
 
-    PyInitializer init_cfg = init_cfg_opt.value_or(PyInitializer{
-        std::make_shared<pro::proxy<se::InitializerBuilderFacade>>(
-            pro::make_proxy<se::InitializerBuilderFacade,
-                            UniformInitializerBuilder>(-0.05f, 0.05f))});
+  static exec::static_thread_pool pool(
+      std::max(1u, std::thread::hardware_concurrency()));
+  auto facade_copy = facade;
 
-    PyOptimizer opt_cfg = opt_cfg_opt.value_or(
-        PyOptimizer{std::make_shared<pro::proxy<se::OptimizerBuilderFacade>>(
-            pro::make_proxy<
-                se::OptimizerBuilderFacade,
-                DefaultOptimizerBuilder<se::AdamOptimizer, se::AdamConfig>>(
-                se::AdamConfig{}))});
+  return se::py::async_dispatch(
+      pool,
+      [facade_copy, n, kdt, keys_data,
+       keys_keeper = std::make_shared<se::py::AsyncPyObjectKeeper>(
+           cap_keys)]() -> DLManagedTensor * {
+        DLManagedTensor *out_dlm = se::py::create_output_tensor<uint32_t>(
+            std::span<const int64_t>({static_cast<int64_t>(n)}));
+        uint32_t *out_ptr =
+            reinterpret_cast<uint32_t *>(out_dlm->dl_tensor.data);
 
-    dims_ = emb_cfg.dims;
-    if (dims_.empty())
-      throw std::invalid_argument("dims must not be empty");
-
-    size_t nt = (emb_cfg.num_threads == 0)
-                    ? std::max(1u, std::thread::hardware_concurrency())
-                    : emb_cfg.num_threads;
-
-    auto construct = [&]<typename ValT>() {
-      pro::proxy<se::InitializerFacade<ParamT>> init_proxy;
-
-      if constexpr (std::is_same_v<ParamT, float>) {
-        init_proxy = (*init_cfg.builder)->build_f32();
-      } else if constexpr (std::is_same_v<ParamT, se::float16_t>) {
-        init_proxy = (*init_cfg.builder)->build_f16();
-      } else if constexpr (std::is_same_v<ParamT, se::bfloat16_t>) {
-        init_proxy = (*init_cfg.builder)->build_bf16();
-      }
-
-      using OptFacade = se::OptimizerFacade<ParamT>;
-      using OptFactory = se::Function<pro::proxy<OptFacade>(size_t)>;
-
-      OptFactory opt_factory;
-
-      if constexpr (std::is_same_v<ParamT, float>) {
-        opt_factory =
-            pro::make_proxy<se::FunctionFacade<pro::proxy<OptFacade>(size_t)>>(
-                [builder = opt_cfg.builder](size_t d) mutable {
-                  return (*builder)->build_f32(d);
-                });
-      } else if constexpr (std::is_same_v<ParamT, se::float16_t>) {
-        opt_factory =
-            pro::make_proxy<se::FunctionFacade<pro::proxy<OptFacade>(size_t)>>(
-                [builder = opt_cfg.builder](size_t d) mutable {
-                  return (*builder)->build_f16(d);
-                });
-      } else if constexpr (std::is_same_v<ParamT, se::bfloat16_t>) {
-        opt_factory =
-            pro::make_proxy<se::FunctionFacade<pro::proxy<OptFacade>(size_t)>>(
-                [builder = opt_cfg.builder](size_t d) mutable {
-                  return (*builder)->build_bf16(d);
-                });
-      }
-
-      auto construct_with_key = [&]<typename KeyT>() {
-        auto construct_with_policy = [&]<typename Policy>(Policy policy) {
-          using StoreType =
-              se::HogwildEmbeddingStore<KeyT, ParamT, OptT, Policy>;
-          store_ = pro::make_proxy<se::EmbeddingTableFacade<ParamT, OptT>,
-                                   StoreType>(
-              dims_, nt, std::move(init_proxy), emb_cfg.max_active_keys,
-              std::move(opt_factory), std::move(policy));
+        auto do_partition = [&](auto ks) {
+          (*facade_copy)->partition_span(ks, std::span<uint32_t>(out_ptr, n));
         };
+        if (kdt == KeyDType::kInt32)
+          do_partition(std::span<const int32_t>(
+              static_cast<const int32_t *>(keys_data), n));
+        else if (kdt == KeyDType::kUInt32)
+          do_partition(std::span<const uint32_t>(
+              static_cast<const uint32_t *>(keys_data), n));
+        else if (kdt == KeyDType::kInt64)
+          do_partition(std::span<const int64_t>(
+              static_cast<const int64_t *>(keys_data), n));
+        else
+          do_partition(std::span<const uint64_t>(
+              static_cast<const uint64_t *>(keys_data), n));
 
-        if (score_policy_name == "none") {
-          construct_with_policy(se::NoScorePolicy{});
-        } else if (score_policy_name == "lfu") {
-          construct_with_policy(se::LfuScorePolicy{});
-        } else if (score_policy_name == "lru") {
-          construct_with_policy(se::LruScorePolicy{});
-        } else if (score_policy_name == "manual") {
-          construct_with_policy(se::ManualScorePolicy{});
-        } else {
-          throw std::invalid_argument("unknown score policy: " +
-                                      score_policy_name);
-        }
-      };
-
-      if (key_dtype_ == "int64")
-        construct_with_key.template operator()<int64_t>();
-      else if (key_dtype_ == "uint64")
-        construct_with_key.template operator()<uint64_t>();
-      else if (key_dtype_ == "int32")
-        construct_with_key.template operator()<int32_t>();
-      else if (key_dtype_ == "uint32")
-        construct_with_key.template operator()<uint32_t>();
-      else
-        throw std::invalid_argument("unsupported key_dtype: " + key_dtype_);
-    };
-
-    dispatch_val(construct);
-  }
-
-  // ---- Metadata ----
-
-  size_t total_size() {
-    size_t sz = 0;
-    dispatch_types([&]<typename ParamT, typename OptT>() {
-      sz = get_store<ParamT, OptT>()->size();
-    });
-    return sz;
-  }
-
-  size_t max_dim() const {
-    if (dims_.empty())
-      return 0;
-    return *std::max_element(dims_.begin(), dims_.end());
-  }
-
-  size_t num_slots() const { return dims_.size(); }
-
-  std::vector<size_t> table_dims() const { return dims_; }
-
-  // ---- Sync Lookup ----
-
-  nb::tuple lookup(nb::object keys, int64_t dim) {
-    if (dim <= 0)
-      throw std::invalid_argument("dim must be > 0");
-    auto [dlm_keys, cap_keys] = se::py::extract_dlpack_tensor(keys);
-    size_t n = get_dlm_size(dlm_keys);
-    DLManagedTensor *vals_dlm = nullptr;
-    DLManagedTensor *lens_dlm = nullptr;
-    std::error_code ec;
-
-    {
-      nb::gil_scoped_release release;
-      dispatch_types([&]<typename ParamT, typename OptT>() {
-        dispatch_on_key(dlm_keys, key_dtype_, key_dtype_, [&](auto ks) {
-          size_t total = static_cast<size_t>(dim) * n;
-          auto row_lengths = std::make_unique<int64_t[]>(n);
-          fill_uniform_row_lengths({row_lengths.get(), n}, dim);
-
-          int64_t vals_shape[] = {static_cast<int64_t>(total)};
-          vals_dlm = se::py::create_output_tensor<ParamT>(vals_shape);
-          lens_dlm =
-              se::py::wrap_unique_ptr_as_tensor(std::move(row_lengths), n);
-
-          auto vals_span = std::span<ParamT>(
-              static_cast<ParamT *>(vals_dlm->dl_tensor.data), total);
-          ec = get_store<ParamT, OptT>()->forward_lookup(
-              ks, vals_span,
-              {static_cast<const int64_t *>(lens_dlm->dl_tensor.data), n});
-        });
+        return out_dlm;
+      },
+      [](nb::object future, DLManagedTensor *mask_dlm) {
+        future.attr("set_result")(se::py::wrap_output_tensor(mask_dlm));
       });
-    }
+}
 
-    if (ec) {
-      if (vals_dlm)
-        vals_dlm->deleter(vals_dlm);
-      if (lens_dlm)
-        lens_dlm->deleter(lens_dlm);
-      throw std::runtime_error(ec.message());
-    }
-    return nb::make_tuple(se::py::wrap_output_tensor(vals_dlm),
-                          se::py::wrap_output_tensor(lens_dlm));
-  }
+nb::object PyPartitioner::filter(nb::object keys, uint32_t target_shard) {
+  auto [dlm_keys, cap_keys] = se::py::extract_dlpack_tensor(keys);
+  size_t n = dlm_keys->dl_tensor.shape[0];
 
-  // ---- Sync lookup_or_insert ----
+  DLManagedTensor *out_dlm = se::py::create_output_tensor<bool>(
+      std::span<const int64_t>({static_cast<int64_t>(n)}));
+  auto out_span = se::py::dlpack_to_span<bool>(out_dlm);
 
-  nb::tuple lookup_or_insert(nb::object keys, int64_t dim) {
-    if (dim <= 0)
-      throw std::invalid_argument("dim must be > 0");
-    auto [dlm_keys, cap_keys] = se::py::extract_dlpack_tensor(keys);
-    size_t n = get_dlm_size(dlm_keys);
-    DLManagedTensor *vals_dlm = nullptr;
-    DLManagedTensor *lens_dlm = nullptr;
-    DLManagedTensor *mask_dlm = nullptr;
-    std::error_code ec;
+  dispatch_partition_key(dlm_keys, [&](auto keys_span) {
+    (*facade)->filter_span(keys_span, target_shard, out_span);
+  });
+  return se::py::wrap_output_tensor(out_dlm);
+}
 
-    {
-      nb::gil_scoped_release release;
-      dispatch_types([&]<typename ParamT, typename OptT>() {
-        dispatch_on_key(dlm_keys, key_dtype_, key_dtype_, [&](auto ks) {
-          size_t total = static_cast<size_t>(dim) * n;
-          auto row_lengths_buf = std::make_unique<int64_t[]>(n);
-          fill_uniform_row_lengths({row_lengths_buf.get(), n}, dim);
+nb::object PyPartitioner::async_filter(nb::object keys, uint32_t target_shard) {
+  auto [dlm_keys, cap_keys] = se::py::extract_dlpack_tensor(keys);
+  size_t n = dlm_keys->dl_tensor.shape[0];
+  auto kdt = detect_key_dtype(dlm_keys);
+  const void *keys_data =
+      reinterpret_cast<const char *>(dlm_keys->dl_tensor.data) +
+      dlm_keys->dl_tensor.byte_offset;
 
-          int64_t lens_shape[] = {static_cast<int64_t>(n)};
-          lens_dlm =
-              se::py::wrap_unique_ptr_as_tensor(std::move(row_lengths_buf), n);
-          auto *lens_out = static_cast<int64_t *>(lens_dlm->dl_tensor.data);
+  static exec::static_thread_pool pool(
+      std::max(1u, std::thread::hardware_concurrency()));
+  auto facade_copy = facade;
 
-          int64_t vals_shape[] = {static_cast<int64_t>(total)};
-          vals_dlm = se::py::create_output_tensor<ParamT>(vals_shape);
-          int64_t mask_shape[] = {static_cast<int64_t>(n)};
-          mask_dlm = se::py::create_output_tensor<uint8_t>(mask_shape);
+  return se::py::async_dispatch(
+      pool,
+      [facade_copy, n, target_shard, kdt, keys_data,
+       keys_keeper = std::make_shared<se::py::AsyncPyObjectKeeper>(
+           cap_keys)]() -> DLManagedTensor * {
+        DLManagedTensor *out_dlm = se::py::create_output_tensor<bool>(
+            std::span<const int64_t>({static_cast<int64_t>(n)}));
+        bool *out_ptr = reinterpret_cast<bool *>(out_dlm->dl_tensor.data);
 
-          auto vals_span = std::span<ParamT>(
-              static_cast<ParamT *>(vals_dlm->dl_tensor.data), total);
-          auto *mask_out = static_cast<uint8_t *>(mask_dlm->dl_tensor.data);
-          ec = get_store<ParamT, OptT>()->lookup_or_insert(
-              ks, vals_span, {lens_out, n}, std::span<uint8_t>(mask_out, n));
-        });
+        auto do_filter = [&](auto ks) {
+          (*facade_copy)
+              ->filter_span(ks, target_shard, std::span<bool>(out_ptr, n));
+        };
+        if (kdt == KeyDType::kInt32)
+          do_filter(std::span<const int32_t>(
+              static_cast<const int32_t *>(keys_data), n));
+        else if (kdt == KeyDType::kUInt32)
+          do_filter(std::span<const uint32_t>(
+              static_cast<const uint32_t *>(keys_data), n));
+        else if (kdt == KeyDType::kInt64)
+          do_filter(std::span<const int64_t>(
+              static_cast<const int64_t *>(keys_data), n));
+        else
+          do_filter(std::span<const uint64_t>(
+              static_cast<const uint64_t *>(keys_data), n));
+
+        return out_dlm;
+      },
+      [](nb::object future, DLManagedTensor *mask_dlm) {
+        future.attr("set_result")(se::py::wrap_output_tensor(mask_dlm));
       });
-    }
+}
 
-    if (ec) {
-      if (vals_dlm)
-        vals_dlm->deleter(vals_dlm);
-      if (lens_dlm)
-        lens_dlm->deleter(lens_dlm);
-      if (mask_dlm)
-        mask_dlm->deleter(mask_dlm);
-      throw std::runtime_error(ec.message());
-    }
-    return nb::make_tuple(se::py::wrap_output_tensor(vals_dlm),
-                          se::py::wrap_output_tensor(lens_dlm),
-                          se::py::wrap_output_tensor(mask_dlm));
-  }
-
-  // ---- Sync assign ----
-  // values must be a 2D tensor of shape (n, dim)
-
-  void assign(nb::object keys, nb::object values) {
-    auto [dlm_keys, cap_keys] = se::py::extract_dlpack_tensor(keys);
-    auto [dlm_values, cap_values] = se::py::extract_dlpack_tensor(values);
-    size_t n = get_dlm_size(dlm_keys);
-    std::error_code ec;
-    {
-      nb::gil_scoped_release release;
-      dispatch_types([&]<typename ParamT, typename OptT>() {
-        dispatch_on_key(dlm_keys, key_dtype_, key_dtype_, [&](auto ks) {
-          auto val_span = se::py::dlpack_to_span<const ValT>(dlm_values);
-          int64_t dim = 0;
-          if (dlm_values->dl_tensor.ndim == 2) {
-            if (dlm_values->dl_tensor.shape[0] != static_cast<int64_t>(n)) {
-              throw std::invalid_argument(
-                  "values shape[0] must match keys length");
-            }
-            dim = dlm_values->dl_tensor.shape[1];
-          } else if (dlm_values->dl_tensor.ndim == 1) {
-            if (n > 0) {
-              if (dlm_values->dl_tensor.shape[0] % n != 0) {
-                throw std::invalid_argument(
-                    "1D values length must be a multiple of keys length");
-              }
-              dim = dlm_values->dl_tensor.shape[0] / n;
-            }
-          } else {
-            throw std::invalid_argument("values must be a 1D or 2D tensor");
-          }
-          thread_local std::vector<int64_t> tls_row_lengths;
-          tls_row_lengths.resize(n);
-          fill_uniform_row_lengths(tls_row_lengths, dim);
-          ec = get_store<ParamT, OptT>()->assign(ks, val_span, tls_row_lengths);
-        });
-      });
-    }
-    check_error(ec);
-  }
-
-  // ---- Sync contains ----
-
-  nb::object contains(nb::object keys) {
-    auto [dlm_keys, cap_keys] = se::py::extract_dlpack_tensor(keys);
-    size_t n = get_dlm_size(dlm_keys);
-    int64_t shape[1] = {static_cast<int64_t>(n)};
-    DLManagedTensor *dlm =
-        se::py::create_output_tensor<uint8_t>(std::span(shape));
-    auto *out = static_cast<uint8_t *>(dlm->dl_tensor.data);
-
-    std::error_code ec;
-    {
-      nb::gil_scoped_release release;
-      dispatch_types([&]<typename ParamT, typename OptT>() {
-        dispatch_on_key(dlm_keys, key_dtype_, key_dtype_, [&](auto ks) {
-          ec = get_store<ParamT, OptT>()->contains(ks,
-                                                   std::span<uint8_t>(out, n));
-        });
-      });
-    }
-
-    check_error(ec);
-    return se::py::wrap_output_tensor(dlm);
-  }
-
-  // ---- Accumulate gradients ----
-
-  void accumulate_gradients(nb::object keys, nb::object grads) {
-    auto [dlm_keys, cap_keys] = se::py::extract_dlpack_tensor(keys);
-    auto [dlm_grads, cap_grads] = se::py::extract_dlpack_tensor(grads);
-    size_t n = get_dlm_size(dlm_keys);
-    int64_t dim = 0;
-    if (dlm_grads->dl_tensor.ndim == 2) {
-      if (dlm_grads->dl_tensor.shape[0] != static_cast<int64_t>(n)) {
-        throw std::invalid_argument("grads shape[0] must match keys length");
-      }
-      dim = dlm_grads->dl_tensor.shape[1];
-    } else if (dlm_grads->dl_tensor.ndim == 1) {
-      if (n > 0) {
-        if (dlm_grads->dl_tensor.shape[0] % n != 0) {
-          throw std::invalid_argument(
-              "1D grads length must be a multiple of keys length");
-        }
-        dim = dlm_grads->dl_tensor.shape[0] / n;
-      }
-    } else {
-      throw std::invalid_argument("grads must be a 1D or 2D tensor");
-    }
-
-    std::error_code ec;
-    {
-      nb::gil_scoped_release release;
-      dispatch_types([&]<typename ParamT, typename OptT>() {
-        auto grads_span = se::py::dlpack_to_span<const ValT>(dlm_grads);
-        dispatch_on_key(dlm_keys, key_dtype_, key_dtype_, [&](auto ks) {
-          thread_local std::vector<int64_t> tls_row_lengths;
-          tls_row_lengths.resize(n);
-          fill_uniform_row_lengths(tls_row_lengths, dim);
-          ec = get_store<ParamT, OptT>()->accumulate_gradients(ks, grads_span,
-                                                               tls_row_lengths);
-        });
-      });
-    }
-    check_error(ec);
-  }
-
-  // ---- Optimizer Step ----
-
-  void optimizer_step() {
-    nb::gil_scoped_release release;
-    std::error_code ec;
-    dispatch_val([&]<typename ValT>() {
-      ec = get_store<ParamT, OptT>()->optimizer_step();
-    });
-    check_error(ec);
-  }
-
-  // ---- Sync erase ----
-
-  void erase(nb::object keys) {
-    auto [dlm_keys, cap_keys] = se::py::extract_dlpack_tensor(keys);
-    std::error_code ec;
-    {
-      nb::gil_scoped_release release;
-      dispatch_types([&]<typename ParamT, typename OptT>() {
-        dispatch_on_key(dlm_keys, key_dtype_, key_dtype_, [&](auto ks) {
-          ec = get_store<ParamT, OptT>()->erase(ks);
-        });
-      });
-    }
-    check_error(ec);
-  }
-
-  // ---- Sync clear ----
-
-  void clear() {
-    nb::gil_scoped_release release;
-    dispatch_types([&]<typename ParamT, typename OptT>() {
-      get_store<ParamT, OptT>()->clear();
-    });
-  }
-
-  // ---- Assign scores ----
-
-  void assign_scores(nb::object keys, nb::object scores) {
-    auto [dlm_keys, cap_keys] = se::py::extract_dlpack_tensor(keys);
-    auto [dlm_scores, cap_scores] = se::py::extract_dlpack_tensor(scores);
-    std::error_code ec;
-    auto scores_span = se::py::dlpack_to_span<const uint64_t>(dlm_scores);
-    {
-      nb::gil_scoped_release release;
-      dispatch_types([&]<typename ParamT, typename OptT>() {
-        dispatch_on_key(dlm_keys, key_dtype_, key_dtype_, [&](auto ks) {
-          ec = get_store<ParamT, OptT>()->assign_scores(ks, scores_span);
-        });
-      });
-    }
-    check_error(ec);
-  }
-
-  // ---- Async lookup ----
-
-  nb::object async_lookup(nb::object keys, int64_t dim) {
-    if (dim <= 0)
-      throw std::invalid_argument("dim must be > 0");
-    auto [dlm_keys, cap_keys] = se::py::extract_dlpack_tensor(keys);
-    size_t n = get_dlm_size(dlm_keys);
-    auto kdt = detect_key_dtype(dlm_keys);
-    const void *keys_data =
-        reinterpret_cast<const char *>(dlm_keys->dl_tensor.data) +
-        dlm_keys->dl_tensor.byte_offset;
-    auto wrapper_ptr = this;
-    return dispatch_types([&]<typename ParamT, typename OptT>() -> nb::object {
-      return se::py::async_dispatch(
-          async_pool_,
-          [wrapper_ptr, n, kdt, keys_data, dim,
-           keys_keeper = std::make_shared<se::py::AsyncPyObjectKeeper>(
-               cap_keys)]() -> std::pair<DLManagedTensor *, DLManagedTensor *> {
-            DLManagedTensor *vals_dlm = nullptr;
-            DLManagedTensor *lens_dlm = nullptr;
-            try {
-              auto do_lookup = [&](auto ks) {
-                size_t total = static_cast<size_t>(dim) * n;
-                auto row_lengths = std::make_unique<int64_t[]>(n);
-                fill_uniform_row_lengths({row_lengths.get(), n}, dim);
-                int64_t vals_shape[] = {static_cast<int64_t>(total)};
-                vals_dlm = se::py::create_output_tensor<ParamT>(vals_shape);
-                lens_dlm = se::py::wrap_unique_ptr_as_tensor(
-                    std::move(row_lengths), n);
-                auto vals_span = std::span<ParamT>(
-                    static_cast<ParamT *>(vals_dlm->dl_tensor.data), total);
-                auto ec =
-                    wrapper_ptr->get_store<ParamT, OptT>()->forward_lookup(
-                        ks, vals_span,
-                        {static_cast<const int64_t *>(lens_dlm->dl_tensor.data),
-                         n});
-                if (ec)
-                  throw std::runtime_error(ec.message());
-              };
-              if (kdt == KeyDType::kInt64)
-                do_lookup(std::span<const int64_t>(
-                    static_cast<const int64_t *>(keys_data), n));
-              else
-                do_lookup(std::span<const uint64_t>(
-                    static_cast<const uint64_t *>(keys_data), n));
-            } catch (...) {
-              if (vals_dlm)
-                vals_dlm->deleter(vals_dlm);
-              if (lens_dlm)
-                lens_dlm->deleter(lens_dlm);
-              throw;
-            }
-            return {vals_dlm, lens_dlm};
-          },
-          [](nb::object future,
-             std::pair<DLManagedTensor *, DLManagedTensor *> result) {
-            auto [vals_dlm, lens_dlm] = result;
-            future.attr("set_result")(
-                nb::make_tuple(se::py::wrap_output_tensor(vals_dlm),
-                               se::py::wrap_output_tensor(lens_dlm)));
-          });
-    });
-  }
-
-  // ---- Async assign ----
-
-  nb::object async_assign(nb::object keys, nb::object values) {
-    auto [dlm_keys, cap_keys] = se::py::extract_dlpack_tensor(keys);
-    auto [dlm_values, cap_values] = se::py::extract_dlpack_tensor(values);
-    size_t n = get_dlm_size(dlm_keys);
-    int64_t val_dim = 0;
-    if (dlm_values->dl_tensor.ndim == 2) {
-      if (dlm_values->dl_tensor.shape[0] != static_cast<int64_t>(n)) {
-        throw std::invalid_argument("values shape[0] must match keys length");
-      }
-      val_dim = dlm_values->dl_tensor.shape[1];
-    } else if (dlm_values->dl_tensor.ndim == 1) {
-      if (n > 0) {
-        if (dlm_values->dl_tensor.shape[0] % n != 0) {
-          throw std::invalid_argument(
-              "1D values length must be a multiple of keys length");
-        }
-        val_dim = dlm_values->dl_tensor.shape[0] / n;
-      }
-    } else {
-      throw std::invalid_argument("values must be a 1D or 2D tensor");
-    }
-    auto kdt = detect_key_dtype(dlm_keys);
-    const void *keys_data =
-        reinterpret_cast<const char *>(dlm_keys->dl_tensor.data) +
-        dlm_keys->dl_tensor.byte_offset;
-    const void *values_data =
-        reinterpret_cast<const char *>(dlm_values->dl_tensor.data) +
-        dlm_values->dl_tensor.byte_offset;
-    auto wrapper_ptr = this;
-    return dispatch_types([&]<typename ParamT, typename OptT>() -> nb::object {
-      return se::py::async_dispatch(
-          async_pool_,
-          [wrapper_ptr, n, kdt, keys_data, values_data, val_dim,
-           keys_keeper =
-               std::make_shared<se::py::AsyncPyObjectKeeper>(cap_keys),
-           values_keeper = std::make_shared<se::py::AsyncPyObjectKeeper>(
-               cap_values)]() -> std::error_code {
-            auto do_assign = [&](auto ks) -> std::error_code {
-              thread_local std::vector<int64_t> tls_row_lengths;
-              tls_row_lengths.resize(n);
-              fill_uniform_row_lengths(tls_row_lengths, val_dim);
-              return wrapper_ptr->get_store<ParamT, OptT>()->assign(
-                  ks,
-                  std::span<const ValT>(
-                      static_cast<const ParamT *>(values_data), n * val_dim),
-                  tls_row_lengths);
-            };
-            if (kdt == KeyDType::kInt64)
-              return do_assign(std::span<const int64_t>(
-                  static_cast<const int64_t *>(keys_data), n));
-            return do_assign(std::span<const uint64_t>(
-                static_cast<const uint64_t *>(keys_data), n));
-          },
-          [](nb::object future, std::error_code ec) {
-            if (!ec)
-              future.attr("set_result")(nb::none());
-            else
-              future.attr("set_exception")(
-                  nb::module_::import_("builtins")
-                      .attr("RuntimeError")(ec.message()));
-          });
-    });
-  }
-
-  // ---- Async lookup_or_insert ----
-
-  nb::object async_lookup_or_insert(nb::object keys, int64_t dim) {
-    if (dim <= 0)
-      throw std::invalid_argument("dim must be > 0");
-    auto [dlm_keys, cap_keys] = se::py::extract_dlpack_tensor(keys);
-    size_t n = get_dlm_size(dlm_keys);
-    auto kdt = detect_key_dtype(dlm_keys);
-    const void *keys_data =
-        reinterpret_cast<const char *>(dlm_keys->dl_tensor.data) +
-        dlm_keys->dl_tensor.byte_offset;
-    auto wrapper_ptr = this;
-    return dispatch_types([&]<typename ParamT, typename OptT>() -> nb::object {
-      return se::py::async_dispatch(
-          async_pool_,
-          [wrapper_ptr, n, kdt, keys_data, dim,
-           keys_keeper = std::make_shared<se::py::AsyncPyObjectKeeper>(
-               cap_keys)]() -> std::tuple<DLManagedTensor *, DLManagedTensor *,
-                                          DLManagedTensor *> {
-            DLManagedTensor *vals_dlm = nullptr, *lens_dlm = nullptr,
-                            *mask_dlm = nullptr;
-            try {
-              auto do_loi = [&](auto ks) {
-                size_t total = static_cast<size_t>(dim) * n;
-                auto row_lengths = std::make_unique<int64_t[]>(n);
-                fill_uniform_row_lengths({row_lengths.get(), n}, dim);
-                lens_dlm = se::py::wrap_unique_ptr_as_tensor(
-                    std::move(row_lengths), n);
-                auto *lens_out =
-                    static_cast<int64_t *>(lens_dlm->dl_tensor.data);
-                int64_t vals_shape[] = {static_cast<int64_t>(total)};
-                vals_dlm = se::py::create_output_tensor<ParamT>(vals_shape);
-                int64_t mask_shape[] = {static_cast<int64_t>(n)};
-                mask_dlm = se::py::create_output_tensor<uint8_t>(mask_shape);
-                auto vals_span = std::span<ParamT>(
-                    static_cast<ParamT *>(vals_dlm->dl_tensor.data), total);
-                auto *mask_out =
-                    static_cast<uint8_t *>(mask_dlm->dl_tensor.data);
-                auto ec =
-                    wrapper_ptr->get_store<ParamT, OptT>()->lookup_or_insert(
-                        ks, vals_span, {lens_out, n},
-                        std::span<uint8_t>(mask_out, n));
-                if (ec)
-                  throw std::runtime_error(ec.message());
-              };
-              if (kdt == KeyDType::kInt64)
-                do_loi(std::span<const int64_t>(
-                    static_cast<const int64_t *>(keys_data), n));
-              else
-                do_loi(std::span<const uint64_t>(
-                    static_cast<const uint64_t *>(keys_data), n));
-            } catch (...) {
-              if (vals_dlm)
-                vals_dlm->deleter(vals_dlm);
-              if (lens_dlm)
-                lens_dlm->deleter(lens_dlm);
-              if (mask_dlm)
-                mask_dlm->deleter(mask_dlm);
-              throw;
-            }
-            return {vals_dlm, lens_dlm, mask_dlm};
-          },
-          [](nb::object future,
-             std::tuple<DLManagedTensor *, DLManagedTensor *, DLManagedTensor *>
-                 result) {
-            auto [v, l, m] = result;
-            future.attr("set_result")(nb::make_tuple(
-                se::py::wrap_output_tensor(v), se::py::wrap_output_tensor(l),
-                se::py::wrap_output_tensor(m)));
-          });
-    });
-  }
-
-  // ---- Async accumulate gradients ----
-
-  nb::object async_accumulate_gradients(nb::object keys, nb::object grads) {
-    auto [dlm_keys, cap_keys] = se::py::extract_dlpack_tensor(keys);
-    auto [dlm_grads, cap_grads] = se::py::extract_dlpack_tensor(grads);
-    size_t n = get_dlm_size(dlm_keys);
-    int64_t dim = 0;
-    if (dlm_grads->dl_tensor.ndim == 2) {
-      if (dlm_grads->dl_tensor.shape[0] != static_cast<int64_t>(n)) {
-        throw std::invalid_argument("grads shape[0] must match keys length");
-      }
-      dim = dlm_grads->dl_tensor.shape[1];
-    } else if (dlm_grads->dl_tensor.ndim == 1) {
-      if (n > 0) {
-        if (dlm_grads->dl_tensor.shape[0] % n != 0) {
-          throw std::invalid_argument(
-              "1D grads length must be a multiple of keys length");
-        }
-        dim = dlm_grads->dl_tensor.shape[0] / n;
-      }
-    } else {
-      throw std::invalid_argument("grads must be a 1D or 2D tensor");
-    }
-    auto kdt = detect_key_dtype(dlm_keys);
-    const void *keys_data =
-        reinterpret_cast<const char *>(dlm_keys->dl_tensor.data) +
-        dlm_keys->dl_tensor.byte_offset;
-    const void *grads_data =
-        reinterpret_cast<const char *>(dlm_grads->dl_tensor.data) +
-        dlm_grads->dl_tensor.byte_offset;
-    auto wrapper_ptr = this;
-    return dispatch_types([&]<typename ParamT, typename OptT>() -> nb::object {
-      return se::py::async_dispatch(
-          async_pool_,
-          [wrapper_ptr, n, kdt, keys_data, grads_data, dim,
-           keys_keeper =
-               std::make_shared<se::py::AsyncPyObjectKeeper>(cap_keys),
-           grads_keeper = std::make_shared<se::py::AsyncPyObjectKeeper>(
-               cap_grads)]() -> std::error_code {
-            auto do_acc = [&](auto ks) -> std::error_code {
-              thread_local std::vector<int64_t> tls_row_lengths;
-              tls_row_lengths.resize(n);
-              fill_uniform_row_lengths(tls_row_lengths, dim);
-              return wrapper_ptr->get_store<ParamT, OptT>()
-                  ->accumulate_gradients(
-                      ks,
-                      std::span<const ValT>(
-                          static_cast<const ParamT *>(grads_data), n * dim),
-                      tls_row_lengths);
-            };
-            if (kdt == KeyDType::kInt64)
-              return do_acc(std::span<const int64_t>(
-                  static_cast<const int64_t *>(keys_data), n));
-            return do_acc(std::span<const uint64_t>(
-                static_cast<const uint64_t *>(keys_data), n));
-          },
-          [](nb::object future, std::error_code ec) {
-            if (!ec)
-              future.attr("set_result")(nb::none());
-            else
-              future.attr("set_exception")(
-                  nb::module_::import_("builtins")
-                      .attr("RuntimeError")(ec.message()));
-          });
-    });
-  }
-
-  // ---- Async optimizer step ----
-
-  nb::object async_optimizer_step() {
-    auto wrapper_ptr = this;
-
-    return dispatch_types([&]<typename ParamT, typename OptT>() -> nb::object {
-      return se::py::async_dispatch(
-          async_pool_,
-          [wrapper_ptr]() -> std::error_code {
-            return wrapper_ptr->get_store<ParamT, OptT>()->optimizer_step();
-          },
-          [](nb::object future, std::error_code ec) {
-            if (!ec) {
-              future.attr("set_result")(nb::none());
-            } else {
-              nb::module_ builtins = nb::module_::import_("builtins");
-              future.attr("set_exception")(
-                  builtins.attr("RuntimeError")(ec.message()));
-            }
-          });
-    });
-  }
-
-  // ---- Async contains ----
-
-  nb::object async_contains(nb::object keys) {
-    auto [dlm_keys, cap_keys] = se::py::extract_dlpack_tensor(keys);
-    size_t n = get_dlm_size(dlm_keys);
-    auto kdt = detect_key_dtype(dlm_keys);
-
-    const void *keys_data =
-        reinterpret_cast<const char *>(dlm_keys->dl_tensor.data) +
-        dlm_keys->dl_tensor.byte_offset;
-
-    auto wrapper_ptr = this;
-
-    return dispatch_types([&]<typename ParamT, typename OptT>() -> nb::object {
-      return se::py::async_dispatch(
-          async_pool_,
-          [wrapper_ptr, n, kdt, keys_data,
-           keys_keeper = std::make_shared<se::py::AsyncPyObjectKeeper>(
-               cap_keys)]() -> DLManagedTensor * {
-            DLManagedTensor *out_dlm = nullptr;
-            try {
-              auto do_contains = [&](auto ks) {
-                int64_t shape[1] = {static_cast<int64_t>(n)};
-                out_dlm =
-                    se::py::create_output_tensor<uint8_t>(std::span(shape));
-                auto *out = static_cast<uint8_t *>(out_dlm->dl_tensor.data);
-                auto ec = wrapper_ptr->get_store<ParamT, OptT>()->contains(
-                    ks, std::span<uint8_t>(out, n));
-                if (ec)
-                  throw std::runtime_error(ec.message());
-              };
-
-              if (kdt == KeyDType::kInt64) {
-                auto ks = std::span<const int64_t>(
-                    static_cast<const int64_t *>(keys_data), n);
-                do_contains(ks);
-              } else {
-                auto ks = std::span<const uint64_t>(
-                    static_cast<const uint64_t *>(keys_data), n);
-                do_contains(ks);
-              }
-            } catch (...) {
-              if (out_dlm)
-                out_dlm->deleter(out_dlm);
-              throw;
-            }
-            return out_dlm;
-          },
-          [](nb::object future, DLManagedTensor *mask_dlm) {
-            future.attr("set_result")(se::py::wrap_output_tensor(mask_dlm));
-          });
-    });
-  }
-
-  // ---- Async erase ----
-
-  nb::object async_erase(nb::object keys) {
-    auto [dlm_keys, cap_keys] = se::py::extract_dlpack_tensor(keys);
-    size_t n = get_dlm_size(dlm_keys);
-    auto kdt = detect_key_dtype(dlm_keys);
-
-    const void *keys_data =
-        reinterpret_cast<const char *>(dlm_keys->dl_tensor.data) +
-        dlm_keys->dl_tensor.byte_offset;
-
-    auto wrapper_ptr = this;
-
-    return dispatch_types([&]<typename ParamT, typename OptT>() -> nb::object {
-      return se::py::async_dispatch(
-          async_pool_,
-          [wrapper_ptr, n, kdt, keys_data,
-           keys_keeper = std::make_shared<se::py::AsyncPyObjectKeeper>(
-               cap_keys)]() -> std::error_code {
-            if (kdt == KeyDType::kInt64) {
-              return wrapper_ptr->get_store<ParamT, OptT>()->erase(
-                  std::span<const int64_t>(
-                      static_cast<const int64_t *>(keys_data), n));
-            } else {
-              return wrapper_ptr->get_store<ParamT, OptT>()->erase(
-                  std::span<const uint64_t>(
-                      static_cast<const uint64_t *>(keys_data), n));
-            }
-          },
-          [](nb::object future, std::error_code ec) {
-            if (!ec) {
-              future.attr("set_result")(nb::none());
-            } else {
-              nb::module_ builtins = nb::module_::import_("builtins");
-              future.attr("set_exception")(
-                  builtins.attr("RuntimeError")(ec.message()));
-            }
-          });
-    });
-  }
-
-  // ---- Async clear ----
-
-  nb::object async_clear() {
-    auto wrapper_ptr = this;
-
-    return dispatch_types([&]<typename ParamT, typename OptT>() -> nb::object {
-      return se::py::async_dispatch(
-          async_pool_,
-          [wrapper_ptr]() -> std::error_code {
-            wrapper_ptr->get_store<ParamT, OptT>()->clear();
-            return std::error_code{};
-          },
-          [](nb::object future, std::error_code ec) {
-            if (!ec) {
-              future.attr("set_result")(nb::none());
-            } else {
-              nb::module_ builtins = nb::module_::import_("builtins");
-              future.attr("set_exception")(
-                  builtins.attr("RuntimeError")(ec.message()));
-            }
-          });
-    });
-  }
-
-  // ---- Async assign scores ----
-
-  nb::object async_assign_scores(nb::object keys, nb::object scores) {
-    auto [dlm_keys, cap_keys] = se::py::extract_dlpack_tensor(keys);
-    auto [dlm_scores, cap_scores] = se::py::extract_dlpack_tensor(scores);
-    size_t n = get_dlm_size(dlm_keys);
-    auto kdt = detect_key_dtype(dlm_keys);
-
-    const void *keys_data =
-        reinterpret_cast<const char *>(dlm_keys->dl_tensor.data) +
-        dlm_keys->dl_tensor.byte_offset;
-    const void *scores_data =
-        reinterpret_cast<const char *>(dlm_scores->dl_tensor.data) +
-        dlm_scores->dl_tensor.byte_offset;
-
-    auto wrapper_ptr = this;
-
-    return dispatch_types([&]<typename ParamT, typename OptT>() -> nb::object {
-      return se::py::async_dispatch(
-          async_pool_,
-          [wrapper_ptr, n, kdt, keys_data, scores_data,
-           keys_keeper =
-               std::make_shared<se::py::AsyncPyObjectKeeper>(cap_keys),
-           scores_keeper = std::make_shared<se::py::AsyncPyObjectKeeper>(
-               cap_scores)]() -> std::error_code {
-            auto scores_span = std::span<const uint64_t>(
-                static_cast<const uint64_t *>(scores_data), n);
-            if (kdt == KeyDType::kInt64) {
-              return wrapper_ptr->get_store<ParamT, OptT>()->assign_scores(
-                  std::span<const int64_t>(
-                      static_cast<const int64_t *>(keys_data), n),
-                  scores_span);
-            } else {
-              return wrapper_ptr->get_store<ParamT, OptT>()->assign_scores(
-                  std::span<const uint64_t>(
-                      static_cast<const uint64_t *>(keys_data), n),
-                  scores_span);
-            }
-          },
-          [](nb::object future, std::error_code ec) {
-            if (!ec) {
-              future.attr("set_result")(nb::none());
-            } else {
-              nb::module_ builtins = nb::module_::import_("builtins");
-              future.attr("set_exception")(
-                  builtins.attr("RuntimeError")(ec.message()));
-            }
-          });
-    });
-  }
-
-#ifdef SE_ENABLE_LANCE_CHECKPOINTER
-  void save_checkpoint(const std::string &uri, const std::string &mode,
-                       uint64_t min_score, bool include_optimizer_state,
-                       bool use_compression) {
-    se::CheckpointExportOptions options;
-    options.mode = (mode == "incremental")
-                       ? se::CheckpointExportOptions::Mode::kIncremental
-                       : se::CheckpointExportOptions::Mode::kFull;
-    options.min_score = min_score;
-    options.include_optimizer_state = include_optimizer_state;
-    options.use_compression = use_compression;
-
-    auto writer = checkpoint_writer_factory_;
-    if (!writer.has_value())
-      throw std::runtime_error("checkpoint backend not configured");
-    bool has_score_policy = false;
-    dispatch_types([&]<typename ParamT, typename OptT>() {
-      has_score_policy = get_store<ParamT, OptT>()->has_score_policy();
-    });
-
-    {
-      nb::gil_scoped_release release;
-      dispatch_types([&]<typename ParamT, typename OptT>() {
-        auto dims = get_store<ParamT, OptT>()->table_dims();
-        for (size_t table_idx = 0; table_idx < dims.size(); ++table_idx) {
-          size_t dim = dims[table_idx];
-          writer->begin(uri, static_cast<uint32_t>(dim), 0, has_score_policy,
-                        options);
-
-          get_store<ParamT, OptT>()->export_batch(
-              pro::make_proxy<se::FunctionFacade<bool(
-                  std::span<const uint64_t>, std::span<const ValT>,
-                  std::span<const uint64_t>)>>(
-                  [&](std::span<const uint64_t> keys,
-                      std::span<const ValT> vals,
-                      std::span<const uint64_t> scores) -> bool {
-                    if (options.mode ==
-                            se::CheckpointExportOptions::Mode::kIncremental &&
-                        has_score_policy) {
-                      std::vector<uint64_t> fkeys;
-                      std::vector<ParamT> fvals;
-                      std::vector<uint64_t> fscores;
-                      for (size_t i = 0; i < keys.size(); ++i) {
-                        if (scores[i] >= options.min_score) {
-                          fkeys.push_back(keys[i]);
-                          fvals.insert(fvals.end(), vals.data() + i * dim,
-                                       vals.data() + (i + 1) * dim);
-                          if (!scores.empty())
-                            fscores.push_back(scores[i]);
-                        }
-                      }
-                      if (!fkeys.empty()) {
-                        writer->write_batch(fkeys, fvals.data(),
-                                            fvals.size() * sizeof(ValT),
-                                            fscores, nullptr, 0);
-                      }
-                    } else {
-                      std::vector<uint64_t> ukeys(keys.begin(), keys.end());
-                      writer->write_batch(ukeys, vals.data(),
-                                          vals.size() * sizeof(ValT), scores,
-                                          nullptr, 0);
-                    }
-                    return true;
-                  }),
-              options.batch_size);
-
-          writer->commit();
-        }
-      });
-    }
-  }
-
-  void load_checkpoint(const std::string &uri, uint64_t version, bool clear,
-                       bool load_optimizer_state,
-                       nb::object filter_fn = nb::none(),
-                       uint32_t target_shard_id = 0,
-                       size_t batch_size = 65536) {
-    se::CheckpointLoadOptions options;
-    options.version = version;
-    options.clear_before_load = clear;
-    options.load_optimizer_state = load_optimizer_state;
-    options.batch_size = batch_size;
-
-    auto reader = checkpoint_reader_factory_;
-    if (!reader.has_value()) {
-      throw std::runtime_error("checkpoint backend not configured");
-    }
-
-    std::shared_ptr<pro::proxy<se::ops::PartitionerFacade>> cpp_partitioner =
-        nullptr;
-    if (!filter_fn.is_none() && nb::isinstance<PyPartitioner>(filter_fn)) {
-      cpp_partitioner = nb::cast<PyPartitioner>(filter_fn).facade;
-    }
-
-    {
-      nb::gil_scoped_release release;
-      if (clear)
-        dispatch_types([&]<typename ParamT, typename OptT>() {
-          get_store<ParamT, OptT>()->clear();
-        });
-
-      dispatch_types([&]<typename ParamT, typename OptT>() {
-        bool has_score = get_store<ParamT, OptT>()->has_score_policy();
-        auto dims = get_store<ParamT, OptT>()->table_dims();
-
-        for (size_t table_idx = 0; table_idx < dims.size(); ++table_idx) {
-          size_t dim = dims[table_idx];
-          reader->open(uri, static_cast<uint32_t>(dim), version,
-                       static_cast<int64_t>(options.batch_size));
-
-          std::vector<uint64_t> keys;
-          std::vector<std::byte> embs;
-          std::vector<uint64_t> scores;
-          std::vector<std::byte> opt_states;
-          std::unique_ptr<bool[]> cpp_mask;
-          size_t cpp_mask_capacity = 0;
-
-          while (reader->read_batch(options.batch_size, keys, embs, scores,
-                                    opt_states)) {
-            size_t n = keys.size();
-            size_t opt_dim =
-                (n > 0 && !opt_states.empty()) ? opt_states.size() / n : 0;
-            if (n == 0)
-              continue;
-
-            auto compact_batch = [&](auto should_keep) {
-              size_t keep_idx = 0;
-              for (size_t i = 0; i < n; ++i) {
-                if (should_keep(i)) {
-                  if (keep_idx != i) {
-                    keys[keep_idx] = keys[i];
-                    std::memcpy(embs.data() + keep_idx * dim * sizeof(ValT),
-                                embs.data() + i * dim * sizeof(ValT),
-                                dim * sizeof(ValT));
-                    if (!scores.empty())
-                      scores[keep_idx] = scores[i];
-                    if (!opt_states.empty())
-                      std::memcpy(opt_states.data() + keep_idx * opt_dim,
-                                  opt_states.data() + i * opt_dim, opt_dim);
-                  }
-                  keep_idx++;
-                }
-              }
-              keys.resize(keep_idx);
-              embs.resize(keep_idx * dim * sizeof(ValT));
-              if (!scores.empty())
-                scores.resize(keep_idx);
-              if (!opt_states.empty())
-                opt_states.resize(keep_idx * opt_dim);
-              n = keep_idx;
-            };
-
-            if (cpp_partitioner) {
-              if (n > cpp_mask_capacity) {
-                cpp_mask.reset(new bool[n]);
-                cpp_mask_capacity = n;
-              }
-              (*cpp_partitioner)
-                  ->filter_span(std::span<const uint64_t>(keys),
-                                target_shard_id,
-                                std::span<bool>(cpp_mask.get(), n));
-              compact_batch([&](size_t i) { return cpp_mask[i]; });
-            } else if (!filter_fn.is_none()) {
-              nb::gil_scoped_acquire acquire;
-              auto keys_sp = std::shared_ptr<uint64_t[]>(
-                  const_cast<uint64_t *>(keys.data()), [](uint64_t *) {});
-              DLManagedTensor *in_dlm =
-                  se::py::wrap_shared_ptr_as_tensor<uint64_t>(keys_sp, n);
-              nb::object keys_arr = se::py::wrap_output_tensor(in_dlm);
-              nb::object shard_ids_obj = filter_fn(keys_arr);
-              keys_arr = nb::none();
-              auto [dlm, cap] = se::py::extract_dlpack_tensor(shard_ids_obj);
-              if (dlm->dl_tensor.ndim != 1 ||
-                  dlm->dl_tensor.shape[0] != static_cast<int64_t>(n))
-                throw std::runtime_error(
-                    "filter_fn returned dlpack tensor of incorrect size");
-              auto span = se::py::dlpack_to_span<uint32_t>(dlm);
-              const uint32_t *shard_ids_data = span.data();
-              if (keys_sp.use_count() > 1)
-                throw std::runtime_error(
-                    "filter_fn retained a reference to the keys tensor, which "
-                    "violates zero-copy memory safety.");
-              compact_batch([&](size_t i) {
-                return shard_ids_data[i] == target_shard_id;
-              });
-            }
-
-            if (n == 0)
-              continue;
-
-            auto vals = std::span<const ValT>(
-                reinterpret_cast<const ParamT *>(embs.data()), n * dim);
-            thread_local std::vector<int64_t> tls_row_lengths;
-            tls_row_lengths.resize(n);
-            fill_uniform_row_lengths(tls_row_lengths,
-                                     static_cast<int64_t>(dim));
-            get_store<ParamT, OptT>()->assign(std::span<const uint64_t>(keys),
-                                              vals, tls_row_lengths);
-            if (has_score && !scores.empty())
-              get_store<ParamT, OptT>()->assign_scores(
-                  std::span<const uint64_t>(keys),
-                  std::span<const uint64_t>(scores));
-          }
-        }
-      });
-    }
-  }
-#endif // SE_ENABLE_LANCE_CHECKPOINTER
-
-  void export_batches_dlpack(nb::callable visitor, size_t batch_size = 65536,
-                             bool include_optimizer_state = false) {
-    nb::gil_scoped_release release;
-    dispatch_types([&]<typename ParamT, typename OptT>() {
-      auto &proxy = get_store<ParamT, OptT>();
-
-      if (!include_optimizer_state) {
-        get_store<ParamT, OptT>()->export_batch(
-            pro::make_proxy<se::FunctionFacade<bool(
-                size_t, std::span<const uint64_t>, std::span<const ValT>,
-                std::span<const uint64_t>)>>(
-                [&](size_t dim, std::span<const uint64_t> keys,
-                    std::span<const ValT> vals,
-                    std::span<const uint64_t>) -> bool {
-                  nb::gil_scoped_acquire acquire;
-                  auto keys_dlp = se::py::span_to_dlpack_no_delete(keys);
-                  auto vals_dlp = se::py::span_to_dlpack_no_delete(vals);
-                  visitor(dim, se::py::wrap_output_tensor(keys_dlp),
-                          se::py::wrap_output_tensor(vals_dlp));
-                  return true;
-                }),
-            batch_size);
-      } else {
-        get_store<ParamT, OptT>()->export_opt_state_batch(
-            pro::make_proxy<se::FunctionFacade<bool(
-                size_t, std::span<const uint64_t>, std::span<const float>,
-                std::span<const float>)>>(
-                [&](size_t dim, std::span<const uint64_t> keys,
-                    std::span<const float> vals,
-                    std::span<const float> opt_states) -> bool {
-                  nb::gil_scoped_acquire acquire;
-                  auto keys_dlp = se::py::span_to_dlpack_no_delete(keys);
-                  auto vals_dlp = se::py::span_to_dlpack_no_delete(vals);
-                  auto opt_dlp = se::py::span_to_dlpack_no_delete(opt_states);
-                  visitor(dim, se::py::wrap_output_tensor(keys_dlp),
-                          se::py::wrap_output_tensor(vals_dlp),
-                          se::py::wrap_output_tensor(opt_dlp));
-                  return true;
-                }),
-            batch_size);
-      }
-    });
-  }
-
-  void export_batches_arrow(nb::callable visitor, size_t batch_size = 65536,
-                            bool include_optimizer_state = false) {
-    nb::gil_scoped_release release;
-    dispatch_types([&]<typename ParamT, typename OptT>() {
-      get_store<ParamT, OptT>()->export_opt_state_batch_owned(
-          pro::make_proxy<se::FunctionFacade<bool(
-              size_t, std::vector<uint64_t> &&, std::vector<float> &&,
-              std::vector<float> &&)>>(
-              [&](size_t dim, std::vector<uint64_t> &&keys,
-                  std::vector<float> &&vals,
-                  std::vector<float> &&opt_states) -> bool {
-                auto pair = include_optimizer_state
-                                ? se::arrow::build_opt_state_batch(
-                                      dim, std::move(keys), std::move(vals),
-                                      std::move(opt_states))
-                                : se::arrow::build_embedding_batch(
-                                      dim, std::move(keys), std::move(vals));
-                auto array_addr = reinterpret_cast<uintptr_t>(&pair.array);
-                auto schema_addr = reinterpret_cast<uintptr_t>(&pair.schema);
-                nb::gil_scoped_acquire acquire;
-                visitor(array_addr, schema_addr);
-                return true;
-              }),
-          batch_size);
-    });
-  }
-
-  void assign_opt_state(nb::object keys_obj, nb::object opt_states_obj) {
-    auto [dlm_keys, cap_keys] = se::py::extract_dlpack_tensor(keys_obj);
-    auto [dlm_opt, cap_opt] = se::py::extract_dlpack_tensor(opt_states_obj);
-    const uint64_t *keys =
-        static_cast<const uint64_t *>(dlm_keys->dl_tensor.data);
-    size_t n = dlm_keys->dl_tensor.shape[0];
-    const float *opt_flat = static_cast<const float *>(dlm_opt->dl_tensor.data);
-    size_t total_opt = static_cast<size_t>(dlm_opt->dl_tensor.shape[0]);
-    nb::gil_scoped_release release;
-    dispatch_types([&]<typename ParamT, typename OptT>() {
-      get_store<ParamT, OptT>()->assign_opt_states(
-          std::span<const uint64_t>(keys, n),
-          std::span<const float>(opt_flat, total_opt));
-    });
-  }
-
-#ifdef SE_ENABLE_LANCE_CHECKPOINTER
-  void set_checkpoint_factories(se::CheckpointWriterFactory wf,
-                                se::CheckpointReaderFactory rf) {
-    checkpoint_writer_factory_ = std::move(wf);
-    checkpoint_reader_factory_ = std::move(rf);
-  }
-#endif // SE_ENABLE_LANCE_CHECKPOINTER
-
-private:
-#ifdef SE_ENABLE_LANCE_CHECKPOINTER
-  se::CheckpointWriterFactory checkpoint_writer_factory_;
-  se::CheckpointReaderFactory checkpoint_reader_factory_;
-#endif
-};
-
-} // namespace
+} // namespace se::py::detail
 
 // =============================================================================
 // NB_MODULE
@@ -1854,14 +516,6 @@ NB_MODULE(_core, m) {
 
   // ---------------------------------------------------------------------------
   // Key codec utilities
-  //
-  // Slot bits are packed into the most-significant bits of the uint64 key.
-  // Layout (slot_bits = 16):
-  //   [63..48] slot_id   [47..0] raw_key
-  //
-  // These are pure compute functions with no store state.  They are
-  // intentionally separate from EmbeddingStore so the store remains fully
-  // schema-agnostic.
   // ---------------------------------------------------------------------------
 
   m.def(
@@ -1890,8 +544,6 @@ NB_MODULE(_core, m) {
             std::array<int64_t, 1>{static_cast<int64_t>(n)});
         uint64_t *out = static_cast<uint64_t *>(out_dlm->dl_tensor.data);
 
-        // Detect input dtype
-        bool is_signed = (dlm->dl_tensor.dtype.code == kDLInt);
         const uint64_t *src = static_cast<const uint64_t *>(src_data);
 
         size_t i = 0;

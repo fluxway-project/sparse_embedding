@@ -84,7 +84,8 @@ struct CheckpointWriterFacade
           MemCkptWriteBatch,
           void(std::span<const uint64_t> keys, const void *embeddings,
                size_t embedding_bytes, std::span<const uint64_t> scores,
-               const void *optimizer_states, size_t opt_state_bytes)> //
+               const void *optimizer_states, size_t opt_state_bytes,
+               std::span<const uint32_t> steps)> //
       ::add_convention<MemCkptCommit, uint64_t()>::support_copy<
           pro::constraint_level::nontrivial> //
       ::build {};
@@ -106,9 +107,10 @@ struct CheckpointReaderFacade
                        bool(size_t max_n, std::vector<uint64_t> &out_keys,
                             std::vector<std::byte> &out_embeddings,
                             std::vector<uint64_t> &out_scores,
-                            std::vector<std::byte> &out_optimizer_states)> //
-      ::add_convention<MemCkptVersionInfo, CheckpointVersion() const>      //
-      ::support_copy<pro::constraint_level::nontrivial>                    //
+                            std::vector<std::byte> &out_optimizer_states,
+                            std::vector<uint32_t> &out_steps)>        //
+      ::add_convention<MemCkptVersionInfo, CheckpointVersion() const> //
+      ::support_copy<pro::constraint_level::nontrivial>               //
       ::build {};
 
 // ---------------------------------------------------------------------------

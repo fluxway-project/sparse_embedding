@@ -112,8 +112,8 @@ public:
         std::memory_order_acquire)[index % kEntriesPerPage];
   }
 
-  ParamT *data(uint32_t index) const {
-    return reinterpret_cast<ParamT *>(data_raw(index));
+  ValT *data(uint32_t index) const {
+    return reinterpret_cast<ValT *>(data_raw(index));
   }
 
   size_t allocated_count() const {
@@ -189,7 +189,8 @@ class HogwildEmbeddingStore {
 public:
   using ValueType = ParamT;
   using Initializer = pro::proxy<InitializerFacade<ParamT>>;
-  using OptimizerFactory = se::Function<pro::proxy<OptimizerFacade>(size_t)>;
+  using OptimizerFactory =
+      se::Function<pro::proxy<OptimizerFacade<ParamT, OptT>>(size_t)>;
 
   template <typename K> struct SplitMixHash {
     size_t operator()(K x) const {
@@ -227,7 +228,7 @@ public:
     Key entries;
     KeyMap key_map;
     EmbeddingArena<ParamT> arena;
-    pro::proxy<OptimizerFacade> optimizer;
+    pro::proxy<OptimizerFacade<ParamT, OptT>> optimizer;
     std::vector<std::unique_ptr<TransientArena<ParamT>>> transient_shards;
     OptimizerFactory opt_factory;
     uint64_t global_step = 0;
@@ -303,8 +304,8 @@ public:
   // Forward Pass: Lock-free lookup via ParlayHash
   // =========================================================================
 
-  template <typename KeyT>
-  std::error_code forward_lookup(std::span<const KeyT> keys,
+  template <typename K>
+  std::error_code forward_lookup(std::span<const K> keys,
                                  std::span<ParamT> out_flat_values,
                                  std::span<const int64_t> row_lengths) {
     size_t n = keys.size();
@@ -359,9 +360,9 @@ public:
   // Backward Gradient Accumulation into TransientArena
   // =========================================================================
 
-  template <typename KeyT>
-  std::error_code accumulate_gradients(std::span<const KeyT> keys,
-                                       std::span<const ValT> flat_grads,
+  template <typename K>
+  std::error_code accumulate_gradients(std::span<const K> keys,
+                                       std::span<const ParamT> flat_grads,
                                        std::span<const int64_t> row_lengths) {
     size_t n = keys.size();
     auto offsets = compute_offsets(row_lengths);
@@ -372,7 +373,7 @@ public:
     // worker threads (via dispatch_parallel) and read on the main thread.
     // Using thread_local here would silently read wrong data.
     std::vector<uint32_t> thread_counts(num_shards * num_shards, 0);
-    SplitMix64Hash hasher;
+    SplitMixHash<K> hasher;
 
     // 1. Parallel Count
     auto do_count = [&](size_t t_begin, size_t t_end) {
@@ -381,22 +382,24 @@ public:
         size_t end = (t + 1) * n / num_shards;
         size_t i = start;
 
+        if constexpr (sizeof(K) == 8) {
 #if defined(__AVX512F__) && defined(__AVX512DQ__)
-        __m512i v_mask = _mm512_set1_epi64(num_shards - 1);
-        for (; i + 8 <= end; i += 8) {
-          __m512i v_keys =
-              _mm512_loadu_si512(reinterpret_cast<const void *>(&keys[i]));
-          __m512i v_hash = hasher.simd_hash(v_keys);
-          __m512i v_shards = _mm512_and_si512(v_hash, v_mask);
+          __m512i v_mask = _mm512_set1_epi64(num_shards - 1);
+          for (; i + 8 <= end; i += 8) {
+            __m512i v_keys =
+                _mm512_loadu_si512(reinterpret_cast<const void *>(&keys[i]));
+            __m512i v_hash = hasher.simd_hash(v_keys);
+            __m512i v_shards = _mm512_and_si512(v_hash, v_mask);
 
-          uint64_t extracted[8] __attribute__((aligned(64)));
-          _mm512_storeu_si512(extracted, v_shards);
+            uint64_t extracted[8] __attribute__((aligned(64)));
+            _mm512_storeu_si512(extracted, v_shards);
 
-          for (int j = 0; j < 8; ++j) {
-            thread_counts[t * num_shards + extracted[j]]++;
+            for (int j = 0; j < 8; ++j) {
+              thread_counts[t * num_shards + extracted[j]]++;
+            }
           }
-        }
 #endif
+        }
         for (; i < end; ++i) {
           uint64_t key = static_cast<uint64_t>(keys[i]);
           uint32_t shard = hasher(key) & (num_shards - 1);
@@ -436,23 +439,25 @@ public:
         size_t end = (t + 1) * n / num_shards;
         size_t i = start;
 
+        if constexpr (sizeof(K) == 8) {
 #if defined(__AVX512F__) && defined(__AVX512DQ__)
-        __m512i v_mask = _mm512_set1_epi64(num_shards - 1);
-        for (; i + 8 <= end; i += 8) {
-          __m512i v_keys =
-              _mm512_loadu_si512(reinterpret_cast<const void *>(&keys[i]));
-          __m512i v_hash = hasher.simd_hash(v_keys);
-          __m512i v_shards = _mm512_and_si512(v_hash, v_mask);
+          __m512i v_mask = _mm512_set1_epi64(num_shards - 1);
+          for (; i + 8 <= end; i += 8) {
+            __m512i v_keys =
+                _mm512_loadu_si512(reinterpret_cast<const void *>(&keys[i]));
+            __m512i v_hash = hasher.simd_hash(v_keys);
+            __m512i v_shards = _mm512_and_si512(v_hash, v_mask);
 
-          uint64_t extracted[8] __attribute__((aligned(64)));
-          _mm512_store_si512(extracted, v_shards);
+            uint64_t extracted[8] __attribute__((aligned(64)));
+            _mm512_store_si512(extracted, v_shards);
 
-          for (int j = 0; j < 8; ++j) {
-            shuffled_indices[thread_offsets[t * num_shards + extracted[j]]++] =
-                i + j;
+            for (int j = 0; j < 8; ++j) {
+              shuffled_indices[thread_offsets[t * num_shards +
+                                              extracted[j]]++] = i + j;
+            }
           }
-        }
 #endif
+        }
         for (; i < end; ++i) {
           uint64_t key = static_cast<uint64_t>(keys[i]);
           uint32_t shard = hasher(key) & (num_shards - 1);
@@ -540,7 +545,7 @@ public:
                   if (slot->optimizer.has_value()) {
                     slot->optimizer->step(
                         arena_idx, std::span<ParamT>(param, slot->dim),
-                        std::span<const ValT>(accumulated_grad, slot->dim),
+                        std::span<const ParamT>(accumulated_grad, slot->dim),
                         slot->global_step);
                   }
                 });
@@ -559,16 +564,16 @@ public:
   // Legacy API (backward compatible)
   // =========================================================================
 
-  template <typename KeyT>
-  std::error_code lookup(std::span<const KeyT> keys,
+  template <typename K>
+  std::error_code lookup(std::span<const K> keys,
                          std::span<ParamT> out_flat_values,
                          std::span<const int64_t> row_lengths) {
     return forward_lookup(keys, out_flat_values, row_lengths);
   }
 
-  template <typename KeyT>
-  std::error_code assign(std::span<const KeyT> keys,
-                         std::span<const ValT> flat_values,
+  template <typename K>
+  std::error_code assign(std::span<const K> keys,
+                         std::span<const ParamT> flat_values,
                          std::span<const int64_t> row_lengths) {
     size_t n = keys.size();
     auto offsets = compute_offsets(row_lengths);
@@ -644,8 +649,8 @@ public:
     return {};
   }
 
-  template <typename KeyT>
-  std::error_code lookup_or_insert(std::span<const KeyT> keys,
+  template <typename K>
+  std::error_code lookup_or_insert(std::span<const K> keys,
                                    std::span<ParamT> out_flat_values,
                                    std::span<const int64_t> row_lengths,
                                    std::span<uint8_t> out_inserted_mask) {
@@ -733,8 +738,8 @@ public:
     return {};
   }
 
-  template <typename KeyT>
-  std::error_code contains(std::span<const KeyT> keys,
+  template <typename K>
+  std::error_code contains(std::span<const K> keys,
                            std::span<uint8_t> out_exists) {
     size_t n = keys.size();
     auto do_range = [&](size_t begin, size_t end) {
@@ -759,7 +764,7 @@ public:
     return {};
   }
 
-  template <typename KeyT> std::error_code erase(std::span<const KeyT> keys) {
+  template <typename K> std::error_code erase(std::span<const K> keys) {
     size_t n = keys.size();
     auto do_range = [&](size_t begin, size_t end) {
       epoch::with_epoch([&] {
@@ -791,8 +796,8 @@ public:
     return {};
   }
 
-  template <typename KeyT>
-  std::error_code assign_scores(std::span<const KeyT> keys,
+  template <typename K>
+  std::error_code assign_scores(std::span<const K> keys,
                                 std::span<const uint64_t> scores) {
     if constexpr (!ScorePolicyT::kHasScore) {
       throw std::runtime_error("assign_scores requires a score-enabled policy");
@@ -877,25 +882,37 @@ private:
           slot->optimizer.has_value() ? slot->optimizer->state_dim() : 0;
       int num_workers = static_cast<int>(parlay::num_workers());
 
+      constexpr bool has_score = ScorePolicyT::kHasScore;
+
       struct Buffer {
         std::vector<uint64_t> keys;
         std::vector<ParamT> vals;
+        std::vector<uint64_t> scores;
         std::vector<OptT> opts;
+        std::vector<uint32_t> steps;
       };
 
       std::vector<Buffer> local_bufs(num_workers);
       for (int i = 0; i < num_workers; ++i) {
         local_bufs[i].keys.reserve(256);
         local_bufs[i].vals.reserve(256 * emb_dim);
-        if (opt_dim > 0)
+        if constexpr (has_score)
+          local_bufs[i].scores.reserve(256);
+        if (opt_dim > 0) {
           local_bufs[i].opts.reserve(256 * opt_dim);
+          local_bufs[i].steps.reserve(256);
+        }
       }
 
       Buffer global_buf;
       global_buf.keys.reserve(batch_size);
       global_buf.vals.reserve(batch_size * emb_dim);
-      if (opt_dim > 0)
+      if constexpr (has_score)
+        global_buf.scores.reserve(batch_size);
+      if (opt_dim > 0) {
         global_buf.opts.reserve(batch_size * opt_dim);
+        global_buf.steps.reserve(batch_size);
+      }
 
       std::atomic<bool> stopped{false};
       std::mutex merge_m;
@@ -906,18 +923,27 @@ private:
           return true;
         if constexpr (Policy == ExportOwnership::kSpan) {
           return visitor(emb_dim, std::span<const uint64_t>(buf.keys),
-                         std::span<const ValT>(buf.vals),
-                         std::span<const OptT>(buf.opts));
+                         std::span<const ParamT>(buf.vals),
+                         std::span<const uint64_t>(buf.scores),
+                         std::span<const OptT>(buf.opts),
+                         std::span<const uint32_t>(buf.steps));
         } else {
           bool cont = visitor(emb_dim, std::move(buf.keys), std::move(buf.vals),
-                              std::move(buf.opts));
+                              std::move(buf.scores), std::move(buf.opts),
+                              std::move(buf.steps));
           buf.keys.clear();
           buf.vals.clear();
+          buf.scores.clear();
           buf.opts.clear();
+          buf.steps.clear();
           buf.keys.reserve(batch_size);
           buf.vals.reserve(batch_size * emb_dim);
-          if (opt_dim > 0)
+          if constexpr (has_score)
+            buf.scores.reserve(batch_size);
+          if (opt_dim > 0) {
             buf.opts.reserve(batch_size * opt_dim);
+            buf.steps.reserve(batch_size);
+          }
           return cont;
         }
       };
@@ -933,9 +959,21 @@ private:
         lb.keys.push_back(key);
         const ParamT *src = slot->arena.data(idx);
         lb.vals.insert(lb.vals.end(), src, src + emb_dim);
+        if constexpr (has_score) {
+          lb.scores.push_back(
+              std::atomic_ref<uint64_t>(slot->arena.score_raw(idx))
+                  .load(std::memory_order_relaxed));
+        }
         if (opt_dim > 0 && slot->optimizer.has_value()) {
-          const OptT *os = slot->optimizer->state_data(idx);
-          lb.opts.insert(lb.opts.end(), os, os + opt_dim);
+          // OptimizerFacade::state_data fills a caller-provided span (so the
+          // optimizer is free to materialise its state from non-contiguous
+          // internal buffers). Reserve room at the back of `lb.opts` and let
+          // the optimizer write directly there to avoid a temporary copy.
+          size_t old_size = lb.opts.size();
+          lb.opts.resize(old_size + opt_dim);
+          slot->optimizer->state_data(
+              idx, std::span<OptT>(lb.opts.data() + old_size, opt_dim));
+          lb.steps.push_back(slot->optimizer->step_data(idx));
         }
 
         if (lb.keys.size() >= 256) {
@@ -949,20 +987,32 @@ private:
                                    lb.keys.end());
             global_buf.vals.insert(global_buf.vals.end(), lb.vals.begin(),
                                    lb.vals.end());
+            if constexpr (has_score) {
+              global_buf.scores.insert(global_buf.scores.end(),
+                                       lb.scores.begin(), lb.scores.end());
+            }
             if (opt_dim > 0) {
               global_buf.opts.insert(global_buf.opts.end(), lb.opts.begin(),
                                      lb.opts.end());
+              global_buf.steps.insert(global_buf.steps.end(), lb.steps.begin(),
+                                      lb.steps.end());
             }
             lb.keys.clear();
             lb.vals.clear();
+            lb.scores.clear();
             lb.opts.clear();
+            lb.steps.clear();
 
             if (global_buf.keys.size() >= batch_size) {
               local_flush_buf = std::move(global_buf);
               global_buf.keys.reserve(batch_size);
               global_buf.vals.reserve(batch_size * emb_dim);
-              if (opt_dim > 0)
+              if constexpr (has_score)
+                global_buf.scores.reserve(batch_size);
+              if (opt_dim > 0) {
                 global_buf.opts.reserve(batch_size * opt_dim);
+                global_buf.steps.reserve(batch_size);
+              }
               need_flush = true;
             }
           }
@@ -986,9 +1036,15 @@ private:
                                  lb.keys.end());
           global_buf.vals.insert(global_buf.vals.end(), lb.vals.begin(),
                                  lb.vals.end());
+          if constexpr (has_score) {
+            global_buf.scores.insert(global_buf.scores.end(), lb.scores.begin(),
+                                     lb.scores.end());
+          }
           if (opt_dim > 0) {
             global_buf.opts.insert(global_buf.opts.end(), lb.opts.begin(),
                                    lb.opts.end());
+            global_buf.steps.insert(global_buf.steps.end(), lb.steps.begin(),
+                                    lb.steps.end());
           }
         }
       }
@@ -1029,9 +1085,9 @@ public:
   // If visitor returns false, iteration stops early.
   // =========================================================================
 
-  template <typename KeyT>
+  template <typename K>
   std::error_code export_batch(
-      se::Function<bool(size_t, std::span<const KeyT>, std::span<const ValT>,
+      se::Function<bool(size_t, std::span<const K>, std::span<const ParamT>,
                         std::span<const uint64_t>)>
           visitor,
       size_t batch_size) {
@@ -1043,13 +1099,13 @@ public:
       int num_workers = static_cast<int>(parlay::num_workers());
 
       struct LocalTinyBuffer {
-        std::vector<KeyT> keys;
+        std::vector<K> keys;
         std::vector<ParamT> vals;
         std::vector<uint64_t> scores;
       };
 
       struct GlobalBuffer {
-        std::vector<KeyT> keys;
+        std::vector<K> keys;
         std::vector<ParamT> vals;
         std::vector<uint64_t> scores;
       };
@@ -1075,8 +1131,8 @@ public:
       auto flush_global = [&](GlobalBuffer &buf) -> bool {
         if (buf.keys.empty())
           return true;
-        bool cont = (*visitor)(dim, std::span<const KeyT>(buf.keys),
-                               std::span<const ValT>(buf.vals),
+        bool cont = (*visitor)(dim, std::span<const K>(buf.keys),
+                               std::span<const ParamT>(buf.vals),
                                std::span<const uint64_t>(buf.scores));
         return cont;
       };
@@ -1089,7 +1145,7 @@ public:
         auto [key, idx] = entry.get_entry();
         auto &lb = local_buffers[w];
 
-        lb.keys.push_back(static_cast<KeyT>(key));
+        lb.keys.push_back(static_cast<K>(key));
         const ParamT *src = slot->arena.data(idx);
         lb.vals.insert(lb.vals.end(), src, src + dim);
         if (has_score) {
@@ -1193,7 +1249,8 @@ public:
   }
 
   void assign_opt_states(std::span<const uint64_t> keys,
-                         std::span<const float> opt_states) {
+                         std::span<const OptT> opt_states,
+                         std::span<const uint32_t> steps) {
     size_t n = keys.size();
     if (n == 0)
       return;
@@ -1215,8 +1272,10 @@ public:
               });
           if (found.has_value()) {
             slot->optimizer->set_state(
-                *found, std::span<const float>(opt_states.data() + i * opt_dim,
-                                               opt_dim));
+                *found, std::span<const OptT>(opt_states.data() + i * opt_dim,
+                                              opt_dim));
+            if (!steps.empty())
+              slot->optimizer->set_step(*found, steps[i]);
             break; // Key found and updated, proceed to next key
           }
         }
@@ -1225,54 +1284,41 @@ public:
   }
 
   // export_opt_state_batch — type-erased facade-compatible wrapper.
-  // Visitor receives (keys, flat_f32_vals, opt_states) for checkpointing.
-  // ParamT values are widened to float32 to provide a uniform interface
-  // regardless of the store's native precision.
+  // Visitor receives (dim, keys, vals, scores, opt_states, steps) with native
+  // ParamT/OptT precision.
   void export_opt_state_batch(
       se::Function<bool(size_t, std::span<const uint64_t>,
-                        std::span<const float>, std::span<const float>)>
+                        std::span<const ParamT>, std::span<const uint64_t>,
+                        std::span<const OptT>, std::span<const uint32_t>)>
           visitor,
       size_t batch_size) {
     export_batch_with_opt(
         [&](size_t dim, std::span<const uint64_t> keys,
-            std::span<const ValT> vals,
-            std::span<const float> opt_states) -> bool {
-          if constexpr (std::is_same_v<ValT, float>) {
-            return (*visitor)(dim, keys, vals, opt_states);
-          } else {
-            thread_local std::vector<float> val_f32_buf;
-            val_f32_buf.resize(vals.size());
-            for (size_t i = 0; i < vals.size(); ++i)
-              val_f32_buf[i] = static_cast<float>(vals[i]);
-            return (*visitor)(dim, keys, std::span<const float>(val_f32_buf),
-                              opt_states);
-          }
+            std::span<const ParamT> vals, std::span<const uint64_t> scores,
+            std::span<const OptT> opt_states,
+            std::span<const uint32_t> steps) -> bool {
+          return (*visitor)(dim, keys, vals, scores, opt_states, steps);
         },
         batch_size);
   }
 
   // export_opt_state_batch_owned — ownership-transferring facade wrapper.
-  // Same as export_opt_state_batch but visitor receives std::vector&&
-  // for zero-copy Arrow C Data Interface construction.
+  // Visitor receives std::vector&& of native ParamT/OptT precision for
+  // zero-copy Arrow C Data Interface construction.
   void export_opt_state_batch_owned(
-      se::Function<bool(size_t, std::vector<uint64_t> &&, std::vector<float> &&,
-                        std::vector<float> &&)>
+      se::Function<bool(size_t, std::vector<uint64_t> &&,
+                        std::vector<ParamT> &&, std::vector<uint64_t> &&,
+                        std::vector<OptT> &&, std::vector<uint32_t> &&)>
           visitor,
       size_t batch_size) {
     export_batch_with_opt_owned(
         [&](size_t dim, std::vector<uint64_t> &&keys,
-            std::vector<ParamT> &&vals,
-            std::vector<float> &&opt_states) -> bool {
-          if constexpr (std::is_same_v<ValT, float>) {
-            return (*visitor)(dim, std::move(keys), std::move(vals),
-                              std::move(opt_states));
-          } else {
-            std::vector<float> val_f32(vals.size());
-            for (size_t i = 0; i < vals.size(); ++i)
-              val_f32[i] = static_cast<float>(vals[i]);
-            return (*visitor)(dim, std::move(keys), std::move(val_f32),
-                              std::move(opt_states));
-          }
+            std::vector<ParamT> &&vals, std::vector<uint64_t> &&scores,
+            std::vector<OptT> &&opt_states,
+            std::vector<uint32_t> &&steps) -> bool {
+          return (*visitor)(dim, std::move(keys), std::move(vals),
+                            std::move(scores), std::move(opt_states),
+                            std::move(steps));
         },
         batch_size);
   }
@@ -1284,9 +1330,9 @@ public:
   // Safe to call from a background thread. Operates per-slot.
   // =========================================================================
 
-  template <typename KeyT>
+  template <typename K>
   std::error_code evict_by_score(uint64_t max_score, size_t max_evict_count,
-                                 std::span<KeyT> out_evicted_keys,
+                                 std::span<K> out_evicted_keys,
                                  std::span<ParamT> out_evicted_values,
                                  size_t &out_evicted_count) {
     if constexpr (!ScorePolicyT::kHasScore)
@@ -1373,7 +1419,7 @@ public:
 
           uint32_t idx = *found;
           if (out_evicted_count < out_evicted_keys.size()) {
-            out_evicted_keys[out_evicted_count] = static_cast<KeyT>(key);
+            out_evicted_keys[out_evicted_count] = static_cast<K>(key);
             std::copy_n(slot->arena.data(idx), dim,
                         out_evicted_values.data() + out_evicted_count * dim);
           }
@@ -1386,6 +1432,44 @@ public:
     return {};
   }
 };
+
+// =============================================================================
+// Extern template declarations — suppress implicit instantiation in TUs that
+// include this header. The explicit instantiation lives in
+// hogwild_embedding_store.cpp.
+// =============================================================================
+#ifndef HOGWILD_EXPLICIT_INSTANTIATION
+
+#define SE_EXTERN_STORE(KEY_T, PARAM_T, OPT_T)                                 \
+  extern template class HogwildEmbeddingStore<KEY_T, PARAM_T, OPT_T,           \
+                                              NoScorePolicy>;                  \
+  extern template class HogwildEmbeddingStore<KEY_T, PARAM_T, OPT_T,           \
+                                              LfuScorePolicy>;                 \
+  extern template class HogwildEmbeddingStore<KEY_T, PARAM_T, OPT_T,           \
+                                              LruScorePolicy>;                 \
+  extern template class HogwildEmbeddingStore<KEY_T, PARAM_T, OPT_T,           \
+                                              ManualScorePolicy>;
+
+#define SE_EXTERN_OPT_PAIR(PARAM_T, OPT_T)                                     \
+  SE_EXTERN_STORE(uint64_t, PARAM_T, OPT_T)                                    \
+  SE_EXTERN_STORE(int64_t, PARAM_T, OPT_T)                                     \
+  SE_EXTERN_STORE(uint32_t, PARAM_T, OPT_T)                                    \
+  SE_EXTERN_STORE(int32_t, PARAM_T, OPT_T)
+
+#define SE_EXTERN_ALL(PARAM_T)                                                 \
+  SE_EXTERN_OPT_PAIR(PARAM_T, float)                                           \
+  SE_EXTERN_OPT_PAIR(PARAM_T, float16_t)                                       \
+  SE_EXTERN_OPT_PAIR(PARAM_T, bfloat16_t)
+
+SE_EXTERN_ALL(float)
+SE_EXTERN_ALL(float16_t)
+SE_EXTERN_ALL(bfloat16_t)
+
+#undef SE_EXTERN_STORE
+#undef SE_EXTERN_OPT_PAIR
+#undef SE_EXTERN_ALL
+
+#endif // HOGWILD_EXPLICIT_INSTANTIATION
 
 } // namespace se
 

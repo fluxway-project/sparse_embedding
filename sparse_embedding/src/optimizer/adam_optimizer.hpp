@@ -31,10 +31,11 @@ namespace se {
 template <typename ParamT, typename OptT> class AdamOptimizer {
   OptimizerStateArena<OptT> m_state;
   OptimizerStateArena<OptT> v_state;
-  OptimizerStateArena<uint64_t>
-      step_state; // Ensure initialized to 0 per Rule 7
-  static_assert(sizeof(uint64_t) == 2 * sizeof(float),
-                "uint64_t must be exactly 2 floats in size");
+  OptimizerStateArena<uint32_t>
+      step_state; // Per-ID step counter (uint32); initialized to 0 by
+                  // OptimizerStateArena's value-initialized allocation so the
+                  // first update sees id_step==1 after the increment, which is
+                  // required for correct Adam bias correction.
   AdamConfig config;
 
 public:
@@ -61,39 +62,32 @@ public:
 
   void state_data(uint32_t idx, std::span<OptT> out) const {
     size_t d = m_state.dim();
-    size_t step_elements = sizeof(uint64_t) / sizeof(OptT);
-    if (out.size() < d * 2 + step_elements) {
+    if (out.size() < d * 2) {
       throw std::invalid_argument("Output buffer too small");
     }
-
     std::copy_n(m_state.data(idx), d, out.data());
     std::copy_n(v_state.data(idx), d, out.data() + d);
-
-    uint64_t step = *step_state.data(idx);
-    std::memcpy(out.data() + d * 2, &step, sizeof(uint64_t));
   }
 
-  size_t state_dim() const {
-    return m_state.dim() * 2 + sizeof(uint64_t) / sizeof(OptT);
-  }
+  size_t state_dim() const { return m_state.dim() * 2; }
 
   void set_state(uint32_t idx, std::span<const OptT> state) {
     size_t d = m_state.dim();
-    size_t step_elements = sizeof(uint64_t) / sizeof(OptT);
-    if (state.size() < d * 2 + step_elements) {
+    if (state.size() < d * 2) {
       throw std::invalid_argument("Input state span is too small.");
     }
-
     std::copy_n(state.data(), d, m_state.data(idx));
     std::copy_n(state.data() + d, d, v_state.data(idx));
-
-    std::memcpy(step_state.data(idx), state.data() + 2 * d, sizeof(uint64_t));
   }
+
+  uint32_t step_data(uint32_t idx) const { return *step_state.data(idx); }
+
+  void set_step(uint32_t idx, uint32_t s) { *step_state.data(idx) = s; }
 
   void step(uint32_t idx, std::span<ParamT> param_span,
             std::span<const ParamT> grad_span,
             [[maybe_unused]] uint64_t global_step) {
-    uint64_t &id_step = *step_state.data(idx);
+    uint32_t &id_step = *step_state.data(idx);
     id_step++;
     const float step_f = static_cast<float>(id_step);
     const float bc1 = 1.0f / (1.0f - std::pow(config.beta1, step_f));

@@ -50,6 +50,16 @@ public:
     (void)state;
   }
 
+  uint32_t step_data(uint32_t idx) const {
+    (void)idx;
+    return 0;
+  }
+
+  void set_step(uint32_t idx, uint32_t s) {
+    (void)idx;
+    (void)s;
+  }
+
   void step(uint32_t idx, std::span<ParamT> param_span,
             std::span<const ParamT> grad_span,
             [[maybe_unused]] uint64_t global_step) {

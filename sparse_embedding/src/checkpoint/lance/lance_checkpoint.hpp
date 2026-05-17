@@ -43,6 +43,7 @@ class LanceCheckpointWriter {
   std::vector<std::byte> buf_embeddings_;
   std::vector<uint64_t> buf_scores_;
   std::vector<std::byte> buf_opt_states_;
+  std::vector<uint32_t> buf_steps_;
   size_t entry_byte_size_ = 0;
   bool is_first_batch_ = true;
   uint64_t committed_version_ = 0;
@@ -70,7 +71,8 @@ public:
 
   void write_batch(std::span<const uint64_t> keys, const void *embeddings,
                    size_t embedding_bytes, std::span<const uint64_t> scores,
-                   const void *optimizer_states, size_t opt_state_bytes);
+                   const void *optimizer_states, size_t opt_state_bytes,
+                   std::span<const uint32_t> steps);
 
   uint64_t commit();
 };
@@ -87,6 +89,7 @@ class LanceCheckpointReader {
   bool stream_open_ = false;
   size_t opt_state_dim_ = 0;
   bool has_score_ = false;
+  bool has_step_ = false;
   int64_t batch_size_ = 65536;
 
   void close_stream();
@@ -100,7 +103,8 @@ public:
   bool read_batch(size_t max_n, std::vector<uint64_t> &out_keys,
                   std::vector<std::byte> &out_embeddings,
                   std::vector<uint64_t> &out_scores,
-                  std::vector<std::byte> &out_optimizer_states);
+                  std::vector<std::byte> &out_optimizer_states,
+                  std::vector<uint32_t> &out_steps);
 
   CheckpointVersion version_info() const { return version_info_; }
 };
