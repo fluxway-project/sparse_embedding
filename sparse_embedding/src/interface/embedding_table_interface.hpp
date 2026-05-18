@@ -104,16 +104,16 @@ using WeakMemOptimizerStep = pro::weak_dispatch<MemOptimizerStep>;
 // ---------------------------------------------------------------------------
 
 #define SE_LOOKUP_FACADE_SIG(key_t)                                            \
-  std::error_code(std::span<const key_t> keys, std::span<ValT> out_values,     \
+  std::error_code(std::span<const key_t> keys, std::span<ParamT> out_values,   \
                   std::span<const int64_t> row_lengths)
 
 #define SE_LOOKUP_OR_INSERT_FACADE_SIG(key_t)                                  \
-  std::error_code(std::span<const key_t> keys, std::span<ValT> out_values,     \
+  std::error_code(std::span<const key_t> keys, std::span<ParamT> out_values,   \
                   std::span<const int64_t> row_lengths,                        \
                   std::span<uint8_t> out_inserted_mask)
 
 #define SE_ASSIGN_FACADE_SIG(key_t)                                            \
-  std::error_code(std::span<const key_t> keys, std::span<const ValT> values,   \
+  std::error_code(std::span<const key_t> keys, std::span<const ParamT> values, \
                   std::span<const int64_t> row_lengths)
 
 #define SE_CONTAINS_FACADE_SIG(key_t)                                          \
@@ -125,12 +125,12 @@ using WeakMemOptimizerStep = pro::weak_dispatch<MemOptimizerStep>;
   std::error_code(std::span<const key_t> keys, std::span<const uint64_t> scores)
 
 #define SE_FORWARD_LOOKUP_FACADE_SIG(key_t)                                    \
-  std::error_code(std::span<const key_t> keys, std::span<ValT> out_values,     \
+  std::error_code(std::span<const key_t> keys, std::span<ParamT> out_values,   \
                   std::span<const int64_t> row_lengths)
 
 #define SE_ACCUMULATE_GRADIENTS_FACADE_SIG(key_t)                              \
   std::error_code(std::span<const key_t> keys,                                 \
-                  std::span<const ValT> grad_values,                           \
+                  std::span<const ParamT> grad_values,                         \
                   std::span<const int64_t> row_lengths)
 
 // evict_by_score: asynchronous-safe GC operation.
@@ -139,7 +139,7 @@ using WeakMemOptimizerStep = pro::weak_dispatch<MemOptimizerStep>;
 #define SE_EVICT_BY_SCORE_FACADE_SIG(key_t)                                    \
   std::error_code(uint64_t max_score, std::size_t max_evict_count,             \
                   std::span<key_t> out_evicted_keys,                           \
-                  std::span<ValT> out_evicted_values,                          \
+                  std::span<ParamT> out_evicted_values,                        \
                   std::size_t &out_evicted_count)
 
 // export_batch: visitor-callback snapshot export.
@@ -149,7 +149,7 @@ using WeakMemOptimizerStep = pro::weak_dispatch<MemOptimizerStep>;
 #define SE_EXPORT_BATCH_FACADE_SIG(key_t)                                      \
   std::error_code(                                                             \
       se::Function<bool(std::size_t, std::span<const key_t>,                   \
-                        std::span<const ValT>, std::span<const uint64_t>)>     \
+                        std::span<const ParamT>, std::span<const uint64_t>)>   \
           visitor,                                                             \
       std::size_t batch_size)
 
@@ -159,93 +159,98 @@ PRO_DEF_MEM_DISPATCH(MemExportOptStateBatchOwned, export_opt_state_batch_owned);
 
 // clang-format off
 // NOLINTBEGIN(whitespace/indent_namespace)
-template <typename ValT>
-struct EmbeddingTableFacade : pro::facade_builder
+template <typename ParamT, typename OptT>
+struct EmbeddingTableFacade : pro::facade_builder //
   // --- Lifecycle -------------------------------------------------------------
   ::add_convention<WeakMemInit,
-                   std::error_code(std::string_view config_json)>
+                   std::error_code(std::string_view config_json)> //
   ::add_convention<WeakMemShutdown,
                    std::error_code()>
 
   // --- Metadata -------------------------------------------------------------
   ::add_convention<WeakMemName,
-                   std::string_view() const>
+                   std::string_view() const> //
   ::add_convention<WeakMemDim,
-                   std::size_t() const>
+                   std::size_t() const> //
   ::add_convention<WeakMemSize,
-                   std::size_t() const>
+                   std::size_t() const> //
   ::add_convention<WeakMemCapacity,
-                   std::size_t() const>
+                   std::size_t() const> //
   ::add_convention<WeakMemReserve,
-                   std::error_code(std::size_t new_capacity)>
+                   std::error_code(std::size_t new_capacity)> //
 
   // --- Lookup ---------------------------------------------------------------
   ::add_convention<WeakMemLookup,
                    SE_LOOKUP_FACADE_SIG(int32_t), SE_LOOKUP_FACADE_SIG(uint32_t),
-                   SE_LOOKUP_FACADE_SIG(int64_t), SE_LOOKUP_FACADE_SIG(uint64_t)>
+                   SE_LOOKUP_FACADE_SIG(int64_t), SE_LOOKUP_FACADE_SIG(uint64_t)> //
 
   // --- Lookup-or-insert -----------------------------------------------------
   ::add_convention<WeakMemLookupOrInsert,
                    SE_LOOKUP_OR_INSERT_FACADE_SIG(int32_t), SE_LOOKUP_OR_INSERT_FACADE_SIG(uint32_t),
-                   SE_LOOKUP_OR_INSERT_FACADE_SIG(int64_t), SE_LOOKUP_OR_INSERT_FACADE_SIG(uint64_t)>
+                   SE_LOOKUP_OR_INSERT_FACADE_SIG(int64_t), SE_LOOKUP_OR_INSERT_FACADE_SIG(uint64_t)> //
 
   // --- Assign ---------------------------------------------------------------
   ::add_convention<WeakMemAssign,
                    SE_ASSIGN_FACADE_SIG(int32_t), SE_ASSIGN_FACADE_SIG(uint32_t),
-                   SE_ASSIGN_FACADE_SIG(int64_t), SE_ASSIGN_FACADE_SIG(uint64_t)>
+                   SE_ASSIGN_FACADE_SIG(int64_t), SE_ASSIGN_FACADE_SIG(uint64_t)> //
 
   // --- Contains -------------------------------------------------------------
   ::add_convention<WeakMemContains,
                    SE_CONTAINS_FACADE_SIG(int32_t), SE_CONTAINS_FACADE_SIG(uint32_t),
-                   SE_CONTAINS_FACADE_SIG(int64_t), SE_CONTAINS_FACADE_SIG(uint64_t)>
+                   SE_CONTAINS_FACADE_SIG(int64_t), SE_CONTAINS_FACADE_SIG(uint64_t)> //
 
   // --- Erase / clear --------------------------------------------------------
   ::add_convention<WeakMemErase,
                    SE_ERASE_FACADE_SIG(int32_t), SE_ERASE_FACADE_SIG(uint32_t),
-                   SE_ERASE_FACADE_SIG(int64_t), SE_ERASE_FACADE_SIG(uint64_t)>
+                   SE_ERASE_FACADE_SIG(int64_t), SE_ERASE_FACADE_SIG(uint64_t)> //
   ::add_convention<WeakMemClear,
-                   std::error_code()>
+                   std::error_code()> //
 
   // --- Score / eviction -----------------------------------------------------
   ::add_convention<WeakMemHasScorePolicy,
-                   bool() const>
+                   bool() const> //
   ::add_convention<WeakMemAssignScores,
                    SE_ASSIGN_SCORES_FACADE_SIG(int32_t), SE_ASSIGN_SCORES_FACADE_SIG(uint32_t),
-                   SE_ASSIGN_SCORES_FACADE_SIG(int64_t), SE_ASSIGN_SCORES_FACADE_SIG(uint64_t)>
+                   SE_ASSIGN_SCORES_FACADE_SIG(int64_t), SE_ASSIGN_SCORES_FACADE_SIG(uint64_t)> //
   ::add_convention<WeakMemEvictByScore,
                    SE_EVICT_BY_SCORE_FACADE_SIG(int32_t), SE_EVICT_BY_SCORE_FACADE_SIG(uint32_t),
-                   SE_EVICT_BY_SCORE_FACADE_SIG(int64_t), SE_EVICT_BY_SCORE_FACADE_SIG(uint64_t)>
+                   SE_EVICT_BY_SCORE_FACADE_SIG(int64_t), SE_EVICT_BY_SCORE_FACADE_SIG(uint64_t)> //
 
   // --- Export / snapshot ----------------------------------------------------
   ::add_convention<WeakMemExportBatch,
                    SE_EXPORT_BATCH_FACADE_SIG(int32_t), SE_EXPORT_BATCH_FACADE_SIG(uint32_t),
-                   SE_EXPORT_BATCH_FACADE_SIG(int64_t), SE_EXPORT_BATCH_FACADE_SIG(uint64_t)>
+                   SE_EXPORT_BATCH_FACADE_SIG(int64_t), SE_EXPORT_BATCH_FACADE_SIG(uint64_t)> //
 
   // --- Training: Forward ----------------------------------------------------
   ::add_convention<WeakMemForwardLookup,
                    SE_FORWARD_LOOKUP_FACADE_SIG(int32_t), SE_FORWARD_LOOKUP_FACADE_SIG(uint32_t),
-                   SE_FORWARD_LOOKUP_FACADE_SIG(int64_t), SE_FORWARD_LOOKUP_FACADE_SIG(uint64_t)>
+                   SE_FORWARD_LOOKUP_FACADE_SIG(int64_t), SE_FORWARD_LOOKUP_FACADE_SIG(uint64_t)> //
 
   // --- Training: Backward ---------------------------------------------------
   ::add_convention<WeakMemAccumulateGradients,
                    SE_ACCUMULATE_GRADIENTS_FACADE_SIG(int32_t), SE_ACCUMULATE_GRADIENTS_FACADE_SIG(uint32_t),
-                   SE_ACCUMULATE_GRADIENTS_FACADE_SIG(int64_t), SE_ACCUMULATE_GRADIENTS_FACADE_SIG(uint64_t)>
+                   SE_ACCUMULATE_GRADIENTS_FACADE_SIG(int64_t), SE_ACCUMULATE_GRADIENTS_FACADE_SIG(uint64_t)> //
   ::add_convention<WeakMemOptimizerStep,
-                   std::error_code()>
+                   std::error_code()> //
 
   // --- Optimizer state checkpoint -------------------------------------------
   ::add_convention<pro::weak_dispatch<MemAssignOptStates>,
-                   void(std::span<const uint64_t>, std::span<const float>)>
+                   void(std::span<const uint64_t>, std::span<const OptT>,
+                        std::span<const uint32_t>)> //
   ::add_convention<pro::weak_dispatch<MemExportOptStateBatch>,
                    void(se::Function<bool(std::size_t, std::span<const uint64_t>,
-                                         std::span<const float>,
-                                         std::span<const float>)>,
-                        std::size_t)>
+                                         std::span<const ParamT>,
+                                         std::span<const uint64_t>,
+                                         std::span<const OptT>,
+                                         std::span<const uint32_t>)>,
+                        std::size_t)> //
   ::add_convention<pro::weak_dispatch<MemExportOptStateBatchOwned>,
                    void(se::Function<bool(std::size_t, std::vector<uint64_t>&&,
-                                         std::vector<float>&&,
-                                         std::vector<float>&&)>,
-                        std::size_t)>
+                                         std::vector<ParamT>&&,
+                                         std::vector<uint64_t>&&,
+                                         std::vector<OptT>&&,
+                                         std::vector<uint32_t>&&)>,
+                        std::size_t)> //
 
   ::build {};
 // NOLINTEND(whitespace/indent_namespace)

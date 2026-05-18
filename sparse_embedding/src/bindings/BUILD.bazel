@@ -7,6 +7,8 @@ filegroup(
     srcs = glob([
         "*.hpp",
         "*.cpp",
+        "typed/*.cpp",
+        "typed/*.inl",
     ]),
     visibility = ["//visibility:public"],
 )

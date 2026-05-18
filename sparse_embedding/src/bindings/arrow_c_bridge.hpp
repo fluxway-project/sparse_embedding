@@ -130,18 +130,32 @@ inline ArrowSchema *make_list_schema(const char *name) {
 
 } // namespace detail
 
+// Build record batch schema with required (dim, key, list_col) and optional
+// uint32 "step" column. Per OCP, callers that don't need per-ID step pass
+// with_step=false (default) and observe the legacy 3-column layout.
 inline void build_record_batch_schema(ArrowSchema *out,
-                                      const char *list_col_name) {
+                                      const char *list_col_name,
+                                      bool with_step = false) {
   auto *dim = detail::make_leaf_schema("I", "dim"); // uint32
   auto *key = detail::make_leaf_schema("L", "key"); // uint64
   auto *list_col = detail::make_list_schema(list_col_name);
+  ArrowSchema *step =
+      with_step ? detail::make_leaf_schema("I", "step") : nullptr;
+
+  const int64_t n_children = with_step ? 4 : 3;
+  auto **children = new ArrowSchema *[static_cast<size_t>(n_children)];
+  children[0] = dim;
+  children[1] = key;
+  children[2] = list_col;
+  if (with_step)
+    children[3] = step;
 
   out->format = "+s"; // struct (record batch)
   out->name = nullptr;
   out->metadata = nullptr;
   out->flags = kArrowFlagNullable;
-  out->n_children = 3;
-  out->children = new ArrowSchema *[3] { dim, key, list_col };
+  out->n_children = n_children;
+  out->children = children;
   out->dictionary = nullptr;
   out->private_data = nullptr;
   out->release = [](ArrowSchema *self) {
@@ -187,15 +201,18 @@ struct ListArrayCtx {
   }
 };
 
+// Holds up to 4 child arrays: [dim, key, list_col, step].
+// step slot remains nullptr when the schema does not include it.
 struct RecordBatchCtx {
   const void *buffers[1]; // [null_bitmap]
-  ArrowArray *children[3];
+  ArrowArray *children[4];
 
   RecordBatchCtx() {
     buffers[0] = nullptr;
     children[0] = nullptr;
     children[1] = nullptr;
     children[2] = nullptr;
+    children[3] = nullptr;
   }
 };
 
@@ -257,35 +274,44 @@ inline ArrowArray *make_list_array(std::vector<int32_t> &&offsets,
 // After this call, all input vectors are in a moved-from state.
 // ============================================================================
 
+// Build the top-level struct array. When `steps` is non-empty, an extra
+// uint32 child column is appended (must match the schema built with
+// with_step=true). Empty steps preserve the legacy 3-column layout.
 inline void build_record_batch_array(ArrowArray *out,
                                      std::vector<uint32_t> &&dims,
                                      std::vector<uint64_t> &&keys,
                                      std::vector<int32_t> &&offsets,
-                                     std::vector<float> &&flat_values) {
+                                     std::vector<float> &&flat_values,
+                                     std::vector<uint32_t> &&steps = {}) {
   int64_t n = static_cast<int64_t>(keys.size());
+  const bool with_step = !steps.empty();
 
   auto *dim_arr = detail::make_leaf_array(std::move(dims));
   auto *key_arr = detail::make_leaf_array(std::move(keys));
   auto *val_child = detail::make_leaf_array(std::move(flat_values));
   auto *list_arr = detail::make_list_array(std::move(offsets), val_child);
+  ArrowArray *step_arr =
+      with_step ? detail::make_leaf_array(std::move(steps)) : nullptr;
 
   auto *ctx = new detail::RecordBatchCtx();
   ctx->children[0] = dim_arr;
   ctx->children[1] = key_arr;
   ctx->children[2] = list_arr;
+  if (with_step)
+    ctx->children[3] = step_arr;
 
   out->length = n;
   out->null_count = 0;
   out->offset = 0;
   out->n_buffers = 1;
-  out->n_children = 3;
+  out->n_children = with_step ? 4 : 3;
   out->buffers = ctx->buffers;
   out->children = ctx->children;
   out->dictionary = nullptr;
   out->private_data = ctx;
   out->release = [](ArrowArray *self) {
     auto *c = static_cast<detail::RecordBatchCtx *>(self->private_data);
-    for (int i = 0; i < 3; ++i) {
+    for (int i = 0; i < 4; ++i) {
       if (c->children[i] && c->children[i]->release) {
         c->children[i]->release(c->children[i]);
       }
@@ -331,12 +357,15 @@ inline ArrowBatchPair build_embedding_batch(size_t emb_dim,
   return pair;
 }
 
-inline ArrowBatchPair build_opt_state_batch(size_t emb_dim,
-                                            std::vector<uint64_t> &&keys,
-                                            std::vector<float> &&vals,
-                                            std::vector<float> &&opt_states) {
+// Build an opt_state record batch with an optional per-ID step column.
+// Empty `steps` produces the legacy 3-column layout (used for optimizers
+// that do not track step state, e.g. SGD).
+inline ArrowBatchPair build_opt_state_batch(
+    size_t emb_dim, std::vector<uint64_t> &&keys, std::vector<float> &&vals,
+    std::vector<float> &&opt_states, std::vector<uint32_t> &&steps = {}) {
   size_t n = keys.size();
   size_t opt_dim = n > 0 ? opt_states.size() / n : 0;
+  const bool with_step = !steps.empty();
 
   std::vector<uint32_t> dims(n, static_cast<uint32_t>(emb_dim));
 
@@ -346,9 +375,10 @@ inline ArrowBatchPair build_opt_state_batch(size_t emb_dim,
   }
 
   ArrowBatchPair pair;
-  build_record_batch_schema(&pair.schema, "opt_state");
+  build_record_batch_schema(&pair.schema, "opt_state", with_step);
   build_record_batch_array(&pair.array, std::move(dims), std::move(keys),
-                           std::move(offsets), std::move(opt_states));
+                           std::move(offsets), std::move(opt_states),
+                           std::move(steps));
   (void)vals;
   return pair;
 }

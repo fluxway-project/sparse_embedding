@@ -21,8 +21,6 @@
 #include <cmath>
 #include <cstdint>
 #include <span>
-#include <type_traits>
-#include <vector>
 
 #include "sparse_embedding/src/optimizer/optimizer_config.hpp"
 #include "sparse_embedding/src/optimizer/optimizer_state.hpp"
@@ -30,109 +28,81 @@
 
 namespace se {
 
-template <typename ValT> class AdamOptimizer {
-  OptimizerStateArena m_state;
-  OptimizerStateArena v_state;
+template <typename ParamT, typename OptT> class AdamOptimizer {
+  OptimizerStateArena<OptT> m_state;
+  OptimizerStateArena<OptT> v_state;
+  OptimizerStateArena<uint32_t>
+      step_state; // Per-ID step counter (uint32); initialized to 0 by
+                  // OptimizerStateArena's value-initialized allocation so the
+                  // first update sees id_step==1 after the increment, which is
+                  // required for correct Adam bias correction.
   AdamConfig config;
 
 public:
   explicit AdamOptimizer(size_t dim, const AdamConfig &cfg)
-      : m_state(dim), v_state(dim), config(cfg) {}
+      : m_state(dim), v_state(dim), step_state(1), config(cfg) {}
 
   void allocate() {
     m_state.allocate();
     v_state.allocate();
+    step_state.allocate();
   }
 
   void deallocate(uint32_t idx) {
     m_state.deallocate(idx);
     v_state.deallocate(idx);
+    step_state.deallocate(idx);
   }
 
   void clear() {
     m_state.clear();
     v_state.clear();
+    step_state.clear();
   }
 
-  // Returns a pointer to a flat buffer [m[0..dim-1], v[0..dim-1]] for idx.
-  // Caller must copy the data before releasing any lock; the buffer is
-  // backed by two separate arenas so we materialise it into a thread-local.
-  const float *state_data(uint32_t idx) const {
+  void state_data(uint32_t idx, std::span<OptT> out) const {
     size_t d = m_state.dim();
-    thread_local std::vector<float> buf;
-    buf.resize(d * 2);
-    std::copy_n(m_state.data(idx), d, buf.data());
-    std::copy_n(v_state.data(idx), d, buf.data() + d);
-    return buf.data();
+    if (out.size() < d * 2) {
+      throw std::invalid_argument("Output buffer too small");
+    }
+    std::copy_n(m_state.data(idx), d, out.data());
+    std::copy_n(v_state.data(idx), d, out.data() + d);
   }
 
   size_t state_dim() const { return m_state.dim() * 2; }
 
-  void set_state(uint32_t idx, std::span<const float> state) {
+  void set_state(uint32_t idx, std::span<const OptT> state) {
     size_t d = m_state.dim();
+    if (state.size() < d * 2) {
+      throw std::invalid_argument("Input state span is too small.");
+    }
     std::copy_n(state.data(), d, m_state.data(idx));
     std::copy_n(state.data() + d, d, v_state.data(idx));
   }
 
-  void step(uint32_t idx, std::span<ValT> param_span,
-            std::span<const ValT> grad_span, uint64_t global_step) {
-    const float step_f = static_cast<float>(global_step);
+  uint32_t step_data(uint32_t idx) const { return *step_state.data(idx); }
+
+  void set_step(uint32_t idx, uint32_t s) { *step_state.data(idx) = s; }
+
+  void step(uint32_t idx, std::span<ParamT> param_span,
+            std::span<const ParamT> grad_span,
+            [[maybe_unused]] uint64_t global_step) {
+    uint32_t &id_step = *step_state.data(idx);
+    id_step++;
+    const float step_f = static_cast<float>(id_step);
     const float bc1 = 1.0f / (1.0f - std::pow(config.beta1, step_f));
     const float bc2 = 1.0f / (1.0f - std::pow(config.beta2, step_f));
 
     size_t dim = param_span.size();
-    ValT *param = param_span.data();
-    const ValT *accumulated_grad = grad_span.data();
+    ParamT *param = param_span.data();
+    const ParamT *accumulated_grad = grad_span.data();
 
-    float *m = m_state.data(idx);
-    float *v = v_state.data(idx);
+    OptT *m = m_state.data(idx);
+    OptT *v = v_state.data(idx);
 
-    if constexpr (simd::is_simd_supported_v<ValT>) {
-      const float *grad_ptr;
-      thread_local std::vector<float> grad_buf;
-
-      if constexpr (std::is_same_v<ValT, float>) {
-        if (config.weight_decay > 0.0f) {
-          grad_buf.resize(dim);
-          for (size_t d = 0; d < dim; ++d) {
-            grad_buf[d] = accumulated_grad[d] + config.weight_decay * param[d];
-          }
-          grad_ptr = grad_buf.data();
-        } else {
-          grad_ptr = accumulated_grad;
-        }
-      } else {
-        grad_buf.resize(dim);
-        if (config.weight_decay > 0.0f) {
-          for (size_t d = 0; d < dim; ++d) {
-            grad_buf[d] = static_cast<float>(accumulated_grad[d]) +
-                          config.weight_decay * static_cast<float>(param[d]);
-          }
-        } else {
-          for (size_t d = 0; d < dim; ++d) {
-            grad_buf[d] = static_cast<float>(accumulated_grad[d]);
-          }
-        }
-        grad_ptr = grad_buf.data();
-      }
-
-      simd::simd_adam_update(param, grad_ptr, m, v, config.lr, config.beta1,
-                             config.beta2, config.eps, bc1, bc2, dim);
-    } else {
-      for (size_t d = 0; d < dim; ++d) {
-        float g = static_cast<float>(accumulated_grad[d]);
-        if (config.weight_decay > 0.0f) {
-          g += config.weight_decay * static_cast<float>(param[d]);
-        }
-        m[d] = config.beta1 * m[d] + (1.0f - config.beta1) * g;
-        v[d] = config.beta2 * v[d] + (1.0f - config.beta2) * g * g;
-        float m_hat = m[d] * bc1;
-        float v_hat = v[d] * bc2;
-        param[d] = static_cast<ValT>(static_cast<float>(param[d]) -
-                                     config.lr * m_hat /
-                                         (std::sqrt(v_hat) + config.eps));
-      }
-    }
+    simd::simd_adam_update(param, accumulated_grad, m, v, config.lr,
+                           config.beta1, config.beta2, config.eps, bc1, bc2,
+                           config.weight_decay, dim);
   }
 };
 

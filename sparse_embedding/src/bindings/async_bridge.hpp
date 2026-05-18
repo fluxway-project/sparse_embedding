@@ -33,6 +33,10 @@
 
 namespace se::py {
 
+#if defined(Py_LIMITED_API)
+extern "C" PyAPI_FUNC(int) PyGILState_Check(void);
+#endif
+
 namespace nb = nanobind;
 
 // AsyncPyObjectKeeper: safely defers Py_DECREF to the GIL-holding wake thread

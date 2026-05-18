@@ -75,17 +75,20 @@ PRO_DEF_MEM_DISPATCH(MemCkptWriteBatch, write_batch);
 PRO_DEF_MEM_DISPATCH(MemCkptCommit, commit);
 
 struct CheckpointWriterFacade
-    : pro::facade_builder ::add_convention<
-          MemCkptWriterBegin,
-          void(std::string_view uri, size_t dim, size_t optimizer_state_dim,
-               bool has_score, CheckpointExportOptions options)>::
-          add_convention<
-              MemCkptWriteBatch,
-              void(std::span<const uint64_t> keys, const void *embeddings,
-                   size_t embedding_bytes, std::span<const uint64_t> scores,
-                   const void *optimizer_states, size_t opt_state_bytes)>::
-              add_convention<MemCkptCommit, uint64_t()>::support_copy<
-                  pro::constraint_level::nontrivial>::build {};
+    : pro::facade_builder //
+      ::add_convention<MemCkptWriterBegin,
+                       void(std::string_view uri, size_t dim,
+                            size_t optimizer_state_dim, bool has_score,
+                            CheckpointExportOptions options)> //
+      ::add_convention<
+          MemCkptWriteBatch,
+          void(std::span<const uint64_t> keys, const void *embeddings,
+               size_t embedding_bytes, std::span<const uint64_t> scores,
+               const void *optimizer_states, size_t opt_state_bytes,
+               std::span<const uint32_t> steps)> //
+      ::add_convention<MemCkptCommit, uint64_t()>::support_copy<
+          pro::constraint_level::nontrivial> //
+      ::build {};
 
 // ---------------------------------------------------------------------------
 // CheckpointReaderFacade — duck-typed proxy.
@@ -96,16 +99,19 @@ PRO_DEF_MEM_DISPATCH(MemCkptReadBatch, read_batch);
 PRO_DEF_MEM_DISPATCH(MemCkptVersionInfo, version_info);
 
 struct CheckpointReaderFacade
-    : pro::facade_builder ::add_convention<
-          MemCkptReaderOpen, void(std::string_view uri, size_t dim,
-                                  uint64_t version, int64_t batch_size)>::
-          add_convention<MemCkptReadBatch,
-                         bool(size_t max_n, std::vector<uint64_t> &out_keys,
-                              std::vector<std::byte> &out_embeddings,
-                              std::vector<uint64_t> &out_scores,
-                              std::vector<std::byte> &out_optimizer_states)>::
-              add_convention<MemCkptVersionInfo, CheckpointVersion() const>::
-                  support_copy<pro::constraint_level::nontrivial>::build {};
+    : pro::facade_builder //
+      ::add_convention<MemCkptReaderOpen,
+                       void(std::string_view uri, size_t dim, uint64_t version,
+                            int64_t batch_size)> //
+      ::add_convention<MemCkptReadBatch,
+                       bool(size_t max_n, std::vector<uint64_t> &out_keys,
+                            std::vector<std::byte> &out_embeddings,
+                            std::vector<uint64_t> &out_scores,
+                            std::vector<std::byte> &out_optimizer_states,
+                            std::vector<uint32_t> &out_steps)>        //
+      ::add_convention<MemCkptVersionInfo, CheckpointVersion() const> //
+      ::support_copy<pro::constraint_level::nontrivial>               //
+      ::build {};
 
 // ---------------------------------------------------------------------------
 // Factory types — injected into the checkpoint coordinator

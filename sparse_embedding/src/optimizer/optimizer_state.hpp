@@ -27,7 +27,7 @@
 
 namespace se {
 
-class OptimizerStateArena {
+template <typename T> class OptimizerStateArena {
   static constexpr size_t kCacheLineSize = 64;
   static constexpr size_t kEntriesPerPage = 4096;
 
@@ -38,7 +38,7 @@ class OptimizerStateArena {
 public:
   explicit OptimizerStateArena(size_t dim) : dim_(dim) {
     row_stride_ =
-        (dim * sizeof(float) + kCacheLineSize - 1) & ~(kCacheLineSize - 1);
+        (dim * sizeof(T) + kCacheLineSize - 1) & ~(kCacheLineSize - 1);
   }
 
   OptimizerStateArena(const OptimizerStateArena &) = delete;
@@ -79,10 +79,10 @@ public:
     next_index_ = 0;
   }
 
-  float *data(uint32_t index) { return reinterpret_cast<float *>(raw(index)); }
+  T *data(uint32_t index) { return reinterpret_cast<T *>(raw(index)); }
 
-  const float *data(uint32_t index) const {
-    return reinterpret_cast<const float *>(raw(index));
+  const T *data(uint32_t index) const {
+    return reinterpret_cast<const T *>(raw(index));
   }
 
   size_t dim() const { return dim_; }
