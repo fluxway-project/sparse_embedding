@@ -357,7 +357,7 @@ void CheckpointOpsImpl<ParamT, OptT>::export_batches_arrow(
                                       std::vector<ParamT> &&vals,
                                       std::vector<uint64_t> && /*scores*/,
                                       std::vector<OptT> &&opt_states,
-                                      std::vector<uint32_t> &&) -> bool {
+                                      std::vector<uint32_t> &&steps) -> bool {
             std::vector<float> vals_f32;
             std::vector<float> opt_f32;
             if constexpr (std::is_same_v<ParamT, float>) {
@@ -374,10 +374,13 @@ void CheckpointOpsImpl<ParamT, OptT>::export_batches_arrow(
               for (size_t i = 0; i < opt_states.size(); ++i)
                 opt_f32[i] = static_cast<float>(opt_states[i]);
             }
+            // For include_optimizer_state path, forward per-ID step counters
+            // (empty for optimizers without step tracking, e.g. SGD). Empty
+            // steps preserve the legacy 3-column layout.
             auto pair = include_optimizer_state
                             ? se::arrow::build_opt_state_batch(
                                   dim, std::move(keys), std::move(vals_f32),
-                                  std::move(opt_f32))
+                                  std::move(opt_f32), std::move(steps))
                             : se::arrow::build_embedding_batch(
                                   dim, std::move(keys), std::move(vals_f32));
             auto array_addr = reinterpret_cast<uintptr_t>(&pair.array);
@@ -392,20 +395,40 @@ void CheckpointOpsImpl<ParamT, OptT>::export_batches_arrow(
 template <typename ParamT, typename OptT>
 void CheckpointOpsImpl<ParamT, OptT>::assign_opt_state(
     EmbeddingStoreWrapper &self, nb::object keys_obj,
-    nb::object opt_states_obj) {
+    nb::object opt_states_obj, nb::object steps_obj) {
   auto [dlm_keys, cap_keys] = se::py::extract_dlpack_tensor(keys_obj);
   auto [dlm_opt, cap_opt] = se::py::extract_dlpack_tensor(opt_states_obj);
+  if (dlm_keys->dl_tensor.dtype.bits != 64)
+    throw std::invalid_argument(
+        "assign_opt_state requires a 64-bit key tensor; received " +
+        std::to_string(dlm_keys->dl_tensor.dtype.bits) + "-bit input");
   const uint64_t *keys =
       static_cast<const uint64_t *>(dlm_keys->dl_tensor.data);
   size_t n = dlm_keys->dl_tensor.shape[0];
   const float *opt_flat = static_cast<const float *>(dlm_opt->dl_tensor.data);
   size_t total_opt = static_cast<size_t>(dlm_opt->dl_tensor.shape[0]);
+
+  // Optional per-ID step tensor (uint32). Absent for SGD-like optimizers.
+  const uint32_t *steps_ptr = nullptr;
+  size_t steps_n = 0;
+  std::optional<std::pair<DLManagedTensor *, nb::object>> steps_holder;
+  if (!steps_obj.is_none()) {
+    auto [dlm_steps, cap_steps] = se::py::extract_dlpack_tensor(steps_obj);
+    if (dlm_steps->dl_tensor.dtype.bits != 32)
+      throw std::invalid_argument(
+          "assign_opt_state requires a 32-bit step tensor; received " +
+          std::to_string(dlm_steps->dl_tensor.dtype.bits) + "-bit input");
+    steps_holder.emplace(dlm_steps, cap_steps);
+    steps_ptr = static_cast<const uint32_t *>(dlm_steps->dl_tensor.data);
+    steps_n = static_cast<size_t>(dlm_steps->dl_tensor.shape[0]);
+  }
+
   nb::gil_scoped_release release;
   if constexpr (std::is_same_v<OptT, float>) {
     self.get_store<ParamT, OptT>()->assign_opt_states(
         std::span<const uint64_t>(keys, n),
         std::span<const OptT>(opt_flat, total_opt),
-        std::span<const uint32_t>());
+        std::span<const uint32_t>(steps_ptr, steps_n));
   } else {
     std::vector<OptT> narrowed(total_opt);
     for (size_t i = 0; i < total_opt; ++i)
@@ -413,7 +436,7 @@ void CheckpointOpsImpl<ParamT, OptT>::assign_opt_state(
     self.get_store<ParamT, OptT>()->assign_opt_states(
         std::span<const uint64_t>(keys, n),
         std::span<const OptT>(narrowed.data(), narrowed.size()),
-        std::span<const uint32_t>());
+        std::span<const uint32_t>(steps_ptr, steps_n));
   }
 }
 

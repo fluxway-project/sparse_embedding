@@ -303,7 +303,7 @@ template <typename ParamT, typename OptT> struct CheckpointOpsImpl {
                                    nb::callable visitor, size_t batch_size,
                                    bool include_optimizer_state);
   static void assign_opt_state(EmbeddingStoreWrapper &self, nb::object keys_obj,
-                               nb::object opt_states_obj);
+                               nb::object opt_states_obj, nb::object steps_obj);
 };
 
 // =============================================================================
@@ -581,10 +581,11 @@ public:
     });
   }
 
-  void assign_opt_state(nb::object keys_obj, nb::object opt_states_obj) {
+  void assign_opt_state(nb::object keys_obj, nb::object opt_states_obj,
+                        nb::object steps_obj) {
     dispatch_types([&]<typename P, typename O>() {
-      CheckpointOpsImpl<P, O>::assign_opt_state(*this, keys_obj,
-                                                opt_states_obj);
+      CheckpointOpsImpl<P, O>::assign_opt_state(*this, keys_obj, opt_states_obj,
+                                                steps_obj);
     });
   }
 };

@@ -355,7 +355,8 @@ NB_MODULE(_core, m) {
            nb::arg("visitor"), nb::arg("batch_size") = 65536,
            nb::arg("include_optimizer_state") = false)
       .def("assign_opt_state", &EmbeddingStoreWrapper::assign_opt_state,
-           nb::arg("keys"), nb::arg("opt_states"))
+           nb::arg("keys"), nb::arg("opt_states"),
+           nb::arg("steps") = nb::none())
 
 #ifdef SE_ENABLE_LANCE_CHECKPOINTER
       .def("save_checkpoint", &EmbeddingStoreWrapper::save_checkpoint,
@@ -529,6 +530,10 @@ NB_MODULE(_core, m) {
               "slot_id is too large for the given slot_bits");
 
         auto [dlm, cap] = se::py::extract_dlpack_tensor(raw_keys_obj);
+        if (dlm->dl_tensor.dtype.bits != 64)
+          throw std::invalid_argument(
+              "encode_keys requires a 64-bit key tensor; received " +
+              std::to_string(dlm->dl_tensor.dtype.bits) + "-bit input");
         size_t n = static_cast<size_t>(dlm->dl_tensor.shape[0]);
         const uint64_t slot_prefix = static_cast<uint64_t>(slot_id)
                                      << (64 - slot_bits);
@@ -573,6 +578,10 @@ NB_MODULE(_core, m) {
           throw std::invalid_argument("slot_bits must be in [1, 63]");
 
         auto [dlm, cap] = se::py::extract_dlpack_tensor(encoded_keys_obj);
+        if (dlm->dl_tensor.dtype.bits != 64)
+          throw std::invalid_argument(
+              "decode_keys requires a 64-bit encoded-key tensor; received " +
+              std::to_string(dlm->dl_tensor.dtype.bits) + "-bit input");
         size_t n = static_cast<size_t>(dlm->dl_tensor.shape[0]);
         const uint64_t raw_mask = (slot_bits == 64)
                                       ? ~uint64_t{0}

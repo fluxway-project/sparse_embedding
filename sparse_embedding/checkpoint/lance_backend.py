@@ -24,6 +24,7 @@ OPT_STATE_SCHEMA = pa.schema(
         pa.field("dim", pa.uint32()),
         pa.field("key", pa.uint64()),
         pa.field("opt_state", pa.list_(pa.float32())),
+        pa.field("step", pa.uint32()),
     ]
 )
 
@@ -223,6 +224,7 @@ def _load_embeddings(store, uri: str, filter_fn, target_shard_id: int):
 
 def _load_opt_states(store, uri: str, filter_fn, target_shard_id: int):
     ds = lance.dataset(uri)
+    has_step = "step" in ds.schema.names
     for dim in store.table_dims():
         scanner = ds.scanner(filter=f"dim = {dim}")
         for batch in scanner.to_batches():
@@ -231,14 +233,17 @@ def _load_opt_states(store, uri: str, filter_fn, target_shard_id: int):
                 continue
 
             opt_arr = batch["opt_state"]
+            step_arr = batch["step"] if has_step else None
             mask = _apply_filter(keys_arr, filter_fn, target_shard_id)
 
             if mask is not None:
                 keys_arr = pc.filter(keys_arr, mask)
                 opt_arr = pc.filter(opt_arr, mask)
+                if step_arr is not None:
+                    step_arr = pc.filter(step_arr, mask)
 
             if len(keys_arr) == 0:
                 continue
 
             flat_opt = pc.list_flatten(opt_arr)
-            store.assign_opt_state(keys_arr, flat_opt)
+            store.assign_opt_state(keys_arr, flat_opt, step_arr)
