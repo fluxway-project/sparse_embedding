@@ -95,6 +95,25 @@ class BazelAwareBuildPy(build_py):
             shutil.copy2(so_src, so_dst)
             print(f"[setup.py] Copied {so_src.name} -> {so_dst}", file=sys.stderr)
 
+            # Generate the _core.pyi type stubs using nanobind.stubgen
+            print("[setup.py] Generating type stubs (_core.pyi)...", file=sys.stderr)
+            subprocess.run(
+                [
+                    sys.executable,
+                    "-m",
+                    "nanobind.stubgen",
+                    "-m",
+                    "sparse_embedding._core",
+                    "-O",
+                    str(_PKG_DIR),
+                ],
+                cwd=str(_PROJECT_DIR),
+                check=True,
+                capture_output=True,
+                text=True,
+            )
+            print("[setup.py] Successfully generated _core.pyi", file=sys.stderr)
+
             if with_lance:
                 lance_so = _PKG_DIR / "liblance_c.so"
                 bazel_lance = (
@@ -122,5 +141,5 @@ class BinaryDistribution(Distribution):
 setup(
     distclass=BinaryDistribution,
     cmdclass={"build_py": BazelAwareBuildPy},
-    package_data={"sparse_embedding": ["*.so"]},
+    package_data={"sparse_embedding": ["*.so", "*.pyi", "py.typed"]},
 )
