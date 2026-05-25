@@ -7,7 +7,7 @@ import sparse_embedding
 def test_embedding_table_basic():
     store = sparse_embedding.EmbeddingStore(
         embedding_config=sparse_embedding.EmbeddingConfig(
-            dims=[128], num_threads=4, dtype="float32"
+            dims=[128], num_threads=4, value_dtype="float32"
         ),
         initializer_config=sparse_embedding.Zeros(),
     )
@@ -31,7 +31,7 @@ def test_embedding_table_basic():
 def test_embedding_table_assign():
     store = sparse_embedding.EmbeddingStore(
         embedding_config=sparse_embedding.EmbeddingConfig(
-            dims=[128], num_threads=4, dtype="float32"
+            dims=[128], num_threads=4, value_dtype="float32"
         ),
         initializer_config=sparse_embedding.Zeros(),
     )
@@ -50,7 +50,7 @@ def test_embedding_table_assign():
 def test_embedding_table_32bit_keys():
     store = sparse_embedding.EmbeddingStore(
         embedding_config=sparse_embedding.EmbeddingConfig(
-            dims=[128], num_threads=4, dtype="float32"
+            dims=[128], num_threads=4, value_dtype="float32"
         ),
         initializer_config=sparse_embedding.Zeros(),
     )
@@ -79,7 +79,7 @@ def test_embedding_table_32bit_keys():
 async def test_embedding_table_async():
     store = sparse_embedding.EmbeddingStore(
         embedding_config=sparse_embedding.EmbeddingConfig(
-            dims=[128], num_threads=4, dtype="float32"
+            dims=[128], num_threads=4, value_dtype="float32"
         ),
         initializer_config=sparse_embedding.Zeros(),
         score_policy="lru",
@@ -134,7 +134,7 @@ def test_optimizer_per_id_step():
     """Verify that optimizer tracks steps per-ID for bias correction."""
     store = sparse_embedding.EmbeddingStore(
         embedding_config=sparse_embedding.EmbeddingConfig(
-            dims=[128], num_threads=1, dtype="float32"
+            dims=[128], num_threads=1, value_dtype="float32"
         ),
         initializer_config=sparse_embedding.Zeros(),
         optimizer_config=sparse_embedding.Adam(

@@ -16,7 +16,7 @@ def test_heavy_collision_adam_update():
         embedding_config=se.EmbeddingConfig(
             dims=[16],
             num_threads=2,
-            dtype="float32",
+            value_dtype="float32",
         ),
         initializer_config=se.Zeros(),
         optimizer_config=se.Adam(lr=0.01),

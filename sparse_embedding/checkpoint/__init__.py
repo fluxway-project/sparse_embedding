@@ -7,7 +7,7 @@ def register_backend(name: str, backend_cls: type):
     _BACKENDS[name] = backend_cls
 
 
-def get_backend(name: str, **kwargs) -> CheckpointBackend:
+def get_checkpointer(name: str, **kwargs) -> CheckpointBackend:
     if name not in _BACKENDS:
         raise ValueError(
             f"Unknown checkpoint backend: {name}. "
@@ -27,6 +27,6 @@ except ImportError:
 __all__ = [
     "CheckpointBackend",
     "DistributedCheckpointBackend",
-    "get_backend",
+    "get_checkpointer",
     "register_backend",
 ]

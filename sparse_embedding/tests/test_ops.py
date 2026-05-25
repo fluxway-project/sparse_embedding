@@ -185,7 +185,7 @@ def test_encode_keys_slot_id_too_large() -> None:
 def test_assign_shape_mismatch() -> None:
     store = sparse_embedding.EmbeddingStore(
         embedding_config=sparse_embedding.EmbeddingConfig(
-            dims=[128], num_threads=1, dtype="float32"
+            dims=[128], num_threads=1, value_dtype="float32"
         ),
         initializer_config=sparse_embedding.Zeros(),
         optimizer_config=sparse_embedding.Adam(lr=0.01),
@@ -216,7 +216,7 @@ def test_assign_shape_mismatch() -> None:
 def test_accumulate_gradients_shape_mismatch() -> None:
     store = sparse_embedding.EmbeddingStore(
         embedding_config=sparse_embedding.EmbeddingConfig(
-            dims=[128], num_threads=1, dtype="float32"
+            dims=[128], num_threads=1, value_dtype="float32"
         ),
         initializer_config=sparse_embedding.Zeros(),
         optimizer_config=sparse_embedding.Adam(lr=0.01),
@@ -250,7 +250,7 @@ def test_1d_tensor_support() -> None:
     """Test 1D flat tensor input to support PyArrow DLPack."""
     store = sparse_embedding.EmbeddingStore(
         embedding_config=sparse_embedding.EmbeddingConfig(
-            dims=[128], num_threads=1, dtype="float32"
+            dims=[128], num_threads=1, value_dtype="float32"
         ),
         initializer_config=sparse_embedding.Zeros(),
         optimizer_config=sparse_embedding.Adam(lr=0.01),
@@ -280,7 +280,7 @@ def test_embedding_store_huge_dim() -> None:
     try:
         _ = sparse_embedding.EmbeddingStore(
             embedding_config=sparse_embedding.EmbeddingConfig(
-                dims=[2000000000], num_threads=1, dtype="float32"
+                dims=[2000000000], num_threads=1, value_dtype="float32"
             ),
             initializer_config=sparse_embedding.Zeros(),
             optimizer_config=sparse_embedding.Adam(lr=0.01),

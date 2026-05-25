@@ -29,8 +29,8 @@ struct EmbeddingConfig {
   std::vector<size_t>
       dims; // physical table dims, each unique value creates one SlotStore
   size_t num_threads = 0; // 0 means auto
-  std::string dtype = "float32";
-  std::string opt_dtype = "";       // if empty, falls back to dtype
+  std::string value_dtype = "float32";
+  std::string optimizer_dtype = ""; // if empty, falls back to value_dtype
   std::string key_dtype = "int64";  // int64, uint64, int32, uint32
   size_t max_active_keys = 1048576; // 1 << 20
 };

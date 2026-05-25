@@ -58,8 +58,10 @@ EmbeddingStoreWrapper::EmbeddingStoreWrapper(
     : async_pool_((emb_cfg.num_threads == 0)
                       ? std::max(1u, std::thread::hardware_concurrency())
                       : emb_cfg.num_threads),
-      dtype_(emb_cfg.dtype),
-      opt_dtype_(emb_cfg.opt_dtype.empty() ? emb_cfg.dtype : emb_cfg.opt_dtype),
+      value_dtype_(emb_cfg.value_dtype),
+      optimizer_dtype_(emb_cfg.optimizer_dtype.empty()
+                           ? emb_cfg.value_dtype
+                           : emb_cfg.optimizer_dtype),
       key_dtype_(emb_cfg.key_dtype) {
 
   PyInitializer init_cfg = init_cfg_opt.value_or(
@@ -224,16 +226,16 @@ nb::object PyPartitioner::async_filter(nb::object keys, uint32_t target_shard) {
 NB_MODULE(_core, m) {
   m.doc() = "sparse_embedding C++ backend";
 
-  nb::class_<se::EmbeddingConfig>(m, "EmbeddingConfig")
+  nb::class_<se::EmbeddingConfig>(m, "_EmbeddingConfig")
       .def(nb::init<std::vector<size_t>, size_t, std::string, std::string,
                     std::string, size_t>(),
            nb::arg("dims"), nb::arg("num_threads") = 0,
-           nb::arg("dtype") = "float32", nb::arg("opt_dtype") = "",
+           nb::arg("value_dtype") = "float32", nb::arg("optimizer_dtype") = "",
            nb::arg("key_dtype") = "int64", nb::arg("max_active_keys") = 1 << 20)
       .def_rw("dims", &se::EmbeddingConfig::dims)
       .def_rw("num_threads", &se::EmbeddingConfig::num_threads)
-      .def_rw("dtype", &se::EmbeddingConfig::dtype)
-      .def_rw("opt_dtype", &se::EmbeddingConfig::opt_dtype)
+      .def_rw("value_dtype", &se::EmbeddingConfig::value_dtype)
+      .def_rw("optimizer_dtype", &se::EmbeddingConfig::optimizer_dtype)
       .def_rw("key_dtype", &se::EmbeddingConfig::key_dtype)
       .def_rw("max_active_keys", &se::EmbeddingConfig::max_active_keys);
 

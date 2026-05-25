@@ -90,7 +90,7 @@ def test_assign_lookup_integrity(param_dtype, opt_dtype):
     rng = np.random.default_rng(42)
 
     cfg = se.EmbeddingConfig(
-        dims=[dim], num_threads=1, dtype=param_dtype, opt_dtype=opt_dtype
+        dims=[dim], num_threads=1, value_dtype=param_dtype, optimizer_dtype=opt_dtype
     )
     store = se.EmbeddingStore(cfg)
 
@@ -128,7 +128,7 @@ def test_adam_optimizer_step(param_dtype, opt_dtype):
     rng = np.random.default_rng(123)
 
     cfg = se.EmbeddingConfig(
-        dims=[dim], num_threads=1, dtype=param_dtype, opt_dtype=opt_dtype
+        dims=[dim], num_threads=1, value_dtype=param_dtype, optimizer_dtype=opt_dtype
     )
     store = se.EmbeddingStore(
         cfg,
@@ -188,7 +188,7 @@ def test_checkpoint_roundtrip(param_dtype, opt_dtype, tmp_path):
     rng = np.random.default_rng(7)
 
     cfg = se.EmbeddingConfig(
-        dims=[dim], num_threads=1, dtype=param_dtype, opt_dtype=opt_dtype
+        dims=[dim], num_threads=1, value_dtype=param_dtype, optimizer_dtype=opt_dtype
     )
     adam = se.Adam(lr=0.01)
 
