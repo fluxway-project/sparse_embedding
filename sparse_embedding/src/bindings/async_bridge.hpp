@@ -115,20 +115,12 @@ nb::object async_dispatch(exec::static_thread_pool &pool, WorkFn &&work,
            future_keeper]() mutable {
             try {
               auto result = work();
-              std::unique_lock try_gil(GetPythonWakeManager().gil_lock(),
-                                       std::try_to_lock);
-              if (try_gil.owns_lock()) {
-                nb::gil_scoped_acquire gil;
-                nb::object fut = nb::borrow(future_keeper->ptr);
-                on_complete(std::move(fut), std::move(result));
-              } else {
-                GetPythonWakeManager().Enqueue(
-                    pro::make_proxy_shared<se::FunctionFacade<void()>>(
-                        [on_complete, future_keeper, result]() mutable {
-                          nb::object fut = nb::borrow(future_keeper->ptr);
-                          on_complete(std::move(fut), std::move(result));
-                        }));
-              }
+              GetPythonWakeManager().Enqueue(
+                  pro::make_proxy_shared<se::FunctionFacade<void()>>(
+                      [on_complete, future_keeper, result]() mutable {
+                        nb::object fut = nb::borrow(future_keeper->ptr);
+                        on_complete(std::move(fut), std::move(result));
+                      }));
             } catch (...) {
               auto eptr = std::current_exception();
               GetPythonWakeManager().Enqueue(
