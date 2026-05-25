@@ -62,18 +62,23 @@ public:
   PythonWakeManager &operator=(const PythonWakeManager &) = delete;
 
   void Enqueue(se::Function<void()> task) {
+    bool was_empty = false;
     {
       std::lock_guard lock(mutex_);
+      was_empty = pending_.empty();
       pending_.push_back(std::move(task));
     }
-    uint64_t val = 1;
-    [[maybe_unused]] auto _ = ::write(event_fd_, &val, sizeof(val));
+    if (was_empty) {
+      uint64_t val = 1;
+      [[maybe_unused]] auto _ = ::write(event_fd_, &val, sizeof(val));
+    }
   }
 
   void Drain() {
     uint64_t val;
     [[maybe_unused]] auto _ = ::read(event_fd_, &val, sizeof(val));
 
+    std::lock_guard gil_lock(gil_lock_);
     std::vector<se::Function<void()>> tasks;
     {
       std::lock_guard lock(mutex_);
@@ -85,6 +90,7 @@ public:
   }
 
   void Clear() {
+    std::lock_guard gil_lock(gil_lock_);
     std::vector<se::Function<void()>> tasks;
     {
       std::lock_guard lock(mutex_);
@@ -95,9 +101,11 @@ public:
   }
 
   int fd() const noexcept { return event_fd_; }
+  std::mutex &gil_lock() noexcept { return gil_lock_; }
 
 private:
   std::mutex mutex_;
+  std::mutex gil_lock_;
   std::vector<se::Function<void()>> pending_;
   int event_fd_ = -1;
 };
