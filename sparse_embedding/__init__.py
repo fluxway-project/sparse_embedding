@@ -3,10 +3,10 @@ Sparse Embedding Package
 """
 
 import atexit
+from typing import Any, Sequence
 
 from ._core import (
     Adam,
-    EmbeddingConfig,
     EmbeddingStore,
     FastRangePartitioner,
     HashPartitioner,
@@ -18,6 +18,7 @@ from ._core import (
     Uniform,
     Zeros,
     _clear_wake_queue,
+    _EmbeddingConfig,
     async_unique,
     decode_keys,
     drain_wake_queue,
@@ -25,6 +26,44 @@ from ._core import (
     set_leak_warnings,
     wake_fd,
 )
+
+
+def _to_str(dt: Any) -> str:
+    if dt is None:
+        return ""
+    name = ""
+    if hasattr(dt, "__name__"):
+        name = dt.__name__
+    elif hasattr(dt, "name"):
+        name = dt.name
+    else:
+        name = str(dt)
+
+    if name == "float":
+        return "float32"
+    if name == "int":
+        return "int64"
+    return name
+
+
+class EmbeddingConfig(_EmbeddingConfig):
+    def __init__(
+        self,
+        dims: Sequence[int],
+        num_threads: int = 0,
+        value_dtype: Any = "float32",
+        optimizer_dtype: Any = "",
+        key_dtype: Any = "int64",
+        max_active_keys: int = 1 << 20,
+    ):
+        super().__init__(
+            dims,
+            num_threads,
+            _to_str(value_dtype),
+            _to_str(optimizer_dtype),
+            _to_str(key_dtype),
+            max_active_keys,
+        )
 
 
 # During interpreter shutdown (finalization), Python clears modules in a semi-random

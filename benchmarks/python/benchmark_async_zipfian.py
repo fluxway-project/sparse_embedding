@@ -55,7 +55,9 @@ async def run_benchmark():
     values = np.random.rand(num_queries, 128).astype(np.float32)
 
     store = se.EmbeddingStore(
-        embedding_config=se.EmbeddingConfig(dims=dims, num_threads=8, dtype="float32"),
+        embedding_config=se.EmbeddingConfig(
+            dims=dims, num_threads=8, value_dtype="float32"
+        ),
         initializer_config=se.Zeros(),
         optimizer_config=se.Adam(lr=0.01),
     )

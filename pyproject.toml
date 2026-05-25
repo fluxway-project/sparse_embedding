@@ -1,5 +1,5 @@
 [build-system]
-requires = ["setuptools>=61.0"]
+requires = ["setuptools>=61.0", "nanobind"]
 build-backend = "setuptools.build_meta"
 
 [project]
@@ -25,6 +25,8 @@ include = ["sparse_embedding*"]
 
 [tool.pytest.ini_options]
 testpaths = ["sparse_embedding/tests"]
-
+markers = [
+    "slow: marks tests as slow (deselect with '-m \"not slow\"')",
+]
 [tool.ruff.lint]
 extend-select = ["I"]

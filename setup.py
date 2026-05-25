@@ -97,21 +97,30 @@ class BazelAwareBuildPy(build_py):
 
             # Generate the _core.pyi type stubs using nanobind.stubgen
             print("[setup.py] Generating type stubs (_core.pyi)...", file=sys.stderr)
-            subprocess.run(
-                [
-                    sys.executable,
-                    "-m",
-                    "nanobind.stubgen",
-                    "-m",
-                    "sparse_embedding._core",
-                    "-O",
-                    str(_PKG_DIR),
-                ],
-                cwd=str(_PROJECT_DIR),
-                check=True,
-                capture_output=True,
-                text=True,
-            )
+            try:
+                subprocess.run(
+                    [
+                        sys.executable,
+                        "-m",
+                        "nanobind.stubgen",
+                        "-m",
+                        "sparse_embedding._core",
+                        "-O",
+                        str(_PKG_DIR),
+                    ],
+                    cwd=str(_PROJECT_DIR),
+                    check=True,
+                    capture_output=True,
+                    text=True,
+                )
+            except subprocess.CalledProcessError as e:
+                print(
+                    f"[setup.py] nanobind.stubgen failed with exit code {e.returncode}",
+                    file=sys.stderr,
+                )
+                print(f"[setup.py] stdout: {e.stdout}", file=sys.stderr)
+                print(f"[setup.py] stderr: {e.stderr}", file=sys.stderr)
+                raise
             print("[setup.py] Successfully generated _core.pyi", file=sys.stderr)
 
             if with_lance:

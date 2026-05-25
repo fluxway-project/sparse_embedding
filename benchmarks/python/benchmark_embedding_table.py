@@ -39,7 +39,7 @@ class EmbeddingTableBenchmark:
 
     def _create_store(self) -> sparse_embedding.EmbeddingStore:
         config = sparse_embedding.EmbeddingConfig(
-            dims=[self.dim], num_threads=self.num_threads, dtype="float32"
+            dims=[self.dim], num_threads=self.num_threads, value_dtype="float32"
         )
         initializer = sparse_embedding.Zeros()
         return sparse_embedding.EmbeddingStore(

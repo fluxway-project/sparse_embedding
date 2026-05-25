@@ -328,8 +328,8 @@ class EmbeddingStoreWrapper {
       pro::proxy<se::EmbeddingTableFacade<se::bfloat16_t, se::bfloat16_t>>>;
   StoreProxyVariant store_;
   exec::static_thread_pool async_pool_;
-  std::string dtype_;
-  std::string opt_dtype_;
+  std::string value_dtype_;
+  std::string optimizer_dtype_;
   std::string key_dtype_;
   std::vector<size_t> dims_;
 
@@ -343,13 +343,13 @@ class EmbeddingStoreWrapper {
   }
 
   template <typename Fn> auto dispatch_val(Fn &&fn) {
-    if (dtype_ == "float32" || dtype_ == "f32")
+    if (value_dtype_ == "float32" || value_dtype_ == "f32")
       return fn.template operator()<float>();
-    if (dtype_ == "float16" || dtype_ == "f16")
+    if (value_dtype_ == "float16" || value_dtype_ == "f16")
       return fn.template operator()<se::float16_t>();
-    if (dtype_ == "bfloat16" || dtype_ == "bf16")
+    if (value_dtype_ == "bfloat16" || value_dtype_ == "bf16")
       return fn.template operator()<se::bfloat16_t>();
-    throw std::invalid_argument("unsupported dtype: " + dtype_);
+    throw std::invalid_argument("unsupported dtype: " + value_dtype_);
   }
 
   template <typename Fn> auto dispatch_types(Fn &&fn) {
@@ -362,12 +362,12 @@ class EmbeddingStoreWrapper {
         return 2;
       return -1;
     };
-    int p = code(dtype_);
-    int o = code(opt_dtype_);
+    int p = code(value_dtype_);
+    int o = code(optimizer_dtype_);
     if (p < 0)
-      throw std::invalid_argument("unsupported dtype: " + dtype_);
+      throw std::invalid_argument("unsupported dtype: " + value_dtype_);
     if (o < 0)
-      throw std::invalid_argument("unsupported opt_dtype: " + opt_dtype_);
+      throw std::invalid_argument("unsupported opt_dtype: " + optimizer_dtype_);
     if (p == 0 && o == 0)
       return fn.template operator()<float, float>();
     if (p == 0 && o == 1)
