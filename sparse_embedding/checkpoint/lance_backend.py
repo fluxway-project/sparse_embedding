@@ -23,7 +23,7 @@ OPT_STATE_SCHEMA = pa.schema(
     [
         pa.field("dim", pa.uint32()),
         pa.field("key", pa.uint64()),
-        pa.field("opt_state", pa.list_(pa.float32())),
+        pa.field("optimizer_state", pa.list_(pa.float32())),
         pa.field("step", pa.uint32()),
     ]
 )
@@ -65,7 +65,7 @@ class LanceCheckpointBackend(DistributedCheckpointBackend):
     Lance-based unified-dataset checkpoint backend.
 
     Embedding parameters and optimizer states are stored in two separate
-    Lance datasets under ``{uri}/embeddings`` and ``{uri}/opt_states``.
+    Lance datasets under ``{uri}/embedding_params`` and ``{uri}/optimizer_states``.
     Both datasets share the same ``slot_id`` / ``key`` primary key, with
     variable-length ``pa.list_(pa.float32())`` columns for the data.
 
@@ -96,8 +96,8 @@ class LanceCheckpointBackend(DistributedCheckpointBackend):
     # ------------------------------------------------------------------
 
     def save(self, store, uri: str, **kwargs):
-        emb_uri = f"{uri}/embeddings"
-        opt_uri = f"{uri}/opt_states"
+        emb_uri = f"{uri}/embedding_params"
+        opt_uri = f"{uri}/optimizer_states"
 
         emb_batches = _build_embedding_batches(store)
         emb_table = (
@@ -115,8 +115,8 @@ class LanceCheckpointBackend(DistributedCheckpointBackend):
     def load(self, store, uri: str, filter_fn=None, target_shard_id: int = 0, **kwargs):
         import os
 
-        emb_uri = f"{uri}/embeddings"
-        opt_uri = f"{uri}/opt_states"
+        emb_uri = f"{uri}/embedding_params"
+        opt_uri = f"{uri}/optimizer_states"
 
         _load_embeddings(store, emb_uri, filter_fn, target_shard_id)
 
@@ -128,14 +128,14 @@ class LanceCheckpointBackend(DistributedCheckpointBackend):
     # ------------------------------------------------------------------
 
     def init_dataset(self, store, uri: str, **kwargs):
-        emb_uri = f"{uri}/embeddings"
-        opt_uri = f"{uri}/opt_states"
+        emb_uri = f"{uri}/embedding_params"
+        opt_uri = f"{uri}/optimizer_states"
         lance.write_dataset(_empty_table(EMBEDDING_SCHEMA), emb_uri, mode="create")
         lance.write_dataset(_empty_table(OPT_STATE_SCHEMA), opt_uri, mode="create")
 
     def export_fragments(self, store, uri: str, **kwargs) -> List[bytes]:
-        emb_uri = f"{uri}/embeddings"
-        opt_uri = f"{uri}/opt_states"
+        emb_uri = f"{uri}/embedding_params"
+        opt_uri = f"{uri}/optimizer_states"
         result: List[bytes] = []
 
         emb_batches = _build_embedding_batches(store)
@@ -155,8 +155,8 @@ class LanceCheckpointBackend(DistributedCheckpointBackend):
     def commit_fragments(
         self, uri: str, all_fragment_metas: List[List[bytes]], **kwargs
     ):
-        emb_uri = f"{uri}/embeddings"
-        opt_uri = f"{uri}/opt_states"
+        emb_uri = f"{uri}/embedding_params"
+        opt_uri = f"{uri}/optimizer_states"
         emb_frags: List[FragmentMetadata] = []
         opt_frags: List[FragmentMetadata] = []
 
@@ -232,7 +232,7 @@ def _load_opt_states(store, uri: str, filter_fn, target_shard_id: int):
             if len(keys_arr) == 0:
                 continue
 
-            opt_arr = batch["opt_state"]
+            opt_arr = batch["optimizer_state"]
             step_arr = batch["step"] if has_step else None
             mask = _apply_filter(keys_arr, filter_fn, target_shard_id)
 
