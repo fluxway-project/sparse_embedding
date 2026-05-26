@@ -583,7 +583,7 @@ def test_large_checkpoint_lance():
     # Perform some lookups to generate LFU scores
     print("Simulating lookups to generate scores...")
     lookup_keys = keys[: num_entries // 2]
-    store.lookup(lookup_keys)  # Look up half the keys
+    store.lookup(lookup_keys, dim=dim)  # Look up half the keys
 
     with tempfile.TemporaryDirectory() as tmpdir:
         ckpt_uri = os.path.join(tmpdir, "large_ckpt.lance")
@@ -616,7 +616,7 @@ def test_large_checkpoint_lance():
         )
 
         print("Verifying values...")
-        vals_dlp, _ = store2.lookup(keys)
+        vals_dlp, _ = store2.lookup(keys, dim=dim)
         restored_vals = np.from_dlpack(vals_dlp).reshape(-1, dim)
 
         np.testing.assert_allclose(restored_vals, vals, atol=1e-5)

@@ -1,5 +1,5 @@
 """
-Mixed-precision tests covering all 9 (param_dtype, opt_dtype) combinations.
+Mixed-precision tests covering all 9 (param_dtype, optimizer_dtype) combinations.
 
 Validates:
  1. assign / lookup data integrity
@@ -79,10 +79,10 @@ ALL_COMBO_IDS = [_combo_id(c) for c in ALL_COMBOS]
 # ---------------------------------------------------------------------------
 
 
-@pytest.mark.parametrize("param_dtype,opt_dtype", ALL_COMBOS, ids=ALL_COMBO_IDS)
-def test_assign_lookup_integrity(param_dtype, opt_dtype):
+@pytest.mark.parametrize("param_dtype,optimizer_dtype", ALL_COMBOS, ids=ALL_COMBO_IDS)
+def test_assign_lookup_integrity(param_dtype, optimizer_dtype):
     """Values written via assign() should be exactly readable via lookup()."""
-    if "bfloat16" in (param_dtype, opt_dtype) and not _HAS_JAX:
+    if "bfloat16" in (param_dtype, optimizer_dtype) and not _HAS_JAX:
         pytest.skip("JAX required for bfloat16")
 
     dim = 8
@@ -90,7 +90,10 @@ def test_assign_lookup_integrity(param_dtype, opt_dtype):
     rng = np.random.default_rng(42)
 
     cfg = se.EmbeddingConfig(
-        dims=[dim], num_threads=1, value_dtype=param_dtype, optimizer_dtype=opt_dtype
+        dims=[dim],
+        num_threads=1,
+        value_dtype=param_dtype,
+        optimizer_dtype=optimizer_dtype,
     )
     store = se.EmbeddingStore(cfg)
 
@@ -118,17 +121,20 @@ def test_assign_lookup_integrity(param_dtype, opt_dtype):
 # ---------------------------------------------------------------------------
 
 
-@pytest.mark.parametrize("param_dtype,opt_dtype", ALL_COMBOS, ids=ALL_COMBO_IDS)
-def test_adam_optimizer_step(param_dtype, opt_dtype):
+@pytest.mark.parametrize("param_dtype,optimizer_dtype", ALL_COMBOS, ids=ALL_COMBO_IDS)
+def test_adam_optimizer_step(param_dtype, optimizer_dtype):
     """Adam should produce non-trivial updates; per-ID step should work."""
-    if "bfloat16" in (param_dtype, opt_dtype) and not _HAS_JAX:
+    if "bfloat16" in (param_dtype, optimizer_dtype) and not _HAS_JAX:
         pytest.skip("JAX required for bfloat16")
 
     dim = 8
     rng = np.random.default_rng(123)
 
     cfg = se.EmbeddingConfig(
-        dims=[dim], num_threads=1, value_dtype=param_dtype, optimizer_dtype=opt_dtype
+        dims=[dim],
+        num_threads=1,
+        value_dtype=param_dtype,
+        optimizer_dtype=optimizer_dtype,
     )
     store = se.EmbeddingStore(
         cfg,
@@ -177,10 +183,10 @@ def test_adam_optimizer_step(param_dtype, opt_dtype):
 # ---------------------------------------------------------------------------
 
 
-@pytest.mark.parametrize("param_dtype,opt_dtype", ALL_COMBOS, ids=ALL_COMBO_IDS)
-def test_checkpoint_roundtrip(param_dtype, opt_dtype, tmp_path):
+@pytest.mark.parametrize("param_dtype,optimizer_dtype", ALL_COMBOS, ids=ALL_COMBO_IDS)
+def test_checkpoint_roundtrip(param_dtype, optimizer_dtype, tmp_path):
     """save_checkpoint -> load_checkpoint should preserve embeddings and opt state."""
-    if "bfloat16" in (param_dtype, opt_dtype) and not _HAS_JAX:
+    if "bfloat16" in (param_dtype, optimizer_dtype) and not _HAS_JAX:
         pytest.skip("JAX required for bfloat16")
 
     dim = 8
@@ -188,7 +194,10 @@ def test_checkpoint_roundtrip(param_dtype, opt_dtype, tmp_path):
     rng = np.random.default_rng(7)
 
     cfg = se.EmbeddingConfig(
-        dims=[dim], num_threads=1, value_dtype=param_dtype, optimizer_dtype=opt_dtype
+        dims=[dim],
+        num_threads=1,
+        value_dtype=param_dtype,
+        optimizer_dtype=optimizer_dtype,
     )
     adam = se.Adam(lr=0.01)
 
@@ -212,13 +221,13 @@ def test_checkpoint_roundtrip(param_dtype, opt_dtype, tmp_path):
         store1.optimizer_step()
 
     uri = str(tmp_path / "ckpt")
-    store1.save_checkpoint(uri)
+    store1.save_checkpoint(uri, include_optimizer_state=True)
 
     # Load into a fresh store
     store2 = se.EmbeddingStore(cfg, optimizer_config=adam)
     if hasattr(store2, "set_checkpoint_factories"):
         store2.set_checkpoint_factories("lance")
-    store2.load_checkpoint(uri)
+    store2.load_checkpoint(uri, load_optimizer_state=True)
 
     assert store2.total_size() == n_keys
 
@@ -248,8 +257,8 @@ def test_checkpoint_roundtrip(param_dtype, opt_dtype, tmp_path):
     # Allow slightly larger tolerance for low-precision combos
     atol_opt = (
         0.05
-        if "float16" in (param_dtype, opt_dtype)
-        or "bfloat16" in (param_dtype, opt_dtype)
+        if "float16" in (param_dtype, optimizer_dtype)
+        or "bfloat16" in (param_dtype, optimizer_dtype)
         else 1e-4
     )
     np.testing.assert_allclose(

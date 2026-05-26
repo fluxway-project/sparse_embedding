@@ -4,8 +4,8 @@
 // Implementation of CheckpointOpsImpl<ParamT, OptT> methods
 // =============================================================================
 
-#include "sparse_embedding/src/bindings/module_wrapper.hpp"
 #include "sparse_embedding/src/bindings/arrow_c_bridge.hpp"
+#include "sparse_embedding/src/bindings/module_wrapper.hpp"
 #ifdef SE_ENABLE_LANCE_CHECKPOINTER
 #include "sparse_embedding/src/checkpoint/lance/lance_checkpoint.hpp"
 #endif
@@ -34,7 +34,7 @@ void CheckpointOpsImpl<ParamT, OptT>::save_checkpoint(
 
   {
     nb::gil_scoped_release release;
-    auto dims = self.get_store<ParamT, OptT>()->table_dims();
+    auto dims = self.table_dims();
     for (size_t table_idx = 0; table_idx < dims.size(); ++table_idx) {
       size_t dim = dims[table_idx];
 
@@ -77,20 +77,18 @@ void CheckpointOpsImpl<ParamT, OptT>::save_checkpoint(
                         fkeys.push_back(keys[i]);
                         fvals.insert(fvals.end(), vals.data() + i * dim,
                                      vals.data() + (i + 1) * dim);
-                        if (!scores.empty())
-                          fscores.push_back(scores[i]);
+                        if (!scores.empty()) fscores.push_back(scores[i]);
                         fopts.insert(fopts.end(),
                                      opt_states.data() + i * opt_per_key,
                                      opt_states.data() + (i + 1) * opt_per_key);
-                        if (!steps.empty())
-                          fsteps.push_back(steps[i]);
+                        if (!steps.empty()) fsteps.push_back(steps[i]);
                       }
                     }
                     if (!fkeys.empty()) {
-                      writer->write_batch(
-                          fkeys, fvals.data(), fvals.size() * sizeof(ParamT),
-                          fscores, fopts.data(), fopts.size() * sizeof(OptT),
-                          fsteps);
+                      writer->write_batch(fkeys, fvals.data(),
+                                          fvals.size() * sizeof(ParamT),
+                                          fscores, fopts.data(),
+                                          fopts.size() * sizeof(OptT), fsteps);
                     }
                   } else {
                     std::vector<uint64_t> ukeys(keys.begin(), keys.end());
@@ -112,10 +110,9 @@ void CheckpointOpsImpl<ParamT, OptT>::save_checkpoint(
                       options);
         self.get_store<ParamT, OptT>()->export_batch(
             pro::make_proxy<se::FunctionFacade<bool(
-                std::size_t, std::span<const uint64_t>,
-                std::span<const ParamT>, std::span<const uint64_t>)>>(
-                [&](std::size_t /*dim_arg*/,
-                    std::span<const uint64_t> keys,
+                std::size_t, std::span<const uint64_t>, std::span<const ParamT>,
+                std::span<const uint64_t>)>>(
+                [&](std::size_t /*dim_arg*/, std::span<const uint64_t> keys,
                     std::span<const ParamT> vals,
                     std::span<const uint64_t> scores) -> bool {
                   if (options.mode ==
@@ -129,8 +126,7 @@ void CheckpointOpsImpl<ParamT, OptT>::save_checkpoint(
                         fkeys.push_back(keys[i]);
                         fvals.insert(fvals.end(), vals.data() + i * dim,
                                      vals.data() + (i + 1) * dim);
-                        if (!scores.empty())
-                          fscores.push_back(scores[i]);
+                        if (!scores.empty()) fscores.push_back(scores[i]);
                       }
                     }
                     if (!fkeys.empty()) {
@@ -177,11 +173,10 @@ void CheckpointOpsImpl<ParamT, OptT>::load_checkpoint(
 
   {
     nb::gil_scoped_release release;
-    if (clear)
-      self.get_store<ParamT, OptT>()->clear();
+    if (clear) self.get_store<ParamT, OptT>()->clear();
 
     bool has_score = self.get_store<ParamT, OptT>()->has_score_policy();
-    auto dims = self.get_store<ParamT, OptT>()->table_dims();
+    auto dims = self.table_dims();
 
     for (size_t table_idx = 0; table_idx < dims.size(); ++table_idx) {
       size_t dim = dims[table_idx];
@@ -201,8 +196,7 @@ void CheckpointOpsImpl<ParamT, OptT>::load_checkpoint(
         size_t n = keys.size();
         size_t opt_dim =
             (n > 0 && !opt_states.empty()) ? opt_states.size() / n : 0;
-        if (n == 0)
-          continue;
+        if (n == 0) continue;
 
         auto compact_batch = [&](auto should_keep) {
           size_t keep_idx = 0;
@@ -213,25 +207,20 @@ void CheckpointOpsImpl<ParamT, OptT>::load_checkpoint(
                 std::memcpy(embs.data() + keep_idx * dim * sizeof(ParamT),
                             embs.data() + i * dim * sizeof(ParamT),
                             dim * sizeof(ParamT));
-                if (!scores.empty())
-                  scores[keep_idx] = scores[i];
+                if (!scores.empty()) scores[keep_idx] = scores[i];
                 if (!opt_states.empty())
                   std::memcpy(opt_states.data() + keep_idx * opt_dim,
                               opt_states.data() + i * opt_dim, opt_dim);
-                if (!steps.empty())
-                  steps[keep_idx] = steps[i];
+                if (!steps.empty()) steps[keep_idx] = steps[i];
               }
               keep_idx++;
             }
           }
           keys.resize(keep_idx);
           embs.resize(keep_idx * dim * sizeof(ParamT));
-          if (!scores.empty())
-            scores.resize(keep_idx);
-          if (!opt_states.empty())
-            opt_states.resize(keep_idx * opt_dim);
-          if (!steps.empty())
-            steps.resize(keep_idx);
+          if (!scores.empty()) scores.resize(keep_idx);
+          if (!opt_states.empty()) opt_states.resize(keep_idx * opt_dim);
+          if (!steps.empty()) steps.resize(keep_idx);
           n = keep_idx;
         };
 
@@ -268,16 +257,15 @@ void CheckpointOpsImpl<ParamT, OptT>::load_checkpoint(
               [&](size_t i) { return shard_ids_data[i] == target_shard_id; });
         }
 
-        if (n == 0)
-          continue;
+        if (n == 0) continue;
 
         auto vals = std::span<const ParamT>(
             reinterpret_cast<const ParamT *>(embs.data()), n * dim);
         thread_local std::vector<int64_t> tls_row_lengths;
         tls_row_lengths.resize(n);
         fill_uniform_row_lengths(tls_row_lengths, static_cast<int64_t>(dim));
-        self.get_store<ParamT, OptT>()->assign(
-            std::span<const uint64_t>(keys), vals, tls_row_lengths);
+        self.get_store<ParamT, OptT>()->assign(std::span<const uint64_t>(keys),
+                                               vals, tls_row_lengths);
         if (has_score && !scores.empty())
           self.get_store<ParamT, OptT>()->assign_scores(
               std::span<const uint64_t>(keys),
@@ -294,7 +282,7 @@ void CheckpointOpsImpl<ParamT, OptT>::load_checkpoint(
     }
   }
 }
-#endif // SE_ENABLE_LANCE_CHECKPOINTER
+#endif  // SE_ENABLE_LANCE_CHECKPOINTER
 
 template <typename ParamT, typename OptT>
 void CheckpointOpsImpl<ParamT, OptT>::export_batches_dlpack(
@@ -347,17 +335,15 @@ void CheckpointOpsImpl<ParamT, OptT>::export_batches_arrow(
     bool include_optimizer_state) {
   nb::gil_scoped_release release;
   self.get_store<ParamT, OptT>()->export_opt_state_batch_owned(
-      pro::make_proxy<se::FunctionFacade<bool(size_t, std::vector<uint64_t> &&,
-                                              std::vector<ParamT> &&,
-                                              std::vector<uint64_t> &&,
-                                              std::vector<OptT> &&,
-                                              std::vector<uint32_t> &&)>>(
-          [&, include_optimizer_state](size_t dim,
-                                      std::vector<uint64_t> &&keys,
-                                      std::vector<ParamT> &&vals,
-                                      std::vector<uint64_t> && /*scores*/,
-                                      std::vector<OptT> &&opt_states,
-                                      std::vector<uint32_t> &&steps) -> bool {
+      pro::make_proxy<se::FunctionFacade<bool(
+          size_t, std::vector<uint64_t> &&, std::vector<ParamT> &&,
+          std::vector<uint64_t> &&, std::vector<OptT> &&,
+          std::vector<uint32_t> &&)>>(
+          [&, include_optimizer_state](size_t dim, std::vector<uint64_t> &&keys,
+                                       std::vector<ParamT> &&vals,
+                                       std::vector<uint64_t> && /*scores*/,
+                                       std::vector<OptT> &&opt_states,
+                                       std::vector<uint32_t> &&steps) -> bool {
             std::vector<float> vals_f32;
             std::vector<float> opt_f32;
             if constexpr (std::is_same_v<ParamT, float>) {
@@ -394,8 +380,8 @@ void CheckpointOpsImpl<ParamT, OptT>::export_batches_arrow(
 
 template <typename ParamT, typename OptT>
 void CheckpointOpsImpl<ParamT, OptT>::assign_opt_state(
-    EmbeddingStoreWrapper &self, nb::object keys_obj,
-    nb::object opt_states_obj, nb::object steps_obj) {
+    EmbeddingStoreWrapper &self, nb::object keys_obj, nb::object opt_states_obj,
+    nb::object steps_obj) {
   auto [dlm_keys, cap_keys] = se::py::extract_dlpack_tensor(keys_obj);
   auto [dlm_opt, cap_opt] = se::py::extract_dlpack_tensor(opt_states_obj);
   if (dlm_keys->dl_tensor.dtype.bits != 64)
@@ -440,4 +426,4 @@ void CheckpointOpsImpl<ParamT, OptT>::assign_opt_state(
   }
 }
 
-} // namespace se::py::detail
+}  // namespace se::py::detail
