@@ -1,7 +1,7 @@
 import json
 import logging
 import os
-from typing import List
+from typing import List, Union
 
 import lance
 import pyarrow as pa
@@ -189,20 +189,30 @@ class LanceCheckpointBackend(DistributedCheckpointBackend):
         return result
 
     def commit_fragments(
-        self, uri: str, all_fragment_metas: List[List[bytes]], **kwargs
+        self,
+        uri: str,
+        all_fragment_metas: Union[List[bytes], List[List[bytes]]],
+        **kwargs,
     ):
         emb_uri = f"{uri}/embedding_params"
         opt_uri = f"{uri}/optimizer_states"
         emb_frags: List[FragmentMetadata] = []
         opt_frags: List[FragmentMetadata] = []
 
-        for rank_metas in all_fragment_metas:
-            for meta_bytes in rank_metas:
-                decoded = meta_bytes.decode()
+        for item in all_fragment_metas:
+            if isinstance(item, bytes):
+                decoded = item.decode()
                 if decoded.startswith("emb:"):
                     emb_frags.append(FragmentMetadata.from_json(decoded[4:]))
                 else:
                     opt_frags.append(FragmentMetadata.from_json(decoded[4:]))
+            else:
+                for meta_bytes in item:
+                    decoded = meta_bytes.decode()
+                    if decoded.startswith("emb:"):
+                        emb_frags.append(FragmentMetadata.from_json(decoded[4:]))
+                    else:
+                        opt_frags.append(FragmentMetadata.from_json(decoded[4:]))
 
         if emb_frags:
             ds = lance.dataset(emb_uri)
