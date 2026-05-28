@@ -52,14 +52,16 @@ def _invoke_bazel(with_lance: bool) -> Path:
         so_glob = "_core.so"
 
     cmd = ["bazel", "build", bazel_target]
-    if "BAZEL_COPTS" in os.environ:
+    env = os.environ.copy()
+    if "BAZEL_COPTS" in env:
         import shlex
 
-        cmd.extend(shlex.split(os.environ["BAZEL_COPTS"]))
+        cmd.extend(shlex.split(env.pop("BAZEL_COPTS")))
 
     subprocess.run(
         cmd,
         cwd=_PROJECT_DIR,
+        env=env,
         check=True,
     )
 

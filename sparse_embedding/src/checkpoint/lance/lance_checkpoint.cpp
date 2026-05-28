@@ -209,7 +209,7 @@ void LanceCheckpointWriter::build_schema(ArrowSchema *out) const {
   thread_local std::string emb_format;
   emb_format = "w:" + std::to_string(entry_bytes);
   out->children[col] = new ArrowSchema();
-  make_child_schema(out->children[col], "embedding", emb_format.c_str());
+  make_child_schema(out->children[col], "embedding_params", emb_format.c_str());
   if (options_.use_compression) {
     out->children[col]->metadata = get_zstd_metadata();
   }
@@ -225,7 +225,7 @@ void LanceCheckpointWriter::build_schema(ArrowSchema *out) const {
     thread_local std::string opt_format;
     opt_format = "w:" + std::to_string(opt_state_dim_);
     out->children[col] = new ArrowSchema();
-    make_child_schema(out->children[col], "optimizer_state",
+    make_child_schema(out->children[col], "optimizer_states",
                       opt_format.c_str());
     if (options_.use_compression) {
       out->children[col]->metadata = get_zstd_metadata();
@@ -467,7 +467,7 @@ void LanceCheckpointReader::open(std::string_view uri, size_t dim,
   dim_ = 0;
   for (int64_t i = 0; i < schema_.n_children; ++i) {
     auto *child = schema_.children[i];
-    if (std::strcmp(child->name, "embedding") == 0) {
+    if (std::strcmp(child->name, "embedding_params") == 0) {
       // format is "w:<nbytes>"
       if (child->format && child->format[0] == 'w' && child->format[1] == ':') {
         size_t bytes = std::stoul(child->format + 2);
@@ -475,7 +475,7 @@ void LanceCheckpointReader::open(std::string_view uri, size_t dim,
       }
     } else if (std::strcmp(child->name, "score") == 0) {
       has_score_ = true;
-    } else if (std::strcmp(child->name, "optimizer_state") == 0) {
+    } else if (std::strcmp(child->name, "optimizer_states") == 0) {
       if (child->format && child->format[0] == 'w' && child->format[1] == ':') {
         size_t bytes = std::stoul(child->format + 2);
         opt_state_dim_ = bytes;
@@ -540,7 +540,7 @@ bool LanceCheckpointReader::read_batch(
     out_scores.clear();
   }
 
-  // optimizer_state column (optional)
+  // optimizer_states column (optional)
   if (opt_state_dim_ > 0 && col < batch.n_children) {
     auto *child = batch.children[col];
     auto *data = static_cast<const std::byte *>(

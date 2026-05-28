@@ -1,5 +1,5 @@
 import abc
-from typing import List
+from typing import List, Union
 
 
 class CheckpointBackend(abc.ABC):
@@ -34,6 +34,9 @@ class DistributedCheckpointBackend(CheckpointBackend):
 
     @abc.abstractmethod
     def commit_fragments(
-        self, uri: str, all_fragment_metas: List[List[bytes]], **kwargs
+        self,
+        uri: str,
+        all_fragment_metas: Union[List[bytes], List[List[bytes]]],
+        **kwargs,
     ):
         """Phase 2: Gather all metadata and perform atomic commit. Called by Driver."""

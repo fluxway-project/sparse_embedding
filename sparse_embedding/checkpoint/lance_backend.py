@@ -1,6 +1,7 @@
 import json
 import logging
-from typing import List
+import os
+from typing import List, Union
 
 import lance
 import pyarrow as pa
@@ -11,19 +12,19 @@ from .base import DistributedCheckpointBackend
 
 logger = logging.getLogger(__name__)
 
-EMBEDDING_SCHEMA = pa.schema(
+EMBEDDING_PARAMS_SCHEMA = pa.schema(
     [
         pa.field("dim", pa.uint32()),
         pa.field("key", pa.uint64()),
-        pa.field("embedding", pa.list_(pa.float32())),
+        pa.field("embedding_params", pa.list_(pa.float32())),
     ]
 )
 
-OPT_STATE_SCHEMA = pa.schema(
+OPTIMIZER_STATES_SCHEMA = pa.schema(
     [
         pa.field("dim", pa.uint32()),
         pa.field("key", pa.uint64()),
-        pa.field("opt_state", pa.list_(pa.float32())),
+        pa.field("optimizer_states", pa.list_(pa.float32())),
         pa.field("step", pa.uint32()),
     ]
 )
@@ -65,7 +66,7 @@ class LanceCheckpointBackend(DistributedCheckpointBackend):
     Lance-based unified-dataset checkpoint backend.
 
     Embedding parameters and optimizer states are stored in two separate
-    Lance datasets under ``{uri}/embeddings`` and ``{uri}/opt_states``.
+    Lance datasets under ``{uri}/embedding_params`` and ``{uri}/optimizer_states``.
     Both datasets share the same ``slot_id`` / ``key`` primary key, with
     variable-length ``pa.list_(pa.float32())`` columns for the data.
 
@@ -96,31 +97,52 @@ class LanceCheckpointBackend(DistributedCheckpointBackend):
     # ------------------------------------------------------------------
 
     def save(self, store, uri: str, **kwargs):
-        emb_uri = f"{uri}/embeddings"
-        opt_uri = f"{uri}/opt_states"
+        os.makedirs(uri, exist_ok=True)
+
+        emb_uri = f"{uri}/embedding_params"
+        opt_uri = f"{uri}/optimizer_states"
 
         emb_batches = _build_embedding_batches(store)
         emb_table = (
-            pa.Table.from_batches(emb_batches, schema=EMBEDDING_SCHEMA)
+            pa.Table.from_batches(emb_batches, schema=EMBEDDING_PARAMS_SCHEMA)
             if emb_batches
-            else _empty_table(EMBEDDING_SCHEMA)
+            else _empty_table(EMBEDDING_PARAMS_SCHEMA)
         )
         lance.write_dataset(emb_table, emb_uri, mode="create")
 
         opt_batches = _build_opt_state_batches(store)
-        if opt_batches:
-            opt_table = pa.Table.from_batches(opt_batches, schema=OPT_STATE_SCHEMA)
+        has_opt = bool(opt_batches)
+        if has_opt:
+            opt_table = pa.Table.from_batches(
+                opt_batches, schema=OPTIMIZER_STATES_SCHEMA
+            )
             lance.write_dataset(opt_table, opt_uri, mode="create")
 
-    def load(self, store, uri: str, filter_fn=None, target_shard_id: int = 0, **kwargs):
-        import os
+        metadata = {"version": 1, "schema_version": 1, "has_opt_states": has_opt}
+        with open(os.path.join(uri, "metadata.json"), "w") as f:
+            json.dump(metadata, f)
 
-        emb_uri = f"{uri}/embeddings"
-        opt_uri = f"{uri}/opt_states"
+    def load(self, store, uri: str, filter_fn=None, target_shard_id: int = 0, **kwargs):
+        meta_path = os.path.join(uri, "metadata.json")
+        if not os.path.exists(meta_path):
+            raise RuntimeError(
+                f"Checkpoint metadata not found at {meta_path}. Older checkpoint formats are not supported."
+            )
+
+        with open(meta_path, "r") as f:
+            metadata = json.load(f)
+
+        if metadata.get("version") != 1:
+            raise RuntimeError(
+                f"Unsupported checkpoint version: {metadata.get('version')}"
+            )
+
+        emb_uri = f"{uri}/embedding_params"
+        opt_uri = f"{uri}/optimizer_states"
 
         _load_embeddings(store, emb_uri, filter_fn, target_shard_id)
 
-        if os.path.exists(opt_uri):
+        if metadata.get("has_opt_states", False):
             _load_opt_states(store, opt_uri, filter_fn, target_shard_id)
 
     # ------------------------------------------------------------------
@@ -128,45 +150,69 @@ class LanceCheckpointBackend(DistributedCheckpointBackend):
     # ------------------------------------------------------------------
 
     def init_dataset(self, store, uri: str, **kwargs):
-        emb_uri = f"{uri}/embeddings"
-        opt_uri = f"{uri}/opt_states"
-        lance.write_dataset(_empty_table(EMBEDDING_SCHEMA), emb_uri, mode="create")
-        lance.write_dataset(_empty_table(OPT_STATE_SCHEMA), opt_uri, mode="create")
+        os.makedirs(uri, exist_ok=True)
+
+        emb_uri = f"{uri}/embedding_params"
+        opt_uri = f"{uri}/optimizer_states"
+        lance.write_dataset(
+            _empty_table(EMBEDDING_PARAMS_SCHEMA), emb_uri, mode="create"
+        )
+        lance.write_dataset(
+            _empty_table(OPTIMIZER_STATES_SCHEMA), opt_uri, mode="create"
+        )
+
+        metadata = {"version": 1, "schema_version": 1, "has_opt_states": True}
+        with open(os.path.join(uri, "metadata.json"), "w") as f:
+            json.dump(metadata, f)
 
     def export_fragments(self, store, uri: str, **kwargs) -> List[bytes]:
-        emb_uri = f"{uri}/embeddings"
-        opt_uri = f"{uri}/opt_states"
+        emb_uri = f"{uri}/embedding_params"
+        opt_uri = f"{uri}/optimizer_states"
         result: List[bytes] = []
 
         emb_batches = _build_embedding_batches(store)
         if emb_batches:
-            emb_table = pa.Table.from_batches(emb_batches, schema=EMBEDDING_SCHEMA)
+            emb_table = pa.Table.from_batches(
+                emb_batches, schema=EMBEDDING_PARAMS_SCHEMA
+            )
             for frag in write_fragments(emb_table, emb_uri):
                 result.append(f"emb:{json.dumps(frag.to_json())}".encode())
 
         opt_batches = _build_opt_state_batches(store)
         if opt_batches:
-            opt_table = pa.Table.from_batches(opt_batches, schema=OPT_STATE_SCHEMA)
+            opt_table = pa.Table.from_batches(
+                opt_batches, schema=OPTIMIZER_STATES_SCHEMA
+            )
             for frag in write_fragments(opt_table, opt_uri):
                 result.append(f"opt:{json.dumps(frag.to_json())}".encode())
 
         return result
 
     def commit_fragments(
-        self, uri: str, all_fragment_metas: List[List[bytes]], **kwargs
+        self,
+        uri: str,
+        all_fragment_metas: Union[List[bytes], List[List[bytes]]],
+        **kwargs,
     ):
-        emb_uri = f"{uri}/embeddings"
-        opt_uri = f"{uri}/opt_states"
+        emb_uri = f"{uri}/embedding_params"
+        opt_uri = f"{uri}/optimizer_states"
         emb_frags: List[FragmentMetadata] = []
         opt_frags: List[FragmentMetadata] = []
 
-        for rank_metas in all_fragment_metas:
-            for meta_bytes in rank_metas:
-                decoded = meta_bytes.decode()
+        for item in all_fragment_metas:
+            if isinstance(item, bytes):
+                decoded = item.decode()
                 if decoded.startswith("emb:"):
                     emb_frags.append(FragmentMetadata.from_json(decoded[4:]))
                 else:
                     opt_frags.append(FragmentMetadata.from_json(decoded[4:]))
+            else:
+                for meta_bytes in item:
+                    decoded = meta_bytes.decode()
+                    if decoded.startswith("emb:"):
+                        emb_frags.append(FragmentMetadata.from_json(decoded[4:]))
+                    else:
+                        opt_frags.append(FragmentMetadata.from_json(decoded[4:]))
 
         if emb_frags:
             ds = lance.dataset(emb_uri)
@@ -208,7 +254,7 @@ def _load_embeddings(store, uri: str, filter_fn, target_shard_id: int):
             if len(keys_arr) == 0:
                 continue
 
-            emb_arr = batch["embedding"]
+            emb_arr = batch["embedding_params"]
             mask = _apply_filter(keys_arr, filter_fn, target_shard_id)
 
             if mask is not None:
@@ -232,7 +278,7 @@ def _load_opt_states(store, uri: str, filter_fn, target_shard_id: int):
             if len(keys_arr) == 0:
                 continue
 
-            opt_arr = batch["opt_state"]
+            opt_arr = batch["optimizer_states"]
             step_arr = batch["step"] if has_step else None
             mask = _apply_filter(keys_arr, filter_fn, target_shard_id)
 

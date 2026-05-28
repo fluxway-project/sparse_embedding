@@ -84,8 +84,10 @@ constexpr int64_t kArrowFlagNullable = 2;
 // SchemaBuilder: constructs ArrowSchema trees for our checkpoint schemas.
 //
 // Two schemas are supported:
-//   - Embedding:  struct<slot_id: uint32, key: uint64, embedding: list<f32>>
-//   - OptState:   struct<slot_id: uint32, key: uint64, opt_state: list<f32>>
+//   - EmbeddingParams:  struct<slot_id: uint32, key: uint64, embedding_params:
+//   list<f32>>
+//   - OptimizerStates:   struct<slot_id: uint32, key: uint64, optimizer_states:
+//   list<f32>>
 // ============================================================================
 
 namespace detail {
@@ -269,7 +271,7 @@ inline ArrowArray *make_list_array(std::vector<int32_t> &&offsets,
 //
 // Takes ownership of keys, slot_ids, list offsets, and flat values.
 // The list column uses (offsets, flat_values) to represent variable-length
-// embeddings or optimizer states.
+// embedding params or optimizer states.
 //
 // After this call, all input vectors are in a moved-from state.
 // ============================================================================
@@ -351,7 +353,7 @@ inline ArrowBatchPair build_embedding_batch(size_t emb_dim,
   }
 
   ArrowBatchPair pair;
-  build_record_batch_schema(&pair.schema, "embedding");
+  build_record_batch_schema(&pair.schema, "embedding_params");
   build_record_batch_array(&pair.array, std::move(dims), std::move(keys),
                            std::move(offsets), std::move(vals));
   return pair;
@@ -375,7 +377,7 @@ inline ArrowBatchPair build_opt_state_batch(
   }
 
   ArrowBatchPair pair;
-  build_record_batch_schema(&pair.schema, "opt_state", with_step);
+  build_record_batch_schema(&pair.schema, "optimizer_states", with_step);
   build_record_batch_array(&pair.array, std::move(dims), std::move(keys),
                            std::move(offsets), std::move(opt_states),
                            std::move(steps));
