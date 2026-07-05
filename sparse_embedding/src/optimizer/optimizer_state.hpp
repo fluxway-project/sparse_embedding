@@ -67,6 +67,25 @@ public:
     return idx;
   }
 
+  void reserve(size_t capacity) {
+    if (capacity == 0) {
+      return;
+    }
+    std::lock_guard<std::mutex> lock(alloc_mtx_);
+    size_t required_pages = (capacity + kEntriesPerPage - 1) / kEntriesPerPage;
+    while (pages_.size() < required_pages) {
+      auto *p = static_cast<std::byte *>(
+          std::aligned_alloc(kCacheLineSize, kEntriesPerPage * row_stride_));
+      if (!p) {
+        throw std::bad_alloc();
+      }
+      std::memset(p, 0, kEntriesPerPage * row_stride_);
+      pages_.emplace_back(p);
+    }
+  }
+
+  size_t capacity() const { return pages_.size() * kEntriesPerPage; }
+
   void deallocate(uint32_t index) {
     std::lock_guard<std::mutex> lock(alloc_mtx_);
     free_list_.push_back(index);

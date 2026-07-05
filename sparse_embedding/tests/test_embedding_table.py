@@ -75,6 +75,63 @@ def test_embedding_table_32bit_keys():
     assert mask_np.shape[0] == 3
 
 
+def test_embedding_table_reserve_api():
+    store = sparse_embedding.EmbeddingStore(
+        embedding_config=sparse_embedding.EmbeddingConfig(
+            dims=[8, 16], num_threads=4, value_dtype="float32"
+        ),
+        initializer_config=sparse_embedding.Zeros(),
+    )
+
+    shard_count = store.internal_shard_count()
+    assert shard_count == 4
+
+    store.reserve(128, dim=8)
+    store.reserve_per_shard([32] * shard_count, dim=8)
+
+    keys = np.arange(64, dtype=np.int64)
+    vals, _, mask = store.lookup_or_insert(keys, dim=8)
+    assert np.from_dlpack(vals).shape[0] == 64 * 8
+    assert int(np.from_dlpack(mask).sum()) == 64
+    assert store.total_size() == 64
+
+    vals_lookup, _ = store.lookup(keys, dim=8)
+    assert np.allclose(np.from_dlpack(vals_lookup), 0.0)
+
+
+def test_embedding_table_reserve_preserves_existing_keys():
+    store = sparse_embedding.EmbeddingStore(
+        embedding_config=sparse_embedding.EmbeddingConfig(
+            dims=[8], num_threads=4, value_dtype="float32"
+        )
+    )
+
+    keys = np.arange(16, dtype=np.int64)
+    values = np.arange(16 * 8, dtype=np.float32).reshape(16, 8)
+    store.assign(keys, values)
+
+    store.reserve(4096, dim=8)
+
+    vals, _ = store.lookup(keys, dim=8)
+    np.testing.assert_array_equal(np.from_dlpack(vals).reshape(16, 8), values)
+    assert store.total_size() == 16
+
+
+def test_embedding_table_reserve_errors():
+    store = sparse_embedding.EmbeddingStore(
+        embedding_config=sparse_embedding.EmbeddingConfig(
+            dims=[8], num_threads=4, value_dtype="float32"
+        ),
+        initializer_config=sparse_embedding.Zeros(),
+    )
+
+    with pytest.raises(ValueError, match="counts size mismatch"):
+        store.reserve_per_shard([1, 2], dim=8)
+
+    with pytest.raises(RuntimeError, match="invalid dim access"):
+        store.reserve(1, dim=16)
+
+
 @pytest.mark.asyncio
 async def test_embedding_table_async():
     store = sparse_embedding.EmbeddingStore(

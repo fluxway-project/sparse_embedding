@@ -28,6 +28,7 @@
 namespace se {
 
 PRO_DEF_MEM_DISPATCH(OptMemAllocate, allocate);
+PRO_DEF_MEM_DISPATCH(OptMemReserve, reserve);
 PRO_DEF_MEM_DISPATCH(OptMemDeallocate, deallocate);
 PRO_DEF_MEM_DISPATCH(OptMemClear, clear);
 PRO_DEF_MEM_DISPATCH(OptMemStep, step);
@@ -39,8 +40,9 @@ PRO_DEF_MEM_DISPATCH(OptMemSetStep, set_step);
 
 template <typename ParamT, typename OptT>
 struct OptimizerFacade
-    : pro::facade_builder                      //
-      ::add_convention<OptMemAllocate, void()> //
+    : pro::facade_builder                           //
+      ::add_convention<OptMemAllocate, void()>      //
+      ::add_convention<OptMemReserve, void(size_t)> //
       ::add_convention<pro::weak_dispatch<OptMemDeallocate>,
                        void(uint32_t idx)>::
           add_convention<pro::weak_dispatch<OptMemClear>, void()> //

@@ -315,6 +315,11 @@ NB_MODULE(_core, m) {
       .def("max_dim", &EmbeddingStoreWrapper::max_dim)
       .def("num_slots", &EmbeddingStoreWrapper::num_slots)
       .def("table_dims", &EmbeddingStoreWrapper::table_dims)
+      .def("internal_shard_count", &EmbeddingStoreWrapper::internal_shard_count)
+      .def("reserve", &EmbeddingStoreWrapper::reserve, nb::arg("keys_count"),
+           nb::arg("dim"))
+      .def("reserve_per_shard", &EmbeddingStoreWrapper::reserve_per_shard,
+           nb::arg("counts"), nb::arg("dim"))
 
       .def("lookup", &EmbeddingStoreWrapper::lookup, nb::arg("keys"),
            nb::arg("dim"))

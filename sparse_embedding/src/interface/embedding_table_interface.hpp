@@ -48,6 +48,8 @@ PRO_DEF_MEM_DISPATCH(MemDim, dim);
 PRO_DEF_MEM_DISPATCH(MemSize, size);
 PRO_DEF_MEM_DISPATCH(MemCapacity, capacity);
 PRO_DEF_MEM_DISPATCH(MemReserve, reserve);
+PRO_DEF_MEM_DISPATCH(MemReservePerShard, reserve_per_shard);
+PRO_DEF_MEM_DISPATCH(MemInternalShardCount, internal_shard_count);
 
 // --- Core read/write ---------------------------------------------------------
 PRO_DEF_MEM_DISPATCH(MemLookup, lookup);
@@ -85,6 +87,8 @@ using WeakMemDim = pro::weak_dispatch<MemDim>;
 using WeakMemSize = pro::weak_dispatch<MemSize>;
 using WeakMemCapacity = pro::weak_dispatch<MemCapacity>;
 using WeakMemReserve = pro::weak_dispatch<MemReserve>;
+using WeakMemReservePerShard = pro::weak_dispatch<MemReservePerShard>;
+using WeakMemInternalShardCount = pro::weak_dispatch<MemInternalShardCount>;
 using WeakMemLookup = pro::weak_dispatch<MemLookup>;
 using WeakMemLookupOrInsert = pro::weak_dispatch<MemLookupOrInsert>;
 using WeakMemAssign = pro::weak_dispatch<MemAssign>;
@@ -177,7 +181,11 @@ struct EmbeddingTableFacade : pro::facade_builder //
   ::add_convention<WeakMemCapacity,
                    std::size_t() const> //
   ::add_convention<WeakMemReserve,
-                   std::error_code(std::size_t new_capacity)> //
+                   std::error_code(std::size_t keys_count, std::size_t dim)> //
+  ::add_convention<WeakMemReservePerShard,
+                   std::error_code(std::span<const std::size_t> counts, std::size_t dim)> //
+  ::add_convention<WeakMemInternalShardCount,
+                   std::size_t() const> //
 
   // --- Lookup ---------------------------------------------------------------
   ::add_convention<WeakMemLookup,
