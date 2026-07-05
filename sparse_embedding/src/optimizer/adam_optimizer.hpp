@@ -48,6 +48,12 @@ public:
     step_state.allocate();
   }
 
+  void reserve(size_t capacity) {
+    m_state.reserve(capacity);
+    v_state.reserve(capacity);
+    step_state.reserve(capacity);
+  }
+
   void deallocate(uint32_t idx) {
     m_state.deallocate(idx);
     v_state.deallocate(idx);

@@ -24,8 +24,10 @@
 #include <cstdint>
 #include <cstdlib>
 #include <cstring>
+#include <limits>
 #include <memory>
 #include <mutex>
+#include <optional>
 #include <span>
 #include <stdexcept>
 #include <string>
@@ -107,6 +109,15 @@ public:
     return idx;
   }
 
+  void reserve_entries(size_t capacity) {
+    if (capacity == 0)
+      return;
+    if (capacity > static_cast<size_t>(std::numeric_limits<uint32_t>::max())) {
+      throw std::overflow_error("embedding arena capacity exceeds uint32_t");
+    }
+    ensure_capacity(static_cast<uint32_t>(capacity - 1));
+  }
+
   uint64_t &score_raw(uint32_t index) const {
     return pages_->score[index / kEntriesPerPage].load(
         std::memory_order_acquire)[index % kEntriesPerPage];
@@ -118,6 +129,10 @@ public:
 
   size_t allocated_count() const {
     return next_index_.load(std::memory_order_relaxed);
+  }
+
+  size_t capacity() const {
+    return num_pages_.load(std::memory_order_acquire) * kEntriesPerPage;
   }
 
   void reset() {
@@ -223,10 +238,39 @@ public:
   using Key = parlay::IndirectEntries<MapData>;
   using KeyMap = parlay::parlay_hash<Key>;
 
-  struct SlotStore {
-    size_t dim;
+  struct KeyShard {
+    size_t reserved_keys;
     Key entries;
     KeyMap key_map;
+
+    explicit KeyShard(size_t requested_keys)
+        : reserved_keys(requested_keys), entries(false),
+          key_map(map_capacity(requested_keys), &entries, false) {}
+
+    static size_t map_capacity(size_t keys_count) {
+      if (keys_count > std::numeric_limits<size_t>::max() / 2) {
+        throw std::overflow_error("key shard capacity overflow");
+      }
+      return std::max(size_t(1024), keys_count * 2);
+    }
+
+    void insert_existing(uint64_t key, uint32_t idx) {
+      auto map_key = Key::Entry::make_key(key);
+      auto read_idx = [](const auto &e) { return e.get_entry().second; };
+      auto existing = key_map.Insert(
+          map_key,
+          [&] { return entries.make_entry(map_key, std::make_pair(key, idx)); },
+          read_idx);
+      if (existing.has_value()) {
+        throw std::logic_error("duplicate key while rebuilding key shard");
+      }
+    }
+  };
+
+  struct SlotStore {
+    size_t dim;
+    std::vector<std::unique_ptr<KeyShard>> key_shards;
+    size_t shard_mask;
     EmbeddingArena<ParamT> arena;
     pro::proxy<OptimizerFacade<ParamT, OptT>> optimizer;
     std::vector<std::unique_ptr<TransientArena<ParamT>>> transient_shards;
@@ -235,13 +279,94 @@ public:
 
     SlotStore(size_t d, size_t max_active_keys, OptimizerFactory opt_factory,
               size_t num_threads, bool enable_score = true)
-        : dim(d), entries(false),
-          key_map(std::max(size_t(1024), max_active_keys * 2), &entries, false),
-          arena(d, enable_score),
+        : dim(d), shard_mask(num_threads - 1), arena(d, enable_score),
           optimizer(opt_factory.has_value() ? (*opt_factory)(d) : nullptr),
           opt_factory(opt_factory) {
+      size_t per_shard = (max_active_keys + num_threads - 1) / num_threads;
+      for (size_t i = 0; i < num_threads; ++i) {
+        key_shards.push_back(std::make_unique<KeyShard>(per_shard));
+      }
       for (size_t i = 0; i < num_threads; ++i) {
         transient_shards.push_back(std::make_unique<TransientArena<ParamT>>(d));
+      }
+    }
+
+    KeyShard &shard_for_key(uint64_t key) {
+      size_t shard_id =
+          SplitMixHash<KeyT>{}(static_cast<KeyT>(key)) & shard_mask;
+      return *key_shards[shard_id];
+    }
+
+    const KeyShard &shard_for_key(uint64_t key) const {
+      size_t shard_id =
+          SplitMixHash<KeyT>{}(static_cast<KeyT>(key)) & shard_mask;
+      return *key_shards[shard_id];
+    }
+
+    std::optional<uint32_t> find(uint64_t key) {
+      auto &shard = shard_for_key(key);
+      return shard.key_map.Find(Key::Entry::make_key(key), [](const auto &e) {
+        return e.get_entry().second;
+      });
+    }
+
+    template <typename Fn> void for_each(Fn &&fn) {
+      for (auto &shard : key_shards) {
+        shard->key_map.for_each(fn);
+      }
+    }
+
+    size_t size() {
+      size_t total = 0;
+      for (auto &shard : key_shards) {
+        total += shard->key_map.size();
+      }
+      return total;
+    }
+
+    void clear_keys() {
+      for (auto &shard : key_shards) {
+        shard = std::make_unique<KeyShard>(shard->reserved_keys);
+      }
+    }
+
+    void reserve(size_t keys_count) {
+      size_t shard_count = key_shards.size();
+      std::vector<size_t> counts(shard_count, keys_count / shard_count);
+      for (size_t i = 0; i < keys_count % shard_count; ++i) {
+        ++counts[i];
+      }
+      reserve_per_shard(counts);
+    }
+
+    void reserve_per_shard(std::span<const size_t> counts) {
+      if (counts.size() != key_shards.size()) {
+        throw std::invalid_argument("reserve_per_shard counts size mismatch");
+      }
+      size_t total_keys = 0;
+      for (size_t i = 0; i < counts.size(); ++i) {
+        size_t current_size = key_shards[i]->key_map.size();
+        size_t target_keys = std::max(counts[i], current_size);
+        if (target_keys > std::numeric_limits<size_t>::max() - total_keys) {
+          throw std::overflow_error(
+              "reserve_per_shard total capacity overflow");
+        }
+        total_keys += target_keys;
+        if (target_keys <= key_shards[i]->reserved_keys) {
+          continue;
+        }
+        auto rebuilt = std::make_unique<KeyShard>(target_keys);
+        key_shards[i]->key_map.for_each([&](const auto &entry) {
+          auto [key, idx] = entry.get_entry();
+          rebuilt->insert_existing(key, idx);
+        });
+        key_shards[i] = std::move(rebuilt);
+      }
+      total_keys =
+          std::max(total_keys, static_cast<size_t>(arena.allocated_count()));
+      arena.reserve_entries(total_keys);
+      if (optimizer.has_value()) {
+        optimizer->reserve(total_keys);
       }
     }
   };
@@ -331,10 +456,7 @@ public:
           auto &slot = *dim_to_slot_[dim];
           ParamT *out = out_flat_values.data() + offsets[i];
 
-          auto found =
-              slot.key_map.Find(Key::Entry::make_key(key), [](const auto &e) {
-                return e.get_entry().second;
-              });
+          auto found = slot.find(key);
           if (found.has_value()) {
             const ParamT *src = slot.arena.data(*found);
             if constexpr (simd::is_simd_supported_v<ParamT>) {
@@ -533,9 +655,7 @@ public:
             auto &shard = slot->transient_shards[shard_id];
             shard->for_each_accumulated(
                 [&](uint64_t feature_id, const ParamT *accumulated_grad) {
-                  auto found = slot->key_map.Find(
-                      Key::Entry::make_key(feature_id),
-                      [](const auto &e) { return e.get_entry().second; });
+                  auto found = slot->find(feature_id);
                   if (!found.has_value())
                     return;
 
@@ -590,6 +710,7 @@ public:
             throw std::runtime_error("invalid dim access");
           }
           auto &slot = *dim_to_slot_[dim];
+          auto &key_shard = slot.shard_for_key(key);
           auto &free_slots = local_free_slots[dim];
           const ParamT *src = flat_values.data() + offsets[i];
 
@@ -628,13 +749,13 @@ public:
             return std::make_pair(key, upsert_fn(std::nullopt));
           };
           auto constr = [&](const auto &opt_e) {
+            auto map_key = Key::Entry::make_key(key);
             return opt_e.has_value()
-                       ? slot.entries.make_entry(Key::Entry::make_key(key),
-                                                 g(opt_e))
-                       : slot.entries.make_entry(Key::Entry::make_key(key),
-                                                 g(std::nullopt));
+                       ? key_shard.entries.make_entry(map_key, g(opt_e))
+                       : key_shard.entries.make_entry(map_key, g(std::nullopt));
           };
-          auto prev = slot.key_map.Upsert(Key::Entry::make_key(key), constr, g);
+          auto prev =
+              key_shard.key_map.Upsert(Key::Entry::make_key(key), constr, g);
 
           if (preallocated_idx.has_value() && !was_inserted) {
             free_slots.push_back(*preallocated_idx);
@@ -669,6 +790,7 @@ public:
             throw std::runtime_error("invalid dim access");
           }
           auto &slot = *dim_to_slot_[dim];
+          auto &key_shard = slot.shard_for_key(key);
           auto &free_slots = local_free_slots[dim];
           ParamT *out = out_flat_values.data() + offsets[i];
 
@@ -717,13 +839,13 @@ public:
             return std::make_pair(key, upsert_fn(std::nullopt));
           };
           auto constr = [&](const auto &opt_e) {
+            auto map_key = Key::Entry::make_key(key);
             return opt_e.has_value()
-                       ? slot.entries.make_entry(Key::Entry::make_key(key),
-                                                 g(opt_e))
-                       : slot.entries.make_entry(Key::Entry::make_key(key),
-                                                 g(std::nullopt));
+                       ? key_shard.entries.make_entry(map_key, g(opt_e))
+                       : key_shard.entries.make_entry(map_key, g(std::nullopt));
           };
-          auto prev = slot.key_map.Upsert(Key::Entry::make_key(key), constr, g);
+          auto prev =
+              key_shard.key_map.Upsert(Key::Entry::make_key(key), constr, g);
 
           if (preallocated_idx.has_value() && !was_inserted) {
             free_slots.push_back(*preallocated_idx);
@@ -748,10 +870,7 @@ public:
           uint64_t key = static_cast<uint64_t>(keys[i]);
           bool found = false;
           for (const auto &slot_ptr : slot_storage_) {
-            if (slot_ptr->key_map
-                    .Find(Key::Entry::make_key(key),
-                          [](const auto &) { return true; })
-                    .has_value()) {
+            if (slot_ptr->find(key).has_value()) {
               found = true;
               break;
             }
@@ -771,8 +890,9 @@ public:
         for (size_t i = begin; i < end; ++i) {
           uint64_t key = static_cast<uint64_t>(keys[i]);
           for (const auto &slot_ptr : slot_storage_) {
-            slot_ptr->key_map.Remove(Key::Entry::make_key(key),
-                                     [](const auto &) { return true; });
+            auto &shard = slot_ptr->shard_for_key(key);
+            shard.key_map.Remove(Key::Entry::make_key(key),
+                                 [](const auto &) { return true; });
           }
         }
       });
@@ -784,7 +904,7 @@ public:
   std::error_code clear() {
     for (const auto &slot_ptr : slot_storage_) {
       auto *slot = slot_ptr.get();
-      slot->key_map.clear();
+      slot->clear_keys();
       if (slot->optimizer.has_value()) {
         slot->optimizer->clear();
       }
@@ -795,6 +915,19 @@ public:
     }
     return {};
   }
+
+  std::error_code reserve(size_t keys_count, size_t dim) {
+    slot_for_dim(dim).reserve(keys_count);
+    return {};
+  }
+
+  std::error_code reserve_per_shard(std::span<const size_t> counts,
+                                    size_t dim) {
+    slot_for_dim(dim).reserve_per_shard(counts);
+    return {};
+  }
+
+  size_t internal_shard_count() const { return num_threads_; }
 
   template <typename K>
   std::error_code assign_scores(std::span<const K> keys,
@@ -809,10 +942,7 @@ public:
 
         for (const auto &slot_ptr : slot_storage_) {
           auto *slot = slot_ptr.get();
-          auto found =
-              slot->key_map.Find(Key::Entry::make_key(key), [](const auto &e) {
-                return e.get_entry().second;
-              });
+          auto found = slot->find(key);
 
           if (found.has_value()) {
             uint32_t idx = *found;
@@ -830,7 +960,7 @@ public:
   size_t size() const {
     size_t s = 0;
     for (const auto &slot_ptr : slot_storage_) {
-      s += slot_ptr->key_map.size();
+      s += slot_ptr->size();
     }
     return s;
   }
@@ -838,6 +968,15 @@ public:
   size_t num_slots() const { return slot_storage_.size(); }
 
 private:
+  SlotStore &slot_for_dim(size_t dim) {
+    if (dim >= dim_to_slot_.size() || dim_to_slot_[dim] == nullptr) {
+      throw std::runtime_error(
+          "invalid dim access: no physical table for dim " +
+          std::to_string(dim));
+    }
+    return *dim_to_slot_[dim];
+  }
+
   template <typename Fn>
   void dispatch_parallel(size_t n, Fn &&fn,
                          size_t threshold = kParallelThreshold) {
@@ -948,7 +1087,7 @@ private:
         }
       };
 
-      slot->key_map.for_each([&](const auto &entry) {
+      slot->for_each([&](const auto &entry) {
         if (stopped.load(std::memory_order_relaxed))
           return;
 
@@ -1137,7 +1276,7 @@ public:
         return cont;
       };
 
-      slot->key_map.for_each([&](const auto &entry) {
+      slot->for_each([&](const auto &entry) {
         if (stopped.load(std::memory_order_relaxed))
           return;
 
@@ -1266,10 +1405,7 @@ public:
           if (opt_dim == 0)
             continue;
 
-          auto found =
-              slot->key_map.Find(Key::Entry::make_key(key), [](const auto &e) {
-                return e.get_entry().second;
-              });
+          auto found = slot->find(key);
           if (found.has_value()) {
             slot->optimizer->set_state(
                 *found, std::span<const OptT>(opt_states.data() + i * opt_dim,
@@ -1383,7 +1519,7 @@ public:
             local_cands.clear();
           };
 
-      slot->key_map.for_each([&](const auto &entry) {
+      slot->for_each([&](const auto &entry) {
         int w = parlay::worker_id();
         auto [key, idx] = entry.get_entry();
         uint64_t s = std::atomic_ref<uint64_t>(slot->arena.score_raw(idx))
@@ -1410,10 +1546,7 @@ public:
           if (out_evicted_count >= max_evict_count)
             break;
 
-          auto found =
-              slot->key_map.Find(Key::Entry::make_key(key), [](const auto &e) {
-                return e.get_entry().second;
-              });
+          auto found = slot->find(key);
           if (!found.has_value())
             continue;
 
@@ -1423,7 +1556,8 @@ public:
             std::copy_n(slot->arena.data(idx), dim,
                         out_evicted_values.data() + out_evicted_count * dim);
           }
-          slot->key_map.Remove(Key::Entry::make_key(key),
+          auto &shard = slot->shard_for_key(key);
+          shard.key_map.Remove(Key::Entry::make_key(key),
                                [](const auto &) { return true; });
           ++out_evicted_count;
         }

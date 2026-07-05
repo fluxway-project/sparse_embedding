@@ -35,6 +35,7 @@ public:
   }
 
   void allocate() {}
+  void reserve(size_t capacity) { (void)capacity; }
   void deallocate(uint32_t idx) {}
   void clear() {}
 

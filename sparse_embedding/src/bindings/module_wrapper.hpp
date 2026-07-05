@@ -414,6 +414,36 @@ public:
 
   std::vector<size_t> table_dims() const { return dims_; }
 
+  size_t internal_shard_count() {
+    size_t count = 0;
+    dispatch_types([&]<typename P, typename O>() {
+      count = get_store<P, O>()->internal_shard_count();
+    });
+    return count;
+  }
+
+  void reserve(size_t keys_count, int64_t dim) {
+    if (dim <= 0)
+      throw std::invalid_argument("dim must be > 0");
+    std::error_code ec;
+    dispatch_types([&]<typename P, typename O>() {
+      ec = get_store<P, O>()->reserve(keys_count, static_cast<size_t>(dim));
+    });
+    check_error(ec);
+  }
+
+  void reserve_per_shard(const std::vector<size_t> &counts, int64_t dim) {
+    if (dim <= 0)
+      throw std::invalid_argument("dim must be > 0");
+    std::error_code ec;
+    dispatch_types([&]<typename P, typename O>() {
+      ec = get_store<P, O>()->reserve_per_shard(
+          std::span<const size_t>(counts.data(), counts.size()),
+          static_cast<size_t>(dim));
+    });
+    check_error(ec);
+  }
+
   // ---- Sync Operations (thin dispatchers) ----
 
   nb::tuple lookup(nb::object keys, int64_t dim) {
