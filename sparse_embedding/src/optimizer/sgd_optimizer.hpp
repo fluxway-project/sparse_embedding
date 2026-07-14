@@ -19,10 +19,12 @@
 #define SPARSE_EMBEDDING_SGD_OPTIMIZER_HPP_
 
 #include <cstdint>
+#include <limits>
 #include <span>
 #include <type_traits>
 
 #include "sparse_embedding/src/optimizer/optimizer_config.hpp"
+#include "sparse_embedding/src/storage/page_storage.hpp"
 
 namespace se {
 
@@ -30,11 +32,15 @@ template <typename ParamT, typename OptT> class SgdOptimizer {
   SgdConfig config;
 
 public:
-  explicit SgdOptimizer(size_t dim, const SgdConfig &cfg) : config(cfg) {
+  explicit SgdOptimizer(size_t dim, const SgdConfig &cfg,
+                        std::shared_ptr<PageStorage> storage)
+      : config(cfg) {
     (void)dim;
+    (void)storage;
   }
 
-  void allocate() {}
+  void allocate(uint32_t idx) { (void)idx; }
+  size_t capacity() const { return std::numeric_limits<size_t>::max(); }
   void reserve(size_t capacity) { (void)capacity; }
   void deallocate(uint32_t idx) {}
   void clear() {}
@@ -64,24 +70,8 @@ public:
   void step(uint32_t idx, std::span<ParamT> param_span,
             std::span<const ParamT> grad_span,
             [[maybe_unused]] uint64_t global_step) {
-    size_t dim = param_span.size();
-    ParamT *param = param_span.data();
-    const ParamT *accumulated_grad = grad_span.data();
-
-    // In SGD, we can just use simd_adam_update? No, we should use a simpler
-    // simd operation. For now, simple fallback.
-    for (size_t i = 0; i < dim; ++i) {
-      float g = static_cast<float>(accumulated_grad[i]);
-      float p_val = static_cast<float>(param[i]);
-      if (config.weight_decay > 0.0f) {
-        g += config.weight_decay * p_val;
-      }
-      if constexpr (std::is_same_v<ParamT, float>) {
-        param[i] = p_val - config.lr * g;
-      } else {
-        param[i] = static_cast<ParamT>(p_val - config.lr * g);
-      }
-    }
+    simd::simd_sgd_update(param_span.data(), grad_span.data(), config.lr,
+                          config.weight_decay, param_span.size());
   }
 };
 

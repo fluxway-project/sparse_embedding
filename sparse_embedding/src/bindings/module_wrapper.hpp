@@ -127,63 +127,11 @@ inline void fill_uniform_row_lengths(std::span<int64_t> out, int64_t dim) {
 // =============================================================================
 
 struct PyOptimizer {
-  std::shared_ptr<pro::proxy<se::OptimizerBuilderFacade>> builder;
+  se::OptimizerConfigVariant config;
 };
 
 struct PyInitializer {
   std::shared_ptr<pro::proxy<se::InitializerBuilderFacade>> builder;
-};
-
-template <template <typename, typename> class OptT, typename ConfigT>
-struct DefaultOptimizerBuilder {
-  ConfigT config;
-
-  pro::proxy<se::OptimizerFacade<float, float>> build_f32_f32(size_t dim) {
-    return pro::make_proxy<se::OptimizerFacade<float, float>,
-                           OptT<float, float>>(dim, config);
-  }
-  pro::proxy<se::OptimizerFacade<float, se::float16_t>>
-  build_f32_f16(size_t dim) {
-    return pro::make_proxy<se::OptimizerFacade<float, se::float16_t>,
-                           OptT<float, se::float16_t>>(dim, config);
-  }
-  pro::proxy<se::OptimizerFacade<float, se::bfloat16_t>>
-  build_f32_bf16(size_t dim) {
-    return pro::make_proxy<se::OptimizerFacade<float, se::bfloat16_t>,
-                           OptT<float, se::bfloat16_t>>(dim, config);
-  }
-
-  pro::proxy<se::OptimizerFacade<se::float16_t, float>>
-  build_f16_f32(size_t dim) {
-    return pro::make_proxy<se::OptimizerFacade<se::float16_t, float>,
-                           OptT<se::float16_t, float>>(dim, config);
-  }
-  pro::proxy<se::OptimizerFacade<se::float16_t, se::float16_t>>
-  build_f16_f16(size_t dim) {
-    return pro::make_proxy<se::OptimizerFacade<se::float16_t, se::float16_t>,
-                           OptT<se::float16_t, se::float16_t>>(dim, config);
-  }
-  pro::proxy<se::OptimizerFacade<se::float16_t, se::bfloat16_t>>
-  build_f16_bf16(size_t dim) {
-    return pro::make_proxy<se::OptimizerFacade<se::float16_t, se::bfloat16_t>,
-                           OptT<se::float16_t, se::bfloat16_t>>(dim, config);
-  }
-
-  pro::proxy<se::OptimizerFacade<se::bfloat16_t, float>>
-  build_bf16_f32(size_t dim) {
-    return pro::make_proxy<se::OptimizerFacade<se::bfloat16_t, float>,
-                           OptT<se::bfloat16_t, float>>(dim, config);
-  }
-  pro::proxy<se::OptimizerFacade<se::bfloat16_t, se::float16_t>>
-  build_bf16_f16(size_t dim) {
-    return pro::make_proxy<se::OptimizerFacade<se::bfloat16_t, se::float16_t>,
-                           OptT<se::bfloat16_t, se::float16_t>>(dim, config);
-  }
-  pro::proxy<se::OptimizerFacade<se::bfloat16_t, se::bfloat16_t>>
-  build_bf16_bf16(size_t dim) {
-    return pro::make_proxy<se::OptimizerFacade<se::bfloat16_t, se::bfloat16_t>,
-                           OptT<se::bfloat16_t, se::bfloat16_t>>(dim, config);
-  }
 };
 
 struct ZerosInitializerBuilder {
@@ -332,6 +280,7 @@ class EmbeddingStoreWrapper {
   std::string optimizer_dtype_;
   std::string key_dtype_;
   std::vector<size_t> dims_;
+  std::shared_ptr<se::PageStorage> storage_;
 
 #ifdef SE_ENABLE_LANCE_CHECKPOINTER
   se::CheckpointWriterFactory checkpoint_writer_factory_;
@@ -420,6 +369,25 @@ public:
       count = get_store<P, O>()->internal_shard_count();
     });
     return count;
+  }
+
+  nb::dict storage_stats() {
+    if (storage_->consume_spill_warning() &&
+        PyErr_WarnEx(PyExc_RuntimeWarning,
+                     "SparseEmbeddingSpillWarning: embedding pages are using "
+                     "file-backed storage",
+                     1) < 0) {
+      throw nb::python_error();
+    }
+    auto stats = storage_->stats();
+    nb::dict result;
+    result["memory_bytes"] = stats.memory_bytes;
+    result["spill_bytes"] = stats.spill_bytes;
+    result["memory_limit_bytes"] = stats.memory_limit_bytes;
+    result["spill_limit_bytes"] = stats.spill_limit_bytes;
+    result["spill_count"] = stats.spill_count;
+    result["spill_directory"] = storage_->spill_directory();
+    return result;
   }
 
   void reserve(size_t keys_count, int64_t dim) {

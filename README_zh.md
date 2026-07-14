@@ -135,6 +135,29 @@
 
 所有 `EmbeddingStore` 方法（如 `lookup_or_insert`, `assign`, `contains`, `erase`, `clear`, `assign_scores`, `accumulate_gradients`, `optimizer_step`）均已提供高性能、边缘触发的 `async_*` 异步变体。得益于 DLPack 和 eventfd 无锁 asyncio 挂载，Python 端的调用开销被降到最低，依然保持了数以百万计的吞吐率。
 
+### 自动存储管理
+
+默认无需配置存储参数。`EmbeddingStore` 会探测系统与 cgroup 内存限制、进程资源限制、文件系统容量和本地设备属性。在安全内存预算仍有余量时，64 字节对齐页面保留在 RAM；超出预算的页面映射到自动选择的本地磁盘，并在创建后立即 unlink。
+
+第一次使用磁盘页面时会向 stderr 输出 `SparseEmbeddingSpillWarning`。调用 `storage_stats()` 还会发出一次标准 Python 警告，并返回当前内存与 spill 使用量：
+
+```python
+config = sparse_embedding.EmbeddingConfig(dims=[128])
+store = sparse_embedding.EmbeddingStore(config)
+print(store.storage_stats())
+```
+
+`spill_count` 统计磁盘后备页面的分配次数（包括复用文件区间），并不表示独立的内存压力事件次数。
+
+高级用户可以指定存储设备，不需要改变 embedding 操作：
+
+```python
+storage = sparse_embedding.DiskSpill("/mnt/nvme/sparse-embedding", 1 << 40)
+config = sparse_embedding.EmbeddingConfig(dims=[128], storage=storage)
+```
+
+`MemoryOnly()` 会禁用磁盘 spill，并在探测出的安全内存预算耗尽时抛出异常。为保持 O(1) 随机访问，key hash 元数据常驻 RAM，但仅从小型分片表开始惰性增长，并受每表 `max_active_keys` 硬上限约束。
+
 ---
 
 ## 架构说明
@@ -144,6 +167,7 @@ HogwildEmbeddingStore
 ├── parlayhash (KeyMap)          # Lock-free concurrent Key→uint32_t mapping
 ├── EmbeddingArena               # Cache-line aligned contiguous embedding storage
 │   └── PageTable[8192]          # Atomic page pointers, lazy allocated
+├── PageStorage                  # 自动探测 RAM 预算与文件映射 spill
 ├── TransientArena[num_threads]  # Per-shard gradient accumulation (lock-free)
 ├── exec::static_thread_pool     # C++26 stdexec thread pool
 └── pro::proxy<OptimizerFacade>  # Type-erased optimizer (SGD, Adam, etc.)
@@ -158,6 +182,8 @@ HogwildEmbeddingStore
 3. **分页内存管理（Paged Arena Allocation）**：嵌入表底层的 `EmbeddingArena` 采用类似操作系统的虚拟内存页表（PageTable）结构。通过惰性分配（Lazy Allocation）大块连续内存页，不仅避免了启动时的巨量内存开销，也防止了高频小规模内存分配导致的内存碎片化问题。
 
 4. **无冲突梯度累积（Conflict-Free Gradient Accumulation）**：反向传播时为每个线程分配独立的 `TransientArena` 分片。各线程先在本地分片中累积梯度，最后再进行 SIMD 加速的汇总与优化器更新，避免了多线程同时更新同一 embedding 时的伪共享（False Sharing）和原子竞争。
+
+5. **深存储模块（Storage as a Deep Module）**：embedding、optimizer state、score 和 transient gradient arena 共享同一个页面存储接口。资源探测、磁盘选择、警告和 extent 复用全部留在分配冷路径，不进入 lookup 与 optimizer 热路径。
 
 ---
 

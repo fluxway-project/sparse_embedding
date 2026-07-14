@@ -28,6 +28,28 @@ def test_embedding_table_basic():
     assert vals_lookup is not None
 
 
+def test_embedding_table_reports_spill(tmp_path, capfd):
+    store = sparse_embedding.EmbeddingStore(
+        embedding_config=sparse_embedding.EmbeddingConfig(
+            dims=[8],
+            num_threads=1,
+            max_active_keys=1024,
+            storage=sparse_embedding.DiskSpill(tmp_path, 4 << 20),
+        ),
+        initializer_config=sparse_embedding.Zeros(),
+    )
+
+    keys = np.array([1, 2, 3], dtype=np.int64)
+    store.lookup_or_insert(keys, dim=8)
+    with pytest.warns(RuntimeWarning, match="SparseEmbeddingSpillWarning"):
+        stats = store.storage_stats()
+
+    assert stats["spill_bytes"] > 0
+    assert stats["memory_bytes"] == 0
+    assert stats["spill_count"] > 0
+    assert "SparseEmbeddingSpillWarning" in capfd.readouterr().err
+
+
 def test_embedding_table_assign():
     store = sparse_embedding.EmbeddingStore(
         embedding_config=sparse_embedding.EmbeddingConfig(
@@ -130,6 +152,29 @@ def test_embedding_table_reserve_errors():
 
     with pytest.raises(RuntimeError, match="invalid dim access"):
         store.reserve(1, dim=16)
+
+
+def test_embedding_table_enforces_active_key_capacity():
+    store = sparse_embedding.EmbeddingStore(
+        embedding_config=sparse_embedding.EmbeddingConfig(
+            dims=[8],
+            num_threads=1,
+            max_active_keys=2,
+            storage=sparse_embedding.MemoryOnly(),
+        ),
+        initializer_config=sparse_embedding.Zeros(),
+        optimizer_config=sparse_embedding.Sgd(),
+    )
+
+    store.lookup_or_insert(np.array([1, 2], dtype=np.int64), dim=8)
+    store.lookup_or_insert(np.array([2], dtype=np.int64), dim=8)
+    with pytest.raises(ValueError, match="max_active_keys"):
+        store.lookup_or_insert(np.array([3], dtype=np.int64), dim=8)
+
+    assert store.total_size() == 2
+    store.erase(np.array([1], dtype=np.int64))
+    store.lookup_or_insert(np.array([3], dtype=np.int64), dim=8)
+    assert store.total_size() == 2
 
 
 @pytest.mark.asyncio

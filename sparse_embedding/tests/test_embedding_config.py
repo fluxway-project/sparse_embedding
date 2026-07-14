@@ -1,6 +1,6 @@
 import numpy as np
 
-from sparse_embedding import EmbeddingConfig
+from sparse_embedding import AutoStorage, DiskSpill, EmbeddingConfig
 
 
 def test_embedding_config_default():
@@ -8,6 +8,7 @@ def test_embedding_config_default():
     assert cfg.value_dtype == "float32"
     assert cfg.optimizer_dtype == ""
     assert cfg.key_dtype == "int64"
+    assert isinstance(cfg.storage, AutoStorage)
 
 
 def test_embedding_config_native_types():
@@ -38,3 +39,10 @@ def test_embedding_config_string_types():
     assert cfg.value_dtype == "bfloat16"
     assert cfg.optimizer_dtype == "f32"
     assert cfg.key_dtype == "uint32"
+
+
+def test_embedding_config_disk_spill(tmp_path):
+    storage = DiskSpill(directory=tmp_path, max_bytes=4 << 20)
+    cfg = EmbeddingConfig(dims=[8], num_threads=1, storage=storage)
+
+    assert cfg.storage is storage

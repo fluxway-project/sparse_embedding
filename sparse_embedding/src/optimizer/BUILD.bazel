@@ -11,5 +11,6 @@ cc_library(
     deps = [
         "//sparse_embedding/src/interface",
         "//sparse_embedding/src/simd",
+        "//sparse_embedding/src/storage",
     ],
 )

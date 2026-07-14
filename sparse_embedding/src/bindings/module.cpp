@@ -62,19 +62,15 @@ EmbeddingStoreWrapper::EmbeddingStoreWrapper(
       optimizer_dtype_(emb_cfg.optimizer_dtype.empty()
                            ? emb_cfg.value_dtype
                            : emb_cfg.optimizer_dtype),
-      key_dtype_(emb_cfg.key_dtype) {
+      key_dtype_(emb_cfg.key_dtype),
+      storage_(se::PageStorage::create(emb_cfg.storage)) {
 
   PyInitializer init_cfg = init_cfg_opt.value_or(
       PyInitializer{std::make_shared<pro::proxy<se::InitializerBuilderFacade>>(
           pro::make_proxy<se::InitializerBuilderFacade,
                           UniformInitializerBuilder>(-0.05f, 0.05f))});
 
-  PyOptimizer opt_cfg = opt_cfg_opt.value_or(
-      PyOptimizer{std::make_shared<pro::proxy<se::OptimizerBuilderFacade>>(
-          pro::make_proxy<
-              se::OptimizerBuilderFacade,
-              DefaultOptimizerBuilder<se::AdamOptimizer, se::AdamConfig>>(
-              se::AdamConfig{}))});
+  PyOptimizer opt_cfg = opt_cfg_opt.value_or(PyOptimizer{se::AdamConfig{}});
 
   dims_ = emb_cfg.dims;
   if (dims_.empty())
@@ -226,12 +222,48 @@ nb::object PyPartitioner::async_filter(nb::object keys, uint32_t target_shard) {
 NB_MODULE(_core, m) {
   m.doc() = "sparse_embedding C++ backend";
 
+  nb::class_<se::StorageOptions>(m, "_StorageOptions")
+      .def_static(
+          "auto",
+          [](std::optional<size_t> memory_limit_bytes,
+             std::optional<std::string> spill_directory,
+             std::optional<size_t> max_spill_bytes) {
+            se::StorageOptions options;
+            options.mode = se::StorageMode::kAuto;
+            options.memory_limit_bytes = memory_limit_bytes;
+            if (spill_directory)
+              options.spill_directory = *spill_directory;
+            options.max_spill_bytes = max_spill_bytes;
+            return options;
+          },
+          nb::arg("memory_limit_bytes") = nb::none(),
+          nb::arg("spill_directory") = nb::none(),
+          nb::arg("max_spill_bytes") = nb::none())
+      .def_static("memory_only",
+                  []() {
+                    se::StorageOptions options;
+                    options.mode = se::StorageMode::kMemoryOnly;
+                    return options;
+                  })
+      .def_static(
+          "disk_spill",
+          [](const std::string &directory, size_t max_bytes) {
+            se::StorageOptions options;
+            options.mode = se::StorageMode::kDiskOnly;
+            options.memory_limit_bytes = 0;
+            options.spill_directory = directory;
+            options.max_spill_bytes = max_bytes;
+            return options;
+          },
+          nb::arg("directory"), nb::arg("max_bytes"));
+
   nb::class_<se::EmbeddingConfig>(m, "_EmbeddingConfig")
       .def(nb::init<std::vector<size_t>, size_t, std::string, std::string,
-                    std::string, size_t>(),
+                    std::string, size_t, se::StorageOptions>(),
            nb::arg("dims"), nb::arg("num_threads") = 0,
            nb::arg("value_dtype") = "float32", nb::arg("optimizer_dtype") = "",
-           nb::arg("key_dtype") = "int64", nb::arg("max_active_keys") = 1 << 20)
+           nb::arg("key_dtype") = "int64", nb::arg("max_active_keys") = 1 << 20,
+           nb::arg("storage") = se::StorageOptions{})
       .def_rw("dims", &se::EmbeddingConfig::dims)
       .def_rw("num_threads", &se::EmbeddingConfig::num_threads)
       .def_rw("value_dtype", &se::EmbeddingConfig::value_dtype)
@@ -273,12 +305,7 @@ NB_MODULE(_core, m) {
       [](AdamOptimizerPy *self, float lr, float beta1, float beta2, float eps,
          float weight_decay) {
         new (self) AdamOptimizerPy();
-        self->builder =
-            std::make_shared<pro::proxy<se::OptimizerBuilderFacade>>(
-                pro::make_proxy<
-                    se::OptimizerBuilderFacade,
-                    DefaultOptimizerBuilder<se::AdamOptimizer, se::AdamConfig>>(
-                    se::AdamConfig{lr, beta1, beta2, eps, weight_decay}));
+        self->config = se::AdamConfig{lr, beta1, beta2, eps, weight_decay};
       },
       nb::arg("lr") = 1e-3f, nb::arg("beta1") = 0.9f, nb::arg("beta2") = 0.999f,
       nb::arg("eps") = 1e-8f, nb::arg("weight_decay") = 0.0f);
@@ -288,12 +315,7 @@ NB_MODULE(_core, m) {
       "__init__",
       [](SgdOptimizerPy *self, float lr, float weight_decay) {
         new (self) SgdOptimizerPy();
-        self->builder =
-            std::make_shared<pro::proxy<se::OptimizerBuilderFacade>>(
-                pro::make_proxy<
-                    se::OptimizerBuilderFacade,
-                    DefaultOptimizerBuilder<se::SgdOptimizer, se::SgdConfig>>(
-                    se::SgdConfig{lr, weight_decay}));
+        self->config = se::SgdConfig{lr, weight_decay};
       },
       nb::arg("lr") = 1e-2f, nb::arg("weight_decay") = 0.0f);
 
@@ -316,6 +338,7 @@ NB_MODULE(_core, m) {
       .def("num_slots", &EmbeddingStoreWrapper::num_slots)
       .def("table_dims", &EmbeddingStoreWrapper::table_dims)
       .def("internal_shard_count", &EmbeddingStoreWrapper::internal_shard_count)
+      .def("storage_stats", &EmbeddingStoreWrapper::storage_stats)
       .def("reserve", &EmbeddingStoreWrapper::reserve, nb::arg("keys_count"),
            nb::arg("dim"))
       .def("reserve_per_shard", &EmbeddingStoreWrapper::reserve_per_shard,

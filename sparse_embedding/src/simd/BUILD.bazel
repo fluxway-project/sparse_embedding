@@ -2,10 +2,17 @@
 BUILD file for simd
 """
 
-load("@rules_cc//cc:defs.bzl", "cc_library")
+load("@rules_cc//cc:defs.bzl", "cc_library", "cc_test")
 
 cc_library(
     name = "simd",
     hdrs = ["simd_ops.hpp"],
     visibility = ["//visibility:public"],
+    deps = ["//sparse_embedding/src/common"],
+)
+
+cc_test(
+    name = "simd_ops_test",
+    srcs = ["simd_ops_test.cpp"],
+    deps = [":simd"],
 )

@@ -28,6 +28,7 @@
 namespace se {
 
 PRO_DEF_MEM_DISPATCH(OptMemAllocate, allocate);
+PRO_DEF_MEM_DISPATCH(OptMemCapacity, capacity);
 PRO_DEF_MEM_DISPATCH(OptMemReserve, reserve);
 PRO_DEF_MEM_DISPATCH(OptMemDeallocate, deallocate);
 PRO_DEF_MEM_DISPATCH(OptMemClear, clear);
@@ -40,9 +41,10 @@ PRO_DEF_MEM_DISPATCH(OptMemSetStep, set_step);
 
 template <typename ParamT, typename OptT>
 struct OptimizerFacade
-    : pro::facade_builder                           //
-      ::add_convention<OptMemAllocate, void()>      //
-      ::add_convention<OptMemReserve, void(size_t)> //
+    : pro::facade_builder                              //
+      ::add_convention<OptMemAllocate, void(uint32_t)> //
+      ::add_convention<OptMemCapacity, size_t() const> //
+      ::add_convention<OptMemReserve, void(size_t)>    //
       ::add_convention<pro::weak_dispatch<OptMemDeallocate>,
                        void(uint32_t idx)>::
           add_convention<pro::weak_dispatch<OptMemClear>, void()> //
@@ -59,47 +61,6 @@ struct OptimizerFacade
                        uint32_t(uint32_t idx) const> //
       ::add_convention<pro::weak_dispatch<OptMemSetStep>,
                        void(uint32_t idx, uint32_t step)> //
-      ::build {};
-
-PRO_DEF_MEM_DISPATCH(MemBuildOpt_f32_f32, build_f32_f32);
-PRO_DEF_MEM_DISPATCH(MemBuildOpt_f32_f16, build_f32_f16);
-PRO_DEF_MEM_DISPATCH(MemBuildOpt_f32_bf16, build_f32_bf16);
-PRO_DEF_MEM_DISPATCH(MemBuildOpt_f16_f32, build_f16_f32);
-PRO_DEF_MEM_DISPATCH(MemBuildOpt_f16_f16, build_f16_f16);
-PRO_DEF_MEM_DISPATCH(MemBuildOpt_f16_bf16, build_f16_bf16);
-PRO_DEF_MEM_DISPATCH(MemBuildOpt_bf16_f32, build_bf16_f32);
-PRO_DEF_MEM_DISPATCH(MemBuildOpt_bf16_f16, build_bf16_f16);
-PRO_DEF_MEM_DISPATCH(MemBuildOpt_bf16_bf16, build_bf16_bf16);
-
-struct OptimizerBuilderFacade
-    : pro::facade_builder //
-      ::add_convention<MemBuildOpt_f32_f32,
-                       pro::proxy<OptimizerFacade<float, float>>(size_t)> //
-      ::add_convention<MemBuildOpt_f32_f16,
-                       pro::proxy<OptimizerFacade<float, se::float16_t>>(
-                           size_t)> //
-      ::add_convention<MemBuildOpt_f32_bf16,
-                       pro::proxy<OptimizerFacade<float, se::bfloat16_t>>(
-                           size_t)> //
-      ::add_convention<MemBuildOpt_f16_f32,
-                       pro::proxy<OptimizerFacade<se::float16_t, float>>(
-                           size_t)> //
-      ::add_convention<
-          MemBuildOpt_f16_f16,
-          pro::proxy<OptimizerFacade<se::float16_t, se::float16_t>>(size_t)> //
-      ::add_convention<
-          MemBuildOpt_f16_bf16,
-          pro::proxy<OptimizerFacade<se::float16_t, se::bfloat16_t>>(size_t)> //
-      ::add_convention<MemBuildOpt_bf16_f32,
-                       pro::proxy<OptimizerFacade<se::bfloat16_t, float>>(
-                           size_t)> //
-      ::add_convention<
-          MemBuildOpt_bf16_f16,
-          pro::proxy<OptimizerFacade<se::bfloat16_t, se::float16_t>>(size_t)> //
-      ::add_convention<
-          MemBuildOpt_bf16_bf16,
-          pro::proxy<OptimizerFacade<se::bfloat16_t, se::bfloat16_t>>(
-              size_t)> //
       ::build {};
 
 } // namespace se
