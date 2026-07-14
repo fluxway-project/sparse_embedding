@@ -28,12 +28,14 @@
 #include <memory>
 #include <mutex>
 #include <optional>
+#include <shared_mutex>
 #include <span>
 #include <stdexcept>
 #include <string>
 #include <system_error>
 #include <thread>
 #include <unordered_map>
+#include <utility>
 #include <vector>
 
 #include <exec/static_thread_pool.hpp>
@@ -48,6 +50,7 @@
 #include "sparse_embedding/src/interface/initializer_interface.hpp"
 #include "sparse_embedding/src/interface/optimizer_interface.hpp"
 #include "sparse_embedding/src/simd/simd_ops.hpp"
+#include "sparse_embedding/src/storage/page_storage.hpp"
 
 namespace se {
 
@@ -74,24 +77,17 @@ template <typename ValT> class EmbeddingArena {
   };
 
 public:
-  explicit EmbeddingArena(size_t dim, bool enable_score = true)
+  explicit EmbeddingArena(size_t dim, bool enable_score,
+                          std::shared_ptr<PageStorage> storage)
       : dim_(dim), enable_score_(enable_score),
-        pages_(std::make_unique<PageTable>()) {
+        pages_(std::make_unique<PageTable>()), storage_(std::move(storage)),
+        data_pages_(std::make_unique<StoragePage[]>(kMaxPages)),
+        score_pages_(std::make_unique<StoragePage[]>(kMaxPages)) {
     data_stride_ =
         (dim * sizeof(ValT) + kCacheLineSize - 1) & ~(kCacheLineSize - 1);
   }
 
-  ~EmbeddingArena() {
-    for (size_t i = 0; i < kMaxPages; ++i) {
-      auto *dp = pages_->data[i].load(std::memory_order_relaxed);
-      if (dp)
-        std::free(dp);
-      if (enable_score_) {
-        auto *sp = pages_->score[i].load(std::memory_order_relaxed);
-        delete[] sp;
-      }
-    }
-  }
+  ~EmbeddingArena() = default;
 
   EmbeddingArena(const EmbeddingArena &) = delete;
   EmbeddingArena &operator=(const EmbeddingArena &) = delete;
@@ -101,12 +97,23 @@ public:
   size_t dim() const { return dim_; }
   bool score_enabled() const { return enable_score_; }
 
+  template <typename Prepare> uint32_t allocate(Prepare &&prepare) {
+    uint32_t idx = next_index_.load(std::memory_order_relaxed);
+    while (true) {
+      ensure_capacity(idx);
+      prepare(idx);
+      if (next_index_.compare_exchange_weak(idx, idx + 1,
+                                            std::memory_order_relaxed,
+                                            std::memory_order_relaxed)) {
+        if (enable_score_)
+          score_raw(idx) = 0;
+        return idx;
+      }
+    }
+  }
+
   uint32_t allocate() {
-    uint32_t idx = next_index_.fetch_add(1, std::memory_order_relaxed);
-    ensure_capacity(idx);
-    if (enable_score_)
-      score_raw(idx) = 0;
-    return idx;
+    return allocate([](uint32_t) {});
   }
 
   void reserve_entries(size_t capacity) {
@@ -138,14 +145,10 @@ public:
   void reset() {
     std::lock_guard lock(grow_mtx_);
     for (size_t i = 0; i < kMaxPages; ++i) {
-      auto *dp = pages_->data[i].exchange(nullptr, std::memory_order_relaxed);
-      if (dp)
-        std::free(dp);
-      if (enable_score_) {
-        auto *sp =
-            pages_->score[i].exchange(nullptr, std::memory_order_relaxed);
-        delete[] sp;
-      }
+      pages_->data[i].store(nullptr, std::memory_order_relaxed);
+      pages_->score[i].store(nullptr, std::memory_order_relaxed);
+      data_pages_[i] = StoragePage{};
+      score_pages_[i] = StoragePage{};
     }
     num_pages_.store(0, std::memory_order_relaxed);
     next_index_.store(0, std::memory_order_relaxed);
@@ -153,24 +156,38 @@ public:
 
   size_t data_stride() const { return data_stride_; }
 
+  static constexpr size_t max_entries() { return kEntriesPerPage * kMaxPages; }
+
+  void prepare_reused(uint32_t index) {
+    if (enable_score_)
+      score_raw(index) = 0;
+  }
+
 private:
   void ensure_capacity(uint32_t idx) {
     size_t page_needed = idx / kEntriesPerPage;
+    if (page_needed >= kMaxPages) {
+      throw std::length_error("embedding arena page capacity exceeded");
+    }
     if (page_needed < num_pages_.load(std::memory_order_acquire))
       return;
     std::lock_guard lock(grow_mtx_);
     while (page_needed >= num_pages_.load(std::memory_order_relaxed)) {
       size_t pg = num_pages_.load(std::memory_order_relaxed);
-      auto *dp = static_cast<std::byte *>(
-          std::aligned_alloc(kCacheLineSize, kEntriesPerPage * data_stride_));
-      if (!dp)
-        throw std::bad_alloc();
-      std::memset(dp, 0, kEntriesPerPage * data_stride_);
-      pages_->data[pg].store(dp, std::memory_order_release);
+      auto data_page =
+          storage_->allocate(kEntriesPerPage * data_stride_, kCacheLineSize);
+      StoragePage score_page;
       if (enable_score_) {
-        auto *sp = new uint64_t[kEntriesPerPage]();
-        pages_->score[pg].store(sp, std::memory_order_release);
+        score_page = storage_->allocate(kEntriesPerPage * sizeof(uint64_t),
+                                        kCacheLineSize);
       }
+      data_pages_[pg] = std::move(data_page);
+      score_pages_[pg] = std::move(score_page);
+      pages_->data[pg].store(data_pages_[pg].data(), std::memory_order_release);
+      if (enable_score_)
+        pages_->score[pg].store(
+            reinterpret_cast<uint64_t *>(score_pages_[pg].data()),
+            std::memory_order_release);
       num_pages_.store(pg + 1, std::memory_order_release);
     }
   }
@@ -185,6 +202,9 @@ private:
   size_t data_stride_;
   bool enable_score_;
   std::unique_ptr<PageTable> pages_;
+  std::shared_ptr<PageStorage> storage_;
+  std::unique_ptr<StoragePage[]> data_pages_;
+  std::unique_ptr<StoragePage[]> score_pages_;
   std::atomic<uint32_t> next_index_{0};
   std::atomic<size_t> num_pages_{0};
   std::mutex grow_mtx_;
@@ -239,9 +259,14 @@ public:
   using KeyMap = parlay::parlay_hash<Key>;
 
   struct KeyShard {
+    static constexpr size_t kInitialRecycleCapacity = 64;
+
     size_t reserved_keys;
     Key entries;
     KeyMap key_map;
+    std::mutex insert_mutex;
+    std::vector<uint32_t> recycled_indices;
+    size_t owned_index_count = 0;
 
     explicit KeyShard(size_t requested_keys)
         : reserved_keys(requested_keys), entries(false),
@@ -252,6 +277,27 @@ public:
         throw std::overflow_error("key shard capacity overflow");
       }
       return std::max(size_t(1024), keys_count * 2);
+    }
+
+    std::optional<uint32_t> find(uint64_t key) {
+      return key_map.Find(Key::Entry::make_key(key), [](const auto &entry) {
+        return entry.get_entry().second;
+      });
+    }
+
+    void prepare_new_index() {
+      if (owned_index_count == std::numeric_limits<size_t>::max()) {
+        throw std::overflow_error("key shard index count overflow");
+      }
+      size_t required_capacity = owned_index_count + 1;
+      if (recycled_indices.capacity() < required_capacity) {
+        size_t current_capacity = recycled_indices.capacity();
+        size_t next_capacity =
+            current_capacity <= std::numeric_limits<size_t>::max() / 2
+                ? std::max(kInitialRecycleCapacity, current_capacity * 2)
+                : std::numeric_limits<size_t>::max();
+        recycled_indices.reserve(std::max(required_capacity, next_capacity));
+      }
     }
 
     void insert_existing(uint64_t key, uint32_t idx) {
@@ -268,6 +314,27 @@ public:
   };
 
   struct SlotStore {
+    static constexpr size_t kInitialKeysPerShard = 512;
+
+    class ActiveKeyReservation {
+    public:
+      explicit ActiveKeyReservation(SlotStore &slot) : slot_(&slot) {
+        slot_->acquire_active_key();
+      }
+      ActiveKeyReservation(const ActiveKeyReservation &) = delete;
+      ActiveKeyReservation &operator=(const ActiveKeyReservation &) = delete;
+      ActiveKeyReservation(ActiveKeyReservation &&other) noexcept
+          : slot_(std::exchange(other.slot_, nullptr)) {}
+      ~ActiveKeyReservation() {
+        if (slot_)
+          slot_->release_active_key();
+      }
+      void commit() noexcept { slot_ = nullptr; }
+
+    private:
+      SlotStore *slot_;
+    };
+
     size_t dim;
     std::vector<std::unique_ptr<KeyShard>> key_shards;
     size_t shard_mask;
@@ -275,19 +342,32 @@ public:
     pro::proxy<OptimizerFacade<ParamT, OptT>> optimizer;
     std::vector<std::unique_ptr<TransientArena<ParamT>>> transient_shards;
     OptimizerFactory opt_factory;
+    size_t max_active_keys;
+    std::atomic<size_t> active_keys{0};
     uint64_t global_step = 0;
 
     SlotStore(size_t d, size_t max_active_keys, OptimizerFactory opt_factory,
-              size_t num_threads, bool enable_score = true)
-        : dim(d), shard_mask(num_threads - 1), arena(d, enable_score),
+              size_t num_threads, bool enable_score,
+              std::shared_ptr<PageStorage> storage)
+        : dim(d), shard_mask(num_threads - 1), arena(d, enable_score, storage),
           optimizer(opt_factory.has_value() ? (*opt_factory)(d) : nullptr),
-          opt_factory(opt_factory) {
+          opt_factory(opt_factory), max_active_keys(max_active_keys) {
+      if (max_active_keys == 0) {
+        throw std::invalid_argument(
+            "max_active_keys must be greater than zero");
+      }
+      if (max_active_keys > arena.max_entries()) {
+        throw std::length_error("max_active_keys exceeds arena capacity");
+      }
       size_t per_shard = (max_active_keys + num_threads - 1) / num_threads;
+      size_t initial_keys_per_shard = std::min(per_shard, kInitialKeysPerShard);
       for (size_t i = 0; i < num_threads; ++i) {
-        key_shards.push_back(std::make_unique<KeyShard>(per_shard));
+        key_shards.push_back(
+            std::make_unique<KeyShard>(initial_keys_per_shard));
       }
       for (size_t i = 0; i < num_threads; ++i) {
-        transient_shards.push_back(std::make_unique<TransientArena<ParamT>>(d));
+        transient_shards.push_back(std::make_unique<TransientArena<ParamT>>(
+            d, storage, max_active_keys));
       }
     }
 
@@ -305,9 +385,7 @@ public:
 
     std::optional<uint32_t> find(uint64_t key) {
       auto &shard = shard_for_key(key);
-      return shard.key_map.Find(Key::Entry::make_key(key), [](const auto &e) {
-        return e.get_entry().second;
-      });
+      return shard.find(key);
     }
 
     template <typename Fn> void for_each(Fn &&fn) {
@@ -328,6 +406,101 @@ public:
       for (auto &shard : key_shards) {
         shard = std::make_unique<KeyShard>(shard->reserved_keys);
       }
+      active_keys.store(0, std::memory_order_release);
+    }
+
+    void acquire_active_key() {
+      size_t current = active_keys.load(std::memory_order_relaxed);
+      while (true) {
+        if (current >= max_active_keys) {
+          throw std::length_error("max_active_keys capacity exceeded");
+        }
+        if (active_keys.compare_exchange_weak(current, current + 1,
+                                              std::memory_order_acq_rel,
+                                              std::memory_order_relaxed))
+          return;
+      }
+    }
+
+    void release_active_key() noexcept {
+      active_keys.fetch_sub(1, std::memory_order_acq_rel);
+    }
+
+    uint32_t allocate_entry() {
+      uint32_t idx = arena.allocate([&](uint32_t candidate) {
+        if (optimizer.has_value() && optimizer->capacity() <= candidate) {
+          optimizer->reserve(static_cast<size_t>(candidate) + 1);
+        }
+      });
+      if (optimizer.has_value())
+        optimizer->allocate(idx);
+      return idx;
+    }
+
+    template <typename Initialize>
+    std::pair<uint32_t, bool> find_or_insert(uint64_t key,
+                                             Initialize &&initialize) {
+      auto &key_shard = shard_for_key(key);
+      if (auto existing = key_shard.find(key))
+        return {*existing, false};
+
+      std::lock_guard insert_lock(key_shard.insert_mutex);
+      if (auto existing = key_shard.find(key))
+        return {*existing, false};
+
+      std::optional<uint32_t> preallocated_idx;
+      std::optional<ActiveKeyReservation> active_key_reservation;
+      bool was_inserted = false;
+      auto upsert = [&](std::optional<uint32_t> existing) -> uint32_t {
+        was_inserted = !existing.has_value();
+        if (existing.has_value())
+          return *existing;
+        if (!active_key_reservation)
+          active_key_reservation.emplace(*this);
+        uint32_t idx;
+        if (preallocated_idx.has_value()) {
+          idx = *preallocated_idx;
+        } else if (!key_shard.recycled_indices.empty()) {
+          idx = key_shard.recycled_indices.back();
+          key_shard.recycled_indices.pop_back();
+          preallocated_idx = idx;
+          arena.prepare_reused(idx);
+          if (optimizer.has_value())
+            optimizer->allocate(idx);
+        } else {
+          key_shard.prepare_new_index();
+          idx = allocate_entry();
+          ++key_shard.owned_index_count;
+          preallocated_idx = idx;
+        }
+        initialize(idx);
+        return idx;
+      };
+      auto update = [&](std::optional<typename Key::Entry> entry) {
+        return std::make_pair(
+            key, upsert(entry ? std::optional(entry->get_entry().second)
+                              : std::nullopt));
+      };
+      auto construct = [&](const auto &entry) {
+        auto map_key = Key::Entry::make_key(key);
+        return key_shard.entries.make_entry(map_key, update(entry));
+      };
+      std::optional<std::pair<uint64_t, uint32_t>> published;
+      try {
+        published = key_shard.key_map.Upsert(Key::Entry::make_key(key),
+                                             construct, update);
+      } catch (...) {
+        if (preallocated_idx.has_value())
+          key_shard.recycled_indices.push_back(*preallocated_idx);
+        throw;
+      }
+
+      if (preallocated_idx.has_value() && !was_inserted)
+        key_shard.recycled_indices.push_back(*preallocated_idx);
+      if (was_inserted)
+        active_key_reservation->commit();
+      return {was_inserted ? *preallocated_idx : published->second,
+              was_inserted};
     }
 
     void reserve(size_t keys_count) {
@@ -352,6 +525,13 @@ public:
               "reserve_per_shard total capacity overflow");
         }
         total_keys += target_keys;
+      }
+      if (total_keys > max_active_keys) {
+        throw std::length_error("reserve exceeds max_active_keys capacity");
+      }
+      for (size_t i = 0; i < counts.size(); ++i) {
+        size_t current_size = key_shards[i]->key_map.size();
+        size_t target_keys = std::max(counts[i], current_size);
         if (target_keys <= key_shards[i]->reserved_keys) {
           continue;
         }
@@ -360,30 +540,31 @@ public:
           auto [key, idx] = entry.get_entry();
           rebuilt->insert_existing(key, idx);
         });
+        rebuilt->recycled_indices = std::move(key_shards[i]->recycled_indices);
+        rebuilt->owned_index_count = key_shards[i]->owned_index_count;
         key_shards[i] = std::move(rebuilt);
       }
-      total_keys =
+      size_t arena_capacity =
           std::max(total_keys, static_cast<size_t>(arena.allocated_count()));
-      arena.reserve_entries(total_keys);
+      arena.reserve_entries(arena_capacity);
       if (optimizer.has_value()) {
-        optimizer->reserve(total_keys);
+        optimizer->reserve(arena_capacity);
       }
     }
   };
 
-  explicit HogwildEmbeddingStore(const std::vector<size_t> &table_dims,
-                                 size_t num_threads = 0,
-                                 Initializer initializer = {},
-                                 size_t max_active_keys = 1 << 20,
-                                 OptimizerFactory opt_factory = nullptr,
-                                 ScorePolicyT score_policy = {},
-                                 uint8_t slot_bits = 16)
+  explicit HogwildEmbeddingStore(
+      const std::vector<size_t> &table_dims, size_t num_threads = 0,
+      Initializer initializer = {}, size_t max_active_keys = 1 << 20,
+      OptimizerFactory opt_factory = nullptr, ScorePolicyT score_policy = {},
+      uint8_t slot_bits = 16, std::shared_ptr<PageStorage> storage = nullptr)
       : num_threads_(num_threads > 0
                          ? num_threads
                          : std::max(1u, std::thread::hardware_concurrency())),
         pool_(static_cast<uint32_t>(num_threads_)),
         initializer_(std::move(initializer)),
-        score_policy_(std::move(score_policy)) {
+        score_policy_(std::move(score_policy)),
+        storage_(storage ? std::move(storage) : PageStorage::create()) {
     uint32_t p2 = 1;
     while (p2 < num_threads_) {
       p2 <<= 1;
@@ -412,8 +593,9 @@ public:
         throw std::invalid_argument("dim must be > 0");
       }
       if (dim_to_slot_[dim] == nullptr) {
-        slot_storage_.push_back(std::make_unique<SlotStore>(
-            dim, max_active_keys, opt_factory, num_threads_, enable_score));
+        slot_storage_.push_back(
+            std::make_unique<SlotStore>(dim, max_active_keys, opt_factory,
+                                        num_threads_, enable_score, storage_));
         dim_to_slot_[dim] = slot_storage_.back().get();
       }
     }
@@ -433,6 +615,7 @@ public:
   std::error_code forward_lookup(std::span<const K> keys,
                                  std::span<ParamT> out_flat_values,
                                  std::span<const int64_t> row_lengths) {
+    std::shared_lock lifecycle_lock(lifecycle_mutex_);
     size_t n = keys.size();
     auto offsets = compute_offsets(row_lengths);
 
@@ -486,6 +669,8 @@ public:
   std::error_code accumulate_gradients(std::span<const K> keys,
                                        std::span<const ParamT> flat_grads,
                                        std::span<const int64_t> row_lengths) {
+    std::shared_lock lifecycle_lock(lifecycle_mutex_);
+    std::lock_guard training_lock(training_mutex_);
     size_t n = keys.size();
     auto offsets = compute_offsets(row_lengths);
 
@@ -638,6 +823,8 @@ public:
   // =========================================================================
 
   std::error_code optimizer_step() {
+    std::shared_lock lifecycle_lock(lifecycle_mutex_);
+    std::lock_guard training_lock(training_mutex_);
     for (const auto &slot_ptr : slot_storage_) {
       auto *slot = slot_ptr.get();
       if (slot->optimizer.has_value()) {
@@ -695,11 +882,11 @@ public:
   std::error_code assign(std::span<const K> keys,
                          std::span<const ParamT> flat_values,
                          std::span<const int64_t> row_lengths) {
+    std::shared_lock lifecycle_lock(lifecycle_mutex_);
     size_t n = keys.size();
     auto offsets = compute_offsets(row_lengths);
 
     auto do_range = [&](size_t begin, size_t end) {
-      std::vector<std::vector<uint32_t>> local_free_slots(max_dim_ + 1);
       epoch::with_epoch([&] {
         for (size_t i = begin; i < end; ++i) {
           uint64_t key = static_cast<uint64_t>(keys[i]);
@@ -710,59 +897,13 @@ public:
             throw std::runtime_error("invalid dim access");
           }
           auto &slot = *dim_to_slot_[dim];
-          auto &key_shard = slot.shard_for_key(key);
-          auto &free_slots = local_free_slots[dim];
           const ParamT *src = flat_values.data() + offsets[i];
-
-          std::optional<uint32_t> preallocated_idx = std::nullopt;
-          bool was_inserted = false;
-
-          auto upsert_fn = [&](std::optional<uint32_t> existing) -> uint32_t {
-            was_inserted = false;
-            if (existing.has_value()) {
-              return *existing;
-            }
-            was_inserted = true;
-            uint32_t idx;
-            if (preallocated_idx.has_value()) {
-              idx = *preallocated_idx;
-            } else if (!free_slots.empty()) {
-              idx = free_slots.back();
-              free_slots.pop_back();
-              preallocated_idx = idx;
-              std::copy_n(src, slot.dim, slot.arena.data(idx));
-            } else {
-              idx = slot.arena.allocate();
-              if (slot.optimizer.has_value())
-                slot.optimizer->allocate();
-              preallocated_idx = idx;
-              std::copy_n(src, slot.dim, slot.arena.data(idx));
-            }
-            return idx;
-          };
-
-          auto g = [&](std::optional<typename Key::Entry> opt_e)
-              -> std::pair<uint64_t, uint32_t> {
-            if (opt_e.has_value()) {
-              return std::make_pair(key, upsert_fn(opt_e->get_entry().second));
-            }
-            return std::make_pair(key, upsert_fn(std::nullopt));
-          };
-          auto constr = [&](const auto &opt_e) {
-            auto map_key = Key::Entry::make_key(key);
-            return opt_e.has_value()
-                       ? key_shard.entries.make_entry(map_key, g(opt_e))
-                       : key_shard.entries.make_entry(map_key, g(std::nullopt));
-          };
-          auto prev =
-              key_shard.key_map.Upsert(Key::Entry::make_key(key), constr, g);
-
-          if (preallocated_idx.has_value() && !was_inserted) {
-            free_slots.push_back(*preallocated_idx);
-          }
-          if (!was_inserted) {
-            std::copy_n(src, slot.dim, slot.arena.data(prev->second));
-          }
+          auto [arena_idx, inserted] =
+              slot.find_or_insert(key, [&](uint32_t idx) {
+                std::copy_n(src, slot.dim, slot.arena.data(idx));
+              });
+          if (!inserted)
+            std::copy_n(src, slot.dim, slot.arena.data(arena_idx));
         }
       });
     };
@@ -775,11 +916,11 @@ public:
                                    std::span<ParamT> out_flat_values,
                                    std::span<const int64_t> row_lengths,
                                    std::span<uint8_t> out_inserted_mask) {
+    std::shared_lock lifecycle_lock(lifecycle_mutex_);
     size_t n = keys.size();
     auto offsets = compute_offsets(row_lengths);
 
     auto do_range = [&](size_t begin, size_t end) {
-      std::vector<std::vector<uint32_t>> local_free_slots(max_dim_ + 1);
       epoch::with_epoch([&] {
         for (size_t i = begin; i < end; ++i) {
           uint64_t key = static_cast<uint64_t>(keys[i]);
@@ -790,68 +931,17 @@ public:
             throw std::runtime_error("invalid dim access");
           }
           auto &slot = *dim_to_slot_[dim];
-          auto &key_shard = slot.shard_for_key(key);
-          auto &free_slots = local_free_slots[dim];
           ParamT *out = out_flat_values.data() + offsets[i];
-
-          std::optional<uint32_t> preallocated_idx = std::nullopt;
-          bool was_inserted = false;
-
-          auto upsert_fn = [&](std::optional<uint32_t> existing) -> uint32_t {
-            was_inserted = false;
-            if (existing.has_value()) {
-              return *existing;
-            }
-            was_inserted = true;
-            uint32_t idx;
-            if (preallocated_idx.has_value()) {
-              idx = *preallocated_idx;
-            } else if (!free_slots.empty()) {
-              idx = free_slots.back();
-              free_slots.pop_back();
-              preallocated_idx = idx;
-              if (initializer_.has_value()) {
-                initializer_->initialize(
-                    std::span<ParamT>(slot.arena.data(idx), dim), key);
-              } else {
-                std::fill_n(slot.arena.data(idx), dim, ParamT{0});
-              }
-            } else {
-              idx = slot.arena.allocate();
-              if (slot.optimizer.has_value())
-                slot.optimizer->allocate();
-              preallocated_idx = idx;
-              if (initializer_.has_value()) {
-                initializer_->initialize(
-                    std::span<ParamT>(slot.arena.data(idx), dim), key);
-              } else {
-                std::fill_n(slot.arena.data(idx), dim, ParamT{0});
-              }
-            }
-            return idx;
-          };
-
-          auto g = [&](std::optional<typename Key::Entry> opt_e)
-              -> std::pair<uint64_t, uint32_t> {
-            if (opt_e.has_value()) {
-              return std::make_pair(key, upsert_fn(opt_e->get_entry().second));
-            }
-            return std::make_pair(key, upsert_fn(std::nullopt));
-          };
-          auto constr = [&](const auto &opt_e) {
-            auto map_key = Key::Entry::make_key(key);
-            return opt_e.has_value()
-                       ? key_shard.entries.make_entry(map_key, g(opt_e))
-                       : key_shard.entries.make_entry(map_key, g(std::nullopt));
-          };
-          auto prev =
-              key_shard.key_map.Upsert(Key::Entry::make_key(key), constr, g);
-
-          if (preallocated_idx.has_value() && !was_inserted) {
-            free_slots.push_back(*preallocated_idx);
-          }
-          uint32_t arena_idx = was_inserted ? *preallocated_idx : prev->second;
-          out_inserted_mask[i] = was_inserted;
+          auto [arena_idx, inserted] =
+              slot.find_or_insert(key, [&](uint32_t idx) {
+                if (initializer_.has_value()) {
+                  initializer_->initialize(
+                      std::span<ParamT>(slot.arena.data(idx), dim), key);
+                } else {
+                  std::fill_n(slot.arena.data(idx), dim, ParamT{0});
+                }
+              });
+          out_inserted_mask[i] = inserted;
           std::copy_n(slot.arena.data(arena_idx), dim, out);
         }
       });
@@ -863,6 +953,7 @@ public:
   template <typename K>
   std::error_code contains(std::span<const K> keys,
                            std::span<uint8_t> out_exists) {
+    std::shared_lock lifecycle_lock(lifecycle_mutex_);
     size_t n = keys.size();
     auto do_range = [&](size_t begin, size_t end) {
       epoch::with_epoch([&] {
@@ -884,6 +975,7 @@ public:
   }
 
   template <typename K> std::error_code erase(std::span<const K> keys) {
+    std::unique_lock lifecycle_lock(lifecycle_mutex_);
     size_t n = keys.size();
     auto do_range = [&](size_t begin, size_t end) {
       epoch::with_epoch([&] {
@@ -891,8 +983,14 @@ public:
           uint64_t key = static_cast<uint64_t>(keys[i]);
           for (const auto &slot_ptr : slot_storage_) {
             auto &shard = slot_ptr->shard_for_key(key);
-            shard.key_map.Remove(Key::Entry::make_key(key),
-                                 [](const auto &) { return true; });
+            auto removed = shard.key_map.Remove(
+                Key::Entry::make_key(key),
+                [](const auto &entry) { return entry.get_entry().second; });
+            if (removed.has_value()) {
+              std::lock_guard recycle_lock(shard.insert_mutex);
+              shard.recycled_indices.push_back(*removed);
+              slot_ptr->release_active_key();
+            }
           }
         }
       });
@@ -902,6 +1000,7 @@ public:
   }
 
   std::error_code clear() {
+    std::unique_lock lifecycle_lock(lifecycle_mutex_);
     for (const auto &slot_ptr : slot_storage_) {
       auto *slot = slot_ptr.get();
       slot->clear_keys();
@@ -917,12 +1016,14 @@ public:
   }
 
   std::error_code reserve(size_t keys_count, size_t dim) {
+    std::unique_lock lifecycle_lock(lifecycle_mutex_);
     slot_for_dim(dim).reserve(keys_count);
     return {};
   }
 
   std::error_code reserve_per_shard(std::span<const size_t> counts,
                                     size_t dim) {
+    std::unique_lock lifecycle_lock(lifecycle_mutex_);
     slot_for_dim(dim).reserve_per_shard(counts);
     return {};
   }
@@ -932,6 +1033,7 @@ public:
   template <typename K>
   std::error_code assign_scores(std::span<const K> keys,
                                 std::span<const uint64_t> scores) {
+    std::shared_lock lifecycle_lock(lifecycle_mutex_);
     if constexpr (!ScorePolicyT::kHasScore) {
       throw std::runtime_error("assign_scores requires a score-enabled policy");
     }
@@ -958,6 +1060,7 @@ public:
   }
 
   size_t size() const {
+    std::shared_lock lifecycle_lock(lifecycle_mutex_);
     size_t s = 0;
     for (const auto &slot_ptr : slot_storage_) {
       s += slot_ptr->size();
@@ -1014,6 +1117,7 @@ private:
 
   template <ExportOwnership Policy, typename VisitorFn>
   void export_with_opt_impl(VisitorFn &&visitor, size_t batch_size) {
+    std::shared_lock lifecycle_lock(lifecycle_mutex_);
     for (const auto &slot_ptr : slot_storage_) {
       auto *slot = slot_ptr.get();
       size_t emb_dim = slot->dim;
@@ -1201,6 +1305,9 @@ private:
   exec::static_thread_pool pool_;
   Initializer initializer_;
   ScorePolicyT score_policy_;
+  std::shared_ptr<PageStorage> storage_;
+  mutable std::shared_mutex lifecycle_mutex_;
+  std::mutex training_mutex_;
   size_t max_dim_ = 0;
   static constexpr size_t kParallelThreshold = 64;
 
@@ -1230,6 +1337,7 @@ public:
                         std::span<const uint64_t>)>
           visitor,
       size_t batch_size) {
+    std::shared_lock lifecycle_lock(lifecycle_mutex_);
     bool has_score = ScorePolicyT::kHasScore;
 
     for (const auto &slot_ptr : slot_storage_) {
@@ -1390,6 +1498,7 @@ public:
   void assign_opt_states(std::span<const uint64_t> keys,
                          std::span<const OptT> opt_states,
                          std::span<const uint32_t> steps) {
+    std::shared_lock lifecycle_lock(lifecycle_mutex_);
     size_t n = keys.size();
     if (n == 0)
       return;
@@ -1471,6 +1580,7 @@ public:
                                  std::span<K> out_evicted_keys,
                                  std::span<ParamT> out_evicted_values,
                                  size_t &out_evicted_count) {
+    std::unique_lock lifecycle_lock(lifecycle_mutex_);
     if constexpr (!ScorePolicyT::kHasScore)
       throw std::runtime_error(
           "evict_by_score requires a score-enabled policy");
@@ -1557,8 +1667,13 @@ public:
                         out_evicted_values.data() + out_evicted_count * dim);
           }
           auto &shard = slot->shard_for_key(key);
-          shard.key_map.Remove(Key::Entry::make_key(key),
-                               [](const auto &) { return true; });
+          auto removed = shard.key_map.Remove(
+              Key::Entry::make_key(key),
+              [](const auto &entry) { return entry.get_entry().second; });
+          if (removed.has_value()) {
+            shard.recycled_indices.push_back(*removed);
+            slot->release_active_key();
+          }
           ++out_evicted_count;
         }
       });

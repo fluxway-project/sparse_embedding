@@ -5,11 +5,7 @@ BUILD file for hogwild
 load("@rules_cc//cc:cc_library.bzl", "cc_library")
 
 cc_library(
-    name = "hogwild_embedding_store",
-    srcs = glob(
-        ["*.cpp"],
-        exclude = ["*_test.cpp"],
-    ),
+    name = "hogwild_headers",
     hdrs = glob(["*.hpp"]),
     visibility = ["//visibility:public"],
     deps = [
@@ -21,19 +17,39 @@ cc_library(
         "//sparse_embedding/src/interface",
         "//sparse_embedding/src/optimizer",
         "//sparse_embedding/src/simd",
+        "//sparse_embedding/src/storage",
         "@parlayhash",
         "@proxy",
         "@stdexec",
     ],
 )
 
+cc_library(
+    name = "hogwild_embedding_store",
+    srcs = ["hogwild_embedding_store.cpp"],
+    visibility = ["//visibility:public"],
+    deps = [":hogwild_headers"],
+)
+
 cc_test(
     name = "hogwild_score_checkpoint_test",
     srcs = ["hogwild_score_checkpoint_test.cpp"],
+    defines = ["HOGWILD_EXPLICIT_INSTANTIATION"],
     linkopts = ["-pthread"],
     deps = [
-        ":hogwild_embedding_store",
+        ":hogwild_headers",
         "//sparse_embedding/src/checkpoint",
         "//sparse_embedding/src/eviction",
+    ],
+)
+
+cc_test(
+    name = "hogwild_storage_test",
+    srcs = ["hogwild_storage_test.cpp"],
+    defines = ["HOGWILD_EXPLICIT_INSTANTIATION"],
+    linkopts = ["-pthread"],
+    deps = [
+        ":hogwild_headers",
+        "//sparse_embedding/src/storage",
     ],
 )

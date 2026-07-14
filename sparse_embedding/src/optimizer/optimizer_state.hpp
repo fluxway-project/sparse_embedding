@@ -18,12 +18,16 @@
 #ifndef SPARSE_EMBEDDING_OPTIMIZER_STATE_HPP_
 #define SPARSE_EMBEDDING_OPTIMIZER_STATE_HPP_
 
+#include <atomic>
 #include <cstdint>
 #include <cstdlib>
 #include <cstring>
 #include <memory>
 #include <mutex>
+#include <stdexcept>
 #include <vector>
+
+#include "sparse_embedding/src/storage/page_storage.hpp"
 
 namespace se {
 
@@ -31,12 +35,9 @@ template <typename T> class OptimizerStateArena {
   static constexpr size_t kCacheLineSize = 64;
   static constexpr size_t kEntriesPerPage = 4096;
 
-  struct AlignedDeleter {
-    void operator()(std::byte *p) const { std::free(p); }
-  };
-
 public:
-  explicit OptimizerStateArena(size_t dim) : dim_(dim) {
+  explicit OptimizerStateArena(size_t dim, std::shared_ptr<PageStorage> storage)
+      : dim_(dim), storage_(std::move(storage)) {
     row_stride_ =
         (dim * sizeof(T) + kCacheLineSize - 1) & ~(kCacheLineSize - 1);
   }
@@ -46,25 +47,11 @@ public:
   OptimizerStateArena(OptimizerStateArena &&) = default;
   OptimizerStateArena &operator=(OptimizerStateArena &&) = default;
 
-  uint32_t allocate() {
-    std::lock_guard<std::mutex> lock(alloc_mtx_);
-    uint32_t idx;
-    if (!free_list_.empty()) {
-      idx = free_list_.back();
-      free_list_.pop_back();
-    } else {
-      idx = next_index_++;
-      if (idx / kEntriesPerPage >= pages_.size()) {
-        auto *p = static_cast<std::byte *>(
-            std::aligned_alloc(kCacheLineSize, kEntriesPerPage * row_stride_));
-        if (!p)
-          throw std::bad_alloc();
-        std::memset(p, 0, kEntriesPerPage * row_stride_);
-        pages_.emplace_back(p);
-      }
+  void allocate(uint32_t idx) {
+    if (idx >= capacity_.load(std::memory_order_acquire)) {
+      throw std::logic_error("optimizer state capacity was not reserved");
     }
     std::memset(raw(idx), 0, row_stride_);
-    return idx;
   }
 
   void reserve(size_t capacity) {
@@ -74,28 +61,21 @@ public:
     std::lock_guard<std::mutex> lock(alloc_mtx_);
     size_t required_pages = (capacity + kEntriesPerPage - 1) / kEntriesPerPage;
     while (pages_.size() < required_pages) {
-      auto *p = static_cast<std::byte *>(
-          std::aligned_alloc(kCacheLineSize, kEntriesPerPage * row_stride_));
-      if (!p) {
-        throw std::bad_alloc();
-      }
-      std::memset(p, 0, kEntriesPerPage * row_stride_);
-      pages_.emplace_back(p);
+      pages_.push_back(
+          storage_->allocate(kEntriesPerPage * row_stride_, kCacheLineSize));
+      capacity_.store(pages_.size() * kEntriesPerPage,
+                      std::memory_order_release);
     }
   }
 
-  size_t capacity() const { return pages_.size() * kEntriesPerPage; }
+  size_t capacity() const { return capacity_.load(std::memory_order_acquire); }
 
-  void deallocate(uint32_t index) {
-    std::lock_guard<std::mutex> lock(alloc_mtx_);
-    free_list_.push_back(index);
-  }
+  void deallocate(uint32_t index) { std::memset(raw(index), 0, row_stride_); }
 
   void clear() {
     std::lock_guard<std::mutex> lock(alloc_mtx_);
     pages_.clear();
-    free_list_.clear();
-    next_index_ = 0;
+    capacity_.store(0, std::memory_order_release);
   }
 
   T *data(uint32_t index) { return reinterpret_cast<T *>(raw(index)); }
@@ -108,15 +88,15 @@ public:
 
 private:
   std::byte *raw(uint32_t index) const {
-    return pages_[index / kEntriesPerPage].get() +
+    return pages_[index / kEntriesPerPage].data() +
            (index % kEntriesPerPage) * row_stride_;
   }
 
   size_t dim_;
   size_t row_stride_;
-  std::vector<std::unique_ptr<std::byte[], AlignedDeleter>> pages_;
-  std::vector<uint32_t> free_list_;
-  uint32_t next_index_ = 0;
+  std::shared_ptr<PageStorage> storage_;
+  std::vector<StoragePage> pages_;
+  std::atomic<size_t> capacity_{0};
   std::mutex alloc_mtx_;
 };
 

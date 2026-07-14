@@ -18,6 +18,7 @@
 #ifndef SPARSE_EMBEDDING_ADAM_OPTIMIZER_HPP_
 #define SPARSE_EMBEDDING_ADAM_OPTIMIZER_HPP_
 
+#include <algorithm>
 #include <cmath>
 #include <cstdint>
 #include <span>
@@ -39,13 +40,20 @@ template <typename ParamT, typename OptT> class AdamOptimizer {
   AdamConfig config;
 
 public:
-  explicit AdamOptimizer(size_t dim, const AdamConfig &cfg)
-      : m_state(dim), v_state(dim), step_state(1), config(cfg) {}
+  explicit AdamOptimizer(size_t dim, const AdamConfig &cfg,
+                         std::shared_ptr<PageStorage> storage)
+      : m_state(dim, storage), v_state(dim, storage),
+        step_state(1, std::move(storage)), config(cfg) {}
 
-  void allocate() {
-    m_state.allocate();
-    v_state.allocate();
-    step_state.allocate();
+  void allocate(uint32_t idx) {
+    m_state.allocate(idx);
+    v_state.allocate(idx);
+    step_state.allocate(idx);
+  }
+
+  size_t capacity() const {
+    return std::min(
+        {m_state.capacity(), v_state.capacity(), step_state.capacity()});
   }
 
   void reserve(size_t capacity) {

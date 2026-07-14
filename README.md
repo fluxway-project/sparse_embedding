@@ -135,6 +135,30 @@ The following throughputs were measured by calling the corresponding interfaces 
 
 All `EmbeddingStore` methods (e.g. `lookup_or_insert`, `assign`, `contains`, `erase`, `clear`, `assign_scores`, `accumulate_gradients`, `optimizer_step`) have high-performance, edge-triggered `async_*` variants. Thanks to DLPack and lock-free `eventfd` asyncio integration, the Python invocation overhead is minimized, easily sustaining millions of operations per second.
 
+### Automatic Storage Management
+
+No storage configuration is required. `EmbeddingStore` detects system and cgroup memory limits, process resource limits, filesystem capacity, and local device characteristics. Cache-line-aligned pages stay in RAM while the safe memory budget has capacity; additional pages use an unlinked file-backed mapping on the best available local disk.
+
+The first disk-backed page emits `SparseEmbeddingSpillWarning` to stderr. `storage_stats()` also raises a standard Python warning once and returns current memory and spill usage:
+
+```python
+config = sparse_embedding.EmbeddingConfig(dims=[128])
+store = sparse_embedding.EmbeddingStore(config)
+print(store.storage_stats())
+```
+
+`spill_count` counts disk-backed page allocations, including reused file
+extents. It is not a count of distinct memory-pressure episodes.
+
+Advanced users can override automatic selection without changing store operations:
+
+```python
+storage = sparse_embedding.DiskSpill("/mnt/nvme/sparse-embedding", 1 << 40)
+config = sparse_embedding.EmbeddingConfig(dims=[128], storage=storage)
+```
+
+`MemoryOnly()` disables disk spill and raises when the detected safe memory budget is exhausted. Key hash metadata stays RAM-resident to preserve O(1) random access, grows lazily from a small per-shard table, and is bounded by the per-table `max_active_keys` hard limit.
+
 ---
 
 ## Architecture Overview
@@ -144,6 +168,7 @@ HogwildEmbeddingStore
 ├── parlayhash (KeyMap)          # Lock-free concurrent Key→uint32_t mapping
 ├── EmbeddingArena               # Cache-line aligned contiguous embedding storage
 │   └── PageTable[8192]          # Atomic page pointers, lazy allocated
+├── PageStorage                   # Auto-detected RAM budget + file-backed spill
 ├── TransientArena[num_threads]  # Per-shard gradient accumulation (lock-free)
 ├── exec::static_thread_pool     # C++26 stdexec thread pool
 └── pro::proxy<OptimizerFacade>  # Type-erased optimizer (SGD, Adam, etc.)
@@ -158,6 +183,8 @@ HogwildEmbeddingStore
 3. **Paged Arena Allocation**: The underlying `EmbeddingArena` uses a PageTable-like structure similar to operating system virtual memory. By lazily allocating large memory pages, it avoids massive upfront memory allocation overhead and prevents memory fragmentation caused by high-frequency, small-scale allocations.
 
 4. **Conflict-Free Gradient Accumulation**: During the backward pass, each thread is assigned an independent shard of a `TransientArena`. Threads accumulate gradients locally within their shards, which are then aggregated and applied using SIMD-accelerated optimizer steps. This prevents false sharing and atomic contention when multiple threads update the same embedding vector.
+
+5. **Storage as a Deep Module**: Embedding, optimizer-state, score, and transient-gradient arenas share one page-storage interface. Allocation policy, resource detection, disk selection, warning emission, and extent reuse stay off the lookup and optimizer hot paths.
 
 ---
 

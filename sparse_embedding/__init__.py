@@ -3,6 +3,7 @@ Sparse Embedding Package
 """
 
 import atexit
+import os
 from typing import Any, Sequence
 
 from ._core import (
@@ -19,6 +20,7 @@ from ._core import (
     Zeros,
     _clear_wake_queue,
     _EmbeddingConfig,
+    _StorageOptions,
     async_unique,
     decode_keys,
     drain_wake_queue,
@@ -26,6 +28,31 @@ from ._core import (
     set_leak_warnings,
     wake_fd,
 )
+
+
+class AutoStorage:
+    def __init__(
+        self,
+        memory_limit_bytes: int | None = None,
+        spill_directory: os.PathLike[str] | str | None = None,
+        max_spill_bytes: int | None = None,
+    ) -> None:
+        directory = None if spill_directory is None else os.fspath(spill_directory)
+        self._native = _StorageOptions.auto(
+            memory_limit_bytes, directory, max_spill_bytes
+        )
+
+
+class MemoryOnly:
+    def __init__(self) -> None:
+        self._native = _StorageOptions.memory_only()
+
+
+class DiskSpill:
+    def __init__(self, directory: os.PathLike[str] | str, max_bytes: int) -> None:
+        if max_bytes <= 0:
+            raise ValueError("max_bytes must be greater than zero")
+        self._native = _StorageOptions.disk_spill(os.fspath(directory), max_bytes)
 
 
 def _to_str(dt: Any) -> str:
@@ -55,7 +82,9 @@ class EmbeddingConfig(_EmbeddingConfig):
         optimizer_dtype: Any = "",
         key_dtype: Any = "int64",
         max_active_keys: int = 1 << 20,
+        storage: AutoStorage | MemoryOnly | DiskSpill | None = None,
     ):
+        resolved_storage = AutoStorage() if storage is None else storage
         super().__init__(
             dims,
             num_threads,
@@ -63,7 +92,9 @@ class EmbeddingConfig(_EmbeddingConfig):
             _to_str(optimizer_dtype),
             _to_str(key_dtype),
             max_active_keys,
+            resolved_storage._native,
         )
+        self.storage = resolved_storage
 
 
 # During interpreter shutdown (finalization), Python clears modules in a semi-random
@@ -89,6 +120,7 @@ atexit.register(_disable_leak_warnings)
 
 __all__ = [
     "Adam",
+    "AutoStorage",
     "Sgd",
     "Optimizer",
     "EmbeddingConfig",
@@ -96,11 +128,13 @@ __all__ = [
     "Uniform",
     "Initializer",
     "EmbeddingStore",
+    "DiskSpill",
     "async_unique",
     "encode_keys",
     "decode_keys",
     "Partitioner",
     "ModuloPartitioner",
+    "MemoryOnly",
     "FastRangePartitioner",
     "HashPartitioner",
     "wake_fd",

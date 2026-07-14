@@ -30,6 +30,7 @@
 #include <vector>
 
 #include "sparse_embedding/src/simd/simd_ops.hpp"
+#include "sparse_embedding/src/storage/page_storage.hpp"
 
 namespace se {
 
@@ -39,28 +40,35 @@ template <typename ValT> class TransientArena {
   static constexpr size_t kChunkSize = 8192; // Number of elements per page
 
 public:
-  TransientArena(size_t dim, size_t initial_capacity = kChunkSize) : dim_(dim) {
+  TransientArena(size_t dim, std::shared_ptr<PageStorage> storage,
+                 size_t max_entries)
+      : dim_(dim), storage_(std::move(storage)), max_entries_(max_entries) {
     grad_stride_ =
         (dim * sizeof(ValT) + kCacheLineSize - 1) & ~(kCacheLineSize - 1);
-    allocate_chunk();
-    id_map_.reserve(initial_capacity);
   }
 
-  ~TransientArena() {
-    for (auto *ptr : grad_chunks_) {
-      std::free(ptr);
-    }
-  }
+  ~TransientArena() = default;
 
   TransientArena(const TransientArena &) = delete;
   TransientArena &operator=(const TransientArena &) = delete;
 
   uint32_t get_or_allocate(uint64_t feature_id) {
+    if (next_slot_ >= max_entries_) {
+      auto existing = id_map_.find(feature_id);
+      if (existing != id_map_.end()) {
+        return existing->second;
+      }
+      throw std::length_error("transient key capacity exceeded");
+    }
+    if (next_slot_ >= capacity_) {
+      auto existing = id_map_.find(feature_id);
+      if (existing != id_map_.end()) {
+        return existing->second;
+      }
+      allocate_chunk();
+    }
     auto [it_new, inserted] = id_map_.try_emplace(feature_id, next_slot_);
     if (inserted) {
-      if (next_slot_ >= capacity_) {
-        allocate_chunk();
-      }
       std::memset(grad_data(next_slot_), 0, dim_ * sizeof(ValT));
       ++next_slot_;
     }
@@ -97,32 +105,30 @@ public:
 
 private:
   void allocate_chunk() {
-    std::byte *new_chunk = static_cast<std::byte *>(
-        std::aligned_alloc(kCacheLineSize, kChunkSize * grad_stride_));
-    if (!new_chunk) {
-      throw std::bad_alloc();
-    }
-    grad_chunks_.push_back(new_chunk);
+    grad_chunks_.push_back(
+        storage_->allocate(kChunkSize * grad_stride_, kCacheLineSize));
     capacity_ += kChunkSize;
   }
 
   ValT *grad_data(uint32_t slot_index) {
     size_t chunk_idx = slot_index / kChunkSize;
     size_t offset = slot_index % kChunkSize;
-    return reinterpret_cast<ValT *>(grad_chunks_[chunk_idx] +
+    return reinterpret_cast<ValT *>(grad_chunks_[chunk_idx].data() +
                                     offset * grad_stride_);
   }
 
   const ValT *grad_data(uint32_t slot_index) const {
     size_t chunk_idx = slot_index / kChunkSize;
     size_t offset = slot_index % kChunkSize;
-    return reinterpret_cast<const ValT *>(grad_chunks_[chunk_idx] +
+    return reinterpret_cast<const ValT *>(grad_chunks_[chunk_idx].data() +
                                           offset * grad_stride_);
   }
 
   size_t dim_;
   size_t grad_stride_;
-  std::vector<std::byte *> grad_chunks_;
+  std::shared_ptr<PageStorage> storage_;
+  size_t max_entries_;
+  std::vector<StoragePage> grad_chunks_;
   size_t capacity_{0};
   ankerl::unordered_dense::map<uint64_t, uint32_t> id_map_;
   uint32_t next_slot_{0};

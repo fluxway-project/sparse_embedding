@@ -1,0 +1,14 @@
+load("@rules_cc//cc:defs.bzl", "cc_library", "cc_test")
+
+cc_library(
+    name = "storage",
+    srcs = ["page_storage.cpp"],
+    hdrs = ["page_storage.hpp"],
+    visibility = ["//visibility:public"],
+)
+
+cc_test(
+    name = "page_storage_test",
+    srcs = ["page_storage_test.cpp"],
+    deps = [":storage"],
+)
