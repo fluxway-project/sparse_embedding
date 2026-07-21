@@ -31,6 +31,7 @@
 #include <cstring>
 #include <memory>
 #include <optional>
+#include <ranges>
 #include <span>
 #include <stdexcept>
 #include <string>
@@ -280,7 +281,7 @@ class EmbeddingStoreWrapper {
   std::string optimizer_dtype_;
   std::string key_dtype_;
   std::vector<size_t> dims_;
-  std::shared_ptr<se::PageStorage> storage_;
+  se::PageStorage storage_;
 
 #ifdef SE_ENABLE_LANCE_CHECKPOINTER
   se::CheckpointWriterFactory checkpoint_writer_factory_;
@@ -356,7 +357,7 @@ public:
   size_t max_dim() const {
     if (dims_.empty())
       return 0;
-    return *std::max_element(dims_.begin(), dims_.end());
+    return std::ranges::max(dims_);
   }
 
   size_t num_slots() const { return dims_.size(); }
@@ -387,6 +388,12 @@ public:
     result["spill_limit_bytes"] = stats.spill_limit_bytes;
     result["spill_count"] = stats.spill_count;
     result["spill_directory"] = storage_->spill_directory();
+    result["swap_out_count"] = stats.swap_out_count;
+    result["eviction_selection_count"] = stats.eviction_selection_count;
+    result["eviction_evaluated_pages"] = stats.eviction_evaluated_pages;
+    result["eviction_selection_ns"] = stats.eviction_selection_ns;
+    result["eviction_candidate_invalidated_count"] =
+        stats.eviction_candidate_invalidated_count;
     return result;
   }
 

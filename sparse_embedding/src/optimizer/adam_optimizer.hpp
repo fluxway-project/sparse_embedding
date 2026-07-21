@@ -40,8 +40,7 @@ template <typename ParamT, typename OptT> class AdamOptimizer {
   AdamConfig config;
 
 public:
-  explicit AdamOptimizer(size_t dim, const AdamConfig &cfg,
-                         std::shared_ptr<PageStorage> storage)
+  explicit AdamOptimizer(size_t dim, const AdamConfig &cfg, PageStorage storage)
       : m_state(dim, storage), v_state(dim, storage),
         step_state(1, std::move(storage)), config(cfg) {}
 
@@ -49,6 +48,12 @@ public:
     m_state.allocate(idx);
     v_state.allocate(idx);
     step_state.allocate(idx);
+  }
+
+  void set_page_eviction_enabled(bool enabled) {
+    m_state.set_page_eviction_enabled(enabled);
+    v_state.set_page_eviction_enabled(enabled);
+    step_state.set_page_eviction_enabled(enabled);
   }
 
   size_t capacity() const {

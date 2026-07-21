@@ -22,7 +22,7 @@
 #include <cstdint>
 #include <cstdlib>
 #include <cstring>
-#include <memory>
+#include <limits>
 #include <mutex>
 #include <stdexcept>
 #include <vector>
@@ -36,8 +36,10 @@ template <typename T> class OptimizerStateArena {
   static constexpr size_t kEntriesPerPage = 4096;
 
 public:
-  explicit OptimizerStateArena(size_t dim, std::shared_ptr<PageStorage> storage)
-      : dim_(dim), storage_(std::move(storage)) {
+  explicit OptimizerStateArena(size_t dim, PageStorage storage,
+                               bool page_eviction_enabled = false)
+      : dim_(dim), storage_(std::move(storage)),
+        page_eviction_enabled_(page_eviction_enabled) {
     row_stride_ =
         (dim * sizeof(T) + kCacheLineSize - 1) & ~(kCacheLineSize - 1);
   }
@@ -61,14 +63,31 @@ public:
     std::lock_guard<std::mutex> lock(alloc_mtx_);
     size_t required_pages = (capacity + kEntriesPerPage - 1) / kEntriesPerPage;
     while (pages_.size() < required_pages) {
-      pages_.push_back(
-          storage_->allocate(kEntriesPerPage * row_stride_, kCacheLineSize));
+      PageEvaluator evaluator;
+      if (page_eviction_enabled_)
+        evaluator = []() constexpr -> uint64_t {
+          return std::numeric_limits<uint64_t>::max();
+        };
+      const PageEvictionMode eviction_mode = page_eviction_enabled_
+                                                 ? PageEvictionMode::kEnabled
+                                                 : PageEvictionMode::kDisabled;
+      pages_.push_back(storage_->allocate(kEntriesPerPage * row_stride_,
+                                          kCacheLineSize, std::move(evaluator),
+                                          eviction_mode));
       capacity_.store(pages_.size() * kEntriesPerPage,
                       std::memory_order_release);
     }
   }
 
   size_t capacity() const { return capacity_.load(std::memory_order_acquire); }
+
+  void set_page_eviction_enabled(bool enabled) {
+    std::lock_guard<std::mutex> lock(alloc_mtx_);
+    if (!pages_.empty() && enabled != page_eviction_enabled_)
+      throw std::logic_error(
+          "optimizer page eviction policy cannot change after allocation");
+    page_eviction_enabled_ = enabled;
+  }
 
   void deallocate(uint32_t index) { std::memset(raw(index), 0, row_stride_); }
 
@@ -94,7 +113,8 @@ private:
 
   size_t dim_;
   size_t row_stride_;
-  std::shared_ptr<PageStorage> storage_;
+  PageStorage storage_;
+  bool page_eviction_enabled_;
   std::vector<StoragePage> pages_;
   std::atomic<size_t> capacity_{0};
   std::mutex alloc_mtx_;

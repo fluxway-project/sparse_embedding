@@ -18,15 +18,13 @@
 #ifndef SPARSE_EMBEDDING_TRANSIENT_ARENA_HPP_
 #define SPARSE_EMBEDDING_TRANSIENT_ARENA_HPP_
 
-#include <atomic>
+#include <ankerl/unordered_dense.h>
+
 #include <cstdint>
 #include <cstdlib>
 #include <cstring>
-#include <memory>
+#include <limits>
 #include <stdexcept>
-#include <type_traits>
-
-#include <ankerl/unordered_dense.h>
 #include <vector>
 
 #include "sparse_embedding/src/simd/simd_ops.hpp"
@@ -40,9 +38,10 @@ template <typename ValT> class TransientArena {
   static constexpr size_t kChunkSize = 8192; // Number of elements per page
 
 public:
-  TransientArena(size_t dim, std::shared_ptr<PageStorage> storage,
-                 size_t max_entries)
-      : dim_(dim), storage_(std::move(storage)), max_entries_(max_entries) {
+  TransientArena(size_t dim, PageStorage storage, size_t max_entries,
+                 bool page_eviction_enabled = false)
+      : dim_(dim), storage_(std::move(storage)), max_entries_(max_entries),
+        page_eviction_enabled_(page_eviction_enabled) {
     grad_stride_ =
         (dim * sizeof(ValT) + kCacheLineSize - 1) & ~(kCacheLineSize - 1);
   }
@@ -76,7 +75,6 @@ public:
   }
 
   void accumulate(uint32_t slot_index, const ValT *grad) {
-
     if constexpr (simd::is_simd_supported_v<ValT>) {
       simd::simd_accumulate(
           grad, reinterpret_cast<ValT *>(grad_data(slot_index)), dim_);
@@ -105,8 +103,17 @@ public:
 
 private:
   void allocate_chunk() {
+    PageEvaluator evaluator;
+    if (page_eviction_enabled_)
+      evaluator = []() constexpr -> uint64_t {
+        return std::numeric_limits<uint64_t>::max();
+      };
+    const PageEvictionMode eviction_mode = page_eviction_enabled_
+                                               ? PageEvictionMode::kEnabled
+                                               : PageEvictionMode::kDisabled;
     grad_chunks_.push_back(
-        storage_->allocate(kChunkSize * grad_stride_, kCacheLineSize));
+        storage_->allocate(kChunkSize * grad_stride_, kCacheLineSize,
+                           std::move(evaluator), eviction_mode));
     capacity_ += kChunkSize;
   }
 
@@ -126,8 +133,9 @@ private:
 
   size_t dim_;
   size_t grad_stride_;
-  std::shared_ptr<PageStorage> storage_;
+  PageStorage storage_;
   size_t max_entries_;
+  bool page_eviction_enabled_;
   std::vector<StoragePage> grad_chunks_;
   size_t capacity_{0};
   ankerl::unordered_dense::map<uint64_t, uint32_t> id_map_;

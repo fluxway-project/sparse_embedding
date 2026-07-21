@@ -18,30 +18,31 @@
 #ifndef SPARSE_EMBEDDING_HOGWILD_EMBEDDING_STORE_HPP_
 #define SPARSE_EMBEDDING_HOGWILD_EMBEDDING_STORE_HPP_
 
+#include <parlay_hash/unordered_map.h>
+
 #include <algorithm>
 #include <array>
 #include <atomic>
 #include <cstdint>
 #include <cstdlib>
 #include <cstring>
+#include <exec/static_thread_pool.hpp>
 #include <limits>
 #include <memory>
 #include <mutex>
+#include <numeric>
 #include <optional>
+#include <ranges>
 #include <shared_mutex>
 #include <span>
 #include <stdexcept>
+#include <stdexec/execution.hpp>
 #include <string>
 #include <system_error>
 #include <thread>
 #include <unordered_map>
 #include <utility>
 #include <vector>
-
-#include <exec/static_thread_pool.hpp>
-#include <stdexec/execution.hpp>
-
-#include <parlay_hash/unordered_map.h>
 
 #include "sparse_embedding/src/arena/transient_arena.hpp"
 #include "sparse_embedding/src/common/function.hpp"
@@ -77,8 +78,7 @@ template <typename ValT> class EmbeddingArena {
   };
 
 public:
-  explicit EmbeddingArena(size_t dim, bool enable_score,
-                          std::shared_ptr<PageStorage> storage)
+  explicit EmbeddingArena(size_t dim, bool enable_score, PageStorage storage)
       : dim_(dim), enable_score_(enable_score),
         pages_(std::make_unique<PageTable>()), storage_(std::move(storage)),
         data_pages_(std::make_unique<StoragePage[]>(kMaxPages)),
@@ -174,12 +174,20 @@ private:
     std::lock_guard lock(grow_mtx_);
     while (page_needed >= num_pages_.load(std::memory_order_relaxed)) {
       size_t pg = num_pages_.load(std::memory_order_relaxed);
+      PageEvaluator evaluator;
+      if (enable_score_)
+        evaluator = [this, pg] { return page_score(pg); };
+      const PageEvictionMode eviction_mode = enable_score_
+                                                 ? PageEvictionMode::kEnabled
+                                                 : PageEvictionMode::kDisabled;
       auto data_page =
-          storage_->allocate(kEntriesPerPage * data_stride_, kCacheLineSize);
+          storage_->allocate(kEntriesPerPage * data_stride_, kCacheLineSize,
+                             evaluator, eviction_mode);
       StoragePage score_page;
       if (enable_score_) {
-        score_page = storage_->allocate(kEntriesPerPage * sizeof(uint64_t),
-                                        kCacheLineSize);
+        score_page = storage_->allocate(
+            kEntriesPerPage * sizeof(uint64_t), kCacheLineSize,
+            [] { return uint64_t{0}; }, PageEvictionMode::kEnabled);
       }
       data_pages_[pg] = std::move(data_page);
       score_pages_[pg] = std::move(score_page);
@@ -192,6 +200,24 @@ private:
     }
   }
 
+  uint64_t page_score(size_t page) const {
+    size_t first = page * kEntriesPerPage;
+    size_t allocated = allocated_count();
+    if (first >= allocated)
+      return 0;
+    size_t count = std::min(kEntriesPerPage, allocated - first);
+    uint64_t total = 0;
+    for (auto index : std::views::iota(static_cast<uint32_t>(first),
+                                       static_cast<uint32_t>(first + count))) {
+      uint64_t score = std::atomic_ref<uint64_t>(score_raw(index))
+                           .load(std::memory_order_relaxed);
+      if (total > std::numeric_limits<uint64_t>::max() - score)
+        return std::numeric_limits<uint64_t>::max();
+      total += score;
+    }
+    return total;
+  }
+
   std::byte *data_raw(uint32_t index) const {
     return pages_->data[index / kEntriesPerPage].load(
                std::memory_order_acquire) +
@@ -202,7 +228,7 @@ private:
   size_t data_stride_;
   bool enable_score_;
   std::unique_ptr<PageTable> pages_;
-  std::shared_ptr<PageStorage> storage_;
+  PageStorage storage_;
   std::unique_ptr<StoragePage[]> data_pages_;
   std::unique_ptr<StoragePage[]> score_pages_;
   std::atomic<uint32_t> next_index_{0};
@@ -260,11 +286,12 @@ public:
 
   struct KeyShard {
     static constexpr size_t kInitialRecycleCapacity = 64;
+    static constexpr size_t kParlayHashCapacityMultiplier = 4;
 
     size_t reserved_keys;
     Key entries;
     KeyMap key_map;
-    std::mutex insert_mutex;
+    mutable std::shared_mutex map_mutex;
     std::vector<uint32_t> recycled_indices;
     size_t owned_index_count = 0;
 
@@ -273,16 +300,22 @@ public:
           key_map(map_capacity(requested_keys), &entries, false) {}
 
     static size_t map_capacity(size_t keys_count) {
-      if (keys_count > std::numeric_limits<size_t>::max() / 2) {
+      if (keys_count >
+          std::numeric_limits<size_t>::max() / kParlayHashCapacityMultiplier) {
         throw std::overflow_error("key shard capacity overflow");
       }
-      return std::max(size_t(1024), keys_count * 2);
+      return std::max(size_t(1024), keys_count * kParlayHashCapacityMultiplier);
     }
 
-    std::optional<uint32_t> find(uint64_t key) {
+    std::optional<uint32_t> find_unlocked(uint64_t key) {
       return key_map.Find(Key::Entry::make_key(key), [](const auto &entry) {
         return entry.get_entry().second;
       });
+    }
+
+    std::optional<uint32_t> find(uint64_t key) {
+      std::shared_lock lock(map_mutex);
+      return find_unlocked(key);
     }
 
     void prepare_new_index() {
@@ -314,7 +347,8 @@ public:
   };
 
   struct SlotStore {
-    static constexpr size_t kInitialKeysPerShard = 512;
+    static constexpr size_t kInitialKeysPerShard = 2048;
+    static constexpr size_t kEagerPreallocationKeyLimit = 131072;
 
     class ActiveKeyReservation {
     public:
@@ -347,8 +381,7 @@ public:
     uint64_t global_step = 0;
 
     SlotStore(size_t d, size_t max_active_keys, OptimizerFactory opt_factory,
-              size_t num_threads, bool enable_score,
-              std::shared_ptr<PageStorage> storage)
+              size_t num_threads, bool enable_score, PageStorage storage)
         : dim(d), shard_mask(num_threads - 1), arena(d, enable_score, storage),
           optimizer(opt_factory.has_value() ? (*opt_factory)(d) : nullptr),
           opt_factory(opt_factory), max_active_keys(max_active_keys) {
@@ -359,15 +392,20 @@ public:
       if (max_active_keys > arena.max_entries()) {
         throw std::length_error("max_active_keys exceeds arena capacity");
       }
+      if (optimizer.has_value())
+        optimizer->set_page_eviction_enabled(enable_score);
       size_t per_shard = (max_active_keys + num_threads - 1) / num_threads;
+      // Keep normal inserts out of ParlayHash's internal rehash path.
       size_t initial_keys_per_shard = std::min(per_shard, kInitialKeysPerShard);
+      if (max_active_keys <= kEagerPreallocationKeyLimit)
+        initial_keys_per_shard = per_shard;
       for (size_t i = 0; i < num_threads; ++i) {
         key_shards.push_back(
             std::make_unique<KeyShard>(initial_keys_per_shard));
       }
       for (size_t i = 0; i < num_threads; ++i) {
         transient_shards.push_back(std::make_unique<TransientArena<ParamT>>(
-            d, storage, max_active_keys));
+            d, storage, max_active_keys, enable_score));
       }
     }
 
@@ -390,6 +428,7 @@ public:
 
     template <typename Fn> void for_each(Fn &&fn) {
       for (auto &shard : key_shards) {
+        std::shared_lock lock(shard->map_mutex);
         shard->key_map.for_each(fn);
       }
     }
@@ -397,6 +436,7 @@ public:
     size_t size() {
       size_t total = 0;
       for (auto &shard : key_shards) {
+        std::shared_lock lock(shard->map_mutex);
         total += shard->key_map.size();
       }
       return total;
@@ -444,8 +484,8 @@ public:
       if (auto existing = key_shard.find(key))
         return {*existing, false};
 
-      std::lock_guard insert_lock(key_shard.insert_mutex);
-      if (auto existing = key_shard.find(key))
+      std::unique_lock map_lock(key_shard.map_mutex);
+      if (auto existing = key_shard.find_unlocked(key))
         return {*existing, false};
 
       std::optional<uint32_t> preallocated_idx;
@@ -518,6 +558,7 @@ public:
       }
       size_t total_keys = 0;
       for (size_t i = 0; i < counts.size(); ++i) {
+        std::shared_lock map_lock(key_shards[i]->map_mutex);
         size_t current_size = key_shards[i]->key_map.size();
         size_t target_keys = std::max(counts[i], current_size);
         if (target_keys > std::numeric_limits<size_t>::max() - total_keys) {
@@ -530,6 +571,7 @@ public:
         throw std::length_error("reserve exceeds max_active_keys capacity");
       }
       for (size_t i = 0; i < counts.size(); ++i) {
+        std::unique_lock map_lock(key_shards[i]->map_mutex);
         size_t current_size = key_shards[i]->key_map.size();
         size_t target_keys = std::max(counts[i], current_size);
         if (target_keys <= key_shards[i]->reserved_keys) {
@@ -542,6 +584,7 @@ public:
         });
         rebuilt->recycled_indices = std::move(key_shards[i]->recycled_indices);
         rebuilt->owned_index_count = key_shards[i]->owned_index_count;
+        map_lock.unlock();
         key_shards[i] = std::move(rebuilt);
       }
       size_t arena_capacity =
@@ -553,18 +596,74 @@ public:
     }
   };
 
+  // =========================================================================
+  // StorePageEvictionProxy — PageEvictionProxy implementation that aggregates
+  // per-entry scores within each 4096-entry Arena page to produce a page-level
+  // heat score.  Registered with PageStorage so the background swap thread
+  // can determine cold pages without any hot-path overhead.
+  //
+  // page_idx is the monotonically-assigned index stored in PageRecord. Each
+  // arena data and score page registers its own evaluator under that index.
+  // =========================================================================
+  class StorePageEvictionProxy {
+  public:
+    explicit StorePageEvictionProxy(
+        std::shared_ptr<std::shared_mutex> lifecycle_mutex)
+        : lifecycle_mutex_(std::move(lifecycle_mutex)) {}
+
+    bool evaluate_page(size_t page_idx, uint64_t &score) {
+      std::function<uint64_t()> evaluator;
+      {
+        std::lock_guard lock(mutex_);
+        auto it = evaluators_.find(page_idx);
+        if (it == evaluators_.end())
+          return false;
+        evaluator = it->second;
+      }
+      score = evaluator();
+      return true;
+    }
+
+    void register_page(size_t page_idx, std::function<uint64_t()> evaluator) {
+      std::lock_guard lock(mutex_);
+      evaluators_[page_idx] = std::move(evaluator);
+    }
+
+    void unregister_page(size_t page_idx) noexcept {
+      std::lock_guard lock(mutex_);
+      evaluators_.erase(page_idx);
+    }
+
+    bool score_enabled() const noexcept { return true; }
+
+    void lock_shared() { lifecycle_mutex_->lock_shared(); }
+    void unlock_shared() noexcept { lifecycle_mutex_->unlock_shared(); }
+    void lock() { lifecycle_mutex_->lock(); }
+    void unlock() noexcept { lifecycle_mutex_->unlock(); }
+
+  private:
+    std::shared_ptr<std::shared_mutex> lifecycle_mutex_;
+    std::mutex mutex_;
+    std::unordered_map<size_t, std::function<uint64_t()>> evaluators_;
+  };
+
   explicit HogwildEmbeddingStore(
       const std::vector<size_t> &table_dims, size_t num_threads = 0,
       Initializer initializer = {}, size_t max_active_keys = 1 << 20,
       OptimizerFactory opt_factory = nullptr, ScorePolicyT score_policy = {},
-      uint8_t slot_bits = 16, std::shared_ptr<PageStorage> storage = nullptr)
+      uint8_t slot_bits = 16, PageStorage storage = create_page_storage())
       : num_threads_(num_threads > 0
                          ? num_threads
                          : std::max(1u, std::thread::hardware_concurrency())),
         pool_(static_cast<uint32_t>(num_threads_)),
         initializer_(std::move(initializer)),
-        score_policy_(std::move(score_policy)),
-        storage_(storage ? std::move(storage) : PageStorage::create()) {
+        score_policy_(std::move(score_policy)), storage_(std::move(storage)),
+        background_page_eviction_enabled_(
+            ScorePolicyT::kHasScore &&
+            storage_->supports_background_page_eviction()),
+        lifecycle_mutex_(background_page_eviction_enabled_
+                             ? storage_->lifecycle_mutex()
+                             : std::make_shared<std::shared_mutex>()) {
     uint32_t p2 = 1;
     while (p2 < num_threads_) {
       p2 <<= 1;
@@ -577,11 +676,7 @@ public:
       throw std::invalid_argument("table_dims must not be empty");
     }
 
-    size_t max_d = 0;
-    for (size_t dim : table_dims) {
-      if (dim > max_d)
-        max_d = dim;
-    }
+    size_t max_d = std::ranges::max(table_dims);
     if (max_d > 1048576) {
       throw std::invalid_argument("dim is too large (max 1048576)");
     }
@@ -599,6 +694,22 @@ public:
         dim_to_slot_[dim] = slot_storage_.back().get();
       }
     }
+
+    if (background_page_eviction_enabled_) {
+      auto proxy =
+          pro::make_proxy_shared<PageEvictionProxyFacade,
+                                 StorePageEvictionProxy>(lifecycle_mutex_);
+      page_eviction_registration_ =
+          storage_->set_page_eviction_proxy(std::move(proxy));
+    }
+  }
+
+  ~HogwildEmbeddingStore() {
+    if (page_eviction_registration_.value != 0)
+      storage_->clear_page_eviction_proxy(page_eviction_registration_);
+    std::unique_lock lifecycle_lock(*lifecycle_mutex_);
+    slot_storage_.clear();
+    dim_to_slot_.clear();
   }
 
   size_t max_dim() const { return max_dim_; }
@@ -615,7 +726,7 @@ public:
   std::error_code forward_lookup(std::span<const K> keys,
                                  std::span<ParamT> out_flat_values,
                                  std::span<const int64_t> row_lengths) {
-    std::shared_lock lifecycle_lock(lifecycle_mutex_);
+    std::shared_lock lifecycle_lock(*lifecycle_mutex_);
     size_t n = keys.size();
     auto offsets = compute_offsets(row_lengths);
 
@@ -625,6 +736,7 @@ public:
           if (i + 16 < end) {
             __builtin_prefetch(&keys[i + 16], 0, 1);
             __builtin_prefetch(&row_lengths[i + 16], 0, 1);
+            __builtin_prefetch(&offsets[i + 16], 0, 1);
             __builtin_prefetch(out_flat_values.data() + offsets[i + 16], 1, 1);
           }
           uint64_t key = static_cast<uint64_t>(keys[i]);
@@ -669,64 +781,76 @@ public:
   std::error_code accumulate_gradients(std::span<const K> keys,
                                        std::span<const ParamT> flat_grads,
                                        std::span<const int64_t> row_lengths) {
-    std::shared_lock lifecycle_lock(lifecycle_mutex_);
+    std::shared_lock lifecycle_lock(*lifecycle_mutex_);
     std::lock_guard training_lock(training_mutex_);
     size_t n = keys.size();
     auto offsets = compute_offsets(row_lengths);
 
     size_t num_shards = num_threads_;
 
-    // NOTE: These buffers are NOT thread_local because they are written by
-    // worker threads (via dispatch_parallel) and read on the main thread.
-    // Using thread_local here would silently read wrong data.
-    std::vector<uint32_t> thread_counts(num_shards * num_shards, 0);
+    if (num_shards > std::numeric_limits<size_t>::max() / num_shards ||
+        num_shards * num_shards >
+            std::numeric_limits<size_t>::max() / sizeof(uint32_t)) {
+      throw std::overflow_error("shard workspace size overflow");
+    }
+    size_t workspace_size = num_shards * num_shards;
+    gradient_thread_counts_.resize(workspace_size);
+    std::fill(gradient_thread_counts_.begin(), gradient_thread_counts_.end(),
+              0);
+
     SplitMixHash<K> hasher;
+
+    // Shared SIMD and scalar visitor keeps both paths identical.
+    auto process_keys_simd = [&](size_t start, size_t end, auto &&visitor) {
+      size_t i = start;
+      if constexpr (sizeof(K) == 8) {
+#if defined(__AVX512F__) && defined(__AVX512DQ__)
+        __m512i v_mask = _mm512_set1_epi64(num_shards - 1);
+        for (; i + 8 <= end; i += 8) {
+          __m512i v_keys =
+              _mm512_loadu_si512(reinterpret_cast<const void *>(&keys[i]));
+          __m512i v_hash = hasher.simd_hash(v_keys);
+          __m512i v_shards = _mm512_and_si512(v_hash, v_mask);
+
+          uint64_t extracted[8] __attribute__((aligned(64)));
+          _mm512_storeu_si512(extracted, v_shards);
+
+          for (int j = 0; j < 8; ++j) {
+            visitor(i + j, static_cast<uint32_t>(extracted[j]));
+          }
+        }
+#endif
+      }
+      for (; i < end; ++i) {
+        uint64_t key = static_cast<uint64_t>(keys[i]);
+        uint32_t shard = hasher(key) & (num_shards - 1);
+        visitor(i, shard);
+      }
+    };
 
     // 1. Parallel Count
     auto do_count = [&](size_t t_begin, size_t t_end) {
       for (size_t t = t_begin; t < t_end; ++t) {
         size_t start = t * n / num_shards;
         size_t end = (t + 1) * n / num_shards;
-        size_t i = start;
-
-        if constexpr (sizeof(K) == 8) {
-#if defined(__AVX512F__) && defined(__AVX512DQ__)
-          __m512i v_mask = _mm512_set1_epi64(num_shards - 1);
-          for (; i + 8 <= end; i += 8) {
-            __m512i v_keys =
-                _mm512_loadu_si512(reinterpret_cast<const void *>(&keys[i]));
-            __m512i v_hash = hasher.simd_hash(v_keys);
-            __m512i v_shards = _mm512_and_si512(v_hash, v_mask);
-
-            uint64_t extracted[8] __attribute__((aligned(64)));
-            _mm512_storeu_si512(extracted, v_shards);
-
-            for (int j = 0; j < 8; ++j) {
-              thread_counts[t * num_shards + extracted[j]]++;
-            }
-          }
-#endif
-        }
-        for (; i < end; ++i) {
-          uint64_t key = static_cast<uint64_t>(keys[i]);
-          uint32_t shard = hasher(key) & (num_shards - 1);
-          thread_counts[t * num_shards + shard]++;
-        }
+        process_keys_simd(start, end, [&](size_t /*idx*/, uint32_t shard) {
+          gradient_thread_counts_[t * num_shards + shard]++;
+        });
       }
     };
     dispatch_parallel(num_shards, do_count, 1);
 
     // 2. Prefix Sum (Sequential)
-    std::vector<uint32_t> thread_offsets(num_shards * num_shards);
-    std::vector<uint32_t> shard_offsets(num_shards + 1, 0);
+    gradient_thread_offsets_.resize(workspace_size);
+    gradient_shard_offsets_.assign(num_shards + 1, 0);
 
     for (size_t s = 0; s < num_shards; ++s) {
-      uint32_t current_offset = shard_offsets[s];
+      uint32_t current_offset = gradient_shard_offsets_[s];
       for (size_t t = 0; t < num_shards; ++t) {
-        thread_offsets[t * num_shards + s] = current_offset;
-        current_offset += thread_counts[t * num_shards + s];
+        gradient_thread_offsets_[t * num_shards + s] = current_offset;
+        current_offset += gradient_thread_counts_[t * num_shards + s];
       }
-      shard_offsets[s + 1] = current_offset;
+      gradient_shard_offsets_[s + 1] = current_offset;
     }
 
     // 3. Parallel Scatter
@@ -744,45 +868,24 @@ public:
       for (size_t t = t_begin; t < t_end; ++t) {
         size_t start = t * n / num_shards;
         size_t end = (t + 1) * n / num_shards;
-        size_t i = start;
-
-        if constexpr (sizeof(K) == 8) {
-#if defined(__AVX512F__) && defined(__AVX512DQ__)
-          __m512i v_mask = _mm512_set1_epi64(num_shards - 1);
-          for (; i + 8 <= end; i += 8) {
-            __m512i v_keys =
-                _mm512_loadu_si512(reinterpret_cast<const void *>(&keys[i]));
-            __m512i v_hash = hasher.simd_hash(v_keys);
-            __m512i v_shards = _mm512_and_si512(v_hash, v_mask);
-
-            uint64_t extracted[8] __attribute__((aligned(64)));
-            _mm512_store_si512(extracted, v_shards);
-
-            for (int j = 0; j < 8; ++j) {
-              shuffled_indices[thread_offsets[t * num_shards +
-                                              extracted[j]]++] = i + j;
-            }
-          }
-#endif
-        }
-        for (; i < end; ++i) {
-          uint64_t key = static_cast<uint64_t>(keys[i]);
-          uint32_t shard = hasher(key) & (num_shards - 1);
-          shuffled_indices[thread_offsets[t * num_shards + shard]++] = i;
-        }
+        process_keys_simd(start, end, [&](size_t idx, uint32_t shard) {
+          shuffled_indices[gradient_thread_offsets_[t * num_shards + shard]++] =
+              idx;
+        });
       }
     };
     dispatch_parallel(num_shards, do_scatter, 1);
 
     auto do_shard = [&](size_t shard_begin, size_t shard_end) {
       for (size_t shard_id = shard_begin; shard_id < shard_end; ++shard_id) {
-        size_t start = shard_offsets[shard_id];
-        size_t end = shard_offsets[shard_id + 1];
+        size_t start = gradient_shard_offsets_[shard_id];
+        size_t end = gradient_shard_offsets_[shard_id + 1];
         for (size_t idx = start; idx < end; ++idx) {
           if (idx + 16 < end) {
             __builtin_prefetch(&shuffled_indices[idx + 16], 0, 1);
             uint32_t prefetch_i = shuffled_indices[idx + 16];
             __builtin_prefetch(&keys[prefetch_i], 0, 1);
+            __builtin_prefetch(&offsets[prefetch_i], 0, 1);
             __builtin_prefetch(flat_grads.data() + offsets[prefetch_i], 0, 1);
           }
           uint32_t i = shuffled_indices[idx];
@@ -823,7 +926,7 @@ public:
   // =========================================================================
 
   std::error_code optimizer_step() {
-    std::shared_lock lifecycle_lock(lifecycle_mutex_);
+    std::shared_lock lifecycle_lock(*lifecycle_mutex_);
     std::lock_guard training_lock(training_mutex_);
     for (const auto &slot_ptr : slot_storage_) {
       auto *slot = slot_ptr.get();
@@ -882,7 +985,7 @@ public:
   std::error_code assign(std::span<const K> keys,
                          std::span<const ParamT> flat_values,
                          std::span<const int64_t> row_lengths) {
-    std::shared_lock lifecycle_lock(lifecycle_mutex_);
+    std::shared_lock lifecycle_lock(*lifecycle_mutex_);
     size_t n = keys.size();
     auto offsets = compute_offsets(row_lengths);
 
@@ -916,7 +1019,7 @@ public:
                                    std::span<ParamT> out_flat_values,
                                    std::span<const int64_t> row_lengths,
                                    std::span<uint8_t> out_inserted_mask) {
-    std::shared_lock lifecycle_lock(lifecycle_mutex_);
+    std::shared_lock lifecycle_lock(*lifecycle_mutex_);
     size_t n = keys.size();
     auto offsets = compute_offsets(row_lengths);
 
@@ -953,7 +1056,7 @@ public:
   template <typename K>
   std::error_code contains(std::span<const K> keys,
                            std::span<uint8_t> out_exists) {
-    std::shared_lock lifecycle_lock(lifecycle_mutex_);
+    std::shared_lock lifecycle_lock(*lifecycle_mutex_);
     size_t n = keys.size();
     auto do_range = [&](size_t begin, size_t end) {
       epoch::with_epoch([&] {
@@ -975,7 +1078,7 @@ public:
   }
 
   template <typename K> std::error_code erase(std::span<const K> keys) {
-    std::unique_lock lifecycle_lock(lifecycle_mutex_);
+    std::unique_lock lifecycle_lock(*lifecycle_mutex_);
     size_t n = keys.size();
     auto do_range = [&](size_t begin, size_t end) {
       epoch::with_epoch([&] {
@@ -983,11 +1086,11 @@ public:
           uint64_t key = static_cast<uint64_t>(keys[i]);
           for (const auto &slot_ptr : slot_storage_) {
             auto &shard = slot_ptr->shard_for_key(key);
+            std::unique_lock map_lock(shard.map_mutex);
             auto removed = shard.key_map.Remove(
                 Key::Entry::make_key(key),
                 [](const auto &entry) { return entry.get_entry().second; });
             if (removed.has_value()) {
-              std::lock_guard recycle_lock(shard.insert_mutex);
               shard.recycled_indices.push_back(*removed);
               slot_ptr->release_active_key();
             }
@@ -1000,7 +1103,7 @@ public:
   }
 
   std::error_code clear() {
-    std::unique_lock lifecycle_lock(lifecycle_mutex_);
+    std::unique_lock lifecycle_lock(*lifecycle_mutex_);
     for (const auto &slot_ptr : slot_storage_) {
       auto *slot = slot_ptr.get();
       slot->clear_keys();
@@ -1011,19 +1114,21 @@ public:
       slot->optimizer = slot->opt_factory.has_value()
                             ? (*slot->opt_factory)(slot->dim)
                             : nullptr;
+      if (slot->optimizer.has_value())
+        slot->optimizer->set_page_eviction_enabled(ScorePolicyT::kHasScore);
     }
     return {};
   }
 
   std::error_code reserve(size_t keys_count, size_t dim) {
-    std::unique_lock lifecycle_lock(lifecycle_mutex_);
+    std::unique_lock lifecycle_lock(*lifecycle_mutex_);
     slot_for_dim(dim).reserve(keys_count);
     return {};
   }
 
   std::error_code reserve_per_shard(std::span<const size_t> counts,
                                     size_t dim) {
-    std::unique_lock lifecycle_lock(lifecycle_mutex_);
+    std::unique_lock lifecycle_lock(*lifecycle_mutex_);
     slot_for_dim(dim).reserve_per_shard(counts);
     return {};
   }
@@ -1033,7 +1138,7 @@ public:
   template <typename K>
   std::error_code assign_scores(std::span<const K> keys,
                                 std::span<const uint64_t> scores) {
-    std::shared_lock lifecycle_lock(lifecycle_mutex_);
+    std::shared_lock lifecycle_lock(*lifecycle_mutex_);
     if constexpr (!ScorePolicyT::kHasScore) {
       throw std::runtime_error("assign_scores requires a score-enabled policy");
     }
@@ -1060,7 +1165,7 @@ public:
   }
 
   size_t size() const {
-    std::shared_lock lifecycle_lock(lifecycle_mutex_);
+    std::shared_lock lifecycle_lock(*lifecycle_mutex_);
     size_t s = 0;
     for (const auto &slot_ptr : slot_storage_) {
       s += slot_ptr->size();
@@ -1087,7 +1192,7 @@ private:
       size_t num_threads = num_threads_;
       size_t chunk_size = (n + num_threads - 1) / num_threads;
       stdexec::sync_wait(stdexec::schedule(pool_.get_scheduler()) |
-                         stdexec::bulk(stdexec::par_unseq, num_threads,
+                         stdexec::bulk(stdexec::par, num_threads,
                                        [&fn, n, chunk_size](size_t i) {
                                          size_t begin =
                                              std::min(i * chunk_size, n);
@@ -1105,11 +1210,11 @@ private:
   std::vector<size_t>
   compute_offsets(std::span<const int64_t> row_lengths) const {
     std::vector<size_t> offsets(row_lengths.size());
-    size_t total = 0;
-    for (size_t i = 0; i < row_lengths.size(); ++i) {
-      offsets[i] = total;
-      total += static_cast<size_t>(row_lengths[i]);
-    }
+    auto casted = row_lengths | std::views::transform([](int64_t v) {
+                    return static_cast<size_t>(v);
+                  });
+    std::exclusive_scan(casted.begin(), casted.end(), offsets.begin(),
+                        size_t{0});
     return offsets;
   }
 
@@ -1117,7 +1222,7 @@ private:
 
   template <ExportOwnership Policy, typename VisitorFn>
   void export_with_opt_impl(VisitorFn &&visitor, size_t batch_size) {
-    std::shared_lock lifecycle_lock(lifecycle_mutex_);
+    std::shared_lock lifecycle_lock(*lifecycle_mutex_);
     for (const auto &slot_ptr : slot_storage_) {
       auto *slot = slot_ptr.get();
       size_t emb_dim = slot->dim;
@@ -1305,9 +1410,14 @@ private:
   exec::static_thread_pool pool_;
   Initializer initializer_;
   ScorePolicyT score_policy_;
-  std::shared_ptr<PageStorage> storage_;
-  mutable std::shared_mutex lifecycle_mutex_;
+  PageStorage storage_;
+  bool background_page_eviction_enabled_;
+  std::shared_ptr<std::shared_mutex> lifecycle_mutex_;
+  PageEvictionRegistration page_eviction_registration_;
   std::mutex training_mutex_;
+  std::vector<uint32_t> gradient_thread_counts_;
+  std::vector<uint32_t> gradient_thread_offsets_;
+  std::vector<uint32_t> gradient_shard_offsets_;
   size_t max_dim_ = 0;
   static constexpr size_t kParallelThreshold = 64;
 
@@ -1337,7 +1447,7 @@ public:
                         std::span<const uint64_t>)>
           visitor,
       size_t batch_size) {
-    std::shared_lock lifecycle_lock(lifecycle_mutex_);
+    std::shared_lock lifecycle_lock(*lifecycle_mutex_);
     bool has_score = ScorePolicyT::kHasScore;
 
     for (const auto &slot_ptr : slot_storage_) {
@@ -1498,7 +1608,7 @@ public:
   void assign_opt_states(std::span<const uint64_t> keys,
                          std::span<const OptT> opt_states,
                          std::span<const uint32_t> steps) {
-    std::shared_lock lifecycle_lock(lifecycle_mutex_);
+    std::shared_lock lifecycle_lock(*lifecycle_mutex_);
     size_t n = keys.size();
     if (n == 0)
       return;
@@ -1580,7 +1690,7 @@ public:
                                  std::span<K> out_evicted_keys,
                                  std::span<ParamT> out_evicted_values,
                                  size_t &out_evicted_count) {
-    std::unique_lock lifecycle_lock(lifecycle_mutex_);
+    std::unique_lock lifecycle_lock(*lifecycle_mutex_);
     if constexpr (!ScorePolicyT::kHasScore)
       throw std::runtime_error(
           "evict_by_score requires a score-enabled policy");
@@ -1649,7 +1759,7 @@ public:
       }
 
       // Sort ascending by score — lowest score evicted first.
-      std::sort(global_candidates.begin(), global_candidates.end());
+      std::ranges::sort(global_candidates);
 
       epoch::with_epoch([&] {
         for (auto &[score, key] : global_candidates) {
@@ -1667,6 +1777,7 @@ public:
                         out_evicted_values.data() + out_evicted_count * dim);
           }
           auto &shard = slot->shard_for_key(key);
+          std::unique_lock map_lock(shard.map_mutex);
           auto removed = shard.key_map.Remove(
               Key::Entry::make_key(key),
               [](const auto &entry) { return entry.get_entry().second; });

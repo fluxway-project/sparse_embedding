@@ -1,147 +1,99 @@
 # sparse_embedding
 
-High-performance Sparse Embedding Table library—designed for large-scale recommendation system training, based on the Hogwild! lock-free concurrent architecture.
+[中文](README_zh.md)
+
+High-performance Sparse Embedding Table library for large-scale recommendation system training, using Hogwild-style relaxed updates, shard-local hash-map synchronization, and paged storage.
 
 ## Core Features
 
-- **Lock-free Concurrency**: Implements Key→Index O(1) lock-free concurrent read/write based on `parlayhash` (Parlay Parallel Hash Map).
+- **Shard-Local Concurrency**: Uses `parlayhash` for expected O(1) Key→Index access, with shared/exclusive locks scoped to one shard so independent shards continue in parallel during insert, erase, rebuild, and expansion.
 - **SIMD Acceleration**: AVX-512 vectorized hash computation and gradient Scatter operations.
 - **Hogwild! Gradient Accumulation**: Sharded TransientArena for lock-free gradient aggregation, avoiding cross-thread synchronization.
-- **C++26 Standard Concurrency**: Standard Sender/Receiver task scheduling based on NVIDIA `stdexec` + `exec::static_thread_pool`.
+- **C++23 Standard Concurrency**: Sender/Receiver task scheduling based on NVIDIA `stdexec` + `exec::static_thread_pool`.
 - **Epoch Memory Safety**: Batch protection for concurrent hash map read/write using `epoch::with_epoch`, avoiding ABA problems.
 - **Distributed Lance Checkpointing**: Native distributed two-phase commit Lance backend with zero-copy PyArrow exports, independently storing embeddings and optimizer states for ultra-fast distributed storage and retrieval.
 - **Dynamic Partitioner OPs**: High-performance C++ Partitioners (`ModuloPartitioner`, `HashPartitioner`, `FastRangePartitioner`) supporting efficient feature routing and on-the-fly cluster resharding during checkpoint loading.
 - **Eviction Management**: Memory-efficient scoring policies (e.g., LFU) using thread-safe `std::atomic_ref` for concurrent state updates without locking.
+- **Page-Level Hot/Cold Swapping**: Background eviction of cold data pages through address-stable `MAP_FIXED` remapping to file-backed storage based on configurable memory watermarks.
 
 ## System Dependencies
 
 | Component | Version |
 |------|------|
-| GCC | ≥ 15.0 (Requires C++26 constexpr exceptions support) |
+| GCC | ≥ 13.4 (validated) |
 | stdexec | NVIDIA main branch `931f256c` |
 | parlayhash | main branch (including 56-bit pointer mask patch) |
 | lance-c | main branch (Rust-based C shared library) |
 | Rust | 1.70+ (2024 Edition) |
 | Bazel | ≥ 7.0 |
 
-> **Note**: GCC 13 and below do not support `__cpp_constexpr_exceptions`, causing `stdexec`'s `sender_in` concept checks to fail, rendering `sync_wait` / `start_detached` unusable. GCC 15+ is required.
+The Bazel configuration compiles C++ sources with `-std=c++2b`. The current acceptance build uses GCC 13.4 and Bazel 7.7.
 
 ---
 
 ## Performance Benchmarks
 
-### Test Environment
+### Benchmark Machine
 
-| Item | Specification |
-|------|------|
-| **CPU** | Intel® Xeon® Silver 4116 × 2 Socket |
-| **Physical Cores** | 12 cores/socket × 2 = **24 cores**, **48 vCPUs** with Hyper-Threading |
-| **CPU Frequency** | 2.10 GHz (Turbo 2.40 GHz) |
-| **L1d Cache** | 768 KiB |
-| **L2 Cache** | 24 MiB |
-| **L3 Cache** | 33 MiB (per socket) |
-| **NUMA** | 2 nodes, inter-node latency ratio 2.1x (node 0: 64 GB, node 1: 64 GB) |
-| **Memory** | 128 GiB DDR4 |
-| **OS** | Ubuntu 20.04 |
-| **Compiler** | GCC 15.2.0, `-O2 -march=native` |
+| Item | Measured configuration |
+|---|---|
+| CPU | 2 x Intel Xeon Silver 4116, nominal 2.10 GHz |
+| Topology | 12 cores/socket, 2 threads/core, 24 physical cores, 48 online logical CPUs |
+| NUMA | 2 nodes; node 0 CPUs `0-11,24-35`, node 1 CPUs `12-23,36-47` |
+| Cache | 768 KiB L1d, 768 KiB L1i, 24 MiB L2, 33 MiB L3 across reported instances |
+| Memory | 125 GiB visible to the OS; swap disabled |
+| OS | Ubuntu 24.04.4 LTS, x86-64 |
+| Toolchain | GCC 13.4, Bazel 7.7, C++23 (`-std=c++2b`), `-c opt` |
+| Optimization flags | `-O3 -march=native -mtune=native -mavx512bf16 -fno-strict-aliasing -DNDEBUG`; link with `-flto` |
+| CPU affinity | Not pinned for this snapshot |
 
-### Test Scenarios
-
-Simulating realistic recommendation system training scenarios:
+### C++ Production Scenario
 
 | Parameter | Value |
-|------|-----|
-| Embedding dimension (dim) | 128 floats (512 bytes) |
-| Vocabulary size (vocab) | 500,000 unique keys |
-| Batch size | 65,536 |
-| Access distribution | Power-law: top-10% keys account for 80% traffic |
-| Slot count | 1 |
+|---|---|
+| Embedding dimension | 128 `float` values (512 bytes) |
+| Vocabulary | 500,000 `uint64_t` keys; one slot |
+| Batch | 65,536 keys |
+| Access distribution | Generated operation batches use 80% traffic to the hottest 10%; erase keys are uniform |
+| Random seed | 42 |
+| Thread counts | 1, 4, 8, 16, 32, 64 |
+| Capacity | `max_active_keys=1,000,000`; `reserve(500000, 128)` before timing |
+| Optimizer | Benchmark SGD, learning rate 0.01 |
+| Timed operations | lookup/insert, forward lookup, assign, gradient accumulation, optimizer step, contains, erase |
 
-### Throughput Results
+The LFU pressure scenario uses dimension 128, 16,384 possible keys, a 4,096-key batch, two workers, `max_active_keys=20,000`, seed 42, the same 80/20 hot/cold distribution, benchmark SGD at 0.01, a 5 MiB memory limit, a 1 GiB spill limit, and 0.8/0.6 watermarks. It executes four timed repetitions of lookup, assign, gradient accumulation, and optimizer step with background eviction enabled. Telemetry collected after a 100 ms wait proves eviction eventually triggered; it does not prove overlap with the timed interval.
 
-> Unit: **Mops/s** (Million operations / second); `forward_lookup` / `assign` also mark memory bandwidth (GB/s)
+The latest reproducibility snapshot was collected on 2026-07-21. This C++ snapshot is one benchmark execution with internal repetitions; it is not the five-run, affinity-pinned baseline/optimized protocol.
 
-#### `forward_lookup` (Inference Forward, Hot Path)
+| Reported benchmark section (Mops/s) | 1T | 4T | 8T | 16T | 32T | 64T |
+|---|---:|---:|---:|---:|---:|---:|
+| `lookup_or_insert` | 1.84 | 1.26 | 1.88 | 3.18 | 4.35 | 4.20 |
+| `forward_lookup` | 2.90 | 5.34 | 7.91 | 10.18 | 12.10 | 11.61 |
+| `assign` | 1.98 | 1.55 | 2.46 | 3.91 | 5.46 | 6.02 |
+| `accumulate_gradients` | 2.35 | 6.30 | 8.60 | 10.37 | 11.54 | 10.80 |
+| `optimizer_step` | 5.53 | 12.99 | 20.66 | 27.77 | 32.54 | 30.30 |
+| `contains` | 6.25 | 5.90 | 8.62 | 11.13 | 15.59 | 16.86 |
+| `erase` (10% batch) | 8.05 | 4.06 | 5.53 | 8.41 | 13.08 | 16.99 |
 
-| Operation | 1T | 4T | 8T | 16T | 32T | 64T |
-|------|----|----|----|-----|-----|-----|
-| forward_lookup | 3.24 Mops/s (1.66 GB/s) | 7.37 Mops/s (3.77 GB/s) | 11.23 Mops/s (5.75 GB/s) | 12.54 Mops/s (6.42 GB/s) | 15.08 Mops/s (7.72 GB/s) | 12.91 Mops/s (6.61 GB/s) |
+These are not isolated API timings. Random batch generation is inside the timer for lookup/insert, forward lookup, assign, gradient accumulation, and contains. The reported optimizer section also includes generation and accumulation of the next gradient batch while using current store size as its throughput numerator, so that row must not be interpreted as standalone optimizer throughput. Erase repeats one key set ten times without reinsertion, so later repetitions primarily measure the not-found path.
 
-`forward_lookup` saturates around 16-32T, with an observed peak of 6.94 GB/s.
+The LFU storage-pressure path reported 2.75 Mops/s, two eventual swap-outs, four evaluated pages, and 9,616 ns cumulative selection time. The Python pressure benchmark measured 4.69 Mops/s for a synchronous training step; asynchronous lookup, assign, and optimizer step measured 12.38, 13.45, and 17.16 Mops/s respectively.
 
-**Note**: This is NOT DRAM bandwidth saturation (theoretical peak is 230.4 GB/s, actual utilization is only 3%), but rather a **random access latency bottleneck**:
-- Each embedding lookup requires random access to 512 bytes (8 cache lines) in the arena, DRAM access latency ~90 ns
-- Single-thread random read bandwidth limit: 64B / 90ns ≈ **0.71 GB/s**
-- Reaching theoretical bandwidth requires maintaining ~324 outstanding misses simultaneously, whereas Xeon Silver 4116 has only ~12 MSHRs per core
-- Adding more threads cannot increase throughput because the DRAM controller's outstanding request queue is full, not because the bus bandwidth is insufficient
-
-#### `lookup_or_insert` (Training Insert, Write Hot Path)
-
-| Operation | 1T | 4T | 8T | 16T | 32T | 64T |
-|------|----|----|----|-----|-----|-----|
-| lookup_or_insert | 1.48 Mops/s | 2.60 Mops/s | 4.02 Mops/s | 4.88 Mops/s | 5.06 Mops/s | 5.17 Mops/s |
-
-1→8T shows a 3.6x linear speedup; post-8T, it saturates due to parlayhash CAS contention and DRAM write bandwidth limits.
-
-#### `assign` (Parameter Assignment)
-
-| Operation | 1T | 4T | 8T | 16T | 32T | 64T |
-|------|----|----|----|-----|-----|-----|
-| assign | 1.49 Mops/s (0.76 GB/s) | 3.19 Mops/s (1.63 GB/s) | 4.93 Mops/s (2.52 GB/s) | 5.90 Mops/s (3.02 GB/s) | 6.15 Mops/s (3.15 GB/s) | 6.28 Mops/s (3.21 GB/s) |
-
-#### `accumulate_gradients` (Gradient Accumulation, Backward Pass)
-
-| Operation | 1T | 4T | 8T | 16T | 32T | 64T |
-|------|----|----|----|-----|-----|-----|
-| accumulate_gradients | 2.11 Mops/s | 5.76 Mops/s | 8.81 Mops/s | 11.33 Mops/s | 11.06 Mops/s | 10.66 Mops/s |
-
-Note: `accumulate_gradients` uses AVX-512 SIMD sharded Scatter-Reduce. With the fixed thread-pool threshold and thread-local buffers, the throughput scales efficiently up to 16-32 threads.
-
-#### `optimizer_step` (Parameter Update)
-
-| Operation | 1T | 4T | 8T | 16T | 32T | 64T |
-|------|----|----|----|-----|-----|-----|
-| optimizer_step | 5.67 Mops/s (5.80 GB/s) | 12.99 Mops/s (13.30 GB/s) | 19.82 Mops/s (20.30 GB/s) | 30.73 Mops/s (31.47 GB/s) | **31.15 Mops/s (31.90 GB/s)** | 28.95 Mops/s (29.65 GB/s) |
-
-Note: `optimizer_step` processes the accumulated unique key set (approx. 252K). With proper parallel dispatch and removal of data races, the update scales impressively to 25.06 GB/s at 32 threads.
-
-#### `contains` (Existence Check)
-
-| Operation | 1T | 4T | 8T | 16T | 32T | 64T |
-|------|----|----|----|-----|-----|-----|
-| contains | 9.40 Mops/s | 16.57 Mops/s | 20.69 Mops/s | 22.48 Mops/s | 23.64 Mops/s | 22.65 Mops/s |
-
-Pure hash lookup without embedding copies, limited by CPU and hash table bucket access latency, nears saturation after 8T.
-
-#### `erase` (Entry Deletion, 10% Batch)
-
-| Operation | 1T | 4T | 8T | 16T | 32T | 64T |
-|------|----|----|----|-----|-----|-----|
-| erase (10% batch) | 12.39 Mops/s | 34.61 Mops/s | 63.85 Mops/s | 61.76 Mops/s | 49.25 Mops/s | 27.92 Mops/s |
-
-`erase` reaches its peak at 8T (64.49 Mops/s), and begins to decline due to NUMA cross-socket contention under Hyper-Threading.
-
-### Python API Performance
-
-The following throughputs were measured by calling the corresponding interfaces in Python (via `nanobind` and DLPack zero-copy wrappers). These numbers include Python/C++ context switching and asyncio scheduling overheads:
-
-| API | Throughput (Mops/s) | Description |
-|-----|---------------------|-------------|
-| `async_unique` | ~25.58 Mops/s | Async fetch of unique keys, ultra-fast hashing |
-| `async_lookup_or_insert` | ~22.72 Mops/s | Async insert and lookup, returning zero-copy tensors |
-| `async_lookup` | ~27.40 Mops/s | Async forward lookup without blocking the event loop |
-| `async_assign` (Zipfian) | ~2.85 Mops/s | Async assignment under heavy power-law distribution |
-| **End-to-End Step** | **~3.87 Mops/s** | Full training step using full asyncio ops |
-
-All `EmbeddingStore` methods (e.g. `lookup_or_insert`, `assign`, `contains`, `erase`, `clear`, `assign_scores`, `accumulate_gradients`, `optimizer_step`) have high-performance, edge-triggered `async_*` variants. Thanks to DLPack and lock-free `eventfd` asyncio integration, the Python invocation overhead is minimized, easily sustaining millions of operations per second.
+These are reproducibility snapshots, not portable performance guarantees. See [Storage, Concurrency, and Performance](docs/storage_and_performance.md) for workload definitions, telemetry semantics, and verification commands.
 
 ### Automatic Storage Management
 
-No storage configuration is required. `EmbeddingStore` detects system and cgroup memory limits, process resource limits, filesystem capacity, and local device characteristics. Cache-line-aligned pages stay in RAM while the safe memory budget has capacity; additional pages use an unlinked file-backed mapping on the best available local disk.
+No storage configuration is required. `EmbeddingStore` detects system and cgroup memory limits, process resource limits, filesystem capacity, and local device characteristics. Cache-line-aligned pages stay in RAM while the safe memory budget has capacity.
+
+A condition-variable-driven background thread tracks configurable watermarks (`high_watermark` and `low_watermark`, defaulting to 0.8 and 0.6). It does not poll periodically or probabilistically skip required eviction. At the high watermark, a score-enabled eviction proxy evaluates candidates and swaps cold pages through `MAP_FIXED` to an unlinked file-backed mapping until memory reaches the low watermark.
+
+Selection is exact for at most 1,024 evictable pages. Larger sets evaluate at most 256 unique sampled pages per pass and continue making passes until the low watermark is reached. Candidate snapshots and proxy generations prevent stale candidates from being applied, and scoring runs without holding the storage mutex.
 
 The first disk-backed page emits `SparseEmbeddingSpillWarning` to stderr. `storage_stats()` also raises a standard Python warning once and returns current memory and spill usage:
 
 ```python
+import sparse_embedding
+
 config = sparse_embedding.EmbeddingConfig(dims=[128])
 store = sparse_embedding.EmbeddingStore(config)
 print(store.storage_stats())
@@ -150,6 +102,13 @@ print(store.storage_stats())
 `spill_count` counts disk-backed page allocations, including reused file
 extents. It is not a count of distinct memory-pressure episodes.
 
+`storage_stats()` also reports `swap_out_count`, `eviction_selection_count`,
+`eviction_evaluated_pages`, `eviction_selection_ns`, and
+`eviction_candidate_invalidated_count`. These counters are cumulative
+diagnostics; they do not represent current resident page counts. In particular,
+`swap_out_count` is distinct from `spill_count`: the former counts background
+RAM-to-file remaps, while the latter counts disk-backed page allocations.
+
 Advanced users can override automatic selection without changing store operations:
 
 ```python
@@ -157,7 +116,11 @@ storage = sparse_embedding.DiskSpill("/mnt/nvme/sparse-embedding", 1 << 40)
 config = sparse_embedding.EmbeddingConfig(dims=[128], storage=storage)
 ```
 
-`MemoryOnly()` disables disk spill and raises when the detected safe memory budget is exhausted. Key hash metadata stays RAM-resident to preserve O(1) random access, grows lazily from a small per-shard table, and is bounded by the per-table `max_active_keys` hard limit.
+`MemoryOnly()` disables disk spill and raises when the detected safe memory budget is exhausted. Key hash metadata stays RAM-resident and is bounded by `max_active_keys`. Tables at or below the eager limit preallocate expected per-shard capacity; larger tables start from a bounded per-shard capacity and grow as needed.
+
+For known large workloads, call `store.reserve(keys_count, dim)` or
+`store.reserve_per_shard(counts, dim)` before the timed phase. This prepares
+ParlayHash capacity outside the hot path without globally serializing Upsert.
 
 ---
 
@@ -165,20 +128,20 @@ config = sparse_embedding.EmbeddingConfig(dims=[128], storage=storage)
 
 ```
 HogwildEmbeddingStore
-├── parlayhash (KeyMap)          # Lock-free concurrent Key→uint32_t mapping
+├── parlayhash (KeyMap)          # Sharded Key→uint32_t mapping
 ├── EmbeddingArena               # Cache-line aligned contiguous embedding storage
 │   └── PageTable[8192]          # Atomic page pointers, lazy allocated
 ├── PageStorage                   # Auto-detected RAM budget + file-backed spill
 ├── TransientArena[num_threads]  # Per-shard gradient accumulation (lock-free)
-├── exec::static_thread_pool     # C++26 stdexec thread pool
-└── pro::proxy<OptimizerFacade>  # Type-erased optimizer (SGD, Adam, etc.)
+├── exec::static_thread_pool     # C++23 stdexec thread pool
+└── pro::proxy<OptimizerFacade<ParamT, OptT>> # Type-erased optimizer
 ```
 
 ### Key Design Decisions
 
 1. **Decoupled Key-Value Storage**: The traditional `Key -> Vector` hash map is split into a two-level structure: `Key -> Index` (`parlayhash`) and `Index -> Vector` (`EmbeddingArena`). The hash table only stores lightweight integer indices, keeping the embedding vectors compactly stored, contiguous, and aligned. This significantly improves CPU cache hit rates and enables efficient SIMD vectorization.
 
-2. **Lock-Free Everywhere**: Mutexes are entirely eliminated across the entire data path, from forward lookup to backward propagation. The hash table uses CAS primitives for concurrent insertions, memory allocation relies on atomic pointers, and gradient updates use the Hogwild! relaxed consistency model. This eliminates scaling bottlenecks on high-core-count NUMA machines.
+2. **Shard-Local Synchronization**: ParlayHash lookup uses a shared lock; Upsert, erase, rebuild, and internal expansion use an exclusive lock for only the affected shard. Independent shards remain concurrent, avoiding the correctness failure of unsynchronized growth and the throughput collapse of a global Upsert lock.
 
 3. **Paged Arena Allocation**: The underlying `EmbeddingArena` uses a PageTable-like structure similar to operating system virtual memory. By lazily allocating large memory pages, it avoids massive upfront memory allocation overhead and prevents memory fragmentation caused by high-frequency, small-scale allocations.
 
@@ -214,4 +177,10 @@ bazel run -c opt //benchmarks:embedding_store_benchmark
 
 # Hot-path microbenchmarks (isolating epoch / parlayhash / memcpy overheads)
 bazel run -c opt //benchmarks:hotpath_microbench
+
+# Python synchronous/asynchronous training under eviction pressure
+PYTHONPATH="$PWD" python3 benchmarks/python/benchmark_e2e.py
+
+# Five-run storage-pressure telemetry benchmark
+PYTHONPATH="$PWD" python3 benchmarks/python/benchmark_storage_pressure.py
 ```

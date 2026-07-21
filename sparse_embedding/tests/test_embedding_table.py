@@ -1,3 +1,5 @@
+import time
+
 import numpy as np
 import pytest
 
@@ -47,7 +49,43 @@ def test_embedding_table_reports_spill(tmp_path, capfd):
     assert stats["spill_bytes"] > 0
     assert stats["memory_bytes"] == 0
     assert stats["spill_count"] > 0
+    assert stats["eviction_selection_count"] == 0
+    assert stats["eviction_evaluated_pages"] == 0
+    assert stats["eviction_selection_ns"] == 0
+    assert stats["eviction_candidate_invalidated_count"] == 0
     assert "SparseEmbeddingSpillWarning" in capfd.readouterr().err
+
+
+def test_embedding_table_reports_eviction_telemetry(tmp_path):
+    store = sparse_embedding.EmbeddingStore(
+        embedding_config=sparse_embedding.EmbeddingConfig(
+            dims=[128],
+            num_threads=2,
+            max_active_keys=20_000,
+            storage=sparse_embedding.AutoStorage(
+                memory_limit_bytes=5 << 20,
+                spill_directory=tmp_path,
+                max_spill_bytes=1 << 30,
+            ),
+        ),
+        initializer_config=sparse_embedding.Zeros(),
+        score_policy="lfu",
+    )
+
+    keys = np.arange(16_384, dtype=np.int64)
+    store.lookup_or_insert(keys, dim=128)
+    with pytest.warns(RuntimeWarning, match="SparseEmbeddingSpillWarning"):
+        stats = store.storage_stats()
+    for _ in range(100):
+        if stats["swap_out_count"] > 0:
+            break
+        time.sleep(0.01)
+        stats = store.storage_stats()
+
+    assert stats["swap_out_count"] > 0
+    assert stats["eviction_selection_count"] > 0
+    assert stats["eviction_evaluated_pages"] > 0
+    assert stats["eviction_selection_ns"] > 0
 
 
 def test_embedding_table_assign():

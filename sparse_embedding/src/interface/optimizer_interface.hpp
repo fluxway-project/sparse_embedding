@@ -28,6 +28,7 @@
 namespace se {
 
 PRO_DEF_MEM_DISPATCH(OptMemAllocate, allocate);
+PRO_DEF_MEM_DISPATCH(OptMemSetPageEvictionEnabled, set_page_eviction_enabled);
 PRO_DEF_MEM_DISPATCH(OptMemCapacity, capacity);
 PRO_DEF_MEM_DISPATCH(OptMemReserve, reserve);
 PRO_DEF_MEM_DISPATCH(OptMemDeallocate, deallocate);
@@ -43,6 +44,8 @@ template <typename ParamT, typename OptT>
 struct OptimizerFacade
     : pro::facade_builder                              //
       ::add_convention<OptMemAllocate, void(uint32_t)> //
+      ::add_convention<pro::weak_dispatch<OptMemSetPageEvictionEnabled>,
+                       void(bool)>                     //
       ::add_convention<OptMemCapacity, size_t() const> //
       ::add_convention<OptMemReserve, void(size_t)>    //
       ::add_convention<pro::weak_dispatch<OptMemDeallocate>,

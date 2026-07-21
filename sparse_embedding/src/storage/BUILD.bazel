@@ -5,6 +5,7 @@ cc_library(
     srcs = ["page_storage.cpp"],
     hdrs = ["page_storage.hpp"],
     visibility = ["//visibility:public"],
+    deps = ["@proxy"],
 )
 
 cc_test(

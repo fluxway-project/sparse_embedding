@@ -63,7 +63,7 @@ EmbeddingStoreWrapper::EmbeddingStoreWrapper(
                            ? emb_cfg.value_dtype
                            : emb_cfg.optimizer_dtype),
       key_dtype_(emb_cfg.key_dtype),
-      storage_(se::PageStorage::create(emb_cfg.storage)) {
+      storage_(se::create_page_storage(emb_cfg.storage)) {
 
   PyInitializer init_cfg = init_cfg_opt.value_or(
       PyInitializer{std::make_shared<pro::proxy<se::InitializerBuilderFacade>>(
@@ -227,18 +227,30 @@ NB_MODULE(_core, m) {
           "auto",
           [](std::optional<size_t> memory_limit_bytes,
              std::optional<std::string> spill_directory,
-             std::optional<size_t> max_spill_bytes) {
+             std::optional<size_t> max_spill_bytes,
+             std::optional<double> high_watermark,
+             std::optional<double> low_watermark) {
             se::StorageOptions options;
             options.mode = se::StorageMode::kAuto;
             options.memory_limit_bytes = memory_limit_bytes;
             if (spill_directory)
               options.spill_directory = *spill_directory;
             options.max_spill_bytes = max_spill_bytes;
+            if (high_watermark || low_watermark) {
+              se::WatermarkConfig wm;
+              if (high_watermark)
+                wm.high = *high_watermark;
+              if (low_watermark)
+                wm.low = *low_watermark;
+              options.watermark = wm;
+            }
             return options;
           },
           nb::arg("memory_limit_bytes") = nb::none(),
           nb::arg("spill_directory") = nb::none(),
-          nb::arg("max_spill_bytes") = nb::none())
+          nb::arg("max_spill_bytes") = nb::none(),
+          nb::arg("high_watermark") = nb::none(),
+          nb::arg("low_watermark") = nb::none())
       .def_static("memory_only",
                   []() {
                     se::StorageOptions options;
@@ -360,22 +372,40 @@ NB_MODULE(_core, m) {
       .def("optimizer_step", &EmbeddingStoreWrapper::optimizer_step)
 
       .def("async_lookup", &EmbeddingStoreWrapper::async_lookup,
-           nb::arg("keys"), nb::arg("dim"))
+           nb::arg("keys"), nb::arg("dim"),
+           nb::sig("def async_lookup(self, keys: object, dim: int) -> "
+                   "typing.Awaitable[typing.Any]"))
       .def("async_assign", &EmbeddingStoreWrapper::async_assign,
-           nb::arg("keys"), nb::arg("values"))
+           nb::arg("keys"), nb::arg("values"),
+           nb::sig("def async_assign(self, keys: object, values: object) -> "
+                   "typing.Awaitable[typing.Any]"))
       .def("async_lookup_or_insert",
            &EmbeddingStoreWrapper::async_lookup_or_insert, nb::arg("keys"),
-           nb::arg("dim"))
+           nb::arg("dim"),
+           nb::sig("def async_lookup_or_insert(self, keys: object, dim: int) "
+                   "-> typing.Awaitable[typing.Any]"))
       .def("async_accumulate_gradients",
            &EmbeddingStoreWrapper::async_accumulate_gradients, nb::arg("keys"),
-           nb::arg("grads"))
-      .def("async_optimizer_step", &EmbeddingStoreWrapper::async_optimizer_step)
+           nb::arg("grads"),
+           nb::sig("def async_accumulate_gradients(self, keys: object, grads: "
+                   "object) -> typing.Awaitable[typing.Any]"))
+      .def(
+          "async_optimizer_step", &EmbeddingStoreWrapper::async_optimizer_step,
+          nb::sig(
+              "def async_optimizer_step(self) -> typing.Awaitable[typing.Any]"))
       .def("async_contains", &EmbeddingStoreWrapper::async_contains,
-           nb::arg("keys"))
-      .def("async_erase", &EmbeddingStoreWrapper::async_erase, nb::arg("keys"))
-      .def("async_clear", &EmbeddingStoreWrapper::async_clear)
+           nb::arg("keys"),
+           nb::sig("def async_contains(self, keys: object) -> "
+                   "typing.Awaitable[typing.Any]"))
+      .def("async_erase", &EmbeddingStoreWrapper::async_erase, nb::arg("keys"),
+           nb::sig("def async_erase(self, keys: object) -> "
+                   "typing.Awaitable[typing.Any]"))
+      .def("async_clear", &EmbeddingStoreWrapper::async_clear,
+           nb::sig("def async_clear(self) -> typing.Awaitable[typing.Any]"))
       .def("async_assign_scores", &EmbeddingStoreWrapper::async_assign_scores,
-           nb::arg("keys"), nb::arg("scores"))
+           nb::arg("keys"), nb::arg("scores"),
+           nb::sig("def async_assign_scores(self, keys: object, scores: "
+                   "object) -> typing.Awaitable[typing.Any]"))
 
       .def("export_batches_dlpack",
            &EmbeddingStoreWrapper::export_batches_dlpack, nb::arg("visitor"),
@@ -498,8 +528,10 @@ NB_MODULE(_core, m) {
             });
       },
       nb::arg("keys"), nb::arg("return_inverse") = true,
-      nb::arg("return_first_indices") = false,
-      nb::arg("return_counts") = false);
+      nb::arg("return_first_indices") = false, nb::arg("return_counts") = false,
+      nb::sig("def async_unique(keys: object, return_inverse: bool = True, "
+              "return_first_indices: bool = False, return_counts: bool = "
+              "False) -> typing.Awaitable[typing.Any]"));
 
   m.def("wake_fd", []() { return se::py::GetPythonWakeManager().fd(); });
   m.def("drain_wake_queue", []() { se::py::GetPythonWakeManager().Drain(); });
@@ -509,11 +541,15 @@ NB_MODULE(_core, m) {
 
   nb::class_<PyPartitioner>(m, "Partitioner")
       .def("partition", &PyPartitioner::partition, nb::arg("keys"))
-      .def("async_partition", &PyPartitioner::async_partition, nb::arg("keys"))
+      .def("async_partition", &PyPartitioner::async_partition, nb::arg("keys"),
+           nb::sig("def async_partition(self, keys: object) -> "
+                   "typing.Awaitable[typing.Any]"))
       .def("filter", &PyPartitioner::filter, nb::arg("keys"),
            nb::arg("target_shard"))
       .def("async_filter", &PyPartitioner::async_filter, nb::arg("keys"),
-           nb::arg("target_shard"));
+           nb::arg("target_shard"),
+           nb::sig("def async_filter(self, keys: object, target_shard: int) -> "
+                   "typing.Awaitable[typing.Any]"));
 
   m.def(
       "ModuloPartitioner",
