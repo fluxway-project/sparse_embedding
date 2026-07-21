@@ -105,6 +105,7 @@ class BazelAwareBuildPy(build_py):
                         sys.executable,
                         "-m",
                         "nanobind.stubgen",
+                        "-P",
                         "-m",
                         "sparse_embedding._core",
                         "-O",

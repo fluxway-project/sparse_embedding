@@ -36,10 +36,16 @@ class AutoStorage:
         memory_limit_bytes: int | None = None,
         spill_directory: os.PathLike[str] | str | None = None,
         max_spill_bytes: int | None = None,
+        high_watermark: float | None = None,
+        low_watermark: float | None = None,
     ) -> None:
         directory = None if spill_directory is None else os.fspath(spill_directory)
         self._native = _StorageOptions.auto(
-            memory_limit_bytes, directory, max_spill_bytes
+            memory_limit_bytes,
+            directory,
+            max_spill_bytes,
+            high_watermark,
+            low_watermark,
         )
 
 

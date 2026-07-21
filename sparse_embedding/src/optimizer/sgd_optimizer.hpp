@@ -32,44 +32,29 @@ template <typename ParamT, typename OptT> class SgdOptimizer {
   SgdConfig config;
 
 public:
-  explicit SgdOptimizer(size_t dim, const SgdConfig &cfg,
-                        std::shared_ptr<PageStorage> storage)
-      : config(cfg) {
-    (void)dim;
-    (void)storage;
-  }
+  explicit SgdOptimizer(size_t /*dim*/, const SgdConfig &cfg,
+                        PageStorage /*storage*/)
+      : config(cfg) {}
 
-  void allocate(uint32_t idx) { (void)idx; }
+  void allocate(uint32_t /*idx*/) {}
+  void set_page_eviction_enabled(bool /*enabled*/) {}
   size_t capacity() const { return std::numeric_limits<size_t>::max(); }
-  void reserve(size_t capacity) { (void)capacity; }
-  void deallocate(uint32_t idx) {}
+  void reserve(size_t /*capacity*/) {}
+  void deallocate(uint32_t /*idx*/) {}
   void clear() {}
 
-  void state_data(uint32_t idx, std::span<OptT> out) const {
-    (void)idx;
-    (void)out;
-  }
+  void state_data(uint32_t /*idx*/, std::span<OptT> /*out*/) const {}
 
   size_t state_dim() const { return 0; }
 
-  void set_state(uint32_t idx, std::span<const OptT> state) {
-    (void)idx;
-    (void)state;
-  }
+  void set_state(uint32_t /*idx*/, std::span<const OptT> /*state*/) {}
 
-  uint32_t step_data(uint32_t idx) const {
-    (void)idx;
-    return 0;
-  }
+  uint32_t step_data(uint32_t /*idx*/) const { return 0; }
 
-  void set_step(uint32_t idx, uint32_t s) {
-    (void)idx;
-    (void)s;
-  }
+  void set_step(uint32_t /*idx*/, uint32_t /*s*/) {}
 
-  void step(uint32_t idx, std::span<ParamT> param_span,
-            std::span<const ParamT> grad_span,
-            [[maybe_unused]] uint64_t global_step) {
+  void step(uint32_t /*idx*/, std::span<ParamT> param_span,
+            std::span<const ParamT> grad_span, uint64_t /*global_step*/) {
     simd::simd_sgd_update(param_span.data(), grad_span.data(), config.lr,
                           config.weight_decay, param_span.size());
   }

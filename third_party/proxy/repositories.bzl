@@ -6,6 +6,6 @@ def proxy_repo():
     new_git_repository(
         name = "proxy",
         remote = "https://github.com/ngcpp/proxy.git",
-        commit = "f188f54f9ef3abfdeb8de5bc36d35eb046d2386f",
+        commit = "1c7ca609aba6d73df06183c14db9d2d210399af3",
         build_file = "//third_party/proxy:BUILD.bazel",
     )

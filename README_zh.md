@@ -1,153 +1,107 @@
 # sparse_embedding
 
-高性能稀疏嵌入表库（Sparse Embedding Table）——为大规模推荐系统训练设计，基于 Hogwild! 无锁并发架构。
+[English](README.md)
+
+高性能稀疏嵌入表库（Sparse Embedding Table），面向大规模推荐系统训练，采用 Hogwild! 松弛更新、分片哈希表同步和分页存储架构。
 
 ## 核心特性
 
-- **无锁并发**：基于 `parlayhash`（Parlay Parallel Hash Map）实现 Key→Index 的 O(1) 无锁并发读写
+- **分片并发**：基于 `parlayhash` 实现期望 O(1) 的 Key→Index 访问；读写锁仅作用于单个 shard，插入、删除、重建和扩容时其他 shard 仍可并行
 - **SIMD 加速**：AVX-512 向量化哈希计算与梯度 Scatter 操作
 - **Hogwild! 梯度累积**：分片 TransientArena 实现无锁梯度聚合，避免跨线程同步
-- **C++26 标准并发**：基于 NVIDIA `stdexec` + `exec::static_thread_pool` 实现标准 Sender/Receiver 任务调度
+- **C++23 标准并发**：基于 NVIDIA `stdexec` + `exec::static_thread_pool` 实现 Sender/Receiver 任务调度
 - **Epoch 内存安全**：通过 `epoch::with_epoch` 批次保护并发哈希表读写，避免 ABA 问题
 - **分布式 Lance Checkpoint**：支持分布式两阶段提交 (Two-Phase Commit) 的 Lance 存储后端，通过零拷贝 PyArrow 导出直接写入 Lance Dataset，解耦 embedding 与优化器状态，支持百 GB 级极速存储与加载。
 - **动态分片与路由 (Partitioner OP)**：新增底层 C++ Partitioner OPs (`ModuloPartitioner`, `HashPartitioner`, `FastRangePartitioner`)，支持多路特征高效路由，支持在 Checkpoint 加载阶段进行灵活的集群弹性扩缩容（Resharding）。
 - **驱逐与内存管理**：高效的打分策略（如 LFU），使用线程安全的 `std::atomic_ref` 实现无锁并发状态更新
+- **页级冷热数据置换 (Page-Level Hot/Cold Swapping)**：后台线程基于可配置的内存水位线，通过保持虚拟地址稳定的 `MAP_FIXED` 重映射将冷数据页置换至磁盘后备存储。
 
 ## 系统依赖
 
 | 组件 | 版本 |
 |------|------|
-| GCC | ≥ 15.0（需要 C++26 constexpr exceptions 支持） |
+| GCC | ≥ 13.4（已验证） |
 | stdexec | NVIDIA main branch `931f256c` |
 | parlayhash | main branch（含 56-bit 指针 mask 补丁） |
 | lance-c | main branch (基于 Rust 的 C 共享库) |
 | Rust | 1.70+ (2024 Edition) |
 | Bazel | ≥ 7.0 |
 
-> **注意**：GCC 13 及以下不支持 `__cpp_constexpr_exceptions`，导致 `stdexec` 的 `sender_in` 概念检查失败，无法使用 `sync_wait` / `start_detached`。必须使用 GCC 15+。
+Bazel 配置使用 `-std=c++2b` 编译 C++ 源码；当前验收构建使用 GCC 13.4 和 Bazel 7.7。
 
 ---
 
 ## 性能基准
 
-### 测试环境
+### 测试机器配置
 
-| 项目 | 规格 |
-|------|------|
-| **CPU** | Intel® Xeon® Silver 4116 × 2 Socket |
-| **物理核心** | 12 cores/socket × 2 = **24 cores**，支持超线程共 **48 vCPUs** |
-| **CPU 主频** | 2.10 GHz（睿频 2.40 GHz） |
-| **L1d Cache** | 768 KiB |
-| **L2 Cache** | 24 MiB |
-| **L3 Cache** | 33 MiB（per socket） |
-| **NUMA** | 2 nodes，node 间延迟比 2.1x（node 0: 64 GB，node 1: 64 GB） |
-| **内存** | 128 GiB DDR4 |
-| **操作系统** | Ubuntu 20.04 |
-| **编译器** | GCC 15.2.0，`-O2 -march=native` |
+| 项目 | 实测配置 |
+|---|---|
+| CPU | 2 x Intel Xeon Silver 4116，标称 2.10 GHz |
+| 拓扑 | 每 socket 12 核、每核 2 线程，共 24 个物理核、48 个在线逻辑 CPU |
+| NUMA | 2 个 node；node 0 CPU 为 `0-11,24-35`，node 1 CPU 为 `12-23,36-47` |
+| Cache | lscpu 汇总：L1d 768 KiB、L1i 768 KiB、L2 24 MiB、L3 33 MiB |
+| 内存 | OS 可见 125 GiB；禁用 swap |
+| 操作系统 | Ubuntu 24.04.4 LTS，x86-64 |
+| 工具链 | GCC 13.4、Bazel 7.7、C++23（`-std=c++2b`）、`-c opt` |
+| 优化参数 | `-O3 -march=native -mtune=native -mavx512bf16 -fno-strict-aliasing -DNDEBUG`；链接使用 `-flto` |
+| CPU affinity | 本次快照未绑定 CPU |
 
-### 测试场景
-
-模拟真实推荐系统训练场景：
+### C++ 生产测试场景
 
 | 参数 | 值 |
-|------|-----|
-| embedding 维度（dim） | 128 floats（512 bytes） |
-| 词汇表大小（vocab） | 500,000 unique keys |
-| 批大小（batch size） | 65,536 |
-| 访问分布 | Power-law：top-10% key 承担 80% 流量 |
-| slot 数量 | 1 |
+|---|---|
+| Embedding 维度 | 128 个 `float`（512 bytes） |
+| 词表 | 500,000 个 `uint64_t` key，单 slot |
+| Batch | 65,536 keys |
+| 访问分布 | 普通 operation batch 的 80% 流量落在最热 10%；erase key 均匀采样 |
+| 随机种子 | 42 |
+| 线程数 | 1、4、8、16、32、64 |
+| 容量 | `max_active_keys=1,000,000`；计时前执行 `reserve(500000, 128)` |
+| 优化器 | benchmark SGD，学习率 0.01 |
+| 计时操作 | lookup/insert、forward lookup、assign、梯度累积、optimizer step、contains、erase |
 
-### 吞吐量结果
+LFU 压力场景使用 dim=128、16,384 个可能 key、4,096-key batch、2 个 worker、`max_active_keys=20,000`、seed=42、相同的 80/20 热冷分布、学习率 0.01 的 benchmark SGD、5 MiB 内存限制、1 GiB spill 限制和 0.8/0.6 水位。它执行 4 次包含 lookup、assign、梯度累积和 optimizer step 的计时重复，并启用后台淘汰。计时结束后等待 100 ms 再读取的 telemetry 只能证明最终触发了淘汰，不能证明淘汰与计时区间重叠。
 
-> 单位：**Mops/s**（百万操作/秒）；`forward_lookup` / `assign` 额外标注内存带宽（GB/s）
+最新复现快照采集于 2026-07-21。该 C++ 数据来自一次包含内部重复的 benchmark 执行，不等同于 5 次独立运行、固定 CPU affinity 的 baseline/optimized 协议。
 
-#### `forward_lookup`（推理前向，热路径）
+| benchmark 报告区间（Mops/s） | 1T | 4T | 8T | 16T | 32T | 64T |
+|---|---:|---:|---:|---:|---:|---:|
+| `lookup_or_insert` | 1.84 | 1.26 | 1.88 | 3.18 | 4.35 | 4.20 |
+| `forward_lookup` | 2.90 | 5.34 | 7.91 | 10.18 | 12.10 | 11.61 |
+| `assign` | 1.98 | 1.55 | 2.46 | 3.91 | 5.46 | 6.02 |
+| `accumulate_gradients` | 2.35 | 6.30 | 8.60 | 10.37 | 11.54 | 10.80 |
+| `optimizer_step` | 5.53 | 12.99 | 20.66 | 27.77 | 32.54 | 30.30 |
+| `contains` | 6.25 | 5.90 | 8.62 | 11.13 | 15.59 | 16.86 |
+| `erase`（10% batch） | 8.05 | 4.06 | 5.53 | 8.41 | 13.08 | 16.99 |
 
-| 操作 | 1T | 4T | 8T | 16T | 32T | 64T |
-|------|----|----|----|-----|-----|-----|
-| forward_lookup | 3.24 Mops/s (1.66 GB/s) | 7.37 Mops/s (3.77 GB/s) | 11.23 Mops/s (5.75 GB/s) | 12.54 Mops/s (6.42 GB/s) | 15.08 Mops/s (7.72 GB/s) | 12.91 Mops/s (6.61 GB/s) |
+这些数据不是隔离 API timing。lookup/insert、forward lookup、assign、梯度累积和 contains 的计时区间包含随机 batch 生成。optimizer 报告区间还包含下一批 key 生成与梯度累积，却使用当前 store size 作为吞吐分子，因此不能解释为独立 optimizer 吞吐。erase 对同一组 key 连续执行 10 次且不重新插入，后续重复主要测量 not-found 路径。
 
-`forward_lookup` 在 16-32T 时趋于饱和，实测峰值 6.94 GB/s。
+LFU 内存压力场景报告 2.75 Mops/s、最终 2 次 swap-out、评估 4 页，累计选择时间 9,616 ns。Python 压力场景的同步训练 step 为 4.69 Mops/s；异步 lookup、assign 和 optimizer step 分别为 12.38、13.45 和 17.16 Mops/s。
 
-**注意**：这并非 DRAM 带宽饱和（理论峰值为 230.4 GB/s，实测仅利用 3%），而是**随机访问延迟瓶颈**：
-- 每次 embedding 查找需随机访问 arena 中 512 字节（8 条 cache line），DRAM 访问延迟 ~90 ns
-- 单线程随机读带宽上限：64B / 90ns ≈ **0.71 GB/s**
-- 要触及理论带宽需要同时保持 ~324 个 outstanding miss，而 Xeon Silver 4116 每核 MSHR 仅约 12 个
-- 继续增加线程无法提升吞吐，因为 DRAM controller 的 outstanding request queue 已满，而非总线带宽不足
-
-#### `lookup_or_insert`（训练插入，写热路径）
-
-| 操作 | 1T | 4T | 8T | 16T | 32T | 64T |
-|------|----|----|----|-----|-----|-----|
-| lookup_or_insert | 1.48 Mops/s | 2.60 Mops/s | 4.02 Mops/s | 4.88 Mops/s | 5.06 Mops/s | 5.17 Mops/s |
-
-1→8T 呈现 3.6x 线性加速；8T 后受 parlayhash CAS 竞争与 DRAM 写带宽限制趋于饱和。
-
-#### `assign`（参数赋值）
-
-| 操作 | 1T | 4T | 8T | 16T | 32T | 64T |
-|------|----|----|----|-----|-----|-----|
-| assign | 1.49 Mops/s (0.76 GB/s) | 3.19 Mops/s (1.63 GB/s) | 4.93 Mops/s (2.52 GB/s) | 5.90 Mops/s (3.02 GB/s) | 6.15 Mops/s (3.15 GB/s) | 6.28 Mops/s (3.21 GB/s) |
-
-#### `accumulate_gradients`（梯度累积，反向传播）
-
-| 操作 | 1T | 4T | 8T | 16T | 32T | 64T |
-|------|----|----|----|-----|-----|-----|
-| accumulate_gradients | 2.11 Mops/s | 5.76 Mops/s | 8.81 Mops/s | 11.33 Mops/s | 11.06 Mops/s | 10.66 Mops/s |
-
-注：`accumulate_gradients` 使用 AVX-512 SIMD 分片 Scatter-Reduce；在修复了线程池调度阈值与使用 thread-local 缓存复用后，在 16-32T 呈现出完美的扩展性。
-
-#### `optimizer_step`（参数更新）
-
-| 操作 | 1T | 4T | 8T | 16T | 32T | 64T |
-|------|----|----|----|-----|-----|-----|
-| optimizer_step | 5.67 Mops/s (5.80 GB/s) | 12.99 Mops/s (13.30 GB/s) | 19.82 Mops/s (20.30 GB/s) | 30.73 Mops/s (31.47 GB/s) | **31.15 Mops/s (31.90 GB/s)** | 28.95 Mops/s (29.65 GB/s) |
-
-注：`optimizer_step` 处理的是已累积的 unique key 集合（约 252K）。在修正了并行调度并移除了 Data Race 后，在 32T 时展现了惊人的 25.06 GB/s 内存带宽利用率，扩展效率绝佳。
-
-#### `contains`（存在性检查）
-
-| 操作 | 1T | 4T | 8T | 16T | 32T | 64T |
-|------|----|----|----|-----|-----|-----|
-| contains | 9.40 Mops/s | 16.57 Mops/s | 20.69 Mops/s | 22.48 Mops/s | 23.64 Mops/s | 22.65 Mops/s |
-
-纯哈希查找无 embedding 拷贝，受 CPU 和哈希表 bucket 访问延迟限制，8T 后接近饱和。
-
-#### `erase`（条目删除，10% 批次）
-
-| 操作 | 1T | 4T | 8T | 16T | 32T | 64T |
-|------|----|----|----|-----|-----|-----|
-| erase (10% batch) | 12.39 Mops/s | 34.61 Mops/s | 63.85 Mops/s | 61.76 Mops/s | 49.25 Mops/s | 27.92 Mops/s |
-
-`erase` 在 8T 时达到峰值（64.49 Mops/s），超线程后因 NUMA 跨 socket 竞争开始下降。
-
-### Python 端性能表现
-
-以下是在 Python 中调用相应接口（通过 `nanobind` 和 DLPack 零拷贝封装）测得的吞吐量，包含 Python 和 C++ 侧上下文切换及 asyncio 调度开销：
-
-| API | 吞吐量 (Mops/s) | 说明 |
-|-----|----------------|------|
-| `async_unique` | ~25.58 Mops/s | 异步获取 unique keys，极速哈希去重 |
-| `async_lookup_or_insert` | ~22.72 Mops/s | 异步插入及查找，零拷贝张量返回 |
-| `async_lookup` | ~27.40 Mops/s | 异步前向查询，无阻滞事件循环 |
-| `async_assign` (Zipfian) | ~2.85 Mops/s | 异步赋值，模拟高偏置幂律分布 |
-| **端到端 Step** | **~3.87 Mops/s** | 全链路 asyncio 训练步 |
-
-所有 `EmbeddingStore` 方法（如 `lookup_or_insert`, `assign`, `contains`, `erase`, `clear`, `assign_scores`, `accumulate_gradients`, `optimizer_step`）均已提供高性能、边缘触发的 `async_*` 异步变体。得益于 DLPack 和 eventfd 无锁 asyncio 挂载，Python 端的调用开销被降到最低，依然保持了数以百万计的吞吐率。
+这些数据用于复现和回归诊断，不是跨机器性能承诺。workload 定义、遥测语义和验证命令见[存储、并发与性能](docs/storage_and_performance_zh.md)。
 
 ### 自动存储管理
 
-默认无需配置存储参数。`EmbeddingStore` 会探测系统与 cgroup 内存限制、进程资源限制、文件系统容量和本地设备属性。在安全内存预算仍有余量时，64 字节对齐页面保留在 RAM；超出预算的页面映射到自动选择的本地磁盘，并在创建后立即 unlink。
+默认无需配置存储参数。`EmbeddingStore` 会探测系统与 cgroup 内存限制、进程资源限制、文件系统容量和本地设备属性。在安全内存预算仍有余量时，64 字节对齐页面保留在 RAM。
+
+后台线程由条件变量和水位事件驱动，跟踪 `high_watermark` 与 `low_watermark`（默认 0.8 与 0.6）；它不会定时轮询，也不会按概率跳过必须执行的淘汰。触及高水位后，启用打分的 Eviction Proxy 会选择冷页，通过 `MAP_FIXED` 置换到未链接的文件后备映射，直到内存降至低水位。
+
+可淘汰页不超过 1,024 页时进行精确选择；更大集合每轮最多评估 256 个不重复采样页，并持续执行到低水位。候选快照和 proxy generation 会阻止旧候选生效，打分阶段不持有 storage mutex。
 
 第一次使用磁盘页面时会向 stderr 输出 `SparseEmbeddingSpillWarning`。调用 `storage_stats()` 还会发出一次标准 Python 警告，并返回当前内存与 spill 使用量：
 
 ```python
+import sparse_embedding
+
 config = sparse_embedding.EmbeddingConfig(dims=[128])
 store = sparse_embedding.EmbeddingStore(config)
 print(store.storage_stats())
 ```
 
 `spill_count` 统计磁盘后备页面的分配次数（包括复用文件区间），并不表示独立的内存压力事件次数。
+
+`storage_stats()` 还会返回 `swap_out_count`、`eviction_selection_count`、`eviction_evaluated_pages`、`eviction_selection_ns` 和 `eviction_candidate_invalidated_count`。这些计数器是累计诊断数据，不表示当前驻留页面数量。其中 `swap_out_count` 与 `spill_count` 语义不同：前者统计后台 RAM→文件映射置换，后者统计磁盘后备页分配。
 
 高级用户可以指定存储设备，不需要改变 embedding 操作：
 
@@ -156,7 +110,9 @@ storage = sparse_embedding.DiskSpill("/mnt/nvme/sparse-embedding", 1 << 40)
 config = sparse_embedding.EmbeddingConfig(dims=[128], storage=storage)
 ```
 
-`MemoryOnly()` 会禁用磁盘 spill，并在探测出的安全内存预算耗尽时抛出异常。为保持 O(1) 随机访问，key hash 元数据常驻 RAM，但仅从小型分片表开始惰性增长，并受每表 `max_active_keys` 硬上限约束。
+`MemoryOnly()` 会禁用磁盘 spill，并在探测出的安全内存预算耗尽时抛出异常。key hash 元数据常驻 RAM，并受 `max_active_keys` 硬上限约束。不超过 eager limit 的表按预期每 shard 容量预分配；更大的表从有界每 shard 容量开始并按需增长。
+
+对于容量已知的大 workload，应在计时前调用 `store.reserve(keys_count, dim)` 或 `store.reserve_per_shard(counts, dim)`，将 ParlayHash 容量准备移出热路径，同时不对所有 shard 的 Upsert 做全局串行化。
 
 ---
 
@@ -164,20 +120,20 @@ config = sparse_embedding.EmbeddingConfig(dims=[128], storage=storage)
 
 ```
 HogwildEmbeddingStore
-├── parlayhash (KeyMap)          # Lock-free concurrent Key→uint32_t mapping
+├── parlayhash (KeyMap)          # 分片 Key→uint32_t mapping
 ├── EmbeddingArena               # Cache-line aligned contiguous embedding storage
 │   └── PageTable[8192]          # Atomic page pointers, lazy allocated
 ├── PageStorage                  # 自动探测 RAM 预算与文件映射 spill
 ├── TransientArena[num_threads]  # Per-shard gradient accumulation (lock-free)
-├── exec::static_thread_pool     # C++26 stdexec thread pool
-└── pro::proxy<OptimizerFacade>  # Type-erased optimizer (SGD, Adam, etc.)
+├── exec::static_thread_pool     # C++23 stdexec thread pool
+└── pro::proxy<OptimizerFacade<ParamT, OptT>> # Type-erased optimizer
 ```
 
 ### 关键设计决策
 
 1. **键值解耦架构（Decoupled KV Storage）**：将传统哈希表的 `Key -> Vector` 拆分为 `Key -> Index`（`parlayhash`）和 `Index -> Vector`（`EmbeddingArena`）两级结构。哈希表仅存储轻量级的整数索引，使嵌入向量的存储保持紧凑、连续且对齐，极大提升了 CPU 缓存命中率与 SIMD 向量化效率。
 
-2. **全局无锁并发（Lock-Free Everywhere）**：从前向查询到反向传播，全链路消除互斥锁（Mutex）。哈希表通过 CAS 原语实现并发插入，内存分配通过原子指针（Atomic Pointers）进行，梯度更新采用 Hogwild! 松弛一致性模型，彻底打通多核环境下的扩展瓶颈。
+2. **分片局部同步（Shard-Local Synchronization）**：ParlayHash 查询使用共享锁；Upsert、删除、重建和内部扩容仅对目标 shard 使用独占锁。其他 shard 继续并发，既避免无同步扩容的正确性问题，也避免全局 Upsert 锁造成的吞吐崩塌。
 
 3. **分页内存管理（Paged Arena Allocation）**：嵌入表底层的 `EmbeddingArena` 采用类似操作系统的虚拟内存页表（PageTable）结构。通过惰性分配（Lazy Allocation）大块连续内存页，不仅避免了启动时的巨量内存开销，也防止了高频小规模内存分配导致的内存碎片化问题。
 
@@ -213,4 +169,10 @@ bazel run -c opt //benchmarks:embedding_store_benchmark
 
 # 热路径微基准（隔离 epoch / parlayhash / memcpy 各项开销）
 bazel run -c opt //benchmarks:hotpath_microbench
+
+# 淘汰压力下的 Python 同步/异步训练
+PYTHONPATH="$PWD" python3 benchmarks/python/benchmark_e2e.py
+
+# 运行 5 次的存储压力遥测 benchmark
+PYTHONPATH="$PWD" python3 benchmarks/python/benchmark_storage_pressure.py
 ```
