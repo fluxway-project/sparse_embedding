@@ -227,6 +227,71 @@ def test_assign_and_lookup_no_score():
     np.testing.assert_allclose(result, vals, atol=1e-5)
 
 
+def test_distributed_checkpoint_restores_optimizer_state_by_dimension(
+    lance_tmp_uri,
+):
+    uri, backend = lance_tmp_uri
+    dimensions = [4, 8]
+    keys = np.array([17, 29], dtype=np.uint64)
+    optimizer = se.Adam(lr=1e-3)
+
+    def create_store():
+        return se.EmbeddingStore(
+            make_cfg(dimensions, threads=2),
+            initializer_config=se.Zeros(),
+            optimizer_config=optimizer,
+        )
+
+    source = create_store()
+    for dimension in dimensions:
+        source.lookup_or_insert(keys, dim=dimension)
+    for step in range(2):
+        for dimension in dimensions:
+            gradients = np.arange(
+                1,
+                keys.size * dimension + 1,
+                dtype=np.float32,
+            ).reshape(keys.size, dimension)
+            source.accumulate_gradients(
+                keys,
+                gradients * np.float32(step + 1),
+            )
+        source.optimizer_step()
+
+    backend.init_dataset(source, uri)
+    fragments = backend.export_fragments(source, uri)
+    backend.commit_fragments(uri, [fragments])
+
+    restored = create_store()
+    backend.load(
+        restored,
+        uri,
+        filter_fn=se.ModuloPartitioner(num_shards=1),
+        target_shard_id=0,
+    )
+
+    for dimension in dimensions:
+        gradients = np.zeros((keys.size, dimension), dtype=np.float32)
+        source.accumulate_gradients(keys, gradients)
+        restored.accumulate_gradients(keys, gradients)
+    source.optimizer_step()
+    restored.optimizer_step()
+
+    for dimension in dimensions:
+        expected = lookup_np(source, keys, dimension)
+        actual = lookup_np(restored, keys, dimension)
+        assert np.all(np.isfinite(actual))
+        np.testing.assert_allclose(actual, expected, rtol=1e-6, atol=1e-7)
+
+    with pytest.raises(ValueError, match="dimension has no physical table"):
+        restored.assign_opt_state(
+            np.empty((0,), dtype=np.uint64),
+            np.empty((0,), dtype=np.float32),
+            16,
+            np.empty((0,), dtype=np.uint32),
+        )
+
+
 def test_checkpoint_load_with_resharding():
     ckpt_dir = "/tmp/test_resharding_ckpt_dual"
     if os.path.exists(ckpt_dir):

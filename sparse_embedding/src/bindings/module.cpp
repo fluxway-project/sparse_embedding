@@ -415,7 +415,7 @@ NB_MODULE(_core, m) {
            nb::arg("visitor"), nb::arg("batch_size") = 65536,
            nb::arg("include_optimizer_state") = false)
       .def("assign_opt_state", &EmbeddingStoreWrapper::assign_opt_state,
-           nb::arg("keys"), nb::arg("opt_states"),
+           nb::arg("keys"), nb::arg("opt_states"), nb::arg("dimension"),
            nb::arg("steps") = nb::none())
 
 #ifdef SE_ENABLE_LANCE_CHECKPOINTER

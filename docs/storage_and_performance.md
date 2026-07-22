@@ -22,6 +22,20 @@ older active-proxy generation cannot be swapped out.
 The legacy virtual storage hierarchy and `PageStorage::create()` are not part
 of the contract.
 
+## Checkpoint Identity
+
+Embedding and optimizer checkpoint rows are identified by `(dimension, key)`.
+`key` alone is not unique because one store can contain the same `uint64` key
+in multiple dimension tables. Checkpoint loaders must call
+`assign_opt_state(keys, optimizer_states, dimension, steps)` with the physical
+dimension from the persisted row group.
+
+The store selects that dimension once, validates the optimizer-state width and
+step count, and then resolves every key only inside the selected table. An
+unknown dimension, missing optimizer, malformed state width, mismatched step
+count, or key absent from that dimension raises immediately. No loader may
+search other dimensions as a fallback.
+
 The embedding and optimizer templates use the following canonical shapes:
 
 ```cpp

@@ -292,4 +292,4 @@ def _load_opt_states(store, uri: str, filter_fn, target_shard_id: int):
                 continue
 
             flat_opt = pc.list_flatten(opt_arr)
-            store.assign_opt_state(keys_arr, flat_opt, step_arr)
+            store.assign_opt_state(keys_arr, flat_opt, dim, step_arr)
