@@ -12,6 +12,17 @@
 
 旧虚基类存储层级与 `PageStorage::create()` 不属于当前契约。
 
+## Checkpoint 标识
+
+Embedding 与 optimizer checkpoint 行使用 `(dimension, key)` 作为标识。
+单独的 `key` 不唯一，因为同一个 store 的多个 dimension table 可以包含相同的
+`uint64` key。Checkpoint loader 必须把持久化行组中的物理 dimension 显式传给
+`assign_opt_state(keys, optimizer_states, dimension, steps)`。
+
+Store 只选择一次对应 dimension，校验 optimizer-state 宽度与 step 数量，然后只在
+该 table 内解析每个 key。未知 dimension、缺少 optimizer、state 宽度错误、step 数量
+不匹配或 key 不存在都会立即抛异常，不允许搜索其他 dimension 作为 fallback。
+
 embedding 与 optimizer 模板使用以下规范形态：
 
 ```cpp

@@ -1605,35 +1605,40 @@ public:
         std::forward<VisitorFn>(visitor), batch_size);
   }
 
-  void assign_opt_states(std::span<const uint64_t> keys,
+  void assign_opt_states(size_t dim, std::span<const uint64_t> keys,
                          std::span<const OptT> opt_states,
                          std::span<const uint32_t> steps) {
     std::shared_lock lifecycle_lock(*lifecycle_mutex_);
     size_t n = keys.size();
+    if (dim >= dim_to_slot_.size() || dim_to_slot_[dim] == nullptr)
+      throw std::invalid_argument(
+          "assign_opt_states dimension has no physical table");
+    auto &slot = *dim_to_slot_[dim];
+    if (!slot.optimizer.has_value())
+      throw std::invalid_argument(
+          "assign_opt_states dimension has no optimizer");
+    size_t opt_dim = slot.optimizer->state_dim();
+    if (opt_dim == 0 || opt_states.size() != n * opt_dim)
+      throw std::invalid_argument(
+          "assign_opt_states payload size does not match dimension");
+    if (!steps.empty() && steps.size() != n)
+      throw std::invalid_argument(
+          "assign_opt_states step count does not match key count");
     if (n == 0)
       return;
 
     epoch::with_epoch([&] {
       for (size_t i = 0; i < n; ++i) {
         uint64_t key = keys[i];
-        for (const auto &slot_ptr : slot_storage_) {
-          auto *slot = slot_ptr.get();
-          if (!slot->optimizer.has_value())
-            continue;
-          size_t opt_dim = slot->optimizer->state_dim();
-          if (opt_dim == 0)
-            continue;
-
-          auto found = slot->find(key);
-          if (found.has_value()) {
-            slot->optimizer->set_state(
-                *found, std::span<const OptT>(opt_states.data() + i * opt_dim,
-                                              opt_dim));
-            if (!steps.empty())
-              slot->optimizer->set_step(*found, steps[i]);
-            break; // Key found and updated, proceed to next key
-          }
-        }
+        auto found = slot.find(key);
+        if (!found.has_value())
+          throw std::invalid_argument(
+              "assign_opt_states key is absent from dimension table");
+        slot.optimizer->set_state(
+            *found,
+            std::span<const OptT>(opt_states.data() + i * opt_dim, opt_dim));
+        if (!steps.empty())
+          slot.optimizer->set_step(*found, steps[i]);
       }
     });
   }
