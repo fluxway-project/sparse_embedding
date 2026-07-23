@@ -40,6 +40,7 @@ struct CheckpointExportOptions {
   bool include_optimizer_state = false;
   size_t batch_size = 65536;
   bool use_compression = false;
+  std::string key_schema = "L"; // default to uint64_t
 };
 
 struct CheckpointLoadOptions {
@@ -82,10 +83,10 @@ struct CheckpointWriterFacade
                             CheckpointExportOptions options)> //
       ::add_convention<
           MemCkptWriteBatch,
-          void(std::span<const uint64_t> keys, const void *embeddings,
-               size_t embedding_bytes, std::span<const uint64_t> scores,
-               const void *optimizer_states, size_t opt_state_bytes,
-               std::span<const uint32_t> steps)> //
+          void(size_t num_keys, const void *keys, size_t key_bytes,
+               const void *embeddings, size_t embedding_bytes,
+               std::span<const uint64_t> scores, const void *optimizer_states,
+               size_t opt_state_bytes, std::span<const uint32_t> steps)> //
       ::add_convention<MemCkptCommit, uint64_t()>::support_copy<
           pro::constraint_level::nontrivial> //
       ::build {};
@@ -104,7 +105,7 @@ struct CheckpointReaderFacade
                        void(std::string_view uri, size_t dim, uint64_t version,
                             int64_t batch_size)> //
       ::add_convention<MemCkptReadBatch,
-                       bool(size_t max_n, std::vector<uint64_t> &out_keys,
+                       bool(size_t max_n, std::vector<std::byte> &out_keys,
                             std::vector<std::byte> &out_embeddings,
                             std::vector<uint64_t> &out_scores,
                             std::vector<std::byte> &out_optimizer_states,

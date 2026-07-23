@@ -15,7 +15,7 @@ logger = logging.getLogger(__name__)
 EMBEDDING_PARAMS_SCHEMA = pa.schema(
     [
         pa.field("dim", pa.uint32()),
-        pa.field("key", pa.uint64()),
+        pa.field("key", pa.int64()),
         pa.field("embedding_params", pa.list_(pa.float32())),
     ]
 )
@@ -23,7 +23,7 @@ EMBEDDING_PARAMS_SCHEMA = pa.schema(
 OPTIMIZER_STATES_SCHEMA = pa.schema(
     [
         pa.field("dim", pa.uint32()),
-        pa.field("key", pa.uint64()),
+        pa.field("key", pa.int64()),
         pa.field("optimizer_states", pa.list_(pa.float32())),
         pa.field("step", pa.uint32()),
     ]

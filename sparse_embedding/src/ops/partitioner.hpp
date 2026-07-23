@@ -20,6 +20,7 @@
 
 #include <cstdint>
 #include <span>
+#include <type_traits>
 
 #include <proxy/proxy.h>
 
@@ -68,6 +69,17 @@ class ModuloPartitioner {
   uint32_t num_shards_;
   bool is_power_of_two_;
 
+  template <typename KeyT> uint32_t shard_for(KeyT key) const {
+    if constexpr (std::is_signed_v<KeyT>) {
+      const auto divisor = static_cast<KeyT>(num_shards_);
+      const auto remainder = key % divisor;
+      return static_cast<uint32_t>(remainder < 0 ? remainder + divisor
+                                                 : remainder);
+    } else {
+      return static_cast<uint32_t>(key % static_cast<KeyT>(num_shards_));
+    }
+  }
+
 public:
   ModuloPartitioner(uint32_t num_shards) : num_shards_(num_shards) {
     if (num_shards_ == 0) {
@@ -113,8 +125,7 @@ public:
       }
     } else {
       for (; i < n; ++i) {
-        out_shard_ids[i] =
-            static_cast<uint32_t>(static_cast<uint64_t>(keys[i]) % num_shards_);
+        out_shard_ids[i] = shard_for(keys[i]);
       }
     }
   }
@@ -160,8 +171,7 @@ public:
       }
     } else {
       for (; i < n; ++i) {
-        out_mask[i] =
-            (static_cast<uint64_t>(keys[i]) % num_shards_) == target_shard;
+        out_mask[i] = shard_for(keys[i]) == target_shard;
       }
     }
   }

@@ -13,6 +13,7 @@
 // limitations under the License.
 // =============================================================================
 
+#include <dlpack/dlpack.h>
 #include <nanobind/nanobind.h>
 #include <nanobind/stl/optional.h>
 #include <nanobind/stl/string.h>
@@ -20,10 +21,9 @@
 #include <nanobind/stl/variant.h>
 #include <nanobind/stl/vector.h>
 
-#include <dlpack/dlpack.h>
-
 #include <algorithm>
 #include <cstdint>
+#include <format>
 #include <memory>
 #include <span>
 #include <stdexcept>
@@ -64,7 +64,17 @@ EmbeddingStoreWrapper::EmbeddingStoreWrapper(
                            : emb_cfg.optimizer_dtype),
       key_dtype_(emb_cfg.key_dtype),
       storage_(se::create_page_storage(emb_cfg.storage)) {
-
+  if (key_dtype_ == "int32" || key_dtype_ == "i32")
+    key_type_enum_ = KeyDType::kInt32;
+  else if (key_dtype_ == "uint32" || key_dtype_ == "u32")
+    key_type_enum_ = KeyDType::kUInt32;
+  else if (key_dtype_ == "int64" || key_dtype_ == "i64")
+    key_type_enum_ = KeyDType::kInt64;
+  else if (key_dtype_ == "uint64" || key_dtype_ == "u64" || key_dtype_.empty())
+    key_type_enum_ = KeyDType::kUInt64;
+  else
+    throw std::invalid_argument(
+        std::format("unsupported key_dtype: {}", key_dtype_));
   PyInitializer init_cfg = init_cfg_opt.value_or(
       PyInitializer{std::make_shared<pro::proxy<se::InitializerBuilderFacade>>(
           pro::make_proxy<se::InitializerBuilderFacade,

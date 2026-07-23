@@ -86,6 +86,18 @@ def test_partitioners() -> None:
     np.testing.assert_array_equal(mask2, shard_ids2 == 1)
 
 
+def test_modulo_partitioner_uses_signed_int64_remainder() -> None:
+    keys = np.asarray([-5, -4, -3, -2, -1, 0, 1, 2, 3], dtype=np.int64)
+    for num_shards in (2, 3, 5):
+        partitioner = sparse_embedding.ModuloPartitioner(num_shards=num_shards)
+        actual = np.from_dlpack(partitioner.partition(keys))
+        expected = np.mod(keys, np.int64(num_shards)).astype(np.uint32)
+        np.testing.assert_array_equal(actual, expected)
+        for target_shard in range(num_shards):
+            mask = np.from_dlpack(partitioner.filter(keys, target_shard))
+            np.testing.assert_array_equal(mask, expected == target_shard)
+
+
 # =============================================================================
 # encode_keys / decode_keys
 # =============================================================================
