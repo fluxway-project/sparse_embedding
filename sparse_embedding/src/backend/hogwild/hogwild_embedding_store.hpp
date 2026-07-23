@@ -1220,7 +1220,7 @@ private:
 
   enum class ExportOwnership { kSpan, kMove };
 
-  template <ExportOwnership Policy, typename VisitorFn>
+  template <typename K, ExportOwnership Policy, typename VisitorFn>
   void export_with_opt_impl(VisitorFn &&visitor, size_t batch_size) {
     std::shared_lock lifecycle_lock(*lifecycle_mutex_);
     for (const auto &slot_ptr : slot_storage_) {
@@ -1233,7 +1233,7 @@ private:
       constexpr bool has_score = ScorePolicyT::kHasScore;
 
       struct Buffer {
-        std::vector<uint64_t> keys;
+        std::vector<K> keys;
         std::vector<ParamT> vals;
         std::vector<uint64_t> scores;
         std::vector<OptT> opts;
@@ -1270,7 +1270,7 @@ private:
         if (buf.keys.empty())
           return true;
         if constexpr (Policy == ExportOwnership::kSpan) {
-          return visitor(emb_dim, std::span<const uint64_t>(buf.keys),
+          return visitor(emb_dim, std::span<const K>(buf.keys),
                          std::span<const ParamT>(buf.vals),
                          std::span<const uint64_t>(buf.scores),
                          std::span<const OptT>(buf.opts),
@@ -1304,7 +1304,7 @@ private:
         auto [key, idx] = entry.get_entry();
         auto &lb = local_bufs[w];
 
-        lb.keys.push_back(key);
+        lb.keys.push_back(static_cast<K>(key));
         const ParamT *src = slot->arena.data(idx);
         lb.vals.insert(lb.vals.end(), src, src + emb_dim);
         if constexpr (has_score) {
@@ -1593,19 +1593,19 @@ public:
     return {};
   }
 
-  template <typename VisitorFn>
+  template <typename K, typename VisitorFn>
   void export_batch_with_opt(VisitorFn &&visitor, size_t batch_size) {
-    export_with_opt_impl<ExportOwnership::kSpan>(
+    export_with_opt_impl<K, ExportOwnership::kSpan>(
         std::forward<VisitorFn>(visitor), batch_size);
   }
 
-  template <typename VisitorFn>
+  template <typename K, typename VisitorFn>
   void export_batch_with_opt_owned(VisitorFn &&visitor, size_t batch_size) {
-    export_with_opt_impl<ExportOwnership::kMove>(
+    export_with_opt_impl<K, ExportOwnership::kMove>(
         std::forward<VisitorFn>(visitor), batch_size);
   }
 
-  void assign_opt_states(size_t dim, std::span<const uint64_t> keys,
+  void assign_opt_states(size_t dim, std::span<const KeyT> keys,
                          std::span<const OptT> opt_states,
                          std::span<const uint32_t> steps) {
     std::shared_lock lifecycle_lock(*lifecycle_mutex_);
@@ -1647,13 +1647,13 @@ public:
   // Visitor receives (dim, keys, vals, scores, opt_states, steps) with native
   // ParamT/OptT precision.
   void export_opt_state_batch(
-      se::Function<bool(size_t, std::span<const uint64_t>,
-                        std::span<const ParamT>, std::span<const uint64_t>,
-                        std::span<const OptT>, std::span<const uint32_t>)>
+      se::Function<bool(size_t, std::span<const KeyT>, std::span<const ParamT>,
+                        std::span<const uint64_t>, std::span<const OptT>,
+                        std::span<const uint32_t>)>
           visitor,
       size_t batch_size) {
-    export_batch_with_opt(
-        [&](size_t dim, std::span<const uint64_t> keys,
+    export_batch_with_opt<KeyT>(
+        [&](size_t dim, std::span<const KeyT> keys,
             std::span<const ParamT> vals, std::span<const uint64_t> scores,
             std::span<const OptT> opt_states,
             std::span<const uint32_t> steps) -> bool {
@@ -1666,15 +1666,14 @@ public:
   // Visitor receives std::vector&& of native ParamT/OptT precision for
   // zero-copy Arrow C Data Interface construction.
   void export_opt_state_batch_owned(
-      se::Function<bool(size_t, std::vector<uint64_t> &&,
-                        std::vector<ParamT> &&, std::vector<uint64_t> &&,
-                        std::vector<OptT> &&, std::vector<uint32_t> &&)>
+      se::Function<bool(size_t, std::vector<KeyT> &&, std::vector<ParamT> &&,
+                        std::vector<uint64_t> &&, std::vector<OptT> &&,
+                        std::vector<uint32_t> &&)>
           visitor,
       size_t batch_size) {
-    export_batch_with_opt_owned(
-        [&](size_t dim, std::vector<uint64_t> &&keys,
-            std::vector<ParamT> &&vals, std::vector<uint64_t> &&scores,
-            std::vector<OptT> &&opt_states,
+    export_batch_with_opt_owned<KeyT>(
+        [&](size_t dim, std::vector<KeyT> &&keys, std::vector<ParamT> &&vals,
+            std::vector<uint64_t> &&scores, std::vector<OptT> &&opt_states,
             std::vector<uint32_t> &&steps) -> bool {
           return (*visitor)(dim, std::move(keys), std::move(vals),
                             std::move(scores), std::move(opt_states),

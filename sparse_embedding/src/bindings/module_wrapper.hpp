@@ -90,13 +90,17 @@ template <typename Fn>
 auto dispatch_on_key(const DLManagedTensor *dlm,
                      const std::string & /*expected_key_dtype*/, Fn &&fn) {
   auto kdt = detect_key_dtype(dlm);
-  if (kdt == KeyDType::kInt32)
+  switch (kdt) {
+  case KeyDType::kInt32:
     return fn(se::py::dlpack_to_span<const int32_t>(dlm));
-  if (kdt == KeyDType::kUInt32)
+  case KeyDType::kUInt32:
     return fn(se::py::dlpack_to_span<const uint32_t>(dlm));
-  if (kdt == KeyDType::kInt64)
+  case KeyDType::kInt64:
     return fn(se::py::dlpack_to_span<const int64_t>(dlm));
-  return fn(se::py::dlpack_to_span<const uint64_t>(dlm));
+  case KeyDType::kUInt64:
+    return fn(se::py::dlpack_to_span<const uint64_t>(dlm));
+  }
+  throw std::invalid_argument("unsupported key_dtype");
 }
 
 template <typename Fn>
@@ -281,6 +285,7 @@ class EmbeddingStoreWrapper {
   std::string value_dtype_;
   std::string optimizer_dtype_;
   std::string key_dtype_;
+  KeyDType key_type_enum_;
   std::vector<size_t> dims_;
   se::PageStorage storage_;
 

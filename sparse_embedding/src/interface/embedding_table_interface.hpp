@@ -157,6 +157,22 @@ using WeakMemOptimizerStep = pro::weak_dispatch<MemOptimizerStep>;
           visitor,                                                             \
       std::size_t batch_size)
 
+#define SE_ASSIGN_OPT_STATES_FACADE_SIG(key_t)                                 \
+  void(std::size_t, std::span<const key_t>, std::span<const OptT>,             \
+       std::span<const uint32_t>)
+
+#define SE_EXPORT_OPT_STATE_BATCH_FACADE_SIG(key_t)                            \
+  void(se::Function<bool(std::size_t, std::span<const key_t>,                  \
+                         std::span<const ParamT>, std::span<const uint64_t>,   \
+                         std::span<const OptT>, std::span<const uint32_t>)>,   \
+       std::size_t)
+
+#define SE_EXPORT_OPT_STATE_BATCH_OWNED_FACADE_SIG(key_t)                      \
+  void(se::Function<bool(std::size_t, std::vector<key_t> &&,                   \
+                         std::vector<ParamT> &&, std::vector<uint64_t> &&,     \
+                         std::vector<OptT> &&, std::vector<uint32_t> &&)>,     \
+       std::size_t)
+
 PRO_DEF_MEM_DISPATCH(MemAssignOptStates, assign_opt_states);
 PRO_DEF_MEM_DISPATCH(MemExportOptStateBatch, export_opt_state_batch);
 PRO_DEF_MEM_DISPATCH(MemExportOptStateBatchOwned, export_opt_state_batch_owned);
@@ -243,23 +259,20 @@ struct EmbeddingTableFacade : pro::facade_builder //
 
   // --- Optimizer state checkpoint -------------------------------------------
   ::add_convention<pro::weak_dispatch<MemAssignOptStates>,
-                   void(std::size_t, std::span<const uint64_t>,
-                        std::span<const OptT>,
-                        std::span<const uint32_t>)> //
+                   SE_ASSIGN_OPT_STATES_FACADE_SIG(int32_t),
+                   SE_ASSIGN_OPT_STATES_FACADE_SIG(uint32_t),
+                   SE_ASSIGN_OPT_STATES_FACADE_SIG(int64_t),
+                   SE_ASSIGN_OPT_STATES_FACADE_SIG(uint64_t)> //
   ::add_convention<pro::weak_dispatch<MemExportOptStateBatch>,
-                   void(se::Function<bool(std::size_t, std::span<const uint64_t>,
-                                         std::span<const ParamT>,
-                                         std::span<const uint64_t>,
-                                         std::span<const OptT>,
-                                         std::span<const uint32_t>)>,
-                        std::size_t)> //
+                   SE_EXPORT_OPT_STATE_BATCH_FACADE_SIG(int32_t),
+                   SE_EXPORT_OPT_STATE_BATCH_FACADE_SIG(uint32_t),
+                   SE_EXPORT_OPT_STATE_BATCH_FACADE_SIG(int64_t),
+                   SE_EXPORT_OPT_STATE_BATCH_FACADE_SIG(uint64_t)> //
   ::add_convention<pro::weak_dispatch<MemExportOptStateBatchOwned>,
-                   void(se::Function<bool(std::size_t, std::vector<uint64_t>&&,
-                                         std::vector<ParamT>&&,
-                                         std::vector<uint64_t>&&,
-                                         std::vector<OptT>&&,
-                                         std::vector<uint32_t>&&)>,
-                        std::size_t)> //
+                   SE_EXPORT_OPT_STATE_BATCH_OWNED_FACADE_SIG(int32_t),
+                   SE_EXPORT_OPT_STATE_BATCH_OWNED_FACADE_SIG(uint32_t),
+                   SE_EXPORT_OPT_STATE_BATCH_OWNED_FACADE_SIG(int64_t),
+                   SE_EXPORT_OPT_STATE_BATCH_OWNED_FACADE_SIG(uint64_t)> //
 
   ::build {};
 // NOLINTEND(whitespace/indent_namespace)
@@ -275,6 +288,9 @@ struct EmbeddingTableFacade : pro::facade_builder //
 #undef SE_ACCUMULATE_GRADIENTS_FACADE_SIG
 #undef SE_EVICT_BY_SCORE_FACADE_SIG
 #undef SE_EXPORT_BATCH_FACADE_SIG
+#undef SE_ASSIGN_OPT_STATES_FACADE_SIG
+#undef SE_EXPORT_OPT_STATE_BATCH_FACADE_SIG
+#undef SE_EXPORT_OPT_STATE_BATCH_OWNED_FACADE_SIG
 
 } // namespace se
 

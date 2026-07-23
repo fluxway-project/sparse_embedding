@@ -136,6 +136,7 @@ void LanceCheckpointWriter::begin(std::string_view uri, size_t dim,
   options_ = options;
   is_first_batch_ = true;
   committed_version_ = 0;
+  num_keys_ = 0;
 
   buf_keys_.clear();
   buf_embeddings_.clear();
@@ -144,14 +145,14 @@ void LanceCheckpointWriter::begin(std::string_view uri, size_t dim,
   buf_steps_.clear();
 }
 
-void LanceCheckpointWriter::write_batch(std::span<const uint64_t> keys,
-                                        const void *embeddings,
-                                        size_t embedding_bytes,
-                                        std::span<const uint64_t> scores,
-                                        const void *optimizer_states,
-                                        size_t opt_state_bytes,
-                                        std::span<const uint32_t> steps) {
-  buf_keys_.assign(keys.begin(), keys.end());
+void LanceCheckpointWriter::write_batch(
+    size_t num_keys, const void *keys, size_t key_bytes, const void *embeddings,
+    size_t embedding_bytes, std::span<const uint64_t> scores,
+    const void *optimizer_states, size_t opt_state_bytes,
+    std::span<const uint32_t> steps) {
+  auto *k = static_cast<const std::byte *>(keys);
+  buf_keys_.insert(buf_keys_.end(), k, k + key_bytes);
+  num_keys_ += num_keys;
 
   buf_embeddings_.resize(embedding_bytes);
   std::memcpy(buf_embeddings_.data(), embeddings, embedding_bytes);
@@ -197,15 +198,14 @@ void LanceCheckpointWriter::build_schema(ArrowSchema *out) const {
 
   int col = 0;
 
-  // key: uint64
+  // key
   out->children[col] = new ArrowSchema();
-  make_child_schema(out->children[col], "key", "L");
+  make_child_schema(out->children[col], "key", options_.key_schema.c_str());
   ++col;
 
   // embedding: fixed_size_binary(dim * val_size)
   // We use fixed_size_binary since we don't know the ValT at this layer
-  size_t entry_bytes =
-      buf_keys_.empty() ? 0 : buf_embeddings_.size() / buf_keys_.size();
+  size_t entry_bytes = num_keys_ == 0 ? 0 : buf_embeddings_.size() / num_keys_;
   thread_local std::string emb_format;
   emb_format = "w:" + std::to_string(entry_bytes);
   out->children[col] = new ArrowSchema();
@@ -242,7 +242,7 @@ void LanceCheckpointWriter::build_schema(ArrowSchema *out) const {
 }
 
 void LanceCheckpointWriter::build_array(ArrowArray *out) const {
-  int64_t n = static_cast<int64_t>(buf_keys_.size());
+  int64_t n = static_cast<int64_t>(num_keys_);
   int n_cols = 2;
   if (has_score_)
     ++n_cols;
@@ -388,6 +388,7 @@ void LanceCheckpointWriter::flush_to_lance() {
   }
 
   buf_keys_.clear();
+  num_keys_ = 0;
   buf_embeddings_.clear();
   buf_scores_.clear();
   buf_opt_states_.clear();
@@ -465,9 +466,17 @@ void LanceCheckpointReader::open(std::string_view uri, size_t dim,
   has_score_ = false;
   opt_state_dim_ = 0;
   dim_ = 0;
+  key_dim_ = 8;
   for (int64_t i = 0; i < schema_.n_children; ++i) {
     auto *child = schema_.children[i];
-    if (std::strcmp(child->name, "embedding_params") == 0) {
+    if (std::strcmp(child->name, "key") == 0) {
+      if (child->format && (std::strcmp(child->format, "i") == 0 ||
+                            std::strcmp(child->format, "I") == 0)) {
+        key_dim_ = 4;
+      } else {
+        key_dim_ = 8;
+      }
+    } else if (std::strcmp(child->name, "embedding_params") == 0) {
       // format is "w:<nbytes>"
       if (child->format && child->format[0] == 'w' && child->format[1] == ':') {
         size_t bytes = std::stoul(child->format + 2);
@@ -490,7 +499,7 @@ void LanceCheckpointReader::open(std::string_view uri, size_t dim,
 }
 
 bool LanceCheckpointReader::read_batch(
-    size_t max_n, std::vector<uint64_t> &out_keys,
+    size_t max_n, std::vector<std::byte> &out_keys,
     std::vector<std::byte> &out_embeddings, std::vector<uint64_t> &out_scores,
     std::vector<std::byte> &out_optimizer_states,
     std::vector<uint32_t> &out_steps) {
@@ -514,8 +523,11 @@ bool LanceCheckpointReader::read_batch(
   // key column
   {
     auto *child = batch.children[col];
-    auto *data = static_cast<const uint64_t *>(child->buffers[1]);
-    out_keys.assign(data + child->offset, data + child->offset + n);
+    auto *data = static_cast<const std::byte *>(
+        static_cast<const void *>(child->buffers[1]));
+    size_t total_bytes = static_cast<size_t>(n) * key_dim_;
+    auto *start = data + child->offset * key_dim_;
+    out_keys.assign(start, start + total_bytes);
     ++col;
   }
 

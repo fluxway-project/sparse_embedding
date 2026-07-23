@@ -71,16 +71,20 @@ void ConstructOpsImpl<ParamT, OptT>::construct(
     }
   };
 
-  if (self.key_dtype_ == "int64")
+  switch (self.key_type_enum_) {
+  case KeyDType::kInt64:
     construct_with_key.template operator()<int64_t>();
-  else if (self.key_dtype_ == "uint64")
+    break;
+  case KeyDType::kUInt64:
     construct_with_key.template operator()<uint64_t>();
-  else if (self.key_dtype_ == "int32")
+    break;
+  case KeyDType::kInt32:
     construct_with_key.template operator()<int32_t>();
-  else if (self.key_dtype_ == "uint32")
+    break;
+  case KeyDType::kUInt32:
     construct_with_key.template operator()<uint32_t>();
-  else
-    throw std::invalid_argument("unsupported key_dtype: " + self.key_dtype_);
+    break;
+  }
 }
 
 } // namespace se::py::detail

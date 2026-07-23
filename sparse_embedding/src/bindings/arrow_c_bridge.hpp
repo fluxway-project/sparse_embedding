@@ -28,10 +28,9 @@
 
 #include <cstdint>
 #include <cstring>
+#include <stdexcept>
 #include <utility>
 #include <vector>
-
-#include "sparse_embedding/src/common/slot_key_codec.hpp"
 
 // ============================================================================
 // Arrow C Data Interface struct definitions (from the Arrow spec).
@@ -84,9 +83,9 @@ constexpr int64_t kArrowFlagNullable = 2;
 // SchemaBuilder: constructs ArrowSchema trees for our checkpoint schemas.
 //
 // Two schemas are supported:
-//   - EmbeddingParams:  struct<slot_id: uint32, key: uint64, embedding_params:
+//   - EmbeddingParams:  struct<slot_id: uint32, key: int64, embedding_params:
 //   list<f32>>
-//   - OptimizerStates:   struct<slot_id: uint32, key: uint64, optimizer_states:
+//   - OptimizerStates:   struct<slot_id: uint32, key: int64, optimizer_states:
 //   list<f32>>
 // ============================================================================
 
@@ -137,9 +136,10 @@ inline ArrowSchema *make_list_schema(const char *name) {
 // with_step=false (default) and observe the legacy 3-column layout.
 inline void build_record_batch_schema(ArrowSchema *out,
                                       const char *list_col_name,
+                                      const char *key_format,
                                       bool with_step = false) {
   auto *dim = detail::make_leaf_schema("I", "dim"); // uint32
-  auto *key = detail::make_leaf_schema("L", "key"); // uint64
+  auto *key = detail::make_leaf_schema(key_format, "key");
   auto *list_col = detail::make_list_schema(list_col_name);
   ArrowSchema *step =
       with_step ? detail::make_leaf_schema("I", "step") : nullptr;
@@ -279,9 +279,10 @@ inline ArrowArray *make_list_array(std::vector<int32_t> &&offsets,
 // Build the top-level struct array. When `steps` is non-empty, an extra
 // uint32 child column is appended (must match the schema built with
 // with_step=true). Empty steps preserve the legacy 3-column layout.
+template <typename KeyT>
 inline void build_record_batch_array(ArrowArray *out,
                                      std::vector<uint32_t> &&dims,
-                                     std::vector<uint64_t> &&keys,
+                                     std::vector<KeyT> &&keys,
                                      std::vector<int32_t> &&offsets,
                                      std::vector<float> &&flat_values,
                                      std::vector<uint32_t> &&steps = {}) {
@@ -339,8 +340,26 @@ struct ArrowBatchPair {
   ArrowSchema schema;
 };
 
+template <typename KeyT> inline const char *arrow_key_format() {
+  if constexpr (std::is_same_v<KeyT, int32_t>)
+    return "i";
+  if constexpr (std::is_same_v<KeyT, uint32_t>)
+    return "I";
+  if constexpr (std::is_same_v<KeyT, int64_t>)
+    return "l";
+  if constexpr (std::is_same_v<KeyT, uint64_t>)
+    return "L";
+  throw std::invalid_argument("Unsupported KeyT for Arrow schema");
+}
+
+// Build an embedding record batch.
+// Note on PyArrow Compatibility: We hardcode `std::vector<float>` instead of a
+// generic `ParamT`. PyArrow does not natively support bfloat16. To ensure the
+// exported C Data Interface struct can be parsed in Python, any bfloat16
+// backend buffers must be cast to float32 before reaching here.
+template <typename KeyT>
 inline ArrowBatchPair build_embedding_batch(size_t emb_dim,
-                                            std::vector<uint64_t> &&keys,
+                                            std::vector<KeyT> &&keys,
                                             std::vector<float> &&vals) {
   size_t n = keys.size();
   size_t dim = n > 0 ? vals.size() / n : 0;
@@ -353,7 +372,8 @@ inline ArrowBatchPair build_embedding_batch(size_t emb_dim,
   }
 
   ArrowBatchPair pair;
-  build_record_batch_schema(&pair.schema, "embedding_params");
+  build_record_batch_schema(&pair.schema, "embedding_params",
+                            arrow_key_format<KeyT>());
   build_record_batch_array(&pair.array, std::move(dims), std::move(keys),
                            std::move(offsets), std::move(vals));
   return pair;
@@ -362,8 +382,9 @@ inline ArrowBatchPair build_embedding_batch(size_t emb_dim,
 // Build an opt_state record batch with an optional per-ID step column.
 // Empty `steps` produces the legacy 3-column layout (used for optimizers
 // that do not track step state, e.g. SGD).
+template <typename KeyT>
 inline ArrowBatchPair build_opt_state_batch(
-    size_t emb_dim, std::vector<uint64_t> &&keys, std::vector<float> &&vals,
+    size_t emb_dim, std::vector<KeyT> &&keys, std::vector<float> &&vals,
     std::vector<float> &&opt_states, std::vector<uint32_t> &&steps = {}) {
   size_t n = keys.size();
   size_t opt_dim = n > 0 ? opt_states.size() / n : 0;
@@ -377,7 +398,8 @@ inline ArrowBatchPair build_opt_state_batch(
   }
 
   ArrowBatchPair pair;
-  build_record_batch_schema(&pair.schema, "optimizer_states", with_step);
+  build_record_batch_schema(&pair.schema, "optimizer_states",
+                            arrow_key_format<KeyT>(), with_step);
   build_record_batch_array(&pair.array, std::move(dims), std::move(keys),
                            std::move(offsets), std::move(opt_states),
                            std::move(steps));

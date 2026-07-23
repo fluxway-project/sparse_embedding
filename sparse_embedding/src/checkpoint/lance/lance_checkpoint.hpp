@@ -24,6 +24,7 @@
 #include <string_view>
 #include <vector>
 
+#include <arrow/c/abi.h>
 #include <lance/lance.h>
 #include <lance/lance.hpp>
 
@@ -39,12 +40,13 @@ class LanceCheckpointWriter {
   bool has_score_ = false;
   CheckpointExportOptions options_;
 
-  std::vector<uint64_t> buf_keys_;
+  std::vector<std::byte> buf_keys_;
   std::vector<std::byte> buf_embeddings_;
   std::vector<uint64_t> buf_scores_;
   std::vector<std::byte> buf_opt_states_;
   std::vector<uint32_t> buf_steps_;
   size_t entry_byte_size_ = 0;
+  size_t num_keys_ = 0;
   bool is_first_batch_ = true;
   uint64_t committed_version_ = 0;
 
@@ -69,8 +71,9 @@ public:
   void begin(std::string_view uri, size_t dim, size_t optimizer_state_dim,
              bool has_score, CheckpointExportOptions options);
 
-  void write_batch(std::span<const uint64_t> keys, const void *embeddings,
-                   size_t embedding_bytes, std::span<const uint64_t> scores,
+  void write_batch(size_t num_keys, const void *keys, size_t key_bytes,
+                   const void *embeddings, size_t embedding_bytes,
+                   std::span<const uint64_t> scores,
                    const void *optimizer_states, size_t opt_state_bytes,
                    std::span<const uint32_t> steps);
 
@@ -87,6 +90,7 @@ class LanceCheckpointReader {
   ArrowArrayStream stream_{};
   ArrowSchema schema_{};
   bool stream_open_ = false;
+  size_t key_dim_ = 8;
   size_t opt_state_dim_ = 0;
   bool has_score_ = false;
   bool has_step_ = false;
@@ -100,7 +104,7 @@ public:
   void open(std::string_view uri, size_t dim, uint64_t version,
             int64_t batch_size = 65536);
 
-  bool read_batch(size_t max_n, std::vector<uint64_t> &out_keys,
+  bool read_batch(size_t max_n, std::vector<std::byte> &out_keys,
                   std::vector<std::byte> &out_embeddings,
                   std::vector<uint64_t> &out_scores,
                   std::vector<std::byte> &out_optimizer_states,

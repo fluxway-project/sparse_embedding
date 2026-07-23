@@ -448,6 +448,42 @@ def test_single_shard_roundtrip_value_correctness(lance_tmp_uri):
         )
 
 
+def test_signed_int64_keys_checkpoint_and_reshard(lance_tmp_uri):
+    uri, backend = lance_tmp_uri
+    keys = np.asarray(
+        [np.iinfo(np.int64).min, -9, -5, -1, 0, 1, 7, np.iinfo(np.int64).max],
+        dtype=np.int64,
+    )
+    values = np.arange(keys.size * 4, dtype=np.float32).reshape(keys.size, 4)
+    config = se.EmbeddingConfig(
+        dims=[4],
+        num_threads=2,
+        value_dtype="float32",
+        key_dtype="int64",
+    )
+    source = se.EmbeddingStore(config)
+    backend.init_dataset(source, uri)
+    source.assign(keys, values)
+    metadata = backend.export_fragments(source, uri)
+    backend.commit_fragments(uri, [metadata])
+
+    partitioner = se.ModuloPartitioner(num_shards=3)
+    for shard_id in range(3):
+        restored = se.EmbeddingStore(config)
+        backend.load(
+            restored,
+            uri,
+            filter_fn=partitioner,
+            target_shard_id=shard_id,
+        )
+        mask = np.mod(keys, np.int64(3)) == shard_id
+        shard_keys = keys[mask]
+        if shard_keys.size == 0:
+            continue
+        actual = lookup_np(restored, shard_keys, 4)
+        np.testing.assert_allclose(actual, values[mask], atol=1e-5)
+
+
 @pytest.mark.parametrize(
     "save_shards,load_shards",
     [
