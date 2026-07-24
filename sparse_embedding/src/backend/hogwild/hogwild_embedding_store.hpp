@@ -125,9 +125,9 @@ public:
     ensure_capacity(static_cast<uint32_t>(capacity - 1));
   }
 
-  uint64_t &score_raw(uint32_t index) const {
+  [[carries_dependency]] uint64_t &score_raw(uint32_t index) const {
     return pages_->score[index / kEntriesPerPage].load(
-        std::memory_order_acquire)[index % kEntriesPerPage];
+        std::memory_order_consume)[index % kEntriesPerPage];
   }
 
   ValT *data(uint32_t index) const {
@@ -218,9 +218,9 @@ private:
     return total;
   }
 
-  std::byte *data_raw(uint32_t index) const {
+  [[carries_dependency]] std::byte *data_raw(uint32_t index) const {
     return pages_->data[index / kEntriesPerPage].load(
-               std::memory_order_acquire) +
+               std::memory_order_consume) +
            (index % kEntriesPerPage) * data_stride_;
   }
 
@@ -741,9 +741,8 @@ public:
           }
           uint64_t key = static_cast<uint64_t>(keys[i]);
           size_t dim = static_cast<size_t>(row_lengths[i]);
-          if (__builtin_expect(dim >= dim_to_slot_.size() ||
-                                   dim_to_slot_[dim] == nullptr,
-                               0)) {
+          if (dim >= dim_to_slot_.size() || dim_to_slot_[dim] == nullptr)
+              [[unlikely]] {
             throw std::runtime_error(
                 "invalid dim access: no physical table for dim " +
                 std::to_string(dim));
@@ -891,9 +890,8 @@ public:
           uint32_t i = shuffled_indices[idx];
           uint64_t key = static_cast<uint64_t>(keys[i]);
           size_t dim = static_cast<size_t>(row_lengths[i]);
-          if (__builtin_expect(dim >= dim_to_slot_.size() ||
-                                   dim_to_slot_[dim] == nullptr,
-                               0)) {
+          if (dim >= dim_to_slot_.size() || dim_to_slot_[dim] == nullptr)
+              [[unlikely]] {
             throw std::runtime_error(
                 "invalid dim access: no physical table for dim " +
                 std::to_string(dim));
@@ -994,9 +992,8 @@ public:
         for (size_t i = begin; i < end; ++i) {
           uint64_t key = static_cast<uint64_t>(keys[i]);
           size_t dim = static_cast<size_t>(row_lengths[i]);
-          if (__builtin_expect(dim >= dim_to_slot_.size() ||
-                                   dim_to_slot_[dim] == nullptr,
-                               0)) {
+          if (dim >= dim_to_slot_.size() || dim_to_slot_[dim] == nullptr)
+              [[unlikely]] {
             throw std::runtime_error("invalid dim access");
           }
           auto &slot = *dim_to_slot_[dim];
@@ -1028,9 +1025,8 @@ public:
         for (size_t i = begin; i < end; ++i) {
           uint64_t key = static_cast<uint64_t>(keys[i]);
           size_t dim = static_cast<size_t>(row_lengths[i]);
-          if (__builtin_expect(dim >= dim_to_slot_.size() ||
-                                   dim_to_slot_[dim] == nullptr,
-                               0)) {
+          if (dim >= dim_to_slot_.size() || dim_to_slot_[dim] == nullptr)
+              [[unlikely]] {
             throw std::runtime_error("invalid dim access");
           }
           auto &slot = *dim_to_slot_[dim];
@@ -1409,7 +1405,7 @@ private:
   size_t num_threads_ = 0;
   exec::static_thread_pool pool_;
   Initializer initializer_;
-  ScorePolicyT score_policy_;
+  [[no_unique_address]] ScorePolicyT score_policy_;
   PageStorage storage_;
   bool background_page_eviction_enabled_;
   std::shared_ptr<std::shared_mutex> lifecycle_mutex_;
