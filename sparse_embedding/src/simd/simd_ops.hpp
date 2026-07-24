@@ -121,6 +121,7 @@ template <typename ValT>
 inline void simd_copy(const ValT *__restrict__ src, ValT *__restrict__ dst,
                       size_t count) {
   size_t i = 0;
+  [[assume(count > 0)]];
 #if defined(__AVX512F__)
   if constexpr (is_simd_supported_v<ValT>) {
     for (; i + 16 <= count; i += 16) {
@@ -147,6 +148,7 @@ template <typename ValT>
 inline void simd_accumulate(const ValT *__restrict__ src,
                             ValT *__restrict__ dst, size_t count) {
   size_t i = 0;
+  [[assume(count > 0)]];
 #if defined(__AVX512F__)
   if constexpr (is_simd_supported_v<ValT>) {
     for (; i + 16 <= count; i += 16) {
@@ -181,6 +183,7 @@ inline void simd_sgd_update(ValT *__restrict__ param,
                             const GradT *__restrict__ grad, float lr,
                             float weight_decay, size_t count) {
   size_t i = 0;
+  [[assume(count > 0)]];
 #if defined(__AVX512F__)
   if constexpr (is_simd_supported_v<ValT> && is_simd_supported_v<GradT>) {
     const __m512 learning_rate = _mm512_set1_ps(lr);
@@ -228,6 +231,7 @@ simd_adam_update(ValT *__restrict__ param, const GradT *__restrict__ grad,
                  float beta1, float beta2, float eps, float bc1, float bc2,
                  float weight_decay, size_t count) {
   size_t i = 0;
+  [[assume(count > 0)]];
 #if defined(__AVX512F__)
   if constexpr (is_simd_supported_v<ValT> && is_simd_supported_v<GradT> &&
                 is_simd_supported_v<OptStateT>) {
@@ -345,6 +349,7 @@ template <typename ValT>
 inline void simd_uniform_init(ValT *__restrict__ data, size_t count,
                               float min_val, float max_val, uint64_t key) {
   size_t i = 0;
+  [[assume(count > 0)]];
 #if defined(__AVX512F__)
   if constexpr (is_simd_supported_v<ValT>) {
     uint32_t seed = static_cast<uint32_t>(key ^ (key >> 32));
