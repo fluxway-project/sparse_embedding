@@ -36,7 +36,7 @@ int main() {
       se::HogwildEmbeddingStore<uint64_t, float, float, se::NoScorePolicy>;
   using ScoredStore =
       se::HogwildEmbeddingStore<uint64_t, float, float, se::ManualScorePolicy>;
-  Store store({8}, 1, {}, 1024, nullptr, se::NoScorePolicy{}, 16, storage);
+  Store store({8}, 1, {}, nullptr, se::NoScorePolicy{}, 16, storage);
 
   constexpr std::array<uint64_t, 3> keys{11, 22, 33};
   constexpr std::array<int64_t, 3> lengths{8, 8, 8};
@@ -50,24 +50,24 @@ int main() {
   require(storage->stats().spill_bytes > 0,
           "store did not use shared spill storage");
 
-  bool rejected_before_allocation = false;
+  bool reserve_overflow_rejected = false;
   try {
     constexpr std::array<size_t, 1> excessive_reserve{
         std::numeric_limits<size_t>::max()};
     store.reserve_per_shard(excessive_reserve, 8);
-  } catch (const std::length_error &error) {
-    rejected_before_allocation = std::string_view(error.what()) ==
-                                 "reserve exceeds max_active_keys capacity";
+  } catch (const std::overflow_error &error) {
+    reserve_overflow_rejected =
+        std::string_view(error.what()) == "key shard capacity overflow";
   }
-  require(rejected_before_allocation,
-          "excessive reserve was not rejected before allocation");
+  require(reserve_overflow_rejected,
+          "reserve overflow was not rejected before allocation");
 
   se::StorageOptions duplicate_options;
   duplicate_options.mode = se::StorageMode::kMemoryOnly;
   duplicate_options.memory_limit_bytes = 64 << 20;
   auto duplicate_storage =
       se::create_page_storage(std::move(duplicate_options));
-  Store duplicate_store({8}, 32, {}, 1, nullptr, se::NoScorePolicy{}, 16,
+  Store duplicate_store({8}, 32, {}, nullptr, se::NoScorePolicy{}, 16,
                         duplicate_storage);
   require(duplicate_storage->stats().memory_bytes == 0,
           "empty store eagerly allocated transient pages");
@@ -85,8 +85,8 @@ int main() {
   require(duplicate_store.size() == 1,
           "concurrent duplicate insertion consumed active-key capacity");
 
-  ScoredStore memory_scored_store(
-      {8}, 1, {}, 16, nullptr, se::ManualScorePolicy{}, 16, duplicate_storage);
+  ScoredStore memory_scored_store({8}, 1, {}, nullptr, se::ManualScorePolicy{},
+                                  16, duplicate_storage);
   constexpr std::array<uint64_t, 1> memory_scored_key{55};
   constexpr std::array<int64_t, 1> memory_scored_length{8};
   std::array<float, 8> memory_scored_values{};
@@ -120,7 +120,7 @@ int main() {
   reuse_options.spill_directory = std::filesystem::temp_directory_path();
   reuse_options.max_spill_bytes = 1 << 20;
   auto reuse_storage = se::create_page_storage(std::move(reuse_options));
-  Store reuse_store({8}, 1, {}, 1, nullptr, se::NoScorePolicy{}, 16,
+  Store reuse_store({8}, 1, {}, nullptr, se::NoScorePolicy{}, 16,
                     reuse_storage);
   std::array<uint64_t, 1> reuse_key{};
   constexpr std::array<int64_t, 1> reuse_length{8};
@@ -135,29 +135,13 @@ int main() {
   require(reuse_storage->stats().spill_count == 1,
           "erased embedding indices were not reused");
 
-  bool arena_limit_rejected = false;
-  try {
-    Store oversized_store({8}, 1, {}, size_t{1} << 40, nullptr,
-                          se::NoScorePolicy{}, 16, duplicate_storage);
-  } catch (const std::length_error &error) {
-    arena_limit_rejected = std::string_view(error.what()) ==
-                           "max_active_keys exceeds arena capacity";
-  }
-  require(arena_limit_rejected,
-          "oversized key index was not rejected before allocation");
+  se::TransientArena<float> transient(8, duplicate_storage);
+  transient.get_or_allocate(1);
+  transient.get_or_allocate(2);
+  require(transient.active_slots() == 2,
+          "transient arena did not grow dynamically");
 
-  se::TransientArena<float> bounded_transient(8, duplicate_storage, 1);
-  bounded_transient.get_or_allocate(1);
-  bool transient_limit_rejected = false;
-  try {
-    bounded_transient.get_or_allocate(2);
-  } catch (const std::length_error &error) {
-    transient_limit_rejected =
-        std::string_view(error.what()) == "transient key capacity exceeded";
-  }
-  require(transient_limit_rejected, "transient key capacity was not enforced");
-
-  Store lifecycle_store({8}, 4, {}, 64, nullptr, se::NoScorePolicy{}, 16,
+  Store lifecycle_store({8}, 4, {}, nullptr, se::NoScorePolicy{}, 16,
                         duplicate_storage);
   std::array<uint64_t, 32> lifecycle_keys{};
   std::iota(lifecycle_keys.begin(), lifecycle_keys.end(), uint64_t{1});
@@ -194,8 +178,8 @@ int main() {
   watermark_options.max_spill_bytes = 1 << 20;
   auto watermark_storage =
       se::create_page_storage(std::move(watermark_options));
-  ScoredStore watermark_store({8}, 1, {}, 16, nullptr, se::ManualScorePolicy{},
-                              16, watermark_storage);
+  ScoredStore watermark_store({8}, 1, {}, nullptr, se::ManualScorePolicy{}, 16,
+                              watermark_storage);
   constexpr std::array<uint64_t, 1> watermark_key{91};
   constexpr std::array<int64_t, 1> watermark_length{8};
   std::array<float, 8> watermark_values{};
@@ -230,10 +214,10 @@ int main() {
   std::array<uint8_t, 1> shared_inserted{};
   {
     auto first = std::make_unique<ScoredStore>(
-        std::vector<size_t>{8}, 1, ScoredStore::Initializer{}, 16, nullptr,
+        std::vector<size_t>{8}, 1, ScoredStore::Initializer{}, nullptr,
         se::ManualScorePolicy{}, 16, shared_storage);
     auto second = std::make_unique<ScoredStore>(
-        std::vector<size_t>{8}, 1, ScoredStore::Initializer{}, 16, nullptr,
+        std::vector<size_t>{8}, 1, ScoredStore::Initializer{}, nullptr,
         se::ManualScorePolicy{}, 16, shared_storage);
     first->lookup_or_insert<uint64_t>(shared_key, shared_values, shared_length,
                                       shared_inserted);
@@ -249,7 +233,7 @@ int main() {
             "shared storage lost the surviving store after peer destruction");
 
     auto memory_store = std::make_unique<Store>(
-        std::vector<size_t>{8}, 1, Store::Initializer{}, 16, nullptr,
+        std::vector<size_t>{8}, 1, Store::Initializer{}, nullptr,
         se::NoScorePolicy{}, 16, shared_storage);
     std::array<uint64_t, 1> memory_key{456};
     std::array<float, 8> memory_values{};
@@ -283,10 +267,10 @@ int main() {
   reverse_options.max_spill_bytes = 4 << 20;
   auto reverse_storage = se::create_page_storage(std::move(reverse_options));
   auto surviving = std::make_unique<ScoredStore>(
-      std::vector<size_t>{8}, 1, ScoredStore::Initializer{}, 16, nullptr,
+      std::vector<size_t>{8}, 1, ScoredStore::Initializer{}, nullptr,
       se::ManualScorePolicy{}, 16, reverse_storage);
   auto departing = std::make_unique<ScoredStore>(
-      std::vector<size_t>{8}, 1, ScoredStore::Initializer{}, 16, nullptr,
+      std::vector<size_t>{8}, 1, ScoredStore::Initializer{}, nullptr,
       se::ManualScorePolicy{}, 16, reverse_storage);
   departing.reset();
   surviving->lookup_or_insert<uint64_t>(shared_key, shared_values,
@@ -303,7 +287,7 @@ int main() {
   stress_options.mode = se::StorageMode::kMemoryOnly;
   stress_options.memory_limit_bytes = 128 << 20;
   auto stress_storage = se::create_page_storage(std::move(stress_options));
-  Store stress_store({8}, 8, {}, 1000000, nullptr, se::NoScorePolicy{}, 16,
+  Store stress_store({8}, 8, {}, nullptr, se::NoScorePolicy{}, 16,
                      stress_storage);
   constexpr size_t stress_batch_size = 8192;
   constexpr size_t stress_rounds = 8;
@@ -333,8 +317,8 @@ int main() {
                              " expected " +
                              std::to_string(expected_stress_size));
 
-  ScoredStore scored_stress_store({8}, 8, {}, expected_stress_size, nullptr,
-                                  se::ManualScorePolicy{}, 16, stress_storage);
+  ScoredStore scored_stress_store({8}, 8, {}, nullptr, se::ManualScorePolicy{},
+                                  16, stress_storage);
   size_t scored_inserted_total = 0;
   for (size_t round = 0; round < stress_rounds; ++round) {
     for (size_t i = 0; i < stress_batch_size; ++i)

@@ -197,8 +197,8 @@ template <typename ParamT, typename OptT> struct ConstructOpsImpl {
   static void construct(EmbeddingStoreWrapper &self,
                         const PyInitializer &init_cfg,
                         const PyOptimizer &opt_cfg,
-                        const std::string &score_policy_name, size_t nt,
-                        size_t max_active_keys);
+                        const std::string &score_policy_name,
+                        size_t num_threads);
 };
 
 template <typename ParamT, typename OptT> struct SyncOpsImpl {

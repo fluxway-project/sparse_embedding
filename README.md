@@ -57,11 +57,11 @@ The Bazel configuration compiles C++ sources with `-std=c++2b`. The current acce
 | Access distribution | Generated operation batches use 80% traffic to the hottest 10%; erase keys are uniform |
 | Random seed | 42 |
 | Thread counts | 1, 4, 8, 16, 32, 64 |
-| Capacity | `max_active_keys=1,000,000`; `reserve(500000, 128)` before timing |
+| Capacity preparation | `reserve(500000, 128)` before timing |
 | Optimizer | Benchmark SGD, learning rate 0.01 |
 | Timed operations | lookup/insert, forward lookup, assign, gradient accumulation, optimizer step, contains, erase |
 
-The LFU pressure scenario uses dimension 128, 16,384 possible keys, a 4,096-key batch, two workers, `max_active_keys=20,000`, seed 42, the same 80/20 hot/cold distribution, benchmark SGD at 0.01, a 5 MiB memory limit, a 1 GiB spill limit, and 0.8/0.6 watermarks. It executes four timed repetitions of lookup, assign, gradient accumulation, and optimizer step with background eviction enabled. Telemetry collected after a 100 ms wait proves eviction eventually triggered; it does not prove overlap with the timed interval.
+The LFU pressure scenario uses dimension 128, 16,384 possible keys, a 4,096-key batch, two workers, seed 42, the same 80/20 hot/cold distribution, benchmark SGD at 0.01, a 5 MiB memory limit, a 1 GiB spill limit, and 0.8/0.6 watermarks. It calls `reserve(16384, 128)` before insertion, then executes four timed repetitions of lookup, assign, gradient accumulation, and optimizer step with background eviction enabled. Telemetry collected after a 100 ms wait proves eviction eventually triggered; it does not prove overlap with the timed interval.
 
 The latest reproducibility snapshot was collected on 2026-07-21. This C++ snapshot is one benchmark execution with internal repetitions; it is not the five-run, affinity-pinned baseline/optimized protocol.
 
@@ -116,7 +116,7 @@ storage = sparse_embedding.DiskSpill("/mnt/nvme/sparse-embedding", 1 << 40)
 config = sparse_embedding.EmbeddingConfig(dims=[128], storage=storage)
 ```
 
-`MemoryOnly()` disables disk spill and raises when the detected safe memory budget is exhausted. Key hash metadata stays RAM-resident and is bounded by `max_active_keys`. Tables at or below the eager limit preallocate expected per-shard capacity; larger tables start from a bounded per-shard capacity and grow as needed.
+`MemoryOnly()` disables disk spill and raises when the detected safe memory budget is exhausted. Key hash metadata stays RAM-resident and grows dynamically per shard. The structural embedding-index limit and actual storage allocations report their own resource errors; disk spill does not make hash metadata disk-resident.
 
 For known large workloads, call `store.reserve(keys_count, dim)` or
 `store.reserve_per_shard(counts, dim)` before the timed phase. This prepares

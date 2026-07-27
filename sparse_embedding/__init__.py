@@ -87,7 +87,6 @@ class EmbeddingConfig(_EmbeddingConfig):
         value_dtype: Any = "float32",
         optimizer_dtype: Any = "",
         key_dtype: Any = "int64",
-        max_active_keys: int = 1 << 20,
         storage: AutoStorage | MemoryOnly | DiskSpill | None = None,
     ):
         resolved_storage = AutoStorage() if storage is None else storage
@@ -97,7 +96,6 @@ class EmbeddingConfig(_EmbeddingConfig):
             _to_str(value_dtype),
             _to_str(optimizer_dtype),
             _to_str(key_dtype),
-            max_active_keys,
             resolved_storage._native,
         )
         self.storage = resolved_storage

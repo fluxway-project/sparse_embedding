@@ -13,8 +13,8 @@ namespace se::py::detail {
 template <typename ParamT, typename OptT>
 void ConstructOpsImpl<ParamT, OptT>::construct(
     EmbeddingStoreWrapper &self, const PyInitializer &init_cfg,
-    const PyOptimizer &opt_cfg, const std::string &score_policy_name, size_t nt,
-    size_t max_active_keys) {
+    const PyOptimizer &opt_cfg, const std::string &score_policy_name,
+    size_t num_threads) {
   // 1) Build the parameter-precision initializer proxy.
   pro::proxy<se::InitializerFacade<ParamT>> init_proxy;
   if constexpr (std::is_same_v<ParamT, float>) {
@@ -54,8 +54,8 @@ void ConstructOpsImpl<ParamT, OptT>::construct(
       using StoreType = se::HogwildEmbeddingStore<KeyT, ParamT, OptT, Policy>;
       self.store_ =
           pro::make_proxy<se::EmbeddingTableFacade<ParamT, OptT>, StoreType>(
-              self.dims_, nt, std::move(init_proxy), max_active_keys,
-              std::move(opt_factory), std::move(policy), 16, self.storage_);
+              self.dims_, num_threads, std::move(init_proxy), std::move(opt_factory),
+              std::move(policy), 16, self.storage_);
     };
 
     if (score_policy_name == "none") {

@@ -348,26 +348,6 @@ public:
 
   struct SlotStore {
     static constexpr size_t kInitialKeysPerShard = 2048;
-    static constexpr size_t kEagerPreallocationKeyLimit = 131072;
-
-    class ActiveKeyReservation {
-    public:
-      explicit ActiveKeyReservation(SlotStore &slot) : slot_(&slot) {
-        slot_->acquire_active_key();
-      }
-      ActiveKeyReservation(const ActiveKeyReservation &) = delete;
-      ActiveKeyReservation &operator=(const ActiveKeyReservation &) = delete;
-      ActiveKeyReservation(ActiveKeyReservation &&other) noexcept
-          : slot_(std::exchange(other.slot_, nullptr)) {}
-      ~ActiveKeyReservation() {
-        if (slot_)
-          slot_->release_active_key();
-      }
-      void commit() noexcept { slot_ = nullptr; }
-
-    private:
-      SlotStore *slot_;
-    };
 
     size_t dim;
     std::vector<std::unique_ptr<KeyShard>> key_shards;
@@ -376,36 +356,21 @@ public:
     pro::proxy<OptimizerFacade<ParamT, OptT>> optimizer;
     std::vector<std::unique_ptr<TransientArena<ParamT>>> transient_shards;
     OptimizerFactory opt_factory;
-    size_t max_active_keys;
-    std::atomic<size_t> active_keys{0};
     uint64_t global_step = 0;
 
-    SlotStore(size_t d, size_t max_active_keys, OptimizerFactory opt_factory,
-              size_t num_threads, bool enable_score, PageStorage storage)
+    SlotStore(size_t d, OptimizerFactory opt_factory, size_t num_threads,
+              bool enable_score, PageStorage storage)
         : dim(d), shard_mask(num_threads - 1), arena(d, enable_score, storage),
           optimizer(opt_factory.has_value() ? (*opt_factory)(d) : nullptr),
-          opt_factory(opt_factory), max_active_keys(max_active_keys) {
-      if (max_active_keys == 0) {
-        throw std::invalid_argument(
-            "max_active_keys must be greater than zero");
-      }
-      if (max_active_keys > arena.max_entries()) {
-        throw std::length_error("max_active_keys exceeds arena capacity");
-      }
+          opt_factory(opt_factory) {
       if (optimizer.has_value())
         optimizer->set_page_eviction_enabled(enable_score);
-      size_t per_shard = (max_active_keys + num_threads - 1) / num_threads;
-      // Keep normal inserts out of ParlayHash's internal rehash path.
-      size_t initial_keys_per_shard = std::min(per_shard, kInitialKeysPerShard);
-      if (max_active_keys <= kEagerPreallocationKeyLimit)
-        initial_keys_per_shard = per_shard;
       for (size_t i = 0; i < num_threads; ++i) {
-        key_shards.push_back(
-            std::make_unique<KeyShard>(initial_keys_per_shard));
+        key_shards.push_back(std::make_unique<KeyShard>(kInitialKeysPerShard));
       }
       for (size_t i = 0; i < num_threads; ++i) {
-        transient_shards.push_back(std::make_unique<TransientArena<ParamT>>(
-            d, storage, max_active_keys, enable_score));
+        transient_shards.push_back(
+            std::make_unique<TransientArena<ParamT>>(d, storage, enable_score));
       }
     }
 
@@ -446,24 +411,6 @@ public:
       for (auto &shard : key_shards) {
         shard = std::make_unique<KeyShard>(shard->reserved_keys);
       }
-      active_keys.store(0, std::memory_order_release);
-    }
-
-    void acquire_active_key() {
-      size_t current = active_keys.load(std::memory_order_relaxed);
-      while (true) {
-        if (current >= max_active_keys) {
-          throw std::length_error("max_active_keys capacity exceeded");
-        }
-        if (active_keys.compare_exchange_weak(current, current + 1,
-                                              std::memory_order_acq_rel,
-                                              std::memory_order_relaxed))
-          return;
-      }
-    }
-
-    void release_active_key() noexcept {
-      active_keys.fetch_sub(1, std::memory_order_acq_rel);
     }
 
     uint32_t allocate_entry() {
@@ -489,14 +436,11 @@ public:
         return {*existing, false};
 
       std::optional<uint32_t> preallocated_idx;
-      std::optional<ActiveKeyReservation> active_key_reservation;
       bool was_inserted = false;
       auto upsert = [&](std::optional<uint32_t> existing) -> uint32_t {
         was_inserted = !existing.has_value();
         if (existing.has_value())
           return *existing;
-        if (!active_key_reservation)
-          active_key_reservation.emplace(*this);
         uint32_t idx;
         if (preallocated_idx.has_value()) {
           idx = *preallocated_idx;
@@ -537,8 +481,6 @@ public:
 
       if (preallocated_idx.has_value() && !was_inserted)
         key_shard.recycled_indices.push_back(*preallocated_idx);
-      if (was_inserted)
-        active_key_reservation->commit();
       return {was_inserted ? *preallocated_idx : published->second,
               was_inserted};
     }
@@ -566,9 +508,6 @@ public:
               "reserve_per_shard total capacity overflow");
         }
         total_keys += target_keys;
-      }
-      if (total_keys > max_active_keys) {
-        throw std::length_error("reserve exceeds max_active_keys capacity");
       }
       for (size_t i = 0; i < counts.size(); ++i) {
         std::unique_lock map_lock(key_shards[i]->map_mutex);
@@ -647,11 +586,13 @@ public:
     std::unordered_map<size_t, std::function<uint64_t()>> evaluators_;
   };
 
-  explicit HogwildEmbeddingStore(
-      const std::vector<size_t> &table_dims, size_t num_threads = 0,
-      Initializer initializer = {}, size_t max_active_keys = 1 << 20,
-      OptimizerFactory opt_factory = nullptr, ScorePolicyT score_policy = {},
-      uint8_t slot_bits = 16, PageStorage storage = create_page_storage())
+  explicit HogwildEmbeddingStore(const std::vector<size_t> &table_dims,
+                                 size_t num_threads = 0,
+                                 Initializer initializer = {},
+                                 OptimizerFactory opt_factory = nullptr,
+                                 ScorePolicyT score_policy = {},
+                                 uint8_t slot_bits = 16,
+                                 PageStorage storage = create_page_storage())
       : num_threads_(num_threads > 0
                          ? num_threads
                          : std::max(1u, std::thread::hardware_concurrency())),
@@ -688,9 +629,8 @@ public:
         throw std::invalid_argument("dim must be > 0");
       }
       if (dim_to_slot_[dim] == nullptr) {
-        slot_storage_.push_back(
-            std::make_unique<SlotStore>(dim, max_active_keys, opt_factory,
-                                        num_threads_, enable_score, storage_));
+        slot_storage_.push_back(std::make_unique<SlotStore>(
+            dim, opt_factory, num_threads_, enable_score, storage_));
         dim_to_slot_[dim] = slot_storage_.back().get();
       }
     }
@@ -1088,7 +1028,6 @@ public:
                 [](const auto &entry) { return entry.get_entry().second; });
             if (removed.has_value()) {
               shard.recycled_indices.push_back(*removed);
-              slot_ptr->release_active_key();
             }
           }
         }
@@ -1783,7 +1722,6 @@ public:
               [](const auto &entry) { return entry.get_entry().second; });
           if (removed.has_value()) {
             shard.recycled_indices.push_back(*removed);
-            slot->release_active_key();
           }
           ++out_evicted_count;
         }

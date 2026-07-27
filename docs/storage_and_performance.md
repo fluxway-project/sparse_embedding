@@ -71,7 +71,6 @@ storage = se.AutoStorage(
 config = se.EmbeddingConfig(
     dims=[128],
     num_threads=8,
-    max_active_keys=1 << 20,
     storage=storage,
 )
 store = se.EmbeddingStore(config, score_policy="lfu")
@@ -94,14 +93,12 @@ The initial-capacity policy is centralized in the store:
 
 - `kParlayHashCapacityMultiplier = 4`
 - `kInitialKeysPerShard = 2048`
-- `kEagerPreallocationKeyLimit = 131072`
-
-Tables at or below the eager limit preallocate their expected per-shard key
-count. Larger tables start from the bounded per-shard target to control startup
-RSS and cache footprint. Known production workloads should call
-`reserve(keys_count, dim)` or `reserve_per_shard(counts, dim)` before the timed
-phase. Reserve rebuilds capacity outside the hot path and rejects requests that
-exceed `max_active_keys`.
+Each shard starts with 2,048 expected keys and grows independently. This keeps
+startup RSS and cache footprint bounded without imposing a logical key quota.
+Known production workloads should call `reserve(keys_count, dim)` or
+`reserve_per_shard(counts, dim)` before the timed phase. Reserve rebuilds
+capacity outside the hot path; structural index overflow and storage allocation
+failures are reported precisely.
 
 The regression test inserts 65,536 unique keys through eight workers for both
 unscored and scored stores and requires an exact key count. This covers the
@@ -174,7 +171,7 @@ the latter.
 ### C++ Production Workload
 
 The production workload uses one dimension-128 slot, 500,000 possible
-`uint64_t` keys, a 65,536-key batch, `max_active_keys=1,000,000`, and seed 42.
+`uint64_t` keys, a 65,536-key batch, and seed 42.
 The hottest 10% of the vocabulary receives 80% of generated operation-batch
 accesses; erase keys are sampled uniformly. Each of the 1, 4, 8, 16, 32, and
 64-thread stores calls `reserve(500000, 128)` before warmup.
@@ -197,10 +194,10 @@ accumulated batch and therefore overstates standalone optimizer throughput.
 Repeated erase iterations after the first are primarily not-found lookups.
 
 The C++ LFU pressure workload uses dimension 128, 16,384 possible keys, a
-4,096-key batch, two workers, `max_active_keys=20,000`, seed 42, the same 80/20
+4,096-key batch, two workers, seed 42, the same 80/20
 hot/cold distribution, benchmark SGD with learning rate 0.01, a 5 MiB
 resident-memory limit, a 1 GiB spill limit, and high/low watermarks 0.8/0.6.
-After insertion it performs four timed repetitions; each repetition executes
+It calls `reserve(16384, 128)` before insertion. After insertion it performs four timed repetitions; each repetition executes
 lookup, assign, gradient accumulation, and optimizer step. It waits 100 ms
 before reading eviction telemetry. The final counters prove eviction was
 enabled and eventually triggered, but do not prove it overlapped the timer.
@@ -208,15 +205,15 @@ enabled and eventually triggered, but do not prove it overlapped the timer.
 ### Python Workloads
 
 The Python E2E workload uses dimension 16, 4,096 sequential `int64` keys, four
-workers, `max_active_keys=8,192`, SGD with learning rate 0.01, LFU scoring, a
+workers, SGD with learning rate 0.01, LFU scoring, a
 256 KiB resident-memory limit, and a 1 GiB spill limit. Synchronous and
 asynchronous paths each run two warmups and five timed iterations. Every async
 lookup, assign, gradient accumulation, and optimizer Future is awaited.
 
 The separate Python storage-pressure workload runs five independent stores.
 Each uses dimension 128, 16,384 sequential keys, two workers,
-`max_active_keys=20,000`, LFU scoring, a 5 MiB resident-memory limit, and a
-1 GiB spill limit. It reports median and p95 throughput/selection time plus
+LFU scoring, a 5 MiB resident-memory limit, and a
+1 GiB spill limit. It reserves 16,384 keys before the measured insertion. It reports median and p95 throughput/selection time plus
 min/max eviction counters.
 
 ## Verification Workloads

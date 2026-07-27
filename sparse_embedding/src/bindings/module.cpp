@@ -86,14 +86,13 @@ EmbeddingStoreWrapper::EmbeddingStoreWrapper(
   if (dims_.empty())
     throw std::invalid_argument("dims must not be empty");
 
-  size_t nt = (emb_cfg.num_threads == 0)
-                  ? std::max(1u, std::thread::hardware_concurrency())
-                  : emb_cfg.num_threads;
+  size_t num_threads = (emb_cfg.num_threads == 0)
+                           ? std::max(1u, std::thread::hardware_concurrency())
+                           : emb_cfg.num_threads;
 
   dispatch_types([&]<typename P, typename O>() {
     ConstructOpsImpl<P, O>::construct(*this, init_cfg, opt_cfg,
-                                      score_policy_name, nt,
-                                      emb_cfg.max_active_keys);
+                                      score_policy_name, num_threads);
   });
 }
 
@@ -281,17 +280,16 @@ NB_MODULE(_core, m) {
 
   nb::class_<se::EmbeddingConfig>(m, "_EmbeddingConfig")
       .def(nb::init<std::vector<size_t>, size_t, std::string, std::string,
-                    std::string, size_t, se::StorageOptions>(),
+                    std::string, se::StorageOptions>(),
            nb::arg("dims"), nb::arg("num_threads") = 0,
            nb::arg("value_dtype") = "float32", nb::arg("optimizer_dtype") = "",
-           nb::arg("key_dtype") = "int64", nb::arg("max_active_keys") = 1 << 20,
+           nb::arg("key_dtype") = "int64",
            nb::arg("storage") = se::StorageOptions{})
       .def_rw("dims", &se::EmbeddingConfig::dims)
       .def_rw("num_threads", &se::EmbeddingConfig::num_threads)
       .def_rw("value_dtype", &se::EmbeddingConfig::value_dtype)
       .def_rw("optimizer_dtype", &se::EmbeddingConfig::optimizer_dtype)
-      .def_rw("key_dtype", &se::EmbeddingConfig::key_dtype)
-      .def_rw("max_active_keys", &se::EmbeddingConfig::max_active_keys);
+      .def_rw("key_dtype", &se::EmbeddingConfig::key_dtype);
 
   nb::class_<PyInitializer>(m, "Initializer");
 

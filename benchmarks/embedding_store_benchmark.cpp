@@ -32,7 +32,6 @@ static constexpr size_t kBatchSize =
     65'536; // batch size (typical training step)
 static constexpr size_t kHotRatio =
     10; // top-10% keys get 80% traffic (power-law)
-static constexpr size_t kMaxActiveKeys = 1'000'000;
 
 // ============================================================================
 // Dummy SGD optimizer
@@ -128,8 +127,10 @@ void run_storage_pressure_benchmark() {
       });
   constexpr size_t kPressureKeys = 16'384;
   constexpr size_t kPressureBatch = 4'096;
-  PressureStore store({kDim}, 2, {}, 20'000, opt_factory, LfuScorePolicy{}, 16,
+  PressureStore store({kDim}, 2, {}, opt_factory, LfuScorePolicy{}, 16,
                       storage);
+  if (store.reserve(kPressureKeys, kDim))
+    throw std::runtime_error("pressure benchmark reserve failed");
   std::mt19937_64 gen(42);
   std::vector<int64_t> row_lengths(kPressureBatch, static_cast<int64_t>(kDim));
   std::vector<float> output(kPressureBatch * kDim);
@@ -200,7 +201,7 @@ int main(int argc, char **argv) {
               << std::string(56, '-') << "\n";
 
     HogwildEmbeddingStore<uint64_t, float, float, NoScorePolicy> store(
-        {kDim}, num_threads, {}, kMaxActiveKeys, opt_factory, NoScorePolicy{});
+        {kDim}, num_threads, {}, opt_factory, NoScorePolicy{});
     if (store.reserve(kUniqueKeys, kDim))
       throw std::runtime_error("benchmark reserve failed");
 
