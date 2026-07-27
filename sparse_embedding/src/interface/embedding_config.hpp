@@ -34,7 +34,6 @@ struct EmbeddingConfig {
   std::string value_dtype = "float32";
   std::string optimizer_dtype = ""; // if empty, falls back to value_dtype
   std::string key_dtype = "int64";  // int64, uint64, int32, uint32
-  size_t max_active_keys = 1048576; // 1 << 20
   StorageOptions storage;
 };
 

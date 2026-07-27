@@ -15,7 +15,6 @@ def run_once() -> dict[str, int | float]:
             embedding_config=se.EmbeddingConfig(
                 dims=[128],
                 num_threads=2,
-                max_active_keys=20_000,
                 storage=se.AutoStorage(
                     memory_limit_bytes=5 << 20,
                     spill_directory=spill_directory,
@@ -26,6 +25,7 @@ def run_once() -> dict[str, int | float]:
             score_policy="lfu",
         )
         keys = np.arange(16_384, dtype=np.int64)
+        store.reserve(len(keys), dim=128)
         start = time.perf_counter()
         store.lookup_or_insert(keys, dim=128)
         elapsed = time.perf_counter() - start

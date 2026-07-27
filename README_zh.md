@@ -57,11 +57,11 @@ Bazel 配置使用 `-std=c++2b` 编译 C++ 源码；当前验收构建使用 GCC
 | 访问分布 | 普通 operation batch 的 80% 流量落在最热 10%；erase key 均匀采样 |
 | 随机种子 | 42 |
 | 线程数 | 1、4、8、16、32、64 |
-| 容量 | `max_active_keys=1,000,000`；计时前执行 `reserve(500000, 128)` |
+| 容量准备 | 计时前执行 `reserve(500000, 128)` |
 | 优化器 | benchmark SGD，学习率 0.01 |
 | 计时操作 | lookup/insert、forward lookup、assign、梯度累积、optimizer step、contains、erase |
 
-LFU 压力场景使用 dim=128、16,384 个可能 key、4,096-key batch、2 个 worker、`max_active_keys=20,000`、seed=42、相同的 80/20 热冷分布、学习率 0.01 的 benchmark SGD、5 MiB 内存限制、1 GiB spill 限制和 0.8/0.6 水位。它执行 4 次包含 lookup、assign、梯度累积和 optimizer step 的计时重复，并启用后台淘汰。计时结束后等待 100 ms 再读取的 telemetry 只能证明最终触发了淘汰，不能证明淘汰与计时区间重叠。
+LFU 压力场景使用 dim=128、16,384 个可能 key、4,096-key batch、2 个 worker、seed=42、相同的 80/20 热冷分布、学习率 0.01 的 benchmark SGD、5 MiB 内存限制、1 GiB spill 限制和 0.8/0.6 水位。它在插入前调用 `reserve(16384, 128)`，之后执行 4 次包含 lookup、assign、梯度累积和 optimizer step 的计时重复，并启用后台淘汰。计时结束后等待 100 ms 再读取的 telemetry 只能证明最终触发了淘汰，不能证明淘汰与计时区间重叠。
 
 最新复现快照采集于 2026-07-21。该 C++ 数据来自一次包含内部重复的 benchmark 执行，不等同于 5 次独立运行、固定 CPU affinity 的 baseline/optimized 协议。
 
@@ -110,7 +110,7 @@ storage = sparse_embedding.DiskSpill("/mnt/nvme/sparse-embedding", 1 << 40)
 config = sparse_embedding.EmbeddingConfig(dims=[128], storage=storage)
 ```
 
-`MemoryOnly()` 会禁用磁盘 spill，并在探测出的安全内存预算耗尽时抛出异常。key hash 元数据常驻 RAM，并受 `max_active_keys` 硬上限约束。不超过 eager limit 的表按预期每 shard 容量预分配；更大的表从有界每 shard 容量开始并按需增长。
+`MemoryOnly()` 会禁用磁盘 spill，并在探测出的安全内存预算耗尽时抛出异常。key hash 元数据始终常驻 RAM，按 shard 动态增长；结构性 embedding index 上限和实际 storage 分配各自报告精确的资源错误，磁盘 spill 不会让 hash 元数据驻盘。
 
 对于容量已知的大 workload，应在计时前调用 `store.reserve(keys_count, dim)` 或 `store.reserve_per_shard(counts, dim)`，将 ParlayHash 容量准备移出热路径，同时不对所有 shard 的 Upsert 做全局串行化。
 

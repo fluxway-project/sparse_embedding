@@ -33,12 +33,11 @@ DIMS = {0: 8, 1: 16}  # slot_id -> dim, for test bookkeeping only
 UNIQUE_DIMS = sorted(set(DIMS.values()))  # [8, 16] — what the store actually needs
 
 
-def make_cfg(dims, threads: int = 4, max_keys: int = 65536):
+def make_cfg(dims, threads: int = 4):
     return se.EmbeddingConfig(
         dims=dims if isinstance(dims, list) else sorted(set(dims.values())),
         num_threads=threads,
         value_dtype="float32",
-        max_active_keys=max_keys,
     )
 
 
@@ -298,7 +297,7 @@ def test_checkpoint_load_with_resharding():
         shutil.rmtree(ckpt_dir)
 
     config = sparse_embedding.EmbeddingConfig(
-        dims=[8], num_threads=2, value_dtype="float32", max_active_keys=1000
+        dims=[8], num_threads=2, value_dtype="float32"
     )
     store = sparse_embedding.EmbeddingStore(config)
     try:
@@ -647,12 +646,11 @@ def test_checkpoint_schema_agnostic_dim_reorder(lance_tmp_uri):
 # --- Large Checkpoint Tests ---
 
 
-def make_cfg_large(dim=4, threads=4, max_keys=100000):
+def make_cfg_large(dim=4, threads=4):
     return se.EmbeddingConfig(
         dims=[dim],
         num_threads=threads,
         value_dtype="float32",
-        max_active_keys=max_keys,
     )
 
 
@@ -665,9 +663,7 @@ def test_large_checkpoint_lance():
     print("Preparing large scale data (50,000 entries)...")
     dim = 64
     num_entries = 50000
-    store = se.EmbeddingStore(
-        make_cfg_large(dim=dim, max_keys=num_entries * 2), score_policy="lfu"
-    )
+    store = se.EmbeddingStore(make_cfg_large(dim=dim), score_policy="lfu")
 
     # Configure Lance Backend
     store.set_checkpoint_factories("lance")
@@ -701,9 +697,7 @@ def test_large_checkpoint_lance():
 
         # Now create a new store and load it
         print("Loading checkpoint into new store...")
-        store2 = se.EmbeddingStore(
-            make_cfg_large(dim=dim, max_keys=num_entries * 2), score_policy="lfu"
-        )
+        store2 = se.EmbeddingStore(make_cfg_large(dim=dim), score_policy="lfu")
         store2.set_checkpoint_factories("lance")
 
         t0 = perf_counter()
@@ -727,9 +721,7 @@ def test_large_checkpoint_lance():
         # Now do an incremental save to the SAME dataset to utilize Lance's versioning
         store2.save_checkpoint(ckpt_uri, mode="incremental", min_score=1)
 
-        store3 = se.EmbeddingStore(
-            make_cfg_large(dim=dim, max_keys=num_entries * 2), score_policy="none"
-        )
+        store3 = se.EmbeddingStore(make_cfg_large(dim=dim), score_policy="none")
         store3.set_checkpoint_factories("lance")
         # Loading should load the latest version (which includes all rows, with the new ones appended)
         store3.load_checkpoint(ckpt_uri)

@@ -38,9 +38,9 @@ template <typename ValT> class TransientArena {
   static constexpr size_t kChunkSize = 8192; // Number of elements per page
 
 public:
-  TransientArena(size_t dim, PageStorage storage, size_t max_entries,
+  TransientArena(size_t dim, PageStorage storage,
                  bool page_eviction_enabled = false)
-      : dim_(dim), storage_(std::move(storage)), max_entries_(max_entries),
+      : dim_(dim), storage_(std::move(storage)),
         page_eviction_enabled_(page_eviction_enabled) {
     grad_stride_ =
         (dim * sizeof(ValT) + kCacheLineSize - 1) & ~(kCacheLineSize - 1);
@@ -52,23 +52,19 @@ public:
   TransientArena &operator=(const TransientArena &) = delete;
 
   uint32_t get_or_allocate(uint64_t feature_id) {
-    if (next_slot_ >= max_entries_) {
+    if (next_slot_ > std::numeric_limits<uint32_t>::max() ||
+        next_slot_ == capacity_) {
       auto existing = id_map_.find(feature_id);
-      if (existing != id_map_.end()) {
+      if (existing != id_map_.end())
         return existing->second;
-      }
-      throw std::length_error("transient key capacity exceeded");
-    }
-    if (next_slot_ >= capacity_) {
-      auto existing = id_map_.find(feature_id);
-      if (existing != id_map_.end()) {
-        return existing->second;
-      }
+      if (next_slot_ > std::numeric_limits<uint32_t>::max())
+        throw std::length_error("transient arena index capacity exceeded");
       allocate_chunk();
     }
-    auto [it_new, inserted] = id_map_.try_emplace(feature_id, next_slot_);
+    const auto slot_index = static_cast<uint32_t>(next_slot_);
+    auto [it_new, inserted] = id_map_.try_emplace(feature_id, slot_index);
     if (inserted) {
-      std::memset(grad_data(next_slot_), 0, dim_ * sizeof(ValT));
+      std::memset(grad_data(slot_index), 0, dim_ * sizeof(ValT));
       ++next_slot_;
     }
     return it_new->second;
@@ -134,12 +130,11 @@ private:
   size_t dim_;
   size_t grad_stride_;
   PageStorage storage_;
-  size_t max_entries_;
   bool page_eviction_enabled_;
   std::vector<StoragePage> grad_chunks_;
   size_t capacity_{0};
   ankerl::unordered_dense::map<uint64_t, uint32_t> id_map_;
-  uint32_t next_slot_{0};
+  size_t next_slot_{0};
 };
 
 } // namespace se

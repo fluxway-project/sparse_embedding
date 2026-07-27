@@ -35,7 +35,6 @@ def test_embedding_table_reports_spill(tmp_path, capfd):
         embedding_config=sparse_embedding.EmbeddingConfig(
             dims=[8],
             num_threads=1,
-            max_active_keys=1024,
             storage=sparse_embedding.DiskSpill(tmp_path, 4 << 20),
         ),
         initializer_config=sparse_embedding.Zeros(),
@@ -61,7 +60,6 @@ def test_embedding_table_reports_eviction_telemetry(tmp_path):
         embedding_config=sparse_embedding.EmbeddingConfig(
             dims=[128],
             num_threads=2,
-            max_active_keys=20_000,
             storage=sparse_embedding.AutoStorage(
                 memory_limit_bytes=5 << 20,
                 spill_directory=tmp_path,
@@ -192,27 +190,23 @@ def test_embedding_table_reserve_errors():
         store.reserve(1, dim=16)
 
 
-def test_embedding_table_enforces_active_key_capacity():
+def test_embedding_table_grows_beyond_initial_shard_capacity():
     store = sparse_embedding.EmbeddingStore(
         embedding_config=sparse_embedding.EmbeddingConfig(
             dims=[8],
             num_threads=1,
-            max_active_keys=2,
             storage=sparse_embedding.MemoryOnly(),
         ),
         initializer_config=sparse_embedding.Zeros(),
         optimizer_config=sparse_embedding.Sgd(),
     )
 
-    store.lookup_or_insert(np.array([1, 2], dtype=np.int64), dim=8)
-    store.lookup_or_insert(np.array([2], dtype=np.int64), dim=8)
-    with pytest.raises(ValueError, match="max_active_keys"):
-        store.lookup_or_insert(np.array([3], dtype=np.int64), dim=8)
-
-    assert store.total_size() == 2
+    keys = np.arange(8193, dtype=np.int64)
+    store.lookup_or_insert(keys, dim=8)
+    assert store.total_size() == len(keys)
     store.erase(np.array([1], dtype=np.int64))
-    store.lookup_or_insert(np.array([3], dtype=np.int64), dim=8)
-    assert store.total_size() == 2
+    store.lookup_or_insert(np.array([8193], dtype=np.int64), dim=8)
+    assert store.total_size() == len(keys)
 
 
 @pytest.mark.asyncio

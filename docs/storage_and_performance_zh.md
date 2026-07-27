@@ -57,7 +57,6 @@ storage = se.AutoStorage(
 config = se.EmbeddingConfig(
     dims=[128],
     num_threads=8,
-    max_active_keys=1 << 20,
     storage=storage,
 )
 store = se.EmbeddingStore(config, score_policy="lfu")
@@ -73,9 +72,7 @@ store = se.EmbeddingStore(config, score_policy="lfu")
 
 - `kParlayHashCapacityMultiplier = 4`
 - `kInitialKeysPerShard = 2048`
-- `kEagerPreallocationKeyLimit = 131072`
-
-不超过 eager limit 的表会预分配预期的每 shard key 数。更大的表从有界的每 shard 容量开始，控制启动 RSS 与 cache footprint。容量已知的生产 workload 应在计时前调用 `reserve(keys_count, dim)` 或 `reserve_per_shard(counts, dim)`。reserve 会在热路径之外重建容量，超过 `max_active_keys` 的请求直接抛异常。
+每个 shard 以 2,048 个预期 key 起步并独立增长，在不引入逻辑 key 配额的前提下控制启动 RSS 与 cache footprint。容量已知的生产 workload 应在计时前调用 `reserve(keys_count, dim)` 或 `reserve_per_shard(counts, dim)`。reserve 在热路径之外重建容量；结构性 index 溢出和 storage 分配失败会报告精确错误。
 
 回归测试通过八个 worker 分别向无打分和有打分 store 插入 65,536 个唯一 key，并要求 key 数精确一致。该测试覆盖了此前导致 key 丢失与 ParlayHash SIGSEGV 的动态扩容竞态。
 
@@ -131,7 +128,7 @@ storage 增量维护匿名可淘汰页索引，因此选择轮次不需要扫描
 
 ### C++ 生产 workload
 
-生产 workload 使用一个 dim=128 slot、500,000 个可能的 `uint64_t` key、65,536-key batch、`max_active_keys=1,000,000` 和 seed=42。生成的普通 operation batch 中，最热的 10% 词表承担 80% 访问；erase key 则均匀采样。1、4、8、16、32、64 线程的 store 都在 warmup 前调用 `reserve(500000, 128)`。parameter 与 optimizer 类型均为 `float`；benchmark SGD 的学习率为 0.01。
+生产 workload 使用一个 dim=128 slot、500,000 个可能的 `uint64_t` key、65,536-key batch 和 seed=42。生成的普通 operation batch 中，最热的 10% 词表承担 80% 访问；erase key 则均匀采样。1、4、8、16、32、64 线程的 store 都在 warmup 前调用 `reserve(500000, 128)`。parameter 与 optimizer 类型均为 `float`；benchmark SGD 的学习率为 0.01。
 
 | 报告区间 | 前置条件 / 独立 warmup | 重复次数 | 计时区间内工作 | 吞吐分子 |
 |---|---:|---:|---|---|
@@ -145,13 +142,13 @@ storage 增量维护匿名可淘汰页索引，因此选择轮次不需要扫描
 
 该表记录 benchmark 的实际实现，而不是隔离 API 成本。optimizer 的吞吐分子并不对应其 accumulated batch 中的 unique key，因此会高估独立 optimizer 吞吐。第一次之后的 erase 重复主要是 not-found 查询。
 
-C++ LFU pressure workload 使用 dim=128、16,384 个可能 key、4,096-key batch、2 个 worker、`max_active_keys=20,000`、seed=42、相同的 80/20 热冷分布、学习率 0.01 的 benchmark SGD、5 MiB 驻留内存限制、1 GiB spill 限制以及 0.8/0.6 高低水位。插入后执行 4 次计时重复；每次重复都执行 lookup、assign、梯度累积和 optimizer step。读取淘汰 telemetry 前等待 100 ms。最终计数器证明淘汰已启用且最终触发，但不能证明它与计时区间重叠。
+C++ LFU pressure workload 使用 dim=128、16,384 个可能 key、4,096-key batch、2 个 worker、seed=42、相同的 80/20 热冷分布、学习率 0.01 的 benchmark SGD、5 MiB 驻留内存限制、1 GiB spill 限制以及 0.8/0.6 高低水位。它在插入前调用 `reserve(16384, 128)`。插入后执行 4 次计时重复；每次重复都执行 lookup、assign、梯度累积和 optimizer step。读取淘汰 telemetry 前等待 100 ms。最终计数器证明淘汰已启用且最终触发，但不能证明它与计时区间重叠。
 
 ### Python workload
 
-Python E2E workload 使用 dim=16、4,096 个连续 `int64` key、4 个 worker、`max_active_keys=8,192`、学习率为 0.01 的 SGD、LFU 打分、256 KiB 驻留内存限制和 1 GiB spill 限制。同步和异步路径都 warmup 2 次、计时 5 次。每个 async lookup、assign、gradient accumulation 和 optimizer Future 都被 await。
+Python E2E workload 使用 dim=16、4,096 个连续 `int64` key、4 个 worker、学习率为 0.01 的 SGD、LFU 打分、256 KiB 驻留内存限制和 1 GiB spill 限制。同步和异步路径都 warmup 2 次、计时 5 次。每个 async lookup、assign、gradient accumulation 和 optimizer Future 都被 await。
 
-独立 Python storage-pressure workload 会运行 5 个相互独立的 store。每个 store 使用 dim=128、16,384 个连续 key、2 个 worker、`max_active_keys=20,000`、LFU 打分、5 MiB 驻留内存限制和 1 GiB spill 限制。输出吞吐与选择耗时的 median/p95，以及淘汰计数器的 min/max。
+独立 Python storage-pressure workload 会运行 5 个相互独立的 store。每个 store 使用 dim=128、16,384 个连续 key、2 个 worker、LFU 打分、5 MiB 驻留内存限制和 1 GiB spill 限制；测量插入前会 reserve 16,384 个 key。输出吞吐与选择耗时的 median/p95，以及淘汰计数器的 min/max。
 
 ## 验证 workload
 
