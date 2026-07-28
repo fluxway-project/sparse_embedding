@@ -33,7 +33,6 @@
 #include "sparse_embedding/src/bindings/async_bridge.hpp"
 #include "sparse_embedding/src/bindings/dlpack_utils.hpp"
 #include "sparse_embedding/src/bindings/module_wrapper.hpp"
-#include "sparse_embedding/src/common/slot_key_codec.hpp"
 #include "sparse_embedding/src/ops/partitioner.hpp"
 #include "sparse_embedding/src/ops/tensor_ops.hpp"
 #ifdef SE_ENABLE_LANCE_CHECKPOINTER
