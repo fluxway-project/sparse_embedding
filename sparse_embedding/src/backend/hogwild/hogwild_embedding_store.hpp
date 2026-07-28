@@ -21,7 +21,6 @@
 #include <parlay_hash/unordered_map.h>
 
 #include <algorithm>
-#include <array>
 #include <atomic>
 #include <cstdint>
 #include <cstdlib>
@@ -46,7 +45,6 @@
 
 #include "sparse_embedding/src/arena/transient_arena.hpp"
 #include "sparse_embedding/src/common/function.hpp"
-#include "sparse_embedding/src/common/slot_key_codec.hpp"
 #include "sparse_embedding/src/eviction/score_policy.hpp"
 #include "sparse_embedding/src/interface/initializer_interface.hpp"
 #include "sparse_embedding/src/interface/optimizer_interface.hpp"
@@ -288,16 +286,23 @@ public:
     static constexpr size_t kInitialRecycleCapacity = 64;
     static constexpr size_t kParlayHashCapacityMultiplier = 4;
 
+    struct MapBundle {
+      Key entries;
+      KeyMap key_map;
+      explicit MapBundle(size_t capacity)
+          : entries(false), key_map(capacity, &entries, false) {}
+    };
+
     size_t reserved_keys;
-    Key entries;
-    KeyMap key_map;
+    size_t count = 0;
+    std::unique_ptr<MapBundle> bundle;
     mutable std::shared_mutex map_mutex;
     std::vector<uint32_t> recycled_indices;
     size_t owned_index_count = 0;
 
     explicit KeyShard(size_t requested_keys)
-        : reserved_keys(requested_keys), entries(false),
-          key_map(map_capacity(requested_keys), &entries, false) {}
+        : reserved_keys(requested_keys),
+          bundle(std::make_unique<MapBundle>(map_capacity(requested_keys))) {}
 
     static size_t map_capacity(size_t keys_count) {
       if (keys_count >
@@ -307,15 +312,48 @@ public:
       return std::max(size_t(1024), keys_count * kParlayHashCapacityMultiplier);
     }
 
+    static size_t compute_next_capacity(size_t current, size_t required) {
+      size_t next = current;
+      while (next < required) {
+        if (next < 65536) { // < 64K, use 2x
+          next = std::max(static_cast<size_t>(1024), next * 2);
+        } else if (next < 1048576) { // < 1M, use 1.5x
+          next += next / 2;
+        } else { // >= 1M, use 1.25x
+          next += next / 4;
+        }
+      }
+      return next;
+    }
+
     std::optional<uint32_t> find_unlocked(uint64_t key) {
-      return key_map.Find(Key::Entry::make_key(key), [](const auto &entry) {
-        return entry.get_entry().second;
-      });
+      return bundle->key_map.Find(
+          Key::Entry::make_key(key),
+          [](const auto &entry) { return entry.get_entry().second; });
     }
 
     std::optional<uint32_t> find(uint64_t key) {
       std::shared_lock lock(map_mutex);
       return find_unlocked(key);
+    }
+
+    void expand(size_t target_keys) {
+      if (target_keys <= reserved_keys)
+        return;
+      auto new_bundle = std::make_unique<MapBundle>(map_capacity(target_keys));
+      bundle->key_map.for_each([&](const auto &entry) {
+        auto [k, idx] = entry.get_entry();
+        auto map_key = Key::Entry::make_key(k);
+        new_bundle->key_map.Insert(
+            map_key,
+            [&] {
+              return new_bundle->entries.make_entry(map_key,
+                                                    std::make_pair(k, idx));
+            },
+            [](const auto &e) { return e.get_entry().second; });
+      });
+      bundle = std::move(new_bundle);
+      reserved_keys = target_keys;
     }
 
     void prepare_new_index() {
@@ -324,21 +362,21 @@ public:
       }
       size_t required_capacity = owned_index_count + 1;
       if (recycled_indices.capacity() < required_capacity) {
-        size_t current_capacity = recycled_indices.capacity();
-        size_t next_capacity =
-            current_capacity <= std::numeric_limits<size_t>::max() / 2
-                ? std::max(kInitialRecycleCapacity, current_capacity * 2)
-                : std::numeric_limits<size_t>::max();
-        recycled_indices.reserve(std::max(required_capacity, next_capacity));
+        size_t next_capacity = compute_next_capacity(
+            recycled_indices.capacity(), required_capacity);
+        recycled_indices.reserve(next_capacity);
       }
     }
 
     void insert_existing(uint64_t key, uint32_t idx) {
       auto map_key = Key::Entry::make_key(key);
       auto read_idx = [](const auto &e) { return e.get_entry().second; };
-      auto existing = key_map.Insert(
+      auto existing = bundle->key_map.Insert(
           map_key,
-          [&] { return entries.make_entry(map_key, std::make_pair(key, idx)); },
+          [&] {
+            return bundle->entries.make_entry(map_key,
+                                              std::make_pair(key, idx));
+          },
           read_idx);
       if (existing.has_value()) {
         throw std::logic_error("duplicate key while rebuilding key shard");
@@ -394,7 +432,7 @@ public:
     template <typename Fn> void for_each(Fn &&fn) {
       for (auto &shard : key_shards) {
         std::shared_lock lock(shard->map_mutex);
-        shard->key_map.for_each(fn);
+        shard->bundle->key_map.for_each(fn);
       }
     }
 
@@ -402,7 +440,7 @@ public:
       size_t total = 0;
       for (auto &shard : key_shards) {
         std::shared_lock lock(shard->map_mutex);
-        total += shard->key_map.size();
+        total += shard->count;
       }
       return total;
     }
@@ -434,6 +472,12 @@ public:
       std::unique_lock map_lock(key_shard.map_mutex);
       if (auto existing = key_shard.find_unlocked(key))
         return {*existing, false};
+
+      if (key_shard.count >= key_shard.reserved_keys) {
+        size_t new_size = KeyShard::compute_next_capacity(
+            key_shard.reserved_keys, key_shard.count + 1);
+        key_shard.expand(new_size);
+      }
 
       std::optional<uint32_t> preallocated_idx;
       bool was_inserted = false;
@@ -467,16 +511,20 @@ public:
       };
       auto construct = [&](const auto &entry) {
         auto map_key = Key::Entry::make_key(key);
-        return key_shard.entries.make_entry(map_key, update(entry));
+        return key_shard.bundle->entries.make_entry(map_key, update(entry));
       };
       std::optional<std::pair<uint64_t, uint32_t>> published;
       try {
-        published = key_shard.key_map.Upsert(Key::Entry::make_key(key),
-                                             construct, update);
+        published = key_shard.bundle->key_map.Upsert(Key::Entry::make_key(key),
+                                                     construct, update);
       } catch (...) {
         if (preallocated_idx.has_value())
           key_shard.recycled_indices.push_back(*preallocated_idx);
         throw;
+      }
+
+      if (was_inserted) {
+        ++key_shard.count;
       }
 
       if (preallocated_idx.has_value() && !was_inserted)
@@ -501,7 +549,7 @@ public:
       size_t total_keys = 0;
       for (size_t i = 0; i < counts.size(); ++i) {
         std::shared_lock map_lock(key_shards[i]->map_mutex);
-        size_t current_size = key_shards[i]->key_map.size();
+        size_t current_size = key_shards[i]->count;
         size_t target_keys = std::max(counts[i], current_size);
         if (target_keys > std::numeric_limits<size_t>::max() - total_keys) {
           throw std::overflow_error(
@@ -511,20 +559,12 @@ public:
       }
       for (size_t i = 0; i < counts.size(); ++i) {
         std::unique_lock map_lock(key_shards[i]->map_mutex);
-        size_t current_size = key_shards[i]->key_map.size();
+        size_t current_size = key_shards[i]->count;
         size_t target_keys = std::max(counts[i], current_size);
         if (target_keys <= key_shards[i]->reserved_keys) {
           continue;
         }
-        auto rebuilt = std::make_unique<KeyShard>(target_keys);
-        key_shards[i]->key_map.for_each([&](const auto &entry) {
-          auto [key, idx] = entry.get_entry();
-          rebuilt->insert_existing(key, idx);
-        });
-        rebuilt->recycled_indices = std::move(key_shards[i]->recycled_indices);
-        rebuilt->owned_index_count = key_shards[i]->owned_index_count;
-        map_lock.unlock();
-        key_shards[i] = std::move(rebuilt);
+        key_shards[i]->expand(target_keys);
       }
       size_t arena_capacity =
           std::max(total_keys, static_cast<size_t>(arena.allocated_count()));
@@ -1023,11 +1063,12 @@ public:
           for (const auto &slot_ptr : slot_storage_) {
             auto &shard = slot_ptr->shard_for_key(key);
             std::unique_lock map_lock(shard.map_mutex);
-            auto removed = shard.key_map.Remove(
+            auto removed = shard.bundle->key_map.Remove(
                 Key::Entry::make_key(key),
                 [](const auto &entry) { return entry.get_entry().second; });
             if (removed.has_value()) {
               shard.recycled_indices.push_back(*removed);
+              --shard.count;
             }
           }
         }
@@ -1717,11 +1758,12 @@ public:
           }
           auto &shard = slot->shard_for_key(key);
           std::unique_lock map_lock(shard.map_mutex);
-          auto removed = shard.key_map.Remove(
+          auto removed = shard.bundle->key_map.Remove(
               Key::Entry::make_key(key),
               [](const auto &entry) { return entry.get_entry().second; });
           if (removed.has_value()) {
             shard.recycled_indices.push_back(*removed);
+            --shard.count;
           }
           ++out_evicted_count;
         }
