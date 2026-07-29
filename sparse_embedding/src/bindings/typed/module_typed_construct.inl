@@ -15,7 +15,20 @@ void ConstructOpsImpl<ParamT, OptT>::construct(
     EmbeddingStoreWrapper &self, const PyInitializer &init_cfg,
     const PyOptimizer &opt_cfg, const std::string &score_policy_name,
     size_t num_threads) {
-  // 1) Build the parameter-precision initializer proxy.
+  const bool requires_score = std::visit(
+      [](const auto &config) {
+        return config.dynamic_lr_policy.has_value() &&
+               std::visit(
+                   [](const auto &policy) { return policy.requires_score(); },
+                   *config.dynamic_lr_policy);
+      },
+      opt_cfg.config);
+  if (requires_score && score_policy_name == "none") {
+    throw std::invalid_argument(
+        "dynamic learning-rate policy requires a score policy");
+  }
+
+  // Build the parameter-precision initializer proxy.
   pro::proxy<se::InitializerFacade<ParamT>> init_proxy;
   if constexpr (std::is_same_v<ParamT, float>) {
     init_proxy = (*init_cfg.builder)->build_f32();
@@ -25,7 +38,7 @@ void ConstructOpsImpl<ParamT, OptT>::construct(
     init_proxy = (*init_cfg.builder)->build_bf16();
   }
 
-  // 2) Build the optimizer factory closure.
+  // Build the optimizer factory closure.
   using OptFacade = se::OptimizerFacade<ParamT, OptT>;
   using OptFactory = se::Function<pro::proxy<OptFacade>(size_t)>;
   OptFactory opt_factory =
@@ -34,28 +47,48 @@ void ConstructOpsImpl<ParamT, OptT>::construct(
             return std::visit(
                 [&](const auto &cfg) -> pro::proxy<OptFacade> {
                   using Config = std::decay_t<decltype(cfg)>;
+                  auto make_optimizer = [&]<template <typename, typename, typename>
+                                            typename Optimizer>()
+                      -> pro::proxy<OptFacade> {
+                    if (cfg.dynamic_lr_policy.has_value()) {
+                      return std::visit(
+                          [&](const auto &policy) -> pro::proxy<OptFacade> {
+                            using Policy = std::decay_t<decltype(policy)>;
+                            using LearningRate =
+                                se::DynamicLearningRate<Policy>;
+                            return pro::make_proxy<
+                                OptFacade,
+                                Optimizer<ParamT, OptT, LearningRate>>(
+                                d, cfg, storage,
+                                LearningRate(cfg.lr, policy));
+                          },
+                          *cfg.dynamic_lr_policy);
+                    }
+                    return pro::make_proxy<
+                        OptFacade,
+                        Optimizer<ParamT, OptT, se::StaticLearningRate>>(
+                        d, cfg, storage, se::StaticLearningRate(cfg.lr));
+                  };
                   if constexpr (std::is_same_v<Config, se::AdamConfig>) {
-                    return pro::make_proxy<OptFacade,
-                                           se::AdamOptimizer<ParamT, OptT>>(
-                        d, cfg, storage);
+                    return make_optimizer
+                        .template operator()<se::AdamOptimizer>();
                   } else {
-                    return pro::make_proxy<OptFacade,
-                                           se::SgdOptimizer<ParamT, OptT>>(
-                        d, cfg, storage);
+                    return make_optimizer
+                        .template operator()<se::SgdOptimizer>();
                   }
                 },
                 config);
           });
 
-  // 3) Pick KeyT and ScorePolicy, then materialise the concrete
-  //    HogwildEmbeddingStore<KeyT, ParamT, OptT, Policy> into the variant.
+  // Pick KeyT and ScorePolicy, then materialise the concrete
+  // HogwildEmbeddingStore<KeyT, ParamT, OptT, Policy> into the variant.
   auto construct_with_key = [&]<typename KeyT>() {
     auto construct_with_policy = [&]<typename Policy>(Policy policy) {
       using StoreType = se::HogwildEmbeddingStore<KeyT, ParamT, OptT, Policy>;
       self.store_ =
           pro::make_proxy<se::EmbeddingTableFacade<ParamT, OptT>, StoreType>(
-              self.dims_, num_threads, std::move(init_proxy), std::move(opt_factory),
-              std::move(policy), 16, self.storage_);
+              self.dims_, num_threads, std::move(init_proxy),
+              std::move(opt_factory), std::move(policy), 16, self.storage_);
     };
 
     if (score_policy_name == "none") {
@@ -72,19 +105,19 @@ void ConstructOpsImpl<ParamT, OptT>::construct(
   };
 
   switch (self.key_type_enum_) {
-  case KeyDType::kInt64:
-    construct_with_key.template operator()<int64_t>();
-    break;
-  case KeyDType::kUInt64:
-    construct_with_key.template operator()<uint64_t>();
-    break;
-  case KeyDType::kInt32:
-    construct_with_key.template operator()<int32_t>();
-    break;
-  case KeyDType::kUInt32:
-    construct_with_key.template operator()<uint32_t>();
-    break;
+    case KeyDType::kInt64:
+      construct_with_key.template operator()<int64_t>();
+      break;
+    case KeyDType::kUInt64:
+      construct_with_key.template operator()<uint64_t>();
+      break;
+    case KeyDType::kInt32:
+      construct_with_key.template operator()<int32_t>();
+      break;
+    case KeyDType::kUInt32:
+      construct_with_key.template operator()<uint32_t>();
+      break;
   }
 }
 
-} // namespace se::py::detail
+}  // namespace se::py::detail

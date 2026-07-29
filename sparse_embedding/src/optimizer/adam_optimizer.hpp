@@ -19,17 +19,18 @@
 #define SPARSE_EMBEDDING_ADAM_OPTIMIZER_HPP_
 
 #include <algorithm>
-#include <cmath>
 #include <cstdint>
 #include <span>
 
+#include "sparse_embedding/src/optimizer/learning_rate.hpp"
 #include "sparse_embedding/src/optimizer/optimizer_config.hpp"
 #include "sparse_embedding/src/optimizer/optimizer_state.hpp"
 #include "sparse_embedding/src/simd/simd_ops.hpp"
 
 namespace se {
 
-template <typename ParamT, typename OptT> class AdamOptimizer {
+template <typename ParamT, typename OptT, typename LearningRateT>
+class AdamOptimizer {
   OptimizerStateArena<OptT> m_state;
   OptimizerStateArena<OptT> v_state;
   OptimizerStateArena<uint32_t>
@@ -38,11 +39,14 @@ template <typename ParamT, typename OptT> class AdamOptimizer {
                   // first update sees id_step==1 after the increment, which is
                   // required for correct Adam bias correction.
   AdamConfig config;
+  LearningRateT learning_rate;
 
 public:
-  explicit AdamOptimizer(size_t dim, const AdamConfig &cfg, PageStorage storage)
+  explicit AdamOptimizer(size_t dim, const AdamConfig &cfg, PageStorage storage,
+                         LearningRateT lr)
       : m_state(dim, storage), v_state(dim, storage),
-        step_state(1, std::move(storage)), config(cfg) {}
+        step_state(1, std::move(storage)), config(cfg),
+        learning_rate(std::move(lr)) {}
 
   void allocate(uint32_t idx) {
     m_state.allocate(idx);
@@ -88,7 +92,7 @@ public:
     std::copy_n(v_state.data(idx), d, out.data() + d);
   }
 
-  size_t state_dim() const { return m_state.dim() * 2; }
+  constexpr size_t state_dim() const { return m_state.dim() * 2; }
 
   void set_state(uint32_t idx, std::span<const OptT> state) {
     size_t d = m_state.dim();
@@ -103,9 +107,13 @@ public:
 
   void set_step(uint32_t idx, uint32_t s) { *step_state.data(idx) = s; }
 
+  constexpr bool requires_score() const {
+    return learning_rate.requires_score();
+  }
+
   void step(uint32_t idx, std::span<ParamT> param_span,
             std::span<const ParamT> grad_span,
-            [[maybe_unused]] uint64_t global_step) {
+            [[maybe_unused]] uint64_t global_step, uint64_t score) {
     uint32_t &id_step = *step_state.data(idx);
     id_step++;
     const float step_f = static_cast<float>(id_step);
@@ -119,8 +127,10 @@ public:
     OptT *m = m_state.data(idx);
     OptT *v = v_state.data(idx);
 
-    simd::simd_adam_update(param, accumulated_grad, m, v, config.lr,
-                           config.beta1, config.beta2, config.eps, bc1, bc2,
+    float lr = learning_rate.compute(score);
+
+    simd::simd_adam_update(param, accumulated_grad, m, v, lr, config.beta1,
+                           config.beta2, config.eps, bc1, bc2,
                            config.weight_decay, dim);
   }
 };

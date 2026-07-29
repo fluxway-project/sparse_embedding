@@ -396,11 +396,17 @@ public:
     OptimizerFactory opt_factory;
     uint64_t global_step = 0;
 
-    SlotStore(size_t d, OptimizerFactory opt_factory, size_t num_threads,
+    SlotStore(size_t d, OptimizerFactory opt_factory_in, size_t num_threads,
               bool enable_score, PageStorage storage)
         : dim(d), shard_mask(num_threads - 1), arena(d, enable_score, storage),
-          optimizer(opt_factory.has_value() ? (*opt_factory)(d) : nullptr),
-          opt_factory(opt_factory) {
+          opt_factory(std::move(opt_factory_in)) {
+      if (opt_factory.has_value()) {
+        optimizer = (*opt_factory)(d);
+        if (optimizer->requires_score() && !enable_score) {
+          throw std::invalid_argument(
+              "dynamic learning-rate policy requires score storage");
+        }
+      }
       if (optimizer.has_value())
         optimizer->set_page_eviction_enabled(enable_score);
       for (size_t i = 0; i < num_threads; ++i) {
@@ -921,22 +927,32 @@ public:
           for (const auto &slot_ptr : slot_storage_) {
             auto *slot = slot_ptr.get();
             auto &shard = slot->transient_shards[shard_id];
-            shard->for_each_accumulated(
-                [&](uint64_t feature_id, const ParamT *accumulated_grad) {
-                  auto found = slot->find(feature_id);
-                  if (!found.has_value())
-                    return;
+            shard->for_each_accumulated([&](uint64_t feature_id,
+                                            const ParamT *accumulated_grad) {
+              auto found = slot->find(feature_id);
+              if (!found.has_value())
+                return;
 
-                  uint32_t arena_idx = *found;
-                  ParamT *param = slot->arena.data(arena_idx);
+              uint32_t arena_idx = *found;
+              ParamT *param = slot->arena.data(arena_idx);
 
-                  if (slot->optimizer.has_value()) {
-                    slot->optimizer->step(
-                        arena_idx, std::span<ParamT>(param, slot->dim),
-                        std::span<const ParamT>(accumulated_grad, slot->dim),
-                        slot->global_step);
-                  }
-                });
+              if (slot->optimizer.has_value()) {
+                if constexpr (ScorePolicyT::kHasScore) {
+                  const uint64_t score = std::atomic_ref<uint64_t>(
+                                             slot->arena.score_raw(arena_idx))
+                                             .load(std::memory_order_relaxed);
+                  slot->optimizer->step(
+                      arena_idx, std::span<ParamT>(param, slot->dim),
+                      std::span<const ParamT>(accumulated_grad, slot->dim),
+                      slot->global_step, score);
+                } else {
+                  slot->optimizer->step(
+                      arena_idx, std::span<ParamT>(param, slot->dim),
+                      std::span<const ParamT>(accumulated_grad, slot->dim),
+                      slot->global_step, 0);
+                }
+              }
+            });
             shard->clear();
           }
         }
@@ -1090,6 +1106,11 @@ public:
       slot->optimizer = slot->opt_factory.has_value()
                             ? (*slot->opt_factory)(slot->dim)
                             : nullptr;
+      if (slot->optimizer.has_value() && slot->optimizer->requires_score() &&
+          !ScorePolicyT::kHasScore) {
+        throw std::invalid_argument(
+            "dynamic learning-rate policy requires score storage");
+      }
       if (slot->optimizer.has_value())
         slot->optimizer->set_page_eviction_enabled(ScorePolicyT::kHasScore);
     }

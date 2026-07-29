@@ -37,8 +37,6 @@ template class TransientArena<bfloat16_t>;
                                        ManualScorePolicy>;
 
 #define INSTANTIATE_OPT_PAIR(PARAM_T, OPT_T)                                   \
-  template class AdamOptimizer<PARAM_T, OPT_T>;                                \
-  template class SgdOptimizer<PARAM_T, OPT_T>;                                 \
   INSTANTIATE_STORE(uint64_t, PARAM_T, OPT_T)                                  \
   INSTANTIATE_STORE(int64_t, PARAM_T, OPT_T)                                   \
   INSTANTIATE_STORE(uint32_t, PARAM_T, OPT_T)                                  \

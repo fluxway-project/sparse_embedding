@@ -18,7 +18,10 @@
 #ifndef SPARSE_EMBEDDING_OPTIMIZER_CONFIG_HPP_
 #define SPARSE_EMBEDDING_OPTIMIZER_CONFIG_HPP_
 
+#include <optional>
 #include <variant>
+
+#include "sparse_embedding/src/optimizer/dynamic_lr_policy.hpp"
 
 namespace se {
 
@@ -28,11 +31,13 @@ struct AdamConfig {
   float beta2 = 0.999f;
   float eps = 1e-8f;
   float weight_decay = 0.0f;
+  std::optional<DynamicLrPolicyVariant> dynamic_lr_policy;
 };
 
 struct SgdConfig {
   float lr = 1e-2f;
   float weight_decay = 0.0f;
+  std::optional<DynamicLrPolicyVariant> dynamic_lr_policy;
 };
 
 // Extensible variant for python bindings
