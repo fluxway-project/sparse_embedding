@@ -20,7 +20,6 @@
 
 #include <proxy/proxy.h>
 
-#include <cstdint>
 #include <span>
 
 #include "sparse_embedding/src/common/numeric_types.hpp"
@@ -39,6 +38,7 @@ PRO_DEF_MEM_DISPATCH(OptMemStateDim, state_dim);
 PRO_DEF_MEM_DISPATCH(OptMemSetState, set_state);
 PRO_DEF_MEM_DISPATCH(OptMemStepData, step_data);
 PRO_DEF_MEM_DISPATCH(OptMemSetStep, set_step);
+PRO_DEF_MEM_DISPATCH(OptMemRequiresScore, requires_score);
 
 template <typename ParamT, typename OptT>
 struct OptimizerFacade
@@ -51,9 +51,11 @@ struct OptimizerFacade
       ::add_convention<pro::weak_dispatch<OptMemDeallocate>,
                        void(uint32_t idx)>::
           add_convention<pro::weak_dispatch<OptMemClear>, void()> //
-      ::add_convention<OptMemStep, void(uint32_t idx, std::span<ParamT> param,
-                                        std::span<const ParamT> grad,
-                                        uint64_t global_step)> //
+      ::add_convention<OptMemStep,
+                       void(uint32_t idx, std::span<ParamT> param,
+                            std::span<const ParamT> grad, uint64_t global_step,
+                            uint64_t score)>              //
+      ::add_convention<OptMemRequiresScore, bool() const> //
       ::add_convention<pro::weak_dispatch<OptMemStateData>,
                        void(uint32_t idx, std::span<OptT> out) const> //
       ::add_convention<pro::weak_dispatch<OptMemStateDim>,

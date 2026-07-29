@@ -292,6 +292,62 @@ NB_MODULE(_core, m) {
 
   nb::class_<PyInitializer>(m, "Initializer");
 
+  struct PyLrPolicy {
+    std::optional<se::DynamicLrPolicyVariant> policy;
+  };
+  nb::class_<PyLrPolicy>(m, "LrPolicy");
+
+  struct ConstantLrPolicyPy : PyLrPolicy {};
+  nb::class_<ConstantLrPolicyPy, PyLrPolicy>(m, "ConstantLrPolicy")
+      .def("__init__", [](ConstantLrPolicyPy *self) {
+        new (self) ConstantLrPolicyPy();
+        self->policy.emplace(se::ConstantLrPolicy{});
+      });
+
+  struct SqrtDecayLrPolicyPy : PyLrPolicy {};
+  nb::class_<SqrtDecayLrPolicyPy, PyLrPolicy>(m, "SqrtDecayLrPolicy")
+      .def("__init__", [](SqrtDecayLrPolicyPy *self) {
+        new (self) SqrtDecayLrPolicyPy();
+        self->policy.emplace(se::SqrtDecayLrPolicy{});
+      });
+
+  struct LogDecayLrPolicyPy : PyLrPolicy {};
+  nb::class_<LogDecayLrPolicyPy, PyLrPolicy>(m, "LogDecayLrPolicy")
+      .def("__init__", [](LogDecayLrPolicyPy *self) {
+        new (self) LogDecayLrPolicyPy();
+        self->policy.emplace(se::LogDecayLrPolicy{});
+      });
+
+  struct InverseDecayLrPolicyPy : PyLrPolicy {};
+  nb::class_<InverseDecayLrPolicyPy, PyLrPolicy>(m, "InverseDecayLrPolicy")
+      .def("__init__", [](InverseDecayLrPolicyPy *self) {
+        new (self) InverseDecayLrPolicyPy();
+        self->policy.emplace(se::InverseDecayLrPolicy{});
+      });
+
+  struct CosineFrequencyLrPolicyPy : PyLrPolicy {};
+  nb::class_<CosineFrequencyLrPolicyPy, PyLrPolicy>(m,
+                                                    "CosineFrequencyLrPolicy")
+      .def(
+          "__init__",
+          [](CosineFrequencyLrPolicyPy *self, float min_lr_ratio,
+             uint64_t max_score) {
+            new (self) CosineFrequencyLrPolicyPy();
+            self->policy.emplace(
+                se::CosineFrequencyLrPolicy(min_lr_ratio, max_score));
+          },
+          nb::arg("min_lr_ratio") = 0.1f, nb::arg("max_score") = 1000);
+
+  struct CustomLutLrPolicyPy : PyLrPolicy {};
+  nb::class_<CustomLutLrPolicyPy, PyLrPolicy>(m, "CustomLutLrPolicy")
+      .def(
+          "__init__",
+          [](CustomLutLrPolicyPy *self, std::vector<float> lut) {
+            new (self) CustomLutLrPolicyPy();
+            self->policy.emplace(se::CustomLutLrPolicy(std::move(lut)));
+          },
+          nb::arg("lut"));
+
   struct ZerosInitializerPy : PyInitializer {};
   nb::class_<ZerosInitializerPy, PyInitializer>(m, "Zeros")
       .def("__init__", [](ZerosInitializerPy *self) {
@@ -322,21 +378,33 @@ NB_MODULE(_core, m) {
   nb::class_<AdamOptimizerPy, PyOptimizer>(m, "Adam").def(
       "__init__",
       [](AdamOptimizerPy *self, float lr, float beta1, float beta2, float eps,
-         float weight_decay) {
+         float weight_decay, std::optional<PyLrPolicy> policy) {
         new (self) AdamOptimizerPy();
-        self->config = se::AdamConfig{lr, beta1, beta2, eps, weight_decay};
+        std::optional<se::DynamicLrPolicyVariant> lr_policy;
+        if (policy) {
+          lr_policy = *policy->policy;
+        }
+        self->config = se::AdamConfig{lr,  beta1,        beta2,
+                                      eps, weight_decay, std::move(lr_policy)};
       },
       nb::arg("lr") = 1e-3f, nb::arg("beta1") = 0.9f, nb::arg("beta2") = 0.999f,
-      nb::arg("eps") = 1e-8f, nb::arg("weight_decay") = 0.0f);
+      nb::arg("eps") = 1e-8f, nb::arg("weight_decay") = 0.0f,
+      nb::arg("dynamic_lr_policy") = nb::none());
 
   struct SgdOptimizerPy : PyOptimizer {};
   nb::class_<SgdOptimizerPy, PyOptimizer>(m, "Sgd").def(
       "__init__",
-      [](SgdOptimizerPy *self, float lr, float weight_decay) {
+      [](SgdOptimizerPy *self, float lr, float weight_decay,
+         std::optional<PyLrPolicy> policy) {
         new (self) SgdOptimizerPy();
-        self->config = se::SgdConfig{lr, weight_decay};
+        std::optional<se::DynamicLrPolicyVariant> lr_policy;
+        if (policy) {
+          lr_policy = *policy->policy;
+        }
+        self->config = se::SgdConfig{lr, weight_decay, std::move(lr_policy)};
       },
-      nb::arg("lr") = 1e-2f, nb::arg("weight_decay") = 0.0f);
+      nb::arg("lr") = 1e-2f, nb::arg("weight_decay") = 0.0f,
+      nb::arg("dynamic_lr_policy") = nb::none());
 
   nb::class_<se::py::DLPackCapsuleWrapper>(m, "DLPackCapsuleWrapper")
       .def("__dlpack__", &se::py::DLPackCapsuleWrapper::dlpack, nb::kw_only(),
