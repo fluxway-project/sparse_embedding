@@ -9,7 +9,6 @@
 #include <functional>
 #include <limits>
 #include <memory>
-#include <shared_mutex>
 #include <stdexcept>
 #include <string>
 #include <thread>
@@ -38,17 +37,12 @@ public:
   void register_page(size_t, std::function<uint64_t()>) {}
   void unregister_page(size_t) noexcept {}
   bool score_enabled() const noexcept { return score_enabled_; }
-  void lock_shared() { mutex_.lock_shared(); }
-  void unlock_shared() noexcept { mutex_.unlock_shared(); }
-  void lock() { mutex_.lock(); }
-  void unlock() noexcept { mutex_.unlock(); }
 
 private:
   bool score_enabled_;
-  std::shared_mutex mutex_;
 };
 
-class BlockingEvictionGuard {
+class BlockingEvictionProxy {
 public:
   bool evaluate_page(size_t, uint64_t &score) {
     std::unique_lock lock(evaluation_mutex_);
@@ -62,12 +56,8 @@ public:
   }
 
   void register_page(size_t, std::function<uint64_t()>) {}
-  void unregister_page(size_t) noexcept {}
+  void unregister_page(size_t) noexcept { wait_for_evaluation_completion(); }
   bool score_enabled() const noexcept { return true; }
-  void lock_shared() { lifecycle_mutex_.lock_shared(); }
-  void unlock_shared() noexcept { lifecycle_mutex_.unlock_shared(); }
-  void lock() { lifecycle_mutex_.lock(); }
-  void unlock() noexcept { lifecycle_mutex_.unlock(); }
 
   void wait_for_evaluation() {
     std::unique_lock lock(evaluation_mutex_);
@@ -86,7 +76,6 @@ public:
   }
 
 private:
-  std::shared_mutex lifecycle_mutex_;
   std::mutex evaluation_mutex_;
   std::condition_variable evaluation_cv_;
   bool evaluation_started_ = false;
@@ -298,6 +287,9 @@ int main() {
       std::make_shared<EvictionGuard>());
   auto watermark_page =
       watermark_storage->allocate(4096, 64, {}, se::PageEvictionMode::kEnabled);
+  const auto watermark_address = watermark_page.data();
+  constexpr std::byte watermark_sentinel{0x5a};
+  watermark_address[0] = watermark_sentinel;
   for (size_t attempt = 0;
        attempt < 100 && watermark_storage->stats().swap_out_count == 0;
        ++attempt) {
@@ -308,6 +300,10 @@ int main() {
           "default watermarks did not trigger background swap-out");
   require(watermark_stats.memory_bytes == 0,
           "background swap-out did not release memory accounting");
+  require(watermark_page.data() == watermark_address,
+          "background swap changed the virtual address");
+  require(watermark_page.data()[0] == watermark_sentinel,
+          "background swap lost mapped page contents");
   require(watermark_stats.eviction_selection_count > 0,
           "background eviction did not record a selection pass");
   require(watermark_stats.eviction_evaluated_pages > 0,
@@ -359,6 +355,37 @@ int main() {
   require(mixed_watermark_storage->stats().memory_bytes == 4096,
           "background eviction removed swap-disabled memory");
 
+  se::StorageOptions gap_watermark_options;
+  gap_watermark_options.memory_limit_bytes = 12288;
+  gap_watermark_options.spill_directory =
+      std::filesystem::temp_directory_path();
+  gap_watermark_options.max_spill_bytes = 1 << 20;
+  gap_watermark_options.watermark = se::WatermarkConfig{0.75, 0.5};
+  auto gap_watermark_storage =
+      se::create_page_storage(std::move(gap_watermark_options));
+  auto gap_watermark_registration =
+      gap_watermark_storage->set_page_eviction_proxy(
+          std::make_shared<EvictionGuard>());
+  (void)gap_watermark_registration;
+  auto gap_page_a = gap_watermark_storage->allocate(
+      4096, 64, [] { return uint64_t{0}; }, se::PageEvictionMode::kEnabled);
+  auto gap_page_b = gap_watermark_storage->allocate(
+      4096, 64, [] { return uint64_t{0}; }, se::PageEvictionMode::kEnabled);
+  std::this_thread::sleep_for(std::chrono::milliseconds(20));
+  const auto gap_passive_stats = gap_watermark_storage->stats();
+  require(gap_passive_stats.memory_bytes == 8192,
+          "low/high gap setup did not keep two resident pages");
+  require(gap_passive_stats.evictable_memory_bytes == 8192,
+          "low/high gap setup did not expose evictable resident bytes");
+  require(gap_passive_stats.swap_out_count == 0,
+          "low/high gap unexpectedly triggered passive background eviction");
+  gap_watermark_storage->drain_page_eviction_backlog(std::chrono::seconds(1));
+  const auto gap_drained_stats = gap_watermark_storage->stats();
+  require(gap_drained_stats.memory_bytes <= 6144,
+          "explicit eviction drain did not reach low watermark");
+  require(gap_drained_stats.swap_out_count == 1,
+          "explicit eviction drain did not swap exactly one gap page");
+
   se::StorageOptions replacement_options;
   replacement_options.memory_limit_bytes = 8192;
   replacement_options.spill_directory = std::filesystem::temp_directory_path();
@@ -366,15 +393,29 @@ int main() {
   replacement_options.watermark = se::WatermarkConfig{0.5, 0.25};
   auto replacement_storage =
       se::create_page_storage(std::move(replacement_options));
-  auto first_proxy = std::make_shared<BlockingEvictionGuard>();
+  auto first_proxy = std::make_shared<BlockingEvictionProxy>();
   auto first_registration =
       replacement_storage->set_page_eviction_proxy(first_proxy);
   auto replacement_page = replacement_storage->allocate(
       4096, 64, [] { return uint64_t{0}; }, se::PageEvictionMode::kEnabled);
   first_proxy->wait_for_evaluation();
-  replacement_storage->clear_page_eviction_proxy(first_registration);
+  std::atomic<bool> first_proxy_clear_finished{false};
+  std::thread first_proxy_clear([&] {
+    replacement_storage->clear_page_eviction_proxy(first_registration);
+    first_proxy_clear_finished.store(true, std::memory_order_release);
+  });
+  for (size_t attempt = 0; attempt < 100 && !first_proxy_clear_finished.load(
+                                                std::memory_order_acquire);
+       ++attempt) {
+    std::this_thread::sleep_for(std::chrono::milliseconds(1));
+  }
+  require(!first_proxy_clear_finished.load(std::memory_order_acquire),
+          "page eviction proxy clear did not wait for active evaluator");
   first_proxy->release_evaluation();
+  first_proxy_clear.join();
   first_proxy->wait_for_evaluation_completion();
+  require(first_proxy_clear_finished.load(std::memory_order_acquire),
+          "page eviction proxy clear did not complete after evaluator exit");
   require(replacement_storage->stats().swap_out_count == 0,
           "stale proxy generation swapped a page after proxy clear");
   auto second_registration = replacement_storage->set_page_eviction_proxy(
@@ -387,7 +428,7 @@ int main() {
   isolation_options.watermark = se::WatermarkConfig{0.5, 0.25};
   auto isolation_storage =
       se::create_page_storage(std::move(isolation_options));
-  auto blocking_proxy = std::make_shared<BlockingEvictionGuard>();
+  auto blocking_proxy = std::make_shared<BlockingEvictionProxy>();
   auto blocking_registration =
       isolation_storage->set_page_eviction_proxy(blocking_proxy);
   auto tiered_page = isolation_storage->allocate(

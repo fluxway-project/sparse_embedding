@@ -19,7 +19,8 @@
 #include <cstdlib>
 #include <cstring>
 #include <filesystem>
-#include <sstream>
+#include <format>
+#include <span>
 #include <stdexcept>
 
 namespace se {
@@ -33,9 +34,10 @@ namespace {
 void no_op_release_schema(ArrowSchema *s) {
   if (!s)
     return;
-  for (int64_t i = 0; i < s->n_children; ++i) {
-    if (s->children[i] && s->children[i]->release) {
-      s->children[i]->release(s->children[i]);
+  for (auto *child :
+       std::span{s->children, static_cast<size_t>(s->n_children)}) {
+    if (child && child->release) {
+      child->release(child);
     }
   }
   delete[] s->children;
@@ -46,9 +48,10 @@ void no_op_release_schema(ArrowSchema *s) {
 void no_op_release_array(ArrowArray *a) {
   if (!a)
     return;
-  for (int64_t i = 0; i < a->n_children; ++i) {
-    if (a->children[i] && a->children[i]->release) {
-      a->children[i]->release(a->children[i]);
+  for (auto *child :
+       std::span{a->children, static_cast<size_t>(a->n_children)}) {
+    if (child && child->release) {
+      child->release(child);
     }
   }
   for (int64_t i = 0; i < a->n_buffers; ++i) {
@@ -63,42 +66,41 @@ void no_op_release_array(ArrowArray *a) {
 
 void make_child_schema(ArrowSchema *child, const char *name,
                        const char *format) {
-  std::memset(child, 0, sizeof(*child));
-  child->format = format;
-  child->name = name;
-  child->flags = 0;
-  child->n_children = 0;
-  child->children = nullptr;
-  child->dictionary = nullptr;
-  child->release = no_op_release_schema;
-  child->private_data = nullptr;
-  child->metadata = nullptr;
+  *child = ArrowSchema{
+      .format = format,
+      .name = name,
+      .metadata = nullptr,
+      .flags = 0,
+      .n_children = 0,
+      .children = nullptr,
+      .dictionary = nullptr,
+      .release = no_op_release_schema,
+      .private_data = nullptr,
+  };
 }
 
 void make_child_array(ArrowArray *child, int64_t length, const void *buf0,
                       const void *buf1) {
-  std::memset(child, 0, sizeof(*child));
-  child->length = length;
-  child->null_count = 0;
-  child->offset = 0;
-  child->n_buffers = 2;
-  child->buffers = new const void *[2];
-  child->buffers[0] = buf0;
-  child->buffers[1] = buf1;
-  child->n_children = 0;
-  child->children = nullptr;
-  child->dictionary = nullptr;
-  child->release = no_op_release_array;
-  child->private_data = nullptr;
+  *child = ArrowArray{
+      .length = length,
+      .null_count = 0,
+      .offset = 0,
+      .n_buffers = 2,
+      .n_children = 0,
+      .buffers = new const void *[2] { buf0, buf1 },
+      .children = nullptr,
+      .dictionary = nullptr,
+      .release = no_op_release_array,
+      .private_data = nullptr,
+  };
 }
 
 std::string dim_uri(std::string_view base, size_t dim) {
-  std::ostringstream oss;
-  oss << base;
-  if (!base.empty() && base.back() != '/')
-    oss << '/';
-  oss << "dim_" << std::setw(4) << std::setfill('0') << dim;
-  return oss.str();
+  if (base.empty() || base.back() == '/') {
+    return std::format("{}dim_{:04}", base, dim);
+  } else {
+    return std::format("{}/dim_{:04}", base, dim);
+  }
 }
 
 const char *get_zstd_metadata() {
@@ -150,28 +152,43 @@ void LanceCheckpointWriter::write_batch(
     size_t embedding_bytes, std::span<const uint64_t> scores,
     const void *optimizer_states, size_t opt_state_bytes,
     std::span<const uint32_t> steps) {
+  if (num_keys == 0)
+    return;
+  if (keys == nullptr || embeddings == nullptr || key_bytes == 0 ||
+      embedding_bytes == 0 || key_bytes % num_keys != 0 ||
+      embedding_bytes % num_keys != 0)
+    throw std::invalid_argument("invalid Lance checkpoint batch buffers");
+  if (has_score_ && scores.size() != num_keys)
+    throw std::invalid_argument("Lance checkpoint score count mismatch");
+  if (opt_state_dim_ > 0 && (optimizer_states == nullptr ||
+                             opt_state_bytes != num_keys * opt_state_dim_))
+    throw std::invalid_argument(
+        "Lance checkpoint optimizer state size mismatch");
+  if (!steps.empty() && steps.size() != num_keys)
+    throw std::invalid_argument("Lance checkpoint step count mismatch");
+
   auto *k = static_cast<const std::byte *>(keys);
   buf_keys_.insert(buf_keys_.end(), k, k + key_bytes);
   num_keys_ += num_keys;
 
-  buf_embeddings_.resize(embedding_bytes);
-  std::memcpy(buf_embeddings_.data(), embeddings, embedding_bytes);
+  auto *e = static_cast<const std::byte *>(embeddings);
+  buf_embeddings_.insert(buf_embeddings_.end(), e, e + embedding_bytes);
 
   if (has_score_ && !scores.empty()) {
-    buf_scores_.assign(scores.begin(), scores.end());
+    buf_scores_.insert(buf_scores_.end(), scores.begin(), scores.end());
   } else {
     buf_scores_.clear();
   }
 
   if (opt_state_dim_ > 0 && optimizer_states && opt_state_bytes > 0) {
     auto *p = static_cast<const std::byte *>(optimizer_states);
-    buf_opt_states_.assign(p, p + opt_state_bytes);
+    buf_opt_states_.insert(buf_opt_states_.end(), p, p + opt_state_bytes);
   } else {
     buf_opt_states_.clear();
   }
 
   if (!steps.empty()) {
-    buf_steps_.assign(steps.begin(), steps.end());
+    buf_steps_.insert(buf_steps_.end(), steps.begin(), steps.end());
   } else {
     buf_steps_.clear();
   }
@@ -188,13 +205,17 @@ void LanceCheckpointWriter::build_schema(ArrowSchema *out) const {
   if (!buf_steps_.empty())
     ++n_cols;
 
-  std::memset(out, 0, sizeof(*out));
-  out->format = "+s"; // struct
-  out->name = "";
-  out->flags = 0;
-  out->n_children = n_cols;
-  out->children = new ArrowSchema *[n_cols];
-  out->release = no_op_release_schema;
+  *out = ArrowSchema{
+      .format = "+s", // struct
+      .name = "",
+      .metadata = nullptr,
+      .flags = 0,
+      .n_children = n_cols,
+      .children = new ArrowSchema *[n_cols],
+      .dictionary = nullptr,
+      .release = no_op_release_schema,
+      .private_data = nullptr,
+  };
 
   int col = 0;
 
@@ -251,16 +272,18 @@ void LanceCheckpointWriter::build_array(ArrowArray *out) const {
   if (!buf_steps_.empty())
     ++n_cols;
 
-  std::memset(out, 0, sizeof(*out));
-  out->length = n;
-  out->null_count = 0;
-  out->offset = 0;
-  out->n_buffers = 1;
-  out->buffers = new const void *[1];
-  out->buffers[0] = nullptr; // validity bitmap (none)
-  out->n_children = n_cols;
-  out->children = new ArrowArray *[n_cols];
-  out->release = no_op_release_array;
+  *out = ArrowArray{
+      .length = n,
+      .null_count = 0,
+      .offset = 0,
+      .n_buffers = 1,
+      .n_children = n_cols,
+      .buffers = new const void *[1] { nullptr }, // validity bitmap (none)
+      .children = new ArrowArray *[n_cols],
+      .dictionary = nullptr,
+      .release = no_op_release_array,
+      .private_data = nullptr,
+  };
 
   int col = 0;
 
@@ -302,8 +325,18 @@ int LanceCheckpointWriter::stream_get_next(ArrowArrayStream *stream,
                                            ArrowArray *out) {
   auto *state = static_cast<BatchStreamState *>(stream->private_data);
   if (state->consumed) {
-    std::memset(out, 0, sizeof(*out));
-    out->release = nullptr;
+    *out = ArrowArray{
+        .length = 0,
+        .null_count = 0,
+        .offset = 0,
+        .n_buffers = 0,
+        .n_children = 0,
+        .buffers = nullptr,
+        .children = nullptr,
+        .dictionary = nullptr,
+        .release = nullptr,
+        .private_data = nullptr,
+    };
     return 0;
   }
   state->consumed = true;
@@ -465,6 +498,7 @@ void LanceCheckpointReader::open(std::string_view uri, size_t dim,
 
   has_score_ = false;
   opt_state_dim_ = 0;
+  has_step_ = false;
   dim_ = 0;
   key_dim_ = 8;
   for (int64_t i = 0; i < schema_.n_children; ++i) {
@@ -581,4 +615,227 @@ bool LanceCheckpointReader::read_batch(
   return true;
 }
 
+// =============================================================================
+// LanceZeroCopyWriter
+// =============================================================================
+
+void LanceZeroCopyWriter::write(
+    std::string_view uri, size_t dim, size_t opt_state_dim, bool has_score,
+    CheckpointExportOptions options,
+    std::function<bool(ChunkData &)> get_next_chunk) {
+  uri_ = dim_uri(uri, dim);
+  dim_ = dim;
+  opt_state_dim_ = opt_state_dim;
+  has_score_ = has_score;
+  options_ = options;
+  get_next_chunk_ = std::move(get_next_chunk);
+
+  ArrowSchema schema{};
+  build_schema(&schema);
+
+  StreamState *state = new StreamState{this};
+
+  ArrowArrayStream stream{};
+  stream.get_schema = &stream_get_schema;
+  stream.get_next = &stream_get_next;
+  stream.get_last_error = &stream_get_last_error;
+  stream.release = &stream_release;
+  stream.private_data = state;
+
+  std::filesystem::create_directories(uri_);
+
+  int32_t mode;
+  bool exists = std::filesystem::exists(uri_ + "/_versions");
+  if (exists) {
+    if (options_.mode == CheckpointExportOptions::Mode::kIncremental) {
+      mode = LANCE_WRITE_APPEND;
+    } else {
+      mode = LANCE_WRITE_OVERWRITE;
+    }
+  } else {
+    mode = LANCE_WRITE_CREATE;
+  }
+
+  LanceDataset *out_ds = nullptr;
+  int32_t rc;
+
+  if (options_.use_compression) {
+    LanceWriteParams params{};
+    params.data_storage_version = "next";
+    rc = lance_dataset_write_with_params(uri_.c_str(), &schema, &stream, mode,
+                                         &params, nullptr, &out_ds);
+  } else {
+    rc = lance_dataset_write(uri_.c_str(), &schema, &stream, mode, nullptr,
+                             &out_ds);
+  }
+
+  if (rc != 0) {
+    std::string err_msg = "LanceZeroCopyWriter flush error: ";
+    err_msg += (out_ds ? "unknown error" : "failed to write dataset");
+    if (out_ds)
+      lance_dataset_close(out_ds);
+    throw std::runtime_error(err_msg);
+  } else if (out_ds) {
+    lance_dataset_close(out_ds);
+  }
+}
+
+void LanceZeroCopyWriter::build_schema(ArrowSchema *out) const {
+  int n_cols = 2; // key + embedding
+  if (has_score_)
+    ++n_cols;
+  if (opt_state_dim_ > 0)
+    ++n_cols;
+  if (options_.include_optimizer_state)
+    ++n_cols;
+
+  *out = ArrowSchema{
+      .format = "+s", // struct
+      .name = "",
+      .metadata = nullptr,
+      .flags = 0,
+      .n_children = n_cols,
+      .children = new ArrowSchema *[n_cols],
+      .dictionary = nullptr,
+      .release = no_op_release_schema,
+      .private_data = nullptr,
+  };
+
+  int col = 0;
+
+  out->children[col] = new ArrowSchema();
+  make_child_schema(out->children[col], "key", options_.key_schema.c_str());
+  ++col;
+
+  thread_local std::string emb_format;
+  emb_format =
+      "w:" +
+      std::to_string(
+          dim_ *
+          sizeof(float)); // we assume element is float or data stride is dim_*4
+  out->children[col] = new ArrowSchema();
+  make_child_schema(out->children[col], "embedding_params", emb_format.c_str());
+  if (options_.use_compression) {
+    out->children[col]->metadata = get_zstd_metadata();
+  }
+  ++col;
+
+  if (has_score_) {
+    out->children[col] = new ArrowSchema();
+    make_child_schema(out->children[col], "score", "L");
+    ++col;
+  }
+
+  if (opt_state_dim_ > 0) {
+    thread_local std::string opt_format;
+    opt_format = "w:" + std::to_string(opt_state_dim_);
+    out->children[col] = new ArrowSchema();
+    make_child_schema(out->children[col], "optimizer_states",
+                      opt_format.c_str());
+    if (options_.use_compression) {
+      out->children[col]->metadata = get_zstd_metadata();
+    }
+    ++col;
+  }
+
+  if (options_.include_optimizer_state) {
+    out->children[col] = new ArrowSchema();
+    make_child_schema(out->children[col], "step", "I");
+    ++col;
+  }
+}
+
+void LanceZeroCopyWriter::build_array(ArrowArray *out,
+                                      const ChunkData &chunk) const {
+  int64_t n = static_cast<int64_t>(chunk.num_keys);
+  int n_cols = 2;
+  if (has_score_)
+    ++n_cols;
+  if (opt_state_dim_ > 0)
+    ++n_cols;
+  if (options_.include_optimizer_state)
+    ++n_cols;
+
+  *out = ArrowArray{
+      .length = n,
+      .null_count = 0,
+      .offset = 0,
+      .n_buffers = 1,
+      .n_children = n_cols,
+      .buffers = new const void *[1] { nullptr },
+      .children = new ArrowArray *[n_cols],
+      .dictionary = nullptr,
+      .release = no_op_release_array,
+      .private_data = nullptr,
+  };
+
+  int col = 0;
+
+  out->children[col] = new ArrowArray();
+  make_child_array(out->children[col], n, nullptr, chunk.keys);
+  ++col;
+
+  out->children[col] = new ArrowArray();
+  make_child_array(out->children[col], n, nullptr, chunk.embeddings);
+  ++col;
+
+  if (has_score_) {
+    out->children[col] = new ArrowArray();
+    make_child_array(out->children[col], n, nullptr, chunk.scores);
+    ++col;
+  }
+
+  if (opt_state_dim_ > 0) {
+    out->children[col] = new ArrowArray();
+    make_child_array(out->children[col], n, nullptr, chunk.opt_states);
+    ++col;
+  }
+
+  if (options_.include_optimizer_state) {
+    out->children[col] = new ArrowArray();
+    make_child_array(out->children[col], n, nullptr, chunk.steps);
+    ++col;
+  }
+}
+
+int LanceZeroCopyWriter::stream_get_schema(ArrowArrayStream *stream,
+                                           ArrowSchema *out) {
+  auto *state = static_cast<StreamState *>(stream->private_data);
+  state->writer->build_schema(out);
+  return 0;
+}
+
+int LanceZeroCopyWriter::stream_get_next(ArrowArrayStream *stream,
+                                         ArrowArray *out) {
+  auto *state = static_cast<StreamState *>(stream->private_data);
+  ChunkData chunk;
+  if (state->writer->get_next_chunk_(chunk)) {
+    state->writer->build_array(out, chunk);
+  } else {
+    *out = ArrowArray{
+        .length = 0,
+        .null_count = 0,
+        .offset = 0,
+        .n_buffers = 0,
+        .n_children = 0,
+        .buffers = nullptr,
+        .children = nullptr,
+        .dictionary = nullptr,
+        .release = nullptr,
+        .private_data = nullptr,
+    };
+  }
+  return 0;
+}
+
+const char *LanceZeroCopyWriter::stream_get_last_error(ArrowArrayStream *) {
+  return nullptr;
+}
+
+void LanceZeroCopyWriter::stream_release(ArrowArrayStream *stream) {
+  auto *state = static_cast<StreamState *>(stream->private_data);
+  delete state;
+  stream->private_data = nullptr;
+  stream->release = nullptr;
+}
 } // namespace se

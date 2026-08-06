@@ -1,4 +1,4 @@
-build --cxxopt=-std=c++2b
+build --cxxopt=-std=c++23
 build --enable_runfiles=false
 
 # Enable AVX512_BF16 extension to support bfloat16 at the hardware/compiler level.

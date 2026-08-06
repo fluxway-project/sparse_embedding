@@ -104,6 +104,7 @@ public:
   }
 
   constexpr size_t dim() const { return dim_; }
+  constexpr size_t row_stride() const { return row_stride_; }
 
 private:
   std::byte *raw(uint32_t index) const {

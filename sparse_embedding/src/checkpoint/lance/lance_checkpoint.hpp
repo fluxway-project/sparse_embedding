@@ -18,17 +18,18 @@
 #ifndef SPARSE_EMBEDDING_LANCE_CHECKPOINT_HPP_
 #define SPARSE_EMBEDDING_LANCE_CHECKPOINT_HPP_
 
+#include "sparse_embedding/src/checkpoint/lance/arrow/c/abi.h"
 #include <cstdint>
 #include <cstring>
+#include <lance/lance.h>
+#include <lance/lance.hpp>
 #include <string>
 #include <string_view>
 #include <vector>
 
-#include <arrow/c/abi.h>
-#include <lance/lance.h>
-#include <lance/lance.hpp>
-
 #include "sparse_embedding/src/checkpoint/checkpoint_interface.hpp"
+
+#include <functional>
 
 namespace se {
 
@@ -78,6 +79,41 @@ public:
                    std::span<const uint32_t> steps);
 
   uint64_t commit();
+};
+
+struct ChunkData {
+  size_t num_keys = 0;
+  const void *keys = nullptr;
+  const void *embeddings = nullptr;
+  const void *scores = nullptr;
+  const void *opt_states = nullptr;
+  const void *steps = nullptr;
+};
+
+class LanceZeroCopyWriter {
+  std::string uri_;
+  size_t dim_ = 0;
+  size_t opt_state_dim_ = 0;
+  bool has_score_ = false;
+  CheckpointExportOptions options_;
+  std::function<bool(ChunkData &)> get_next_chunk_;
+
+  struct StreamState {
+    LanceZeroCopyWriter *writer;
+  };
+
+  static int stream_get_schema(ArrowArrayStream *stream, ArrowSchema *out);
+  static int stream_get_next(ArrowArrayStream *stream, ArrowArray *out);
+  static const char *stream_get_last_error(ArrowArrayStream *);
+  static void stream_release(ArrowArrayStream *stream);
+
+  void build_schema(ArrowSchema *out) const;
+  void build_array(ArrowArray *out, const ChunkData &chunk) const;
+
+public:
+  void write(std::string_view uri, size_t dim, size_t opt_state_dim,
+             bool has_score, CheckpointExportOptions options,
+             std::function<bool(ChunkData &)> get_next_chunk);
 };
 
 // Plain struct — satisfies CheckpointReaderFacade via duck typing (no virtual).

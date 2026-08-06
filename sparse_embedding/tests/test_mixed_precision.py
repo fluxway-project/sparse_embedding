@@ -91,7 +91,7 @@ def test_assign_lookup_integrity(param_dtype, optimizer_dtype):
 
     cfg = se.EmbeddingConfig(
         dims=[dim],
-        num_threads=1,
+        thread_budget=1,
         value_dtype=param_dtype,
         optimizer_dtype=optimizer_dtype,
     )
@@ -132,7 +132,7 @@ def test_adam_optimizer_step(param_dtype, optimizer_dtype):
 
     cfg = se.EmbeddingConfig(
         dims=[dim],
-        num_threads=1,
+        thread_budget=1,
         value_dtype=param_dtype,
         optimizer_dtype=optimizer_dtype,
     )
@@ -195,7 +195,7 @@ def test_checkpoint_roundtrip(param_dtype, optimizer_dtype, tmp_path):
 
     cfg = se.EmbeddingConfig(
         dims=[dim],
-        num_threads=1,
+        thread_budget=1,
         value_dtype=param_dtype,
         optimizer_dtype=optimizer_dtype,
     )

@@ -21,12 +21,31 @@
 #include <proxy/proxy.h>
 
 #include <span>
+#include <string>
 #include <system_error>
 #include <vector>
 
 #include "sparse_embedding/src/common/function.hpp"
 
 namespace se {
+
+template <typename ParamT, typename OptT> struct PageImageExport {
+  uint64_t physical_page_id;
+  uint32_t vector_dim;
+  uint32_t vector_stride;
+  std::vector<uint32_t> slot_ordinals;
+  std::vector<uint64_t> keys;
+  std::vector<uint64_t> seq_counts;
+  std::vector<ParamT> values;
+  std::vector<uint64_t> scores;
+  std::vector<OptT> optimizer_states;
+  std::vector<uint32_t> steps;
+};
+
+template <typename ParamT, typename OptT> struct PageImageImport {
+  size_t dim;
+  PageImageExport<ParamT, OptT> image;
+};
 
 struct NotImplemented {
   explicit NotImplemented(auto &&...) {
@@ -69,6 +88,11 @@ PRO_DEF_MEM_DISPATCH(MemEvictByScore, evict_by_score);
 // for_each and calls visitor(keys, values, scores) per batch.
 // visitor returns false to stop early.
 PRO_DEF_MEM_DISPATCH(MemExportBatch, export_batch);
+PRO_DEF_MEM_DISPATCH(MemCompactPage, compact_page);
+PRO_DEF_MEM_DISPATCH(MemPromoteHotKeys, promote_hot_keys);
+PRO_DEF_MEM_DISPATCH(MemPromotedHotPageSize, promoted_hot_page_size);
+PRO_DEF_MEM_DISPATCH(MemExportPageImages, export_page_images);
+PRO_DEF_MEM_DISPATCH(MemImportPageImages, import_page_images);
 
 // --- Training: Forward -------------------------------------------------------
 PRO_DEF_MEM_DISPATCH(MemForwardLookup, forward_lookup);
@@ -99,6 +123,11 @@ using WeakMemHasScorePolicy = pro::weak_dispatch<MemHasScorePolicy>;
 using WeakMemAssignScores = pro::weak_dispatch<MemAssignScores>;
 using WeakMemEvictByScore = pro::weak_dispatch<MemEvictByScore>;
 using WeakMemExportBatch = pro::weak_dispatch<MemExportBatch>;
+using WeakMemCompactPage = pro::weak_dispatch<MemCompactPage>;
+using WeakMemPromoteHotKeys = pro::weak_dispatch<MemPromoteHotKeys>;
+using WeakMemPromotedHotPageSize = pro::weak_dispatch<MemPromotedHotPageSize>;
+using WeakMemExportPageImages = pro::weak_dispatch<MemExportPageImages>;
+using WeakMemImportPageImages = pro::weak_dispatch<MemImportPageImages>;
 using WeakMemForwardLookup = pro::weak_dispatch<MemForwardLookup>;
 using WeakMemAccumulateGradients = pro::weak_dispatch<MemAccumulateGradients>;
 using WeakMemOptimizerStep = pro::weak_dispatch<MemOptimizerStep>;
@@ -157,6 +186,22 @@ using WeakMemOptimizerStep = pro::weak_dispatch<MemOptimizerStep>;
           visitor,                                                             \
       std::size_t batch_size)
 
+#define SE_COMPACT_PAGE_FACADE_SIG                                             \
+  std::size_t(std::size_t dim, uint64_t page_id)
+
+#define SE_PROMOTE_HOT_KEYS_FACADE_SIG                                         \
+  std::size_t(std::size_t dim, uint64_t page_id, std::size_t maximum_keys,     \
+              uint64_t minimum_score)
+
+#define SE_PROMOTED_HOT_PAGE_SIZE_FACADE_SIG std::size_t(std::size_t dim) const
+
+#define SE_EXPORT_PAGE_IMAGES_FACADE_SIG                                       \
+  void(se::Function<bool(std::size_t, PageImageExport<ParamT, OptT> &&)>       \
+           visitor)
+
+#define SE_IMPORT_PAGE_IMAGES_FACADE_SIG                                       \
+  void(std::span<const PageImageImport<ParamT, OptT>> images)
+
 #define SE_ASSIGN_OPT_STATES_FACADE_SIG(key_t)                                 \
   void(std::size_t, std::span<const key_t>, std::span<const OptT>,             \
        std::span<const uint32_t>)
@@ -180,7 +225,8 @@ PRO_DEF_MEM_DISPATCH(MemExportOptStateBatchOwned, export_opt_state_batch_owned);
 // clang-format off
 // NOLINTBEGIN(whitespace/indent_namespace)
 template <typename ParamT, typename OptT>
-struct EmbeddingTableFacade : pro::facade_builder //
+struct EmbeddingTableFacade : pro //
+  ::facade_builder //
   // --- Lifecycle -------------------------------------------------------------
   ::add_convention<WeakMemInit,
                    std::error_code(std::string_view config_json)> //
@@ -244,6 +290,12 @@ struct EmbeddingTableFacade : pro::facade_builder //
   ::add_convention<WeakMemExportBatch,
                    SE_EXPORT_BATCH_FACADE_SIG(int32_t), SE_EXPORT_BATCH_FACADE_SIG(uint32_t),
                    SE_EXPORT_BATCH_FACADE_SIG(int64_t), SE_EXPORT_BATCH_FACADE_SIG(uint64_t)> //
+  ::add_convention<WeakMemCompactPage, SE_COMPACT_PAGE_FACADE_SIG> //
+  ::add_convention<WeakMemPromoteHotKeys, SE_PROMOTE_HOT_KEYS_FACADE_SIG> //
+  ::add_convention<WeakMemPromotedHotPageSize,                                \
+                   SE_PROMOTED_HOT_PAGE_SIZE_FACADE_SIG> //
+  ::add_convention<WeakMemExportPageImages, SE_EXPORT_PAGE_IMAGES_FACADE_SIG> //
+  ::add_convention<WeakMemImportPageImages, SE_IMPORT_PAGE_IMAGES_FACADE_SIG> //
 
   // --- Training: Forward ----------------------------------------------------
   ::add_convention<WeakMemForwardLookup,
@@ -288,6 +340,11 @@ struct EmbeddingTableFacade : pro::facade_builder //
 #undef SE_ACCUMULATE_GRADIENTS_FACADE_SIG
 #undef SE_EVICT_BY_SCORE_FACADE_SIG
 #undef SE_EXPORT_BATCH_FACADE_SIG
+#undef SE_COMPACT_PAGE_FACADE_SIG
+#undef SE_PROMOTE_HOT_KEYS_FACADE_SIG
+#undef SE_PROMOTED_HOT_PAGE_SIZE_FACADE_SIG
+#undef SE_EXPORT_PAGE_IMAGES_FACADE_SIG
+#undef SE_IMPORT_PAGE_IMAGES_FACADE_SIG
 #undef SE_ASSIGN_OPT_STATES_FACADE_SIG
 #undef SE_EXPORT_OPT_STATE_BATCH_FACADE_SIG
 #undef SE_EXPORT_OPT_STATE_BATCH_OWNED_FACADE_SIG

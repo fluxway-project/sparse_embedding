@@ -15,7 +15,7 @@ def test_heavy_collision_adam_update():
     store = se.EmbeddingStore(
         embedding_config=se.EmbeddingConfig(
             dims=[16],
-            num_threads=2,
+            thread_budget=2,
             value_dtype="float32",
         ),
         initializer_config=se.Zeros(),

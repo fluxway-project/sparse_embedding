@@ -2,16 +2,16 @@
 
 [English](README.md)
 
-高性能稀疏嵌入表库（Sparse Embedding Table），面向大规模推荐系统训练，采用 Hogwild! 松弛更新、分片哈希表同步和分页存储架构。
+高性能稀疏嵌入表库（Sparse Embedding Table），面向大规模推荐系统训练，采用 Hogwild! 松弛更新、Slot Directory 读路径、x86 SeqLock 发布和分页存储架构。
 
 ## 核心特性
 
-- **分片并发**：基于 `parlayhash` 实现期望 O(1) 的 Key→Index 访问；读写锁仅作用于单个 shard，插入、删除、重建和扩容时其他 shard 仍可并行
+- **Slot Directory 读路径**：基于 `parlayhash` 实现稳定 Key→slot lookup，再通过 segmented locator table 发布 Slot→arena；warm 后的 lookup/forward 读侧不再经过 shard shared lock 或 lifecycle lock
 - **SIMD 加速**：AVX-512 向量化哈希计算与梯度 Scatter 操作
 - **Hogwild! 梯度累积**：分片 TransientArena 实现无锁梯度聚合，避免跨线程同步
 - **C++23 标准并发**：基于 NVIDIA `stdexec` + `exec::static_thread_pool` 实现 Sender/Receiver 任务调度
 - **Epoch 内存安全**：通过 `epoch::with_epoch` 批次保护并发哈希表读写，避免 ABA 问题
-- **分布式 Lance Checkpoint**：支持分布式两阶段提交 (Two-Phase Commit) 的 Lance 存储后端，通过零拷贝 PyArrow 导出直接写入 Lance Dataset，解耦 embedding 与优化器状态，支持百 GB 级极速存储与加载。
+- **分布式 Lance Checkpoint**：由 Fluxway 协调两阶段提交，写入 manifest 固定版本的 `entries` 与物理 `page_images`，保存 slot 布局、`seq_count`、payload/state，并以 SHA-256 校验支持弹性恢复。Lance manifest 是唯一 checkpoint metadata 记录；分布式加载必须显式传入 `filter_fn`，路由唯一由调用方负责。
 - **动态分片与路由 (Partitioner OP)**：新增底层 C++ Partitioner OPs (`ModuloPartitioner`, `HashPartitioner`, `FastRangePartitioner`)，支持多路特征高效路由，支持在 Checkpoint 加载阶段进行灵活的集群弹性扩缩容（Resharding）。
 - **驱逐与内存管理**：高效的打分策略（如 LFU），使用线程安全的 `std::atomic_ref` 实现无锁并发状态更新
 - **页级冷热数据置换 (Page-Level Hot/Cold Swapping)**：后台线程基于可配置的内存水位线，通过保持虚拟地址稳定的 `MAP_FIXED` 重映射将冷数据页置换至磁盘后备存储。
@@ -26,8 +26,9 @@
 | lance-c | main branch (基于 Rust 的 C 共享库) |
 | Rust | 1.70+ (2024 Edition) |
 | Bazel | ≥ 7.0 |
+| libnuma | numactl 2.0.19（Bazel module `2.0.19.bcr.1`） |
 
-Bazel 配置使用 `-std=c++2b` 编译 C++ 源码；当前验收构建使用 GCC 13.4 和 Bazel 7.7。
+Bazel 配置使用 `-std=c++23` 编译 C++ 源码；当前验收构建使用 GCC 13.4 和 Bazel 7.7。
 
 ---
 
@@ -43,43 +44,73 @@ Bazel 配置使用 `-std=c++2b` 编译 C++ 源码；当前验收构建使用 GCC
 | Cache | lscpu 汇总：L1d 768 KiB、L1i 768 KiB、L2 24 MiB、L3 33 MiB |
 | 内存 | OS 可见 125 GiB；禁用 swap |
 | 操作系统 | Ubuntu 24.04.4 LTS，x86-64 |
-| 工具链 | GCC 13.4、Bazel 7.7、C++23（`-std=c++2b`）、`-c opt` |
+| 工具链 | GCC 13.4、Bazel 7.7、C++23（`-std=c++23`）、`-c opt` |
 | 优化参数 | `-O3 -march=native -mtune=native -mavx512bf16 -fno-strict-aliasing -DNDEBUG`；链接使用 `-flto` |
-| CPU affinity | 本次快照未绑定 CPU |
+| CPU affinity | Slot Directory forward proof 通过 benchmark affinity helper 绑定 worker；允许使用 48 个 CPU |
 
-### C++ 生产测试场景
+### 已接受 C++ Proof（2026-08-04）
 
-| 参数 | 值 |
-|---|---|
-| Embedding 维度 | 128 个 `float`（512 bytes） |
-| 词表 | 500,000 个 `uint64_t` key，单 slot |
-| Batch | 65,536 keys |
-| 访问分布 | 普通 operation batch 的 80% 流量落在最热 10%；erase key 均匀采样 |
-| 随机种子 | 42 |
-| 线程数 | 1、4、8、16、32、64 |
-| 容量准备 | 计时前执行 `reserve(500000, 128)` |
-| 优化器 | benchmark SGD，学习率 0.01 |
-| 计时操作 | lookup/insert、forward lookup、assign、梯度累积、optimizer step、contains、erase |
+当前已接受的重构性能数据来自两个专用 proof binary。更完整的 `embedding_store_benchmark --bind-affinity --skip-pressure` 运行违反了新的 caller-dedup 契约，并以 `key shard batch contains duplicate key` 抛异常，因此只记录为失败尝试，不能作为已接受性能结果。
 
-LFU 压力场景使用 dim=128、16,384 个可能 key、4,096-key batch、2 个 worker、seed=42、相同的 80/20 热冷分布、学习率 0.01 的 benchmark SGD、5 MiB 内存限制、1 GiB spill 限制和 0.8/0.6 水位。它在插入前调用 `reserve(16384, 128)`，之后执行 4 次包含 lookup、assign、梯度累积和 optimizer step 的计时重复，并启用后台淘汰。计时结束后等待 100 ms 再读取的 telemetry 只能证明最终触发了淘汰，不能证明淘汰与计时区间重叠。
+#### Slot Directory Forward Scaling
 
-最新复现快照采集于 2026-07-21。该 C++ 数据来自一次包含内部重复的 benchmark 执行，不等同于 5 次独立运行、固定 CPU affinity 的 baseline/optimized 协议。
+隔离 forward proof 使用 dim=32 的 memory-only store、128 个已发布 key、4,096-key 固定 power-law batch、seed `0x5EED5CA1E`、400 次计时 `forward_lookup` 重复、48 个 allowed CPU，以及 1/2/4/8/16/64 线程。
 
-| benchmark 报告区间（Mops/s） | 1T | 4T | 8T | 16T | 32T | 64T |
-|---|---:|---:|---:|---:|---:|---:|
-| `lookup_or_insert` | 1.84 | 1.26 | 1.88 | 3.18 | 4.35 | 4.20 |
-| `forward_lookup` | 2.90 | 5.34 | 7.91 | 10.18 | 12.10 | 11.61 |
-| `assign` | 1.98 | 1.55 | 2.46 | 3.91 | 5.46 | 6.02 |
-| `accumulate_gradients` | 2.35 | 6.30 | 8.60 | 10.37 | 11.54 | 10.80 |
-| `optimizer_step` | 5.53 | 12.99 | 20.66 | 27.77 | 32.54 | 30.30 |
-| `contains` | 6.25 | 5.90 | 8.62 | 11.13 | 15.59 | 16.86 |
-| `erase`（10% batch） | 8.05 | 4.06 | 5.53 | 8.41 | 13.08 | 16.99 |
+| 线程数 | Forward 吞吐 |
+|---:|---:|
+| 1 | 9.632 Mops/s |
+| 2 | 16.436 Mops/s |
+| 4 | 27.914 Mops/s |
+| 8 | 40.707 Mops/s |
+| 16 | 42.049 Mops/s |
+| 64 | 12.591 Mops/s |
 
-这些数据不是隔离 API timing。lookup/insert、forward lookup、assign、梯度累积和 contains 的计时区间包含随机 batch 生成。optimizer 报告区间还包含下一批 key 生成与梯度累积，却使用当前 store size 作为吞吐分子，因此不能解释为独立 optimizer 吞吐。erase 对同一组 key 连续执行 10 次且不重新插入，后续重复主要测量 not-found 路径。
+相对单线程的 scaling ratio 为：2 线程 1.706x、4 线程 2.898x、8 线程 4.226x，超过当前 1.6x/2.5x/3.5x forward-scaling gate。
 
-LFU 内存压力场景报告 2.75 Mops/s、最终 2 次 swap-out、评估 4 页，累计选择时间 9,616 ns。Python 压力场景的同步训练 step 为 4.69 Mops/s；异步 lookup、assign 和 optimizer step 分别为 12.38、13.45 和 17.16 Mops/s。
+#### 持续 Retirement Pressure 与 Sink
 
-这些数据用于复现和回归诊断，不是跨机器性能承诺。workload 定义、遥测语义和验证命令见[存储、并发与性能](docs/storage_and_performance_zh.md)。
+sustained-pressure proof 使用 8 个 producer、1,048,576 个总 key、dim=8、Auto storage、8 MiB 驻留内存限制、512 MiB spill 限制，以及 0.75/0.50 水位。该测试在压力阶段后校验已保留 payload，报告当前 retirement/Sink 契约，而不是 disk spill/swap 吞吐。
+
+| 指标 | 结果 |
+|---|---:|
+| Pressure pages (`spill_count + swap_out_count`) | 0 |
+| `spill_count` | 0 |
+| `swap_out_count` | 0 |
+| `memory_bytes` | 294,912 |
+| `spill_bytes` | 0 |
+| `retired_bytes` | 2,109,456 |
+| `retirement_sink_hit_count` | 1,047,040 |
+| Allocation p95 | 1.163 ms |
+| Allocation p99 | 2.599 ms |
+| Backlog drain | 0.003 ms |
+| Producer elapsed | 129.397 ms |
+
+该 run 有意在 page spill/swap 发生前打开 retirement-pressure circuit。已接受结论是 Sink admission 能在无 payload corruption 的情况下处理压力。
+
+这些数据用于复现和回归诊断，不是跨机器性能承诺。架构设计与遥测语义见[架构与 API 契约](docs/storage_architecture_zh.md)，workload 定义和验证命令见[性能与可靠性报告](docs/performance_and_reliability_report_zh.md)。
+
+Mutation benchmark 在调用要求唯一的 mutation API 前会先对 power-law 候选去重，并按实际
+处理行数报告吞吐。纯 assign/accumulate/optimizer 测量请使用 `training_path_profile`。
+该 profile 会在梯度路由、transient 累积和 optimizer lookup 之间复用同一次 hash；
+当前开启 affinity 的测量结果见性能报告。
+NUMA-aware sharding 通过 `--numa-aware-sharding` opt-in；它按 node 放置 arena page 和
+worker，并在复用线程改变目标 CPU 时重新绑定。benchmark profile 以物理核为上限，不把
+SMT sibling 当成额外内存带宽。lookup-only forward 直接使用 shard `ReadView` 并复用路由
+hash。估算 payload 小于 512 KiB 时跳过 NUMA 二次分桶，因为小 batch 的调度成本高于
+locality 收益；更大的 payload 仍使用 node-local routing。API 语义保持不变。
+
+长期存在的 `exec::static_thread_pool` 消除了线程创建/销毁，但每次 `bulk + sync_wait`
+仍需付出 task 入队、唤醒、steal、完成计数和 barrier 成本。空 bulk proof 在 1/2/8/24
+worker 下约为 3.47/21.7/41.6/87.4 微秒。
+
+如需复现覆盖全部公开操作的磁盘换页压力测试，可运行
+`small_memory_all_paths_pressure_test`。64 MiB Auto-storage 配置会真实触发 swap-out，
+并校验换页后的 payload：
+
+```bash
+bazel test -c opt //sparse_embedding/src/backend/hogwild:small_memory_all_paths_pressure_test \
+  --test_output=errors
+```
 
 ### 自动存储管理
 
@@ -106,7 +137,11 @@ print(store.storage_stats())
 高级用户可以指定存储设备，不需要改变 embedding 操作：
 
 ```python
-storage = sparse_embedding.DiskSpill("/mnt/nvme/sparse-embedding", 1 << 40)
+storage = sparse_embedding.AutoStorage(
+    memory_limit_bytes=0,
+    spill_directory="/mnt/nvme/sparse-embedding",
+    max_spill_bytes=1 << 40,
+)
 config = sparse_embedding.EmbeddingConfig(dims=[128], storage=storage)
 ```
 
@@ -124,7 +159,7 @@ HogwildEmbeddingStore
 ├── EmbeddingArena               # Cache-line aligned contiguous embedding storage
 │   └── PageTable[8192]          # Atomic page pointers, lazy allocated
 ├── PageStorage                  # 自动探测 RAM 预算与文件映射 spill
-├── TransientArena[num_threads]  # Per-shard gradient accumulation (lock-free)
+├── TransientArena[thread_budget]  # Per-shard gradient accumulation (lock-free)
 ├── exec::static_thread_pool     # C++23 stdexec thread pool
 └── pro::proxy<OptimizerFacade<ParamT, OptT>> # Type-erased optimizer
 ```

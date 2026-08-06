@@ -9,7 +9,7 @@ import sparse_embedding
 def test_embedding_table_basic():
     store = sparse_embedding.EmbeddingStore(
         embedding_config=sparse_embedding.EmbeddingConfig(
-            dims=[128], num_threads=4, value_dtype="float32"
+            dims=[128], thread_budget=4, value_dtype="float32"
         ),
         initializer_config=sparse_embedding.Zeros(),
     )
@@ -34,8 +34,12 @@ def test_embedding_table_reports_spill(tmp_path, capfd):
     store = sparse_embedding.EmbeddingStore(
         embedding_config=sparse_embedding.EmbeddingConfig(
             dims=[8],
-            num_threads=1,
-            storage=sparse_embedding.DiskSpill(tmp_path, 4 << 20),
+            thread_budget=1,
+            storage=sparse_embedding.AutoStorage(
+                memory_limit_bytes=0,
+                spill_directory=tmp_path,
+                max_spill_bytes=4 << 20,
+            ),
         ),
         initializer_config=sparse_embedding.Zeros(),
     )
@@ -59,7 +63,7 @@ def test_embedding_table_reports_eviction_telemetry(tmp_path):
     store = sparse_embedding.EmbeddingStore(
         embedding_config=sparse_embedding.EmbeddingConfig(
             dims=[128],
-            num_threads=2,
+            thread_budget=2,
             storage=sparse_embedding.AutoStorage(
                 memory_limit_bytes=5 << 20,
                 spill_directory=tmp_path,
@@ -89,7 +93,7 @@ def test_embedding_table_reports_eviction_telemetry(tmp_path):
 def test_embedding_table_assign():
     store = sparse_embedding.EmbeddingStore(
         embedding_config=sparse_embedding.EmbeddingConfig(
-            dims=[128], num_threads=4, value_dtype="float32"
+            dims=[128], thread_budget=4, value_dtype="float32"
         ),
         initializer_config=sparse_embedding.Zeros(),
     )
@@ -108,7 +112,7 @@ def test_embedding_table_assign():
 def test_embedding_table_32bit_keys():
     store = sparse_embedding.EmbeddingStore(
         embedding_config=sparse_embedding.EmbeddingConfig(
-            dims=[128], num_threads=4, value_dtype="float32"
+            dims=[128], thread_budget=4, value_dtype="float32"
         ),
         initializer_config=sparse_embedding.Zeros(),
     )
@@ -136,7 +140,7 @@ def test_embedding_table_32bit_keys():
 def test_embedding_table_reserve_api():
     store = sparse_embedding.EmbeddingStore(
         embedding_config=sparse_embedding.EmbeddingConfig(
-            dims=[8, 16], num_threads=4, value_dtype="float32"
+            dims=[8, 16], thread_budget=4, value_dtype="float32"
         ),
         initializer_config=sparse_embedding.Zeros(),
     )
@@ -160,7 +164,7 @@ def test_embedding_table_reserve_api():
 def test_embedding_table_reserve_preserves_existing_keys():
     store = sparse_embedding.EmbeddingStore(
         embedding_config=sparse_embedding.EmbeddingConfig(
-            dims=[8], num_threads=4, value_dtype="float32"
+            dims=[8], thread_budget=4, value_dtype="float32"
         )
     )
 
@@ -178,7 +182,7 @@ def test_embedding_table_reserve_preserves_existing_keys():
 def test_embedding_table_reserve_errors():
     store = sparse_embedding.EmbeddingStore(
         embedding_config=sparse_embedding.EmbeddingConfig(
-            dims=[8], num_threads=4, value_dtype="float32"
+            dims=[8], thread_budget=4, value_dtype="float32"
         ),
         initializer_config=sparse_embedding.Zeros(),
     )
@@ -194,7 +198,7 @@ def test_embedding_table_grows_beyond_initial_shard_capacity():
     store = sparse_embedding.EmbeddingStore(
         embedding_config=sparse_embedding.EmbeddingConfig(
             dims=[8],
-            num_threads=1,
+            thread_budget=1,
             storage=sparse_embedding.MemoryOnly(),
         ),
         initializer_config=sparse_embedding.Zeros(),
@@ -213,7 +217,7 @@ def test_embedding_table_grows_beyond_initial_shard_capacity():
 async def test_embedding_table_async():
     store = sparse_embedding.EmbeddingStore(
         embedding_config=sparse_embedding.EmbeddingConfig(
-            dims=[128], num_threads=4, value_dtype="float32"
+            dims=[128], thread_budget=4, value_dtype="float32"
         ),
         initializer_config=sparse_embedding.Zeros(),
         score_policy="lru",
@@ -268,7 +272,7 @@ def test_optimizer_per_id_step():
     """Verify that optimizer tracks steps per-ID for bias correction."""
     store = sparse_embedding.EmbeddingStore(
         embedding_config=sparse_embedding.EmbeddingConfig(
-            dims=[128], num_threads=1, value_dtype="float32"
+            dims=[128], thread_budget=1, value_dtype="float32"
         ),
         initializer_config=sparse_embedding.Zeros(),
         optimizer_config=sparse_embedding.Adam(

@@ -20,6 +20,7 @@
 
 #include <cstdint>
 #include <memory>
+#include <ranges>
 #include <span>
 
 #include <ankerl/unordered_dense.h>
@@ -61,8 +62,7 @@ UniqueResult<KeyT> unique_keys_inverse(std::span<const KeyT> keys,
   ankerl::unordered_dense::map<KeyT, int32_t> unique_map;
   unique_map.reserve(n);
 
-  for (size_t i = 0; i < n; ++i) {
-    KeyT key = keys[i];
+  for (auto [i, key] : std::views::enumerate(keys)) {
     auto [it, inserted] = unique_map.try_emplace(key, unique_map.size());
     int32_t uid = it->second;
     inverse[i] = uid;

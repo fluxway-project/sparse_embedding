@@ -6,9 +6,7 @@
 
 #include "sparse_embedding/src/bindings/arrow_c_bridge.hpp"
 #include "sparse_embedding/src/bindings/module_wrapper.hpp"
-#ifdef SE_ENABLE_LANCE_CHECKPOINTER
-#include "sparse_embedding/src/checkpoint/lance/lance_checkpoint.hpp"
-#endif
+#include "sparse_embedding/src/checkpoint/checkpoint_batch_filter.hpp"
 #include "sparse_embedding/src/ops/partitioner.hpp"
 
 namespace se::py::detail {
@@ -72,6 +70,7 @@ void CheckpointOpsImpl<ParamT, OptT>::save_checkpoint(
         // in a single pass. Defer writer->begin until the first batch so we
         // know opt_state_dim in bytes.
         bool begun = false;
+        se::FilteredCheckpointBatch<KeyT, ParamT, OptT> filtered;
         self.get_store<ParamT, OptT>()->export_opt_state_batch(
             pro::make_proxy<se::FunctionFacade<bool(
                 size_t, std::span<const KeyT>, std::span<const ParamT>,
@@ -94,31 +93,16 @@ void CheckpointOpsImpl<ParamT, OptT>::save_checkpoint(
                   if (options.mode ==
                           se::CheckpointExportOptions::Mode::kIncremental &&
                       has_score_policy) {
-                    std::vector<KeyT> fkeys;
-                    std::vector<ParamT> fvals;
-                    std::vector<uint64_t> fscores;
-                    std::vector<OptT> fopts;
-                    std::vector<uint32_t> fsteps;
-                    size_t opt_per_key =
-                        keys.empty() ? 0 : opt_states.size() / keys.size();
-                    for (size_t i = 0; i < keys.size(); ++i) {
-                      if (scores[i] >= options.min_score) {
-                        fkeys.push_back(keys[i]);
-                        fvals.insert(fvals.end(), vals.data() + i * dim,
-                                     vals.data() + (i + 1) * dim);
-                        if (!scores.empty()) fscores.push_back(scores[i]);
-                        fopts.insert(fopts.end(),
-                                     opt_states.data() + i * opt_per_key,
-                                     opt_states.data() + (i + 1) * opt_per_key);
-                        if (!steps.empty()) fsteps.push_back(steps[i]);
-                      }
-                    }
-                    if (!fkeys.empty()) {
+                    if (filtered.assign(keys, vals, scores, opt_states, steps,
+                                        dim, options.min_score) != 0) {
                       writer->write_batch(
-                          fkeys.size(), fkeys.data(),
-                          fkeys.size() * sizeof(KeyT), fvals.data(),
-                          fvals.size() * sizeof(ParamT), fscores, fopts.data(),
-                          fopts.size() * sizeof(OptT), fsteps);
+                          filtered.keys.size(), filtered.keys.data(),
+                          filtered.keys.size() * sizeof(KeyT),
+                          filtered.values.data(),
+                          filtered.values.size() * sizeof(ParamT),
+                          filtered.scores, filtered.optimizer_states.data(),
+                          filtered.optimizer_states.size() * sizeof(OptT),
+                          filtered.steps);
                     }
                   } else {
                     writer->write_batch(
@@ -138,6 +122,7 @@ void CheckpointOpsImpl<ParamT, OptT>::save_checkpoint(
       } else {
         writer->begin(uri, static_cast<uint32_t>(dim), 0, has_score_policy,
                       options);
+        se::FilteredCheckpointBatch<KeyT, ParamT, OptT> filtered;
         self.get_store<ParamT, OptT>()->export_batch(
             pro::make_proxy<se::FunctionFacade<bool(
                 std::size_t, std::span<const KeyT>, std::span<const ParamT>,
@@ -148,23 +133,16 @@ void CheckpointOpsImpl<ParamT, OptT>::save_checkpoint(
                   if (options.mode ==
                           se::CheckpointExportOptions::Mode::kIncremental &&
                       has_score_policy) {
-                    std::vector<KeyT> fkeys;
-                    std::vector<ParamT> fvals;
-                    std::vector<uint64_t> fscores;
-                    for (size_t i = 0; i < keys.size(); ++i) {
-                      if (scores[i] >= options.min_score) {
-                        fkeys.push_back(keys[i]);
-                        fvals.insert(fvals.end(), vals.data() + i * dim,
-                                     vals.data() + (i + 1) * dim);
-                        if (!scores.empty()) fscores.push_back(scores[i]);
-                      }
-                    }
-                    if (!fkeys.empty()) {
-                      writer->write_batch(fkeys.size(), fkeys.data(),
-                                          fkeys.size() * sizeof(KeyT),
-                                          fvals.data(),
-                                          fvals.size() * sizeof(ParamT),
-                                          fscores, nullptr, 0, {});
+                    if (filtered.assign(keys, vals, scores,
+                                        std::span<const OptT>{},
+                                        std::span<const uint32_t>{}, dim,
+                                        options.min_score) != 0) {
+                      writer->write_batch(
+                          filtered.keys.size(), filtered.keys.data(),
+                          filtered.keys.size() * sizeof(KeyT),
+                          filtered.values.data(),
+                          filtered.values.size() * sizeof(ParamT),
+                          filtered.scores, nullptr, 0, {});
                     }
                   } else {
                     writer->write_batch(keys.size(), keys.data(),

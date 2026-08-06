@@ -14,7 +14,7 @@ def run_once() -> dict[str, int | float]:
         store = se.EmbeddingStore(
             embedding_config=se.EmbeddingConfig(
                 dims=[128],
-                num_threads=2,
+                thread_budget=2,
                 storage=se.AutoStorage(
                     memory_limit_bytes=5 << 20,
                     spill_directory=spill_directory,

@@ -1,0 +1,17 @@
+--- a/BUILD.bazel
++++ b/BUILD.bazel
+@@ -78,14 +78,8 @@
+         "numacompat1.h",
+         "numaif.h",
+     ],
+-    additional_linker_inputs = ["versions.ldscript"],
+     copts = COMMON_COPTS,
+     includes = ["."],
+-    linkopts = [
+-        "-Wl,--version-script=$(location versions.ldscript)",
+-        "-Wl,-init,numa_init",
+-        "-Wl,-fini,numa_fini",
+-    ],
+     target_compatible_with = LINUX_ONLY,
+     visibility = ["//visibility:public"],
+     alwayslink = True,

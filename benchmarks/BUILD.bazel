@@ -7,12 +7,146 @@ load("@rules_cc//cc:defs.bzl", "cc_binary")
 cc_binary(
     name = "embedding_store_benchmark",
     srcs = ["embedding_store_benchmark.cpp"],
+    defines = ["HOGWILD_EXPLICIT_INSTANTIATION"],
     linkopts = ["-pthread"],
     deps = [
-        "//sparse_embedding/src/backend/hogwild:hogwild_embedding_store",
-        "//sparse_embedding/src/interface",
-        "//sparse_embedding/src/optimizer",
-        "@proxy",
+        "//sparse_embedding/src/backend/hogwild:hogwild_headers",
+        "//sparse_embedding/src/storage",
+    ],
+)
+
+cc_binary(
+    name = "forward_scaling_benchmark",
+    srcs = ["forward_scaling_benchmark.cpp"],
+    defines = ["HOGWILD_EXPLICIT_INSTANTIATION"],
+    linkopts = ["-pthread"],
+    deps = [
+        "//sparse_embedding/src/backend/hogwild:hogwild_headers",
+        "//sparse_embedding/src/storage",
+    ],
+)
+
+cc_binary(
+    name = "training_path_profile",
+    srcs = ["training_path_profile.cpp"],
+    defines = ["HOGWILD_EXPLICIT_INSTANTIATION"],
+    linkopts = ["-pthread"],
+    deps = [
+        "//sparse_embedding/src/backend/hogwild:hogwild_headers",
+        "//sparse_embedding/src/storage",
+    ],
+)
+
+cc_binary(
+    name = "page_compaction_benchmark",
+    srcs = ["page_compaction_benchmark.cpp"],
+    defines = [
+        "HOGWILD_EXPLICIT_INSTANTIATION",
+        "PAGE_COMPACTION_PROFILE",
+    ],
+    linkopts = ["-pthread"],
+    deps = [
+        "//sparse_embedding/src/backend/hogwild:hogwild_headers",
+        "//sparse_embedding/src/storage",
+    ],
+)
+
+cc_binary(
+    name = "page_compaction_admission_profile",
+    srcs = ["page_compaction_benchmark.cpp"],
+    defines = [
+        "HOGWILD_EXPLICIT_INSTANTIATION",
+        "PAGE_COMPACTION_PROFILE",
+        "PAGE_COMPACTION_ADMISSION_PROFILE",
+    ],
+    linkopts = ["-pthread"],
+    deps = [
+        "//sparse_embedding/src/backend/hogwild:hogwild_headers",
+        "//sparse_embedding/src/storage",
+    ],
+)
+
+cc_binary(
+    name = "page_compaction_shard_profile",
+    srcs = ["page_compaction_benchmark.cpp"],
+    defines = [
+        "HOGWILD_EXPLICIT_INSTANTIATION",
+        "PAGE_COMPACTION_PROFILE",
+        "PAGE_COMPACTION_ADMISSION_PROFILE",
+        "PAGE_COMPACTION_SHARD_PROFILE",
+    ],
+    linkopts = ["-pthread"],
+    deps = [
+        "//sparse_embedding/src/backend/hogwild:hogwild_headers",
+        "//sparse_embedding/src/storage",
+    ],
+)
+
+cc_binary(
+    name = "page_compaction_deep_profile",
+    srcs = ["page_compaction_benchmark.cpp"],
+    defines = [
+        "HOGWILD_EXPLICIT_INSTANTIATION",
+        "PAGE_COMPACTION_PROFILE",
+        "PAGE_COMPACTION_DEEP_PROFILE",
+    ],
+    linkopts = ["-pthread"],
+    deps = [
+        "//sparse_embedding/src/backend/hogwild:hogwild_headers",
+        "//sparse_embedding/src/storage",
+    ],
+)
+
+cc_binary(
+    name = "page_compaction_thread_fault_profile",
+    srcs = ["page_compaction_benchmark.cpp"],
+    defines = [
+        "HOGWILD_EXPLICIT_INSTANTIATION",
+        "PAGE_COMPACTION_PROFILE",
+        "PAGE_COMPACTION_THREAD_FAULT_PROFILE",
+    ],
+    linkopts = ["-pthread"],
+    deps = [
+        "//sparse_embedding/src/backend/hogwild:hogwild_headers",
+        "//sparse_embedding/src/storage",
+    ],
+)
+
+cc_binary(
+    name = "page_compaction_owner_benchmark",
+    srcs = ["page_compaction_owner_benchmark.cpp"],
+    defines = ["HOGWILD_EXPLICIT_INSTANTIATION"],
+    linkopts = ["-pthread"],
+    deps = [
+        "//sparse_embedding/src/backend/hogwild:hogwild_headers",
+        "//sparse_embedding/src/storage",
+    ],
+)
+
+cc_binary(
+    name = "page_compaction_shard_topology_benchmark",
+    srcs = ["page_compaction_shard_topology_benchmark.cpp"],
+    defines = ["HOGWILD_EXPLICIT_INSTANTIATION"],
+    linkopts = ["-pthread"],
+    deps = [
+        "//sparse_embedding/src/backend/hogwild:hogwild_headers",
+        "//sparse_embedding/src/storage",
+    ],
+)
+
+cc_binary(
+    name = "page_compaction_worker_profile",
+    srcs = ["page_compaction_benchmark.cpp"],
+    defines = [
+        "HOGWILD_EXPLICIT_INSTANTIATION",
+        "PAGE_COMPACTION_PROFILE",
+        "PAGE_COMPACTION_PIN_WORKERS",
+        "PAGE_COMPACTION_WORKER_PROFILE",
+    ],
+    linkopts = ["-pthread"],
+    deps = [
+        "//sparse_embedding/src/backend/hogwild:hogwild_headers",
+        "//sparse_embedding/src/storage",
     ],
 )
 
@@ -23,5 +157,15 @@ cc_binary(
     deps = [
         "@parlayhash",
         "@stdexec",
+    ],
+)
+
+cc_binary(
+    name = "hash_directory_benchmark",
+    srcs = ["hash_directory_benchmark.cpp"],
+    linkopts = ["-pthread"],
+    deps = [
+        "//sparse_embedding/src/backend/hogwild:hogwild_headers",
+        "@parlayhash",
     ],
 )

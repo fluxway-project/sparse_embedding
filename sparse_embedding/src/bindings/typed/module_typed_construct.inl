@@ -14,7 +14,7 @@ template <typename ParamT, typename OptT>
 void ConstructOpsImpl<ParamT, OptT>::construct(
     EmbeddingStoreWrapper &self, const PyInitializer &init_cfg,
     const PyOptimizer &opt_cfg, const std::string &score_policy_name,
-    size_t num_threads) {
+    size_t thread_budget) {
   const bool requires_score = std::visit(
       [](const auto &config) {
         return config.dynamic_lr_policy.has_value() &&
@@ -87,8 +87,10 @@ void ConstructOpsImpl<ParamT, OptT>::construct(
       using StoreType = se::HogwildEmbeddingStore<KeyT, ParamT, OptT, Policy>;
       self.store_ =
           pro::make_proxy<se::EmbeddingTableFacade<ParamT, OptT>, StoreType>(
-              self.dims_, num_threads, std::move(init_proxy),
-              std::move(opt_factory), std::move(policy), 16, self.storage_);
+              self.dims_, std::move(init_proxy), std::move(opt_factory),
+              std::move(policy), se::HogwildStoreOptions{
+                  .thread_budget = thread_budget,
+                  .storage = self.storage_});
     };
 
     if (score_policy_name == "none") {

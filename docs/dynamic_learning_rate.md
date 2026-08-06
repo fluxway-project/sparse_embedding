@@ -34,7 +34,7 @@ import sparse_embedding as se
 # Define the Embedding configuration
 embedding_config = se.EmbeddingConfig(
     dims=[128],
-    num_threads=16,
+    thread_budget=16,
     value_dtype="float32"
 )
 

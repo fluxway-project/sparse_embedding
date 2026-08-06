@@ -51,6 +51,8 @@ public:
 
   constexpr size_t state_dim() const { return 0; }
 
+  constexpr size_t allocation_bytes_per_entry() const { return 0; }
+
   void set_state(uint32_t /*idx*/, std::span<const OptT> /*state*/) {}
 
   constexpr uint32_t step_data(uint32_t /*idx*/) const { return 0; }

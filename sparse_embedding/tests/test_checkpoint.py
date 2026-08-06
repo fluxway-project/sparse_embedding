@@ -10,6 +10,7 @@ import shutil
 import tempfile
 from time import perf_counter
 
+import lance
 import numpy as np
 import pytest
 
@@ -20,6 +21,7 @@ from sparse_embedding.checkpoint import (
     get_checkpointer,
     register_backend,
 )
+from sparse_embedding.checkpoint.lance_backend import _FORMAT_VERSION
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -113,7 +115,15 @@ async def distributed_save(
         ]
         if assigns:
             await asyncio.gather(*assigns)
-        return await asyncio.to_thread(backend.export_fragments, store, uri)
+        return await asyncio.to_thread(
+            backend.export_fragments,
+            store,
+            uri,
+            snapshot_id=1,
+            worker_id=shard_id,
+            worker_count=num_shards,
+            shard_count=num_shards,
+        )
 
     all_metas = await asyncio.gather(*[worker_export(s) for s in range(num_shards)])
     await asyncio.to_thread(backend.commit_fragments, uri, list(all_metas))
@@ -132,7 +142,12 @@ async def load_shard(
         **({"optimizer_config": optimizer_config} if optimizer_config else {}),
     )
     await asyncio.to_thread(
-        backend.load, store, uri, filter_fn=partitioner, target_shard_id=shard_id
+        backend.load,
+        store,
+        uri,
+        filter_fn=partitioner,
+        distributed=True,
+        target_shard_id=shard_id,
     )
     return store
 
@@ -258,7 +273,9 @@ def test_distributed_checkpoint_restores_optimizer_state_by_dimension(
         source.optimizer_step()
 
     backend.init_dataset(source, uri)
-    fragments = backend.export_fragments(source, uri)
+    fragments = backend.export_fragments(
+        source, uri, snapshot_id=1, worker_id=0, worker_count=1, shard_count=1
+    )
     backend.commit_fragments(uri, [fragments])
 
     restored = create_store()
@@ -266,6 +283,7 @@ def test_distributed_checkpoint_restores_optimizer_state_by_dimension(
         restored,
         uri,
         filter_fn=se.ModuloPartitioner(num_shards=1),
+        distributed=True,
         target_shard_id=0,
     )
 
@@ -429,6 +447,767 @@ def test_distributed_save_and_load_all_shards_concurrent(lance_backend):
         verify_shard_contents(store, truth, DIMS, partitioner, shard_id)
 
 
+def test_partitioned_lance_manifest_roundtrip_with_parallel_workers(lance_tmp_uri):
+    import lance
+
+    uri, backend = lance_tmp_uri
+    worker_count = 8
+    snapshot_id = 19
+    dim = 8
+    keys = np.arange(4096, dtype=np.uint64)
+    values = np.arange(keys.size * dim, dtype=np.float32).reshape(keys.size, dim)
+
+    init_store = se.EmbeddingStore(make_cfg([dim]))
+    backend.init_dataset(init_store, uri)
+
+    async def export_worker(worker_id: int):
+        worker_store = se.EmbeddingStore(make_cfg([dim]))
+        mask = (keys % np.uint64(worker_count)) == worker_id
+        worker_store.assign(keys[mask], values[mask])
+        return await asyncio.to_thread(
+            backend.export_fragments,
+            worker_store,
+            uri,
+            snapshot_id=snapshot_id,
+            worker_id=worker_id,
+            worker_count=worker_count,
+            shard_count=worker_count,
+        )
+
+    async def export_all_workers():
+        return await asyncio.gather(
+            *(export_worker(worker_id) for worker_id in range(worker_count))
+        )
+
+    artifacts = asyncio.run(export_all_workers())
+    backend.commit_fragments(uri, artifacts)
+
+    next_epoch = snapshot_id + 1
+
+    async def export_next_epoch_worker(worker_id: int):
+        worker_store = se.EmbeddingStore(make_cfg([dim]))
+        mask = (keys % np.uint64(worker_count)) == worker_id
+        worker_store.assign(keys[mask], values[mask] + np.float32(1))
+        return await asyncio.to_thread(
+            backend.export_fragments,
+            worker_store,
+            uri,
+            snapshot_id=next_epoch,
+            worker_id=worker_id,
+            worker_count=worker_count,
+            shard_count=worker_count,
+        )
+
+    async def export_next_epoch():
+        return await asyncio.gather(
+            *(export_next_epoch_worker(worker_id) for worker_id in range(worker_count))
+        )
+
+    backend.commit_fragments(uri, asyncio.run(export_next_epoch()))
+
+    manifest = lance.dataset(f"{uri}/snapshot_manifest").to_table().to_pylist()
+    assert len(manifest) == 2
+    first_manifest = next(row for row in manifest if row["snapshot_id"] == snapshot_id)
+    assert first_manifest["worker_count"] == worker_count
+    assert first_manifest["entries_version"] > 0
+    assert first_manifest["page_images_version"] > 0
+
+    partitioner = se.ModuloPartitioner(num_shards=worker_count)
+
+    async def restore_worker(worker_id: int):
+        worker_store = se.EmbeddingStore(make_cfg([dim]))
+        await asyncio.to_thread(
+            backend.load,
+            worker_store,
+            uri,
+            filter_fn=partitioner,
+            distributed=True,
+            target_shard_id=worker_id,
+            snapshot_id=snapshot_id,
+        )
+        return worker_store
+
+    async def restore_all_workers():
+        return await asyncio.gather(
+            *(restore_worker(worker_id) for worker_id in range(worker_count))
+        )
+
+    restored = asyncio.run(restore_all_workers())
+    seen = set()
+    for worker_id, worker_store in enumerate(restored):
+        mask = (keys % np.uint64(worker_count)) == worker_id
+        worker_keys = keys[mask]
+        actual = lookup_np(worker_store, worker_keys, dim)
+        np.testing.assert_allclose(actual, values[mask], atol=1e-5)
+        assert not seen.intersection(worker_keys.tolist())
+        seen.update(worker_keys.tolist())
+    assert seen == set(keys.tolist())
+
+
+def test_partitioned_lance_full_snapshot_isolated_by_snapshot_id(lance_tmp_uri):
+    uri, backend = lance_tmp_uri
+    dim = 2
+    keys = np.asarray([1, 2], dtype=np.uint64)
+    first_values = np.asarray([[1.0, 1.0], [2.0, 2.0]], dtype=np.float32)
+    second_values = np.asarray([[3.0, 3.0]], dtype=np.float32)
+    backend.init_dataset(se.EmbeddingStore(make_cfg([dim])), uri)
+
+    first = se.EmbeddingStore(make_cfg([dim]))
+    first.assign(keys, first_values)
+    first_artifact = backend.export_fragments(
+        first, uri, snapshot_id=1, worker_id=0, worker_count=1, shard_count=1
+    )
+    backend.commit_fragments(uri, [first_artifact])
+
+    second = se.EmbeddingStore(make_cfg([dim]))
+    second.assign(keys[:1], second_values)
+    second_artifact = backend.export_fragments(
+        second, uri, snapshot_id=2, worker_id=0, worker_count=1, shard_count=1
+    )
+    backend.commit_fragments(uri, [second_artifact])
+
+    restored = se.EmbeddingStore(make_cfg([dim]))
+    backend.load(restored, uri, snapshot_id=2)
+    present = np.from_dlpack(restored.contains(keys))
+    assert present.tolist() == [1, 0]
+    np.testing.assert_array_equal(lookup_np(restored, keys[:1], dim), second_values)
+
+
+def test_partitioned_lance_default_load_uses_latest_committed_manifest(lance_tmp_uri):
+    uri, backend = lance_tmp_uri
+    dim = 2
+    key = np.asarray([7], dtype=np.uint64)
+    backend.init_dataset(se.EmbeddingStore(make_cfg([dim])), uri)
+
+    first = se.EmbeddingStore(make_cfg([dim]))
+    first.assign(key, np.asarray([[1.0, 1.0]], dtype=np.float32))
+    backend.commit_fragments(
+        uri,
+        [
+            backend.export_fragments(
+                first,
+                uri,
+                snapshot_id=1,
+                worker_id=0,
+                worker_count=1,
+                shard_count=1,
+            )
+        ],
+    )
+
+    uncommitted = se.EmbeddingStore(make_cfg([dim]))
+    uncommitted.assign(key, np.asarray([[99.0, 99.0]], dtype=np.float32))
+    backend.export_fragments(
+        uncommitted,
+        uri,
+        snapshot_id=2,
+        worker_id=0,
+        worker_count=1,
+        shard_count=1,
+    )
+
+    restored = se.EmbeddingStore(make_cfg([dim]))
+    backend.load(restored, uri)
+    np.testing.assert_array_equal(
+        lookup_np(restored, key, dim),
+        np.asarray([[1.0, 1.0]], dtype=np.float32),
+    )
+
+
+def test_partitioned_lance_init_dataset_is_pure_lance(lance_tmp_uri):
+    uri, backend = lance_tmp_uri
+    backend.init_dataset(se.EmbeddingStore(make_cfg([2])), uri)
+
+    assert not os.path.exists(os.path.join(uri, "metadata.json"))
+    assert lance.dataset(f"{uri}/entries").version >= 1
+    assert lance.dataset(f"{uri}/page_images").version >= 1
+    assert lance.dataset(f"{uri}/snapshot_manifest").version >= 1
+
+
+def test_partitioned_lance_single_node_save_is_pure_lance(lance_tmp_uri):
+    uri, backend = lance_tmp_uri
+    dim = 2
+    key = np.asarray([13], dtype=np.uint64)
+    value = np.asarray([[4.0, 5.0]], dtype=np.float32)
+    store = se.EmbeddingStore(make_cfg([dim]))
+    store.assign(key, value)
+
+    backend.save(store, uri)
+
+    assert not os.path.exists(os.path.join(uri, "metadata.json"))
+    manifest = lance.dataset(f"{uri}/snapshot_manifest").to_table().to_pylist()
+    assert manifest == [
+        {
+            "schema_version": _FORMAT_VERSION,
+            "snapshot_id": 1,
+            "worker_count": 1,
+            "shard_count": 1,
+            "entries_version": lance.dataset(f"{uri}/entries").version,
+            "page_images_version": lance.dataset(f"{uri}/page_images").version,
+            "parent_snapshot_id": 0,
+            "shard_high_watermarks": [1],
+            "checkpoint_mode": "full",
+            "parent_uri": "",
+        }
+    ]
+
+    restored = se.EmbeddingStore(make_cfg([dim]))
+    backend.load(restored, uri)
+    np.testing.assert_array_equal(lookup_np(restored, key, dim), value)
+
+
+def test_partitioned_lance_load_rejects_unsupported_manifest_schema(lance_tmp_uri):
+    uri, backend = lance_tmp_uri
+    dim = 2
+    key = np.asarray([17], dtype=np.uint64)
+    value = np.asarray([[6.0, 7.0]], dtype=np.float32)
+    store = se.EmbeddingStore(make_cfg([dim]))
+    store.assign(key, value)
+    backend.save(store, uri)
+
+    manifest_uri = f"{uri}/snapshot_manifest"
+    manifest_dataset = lance.dataset(manifest_uri)
+    manifest_schema = manifest_dataset.schema
+    rows = manifest_dataset.to_table().to_pylist()
+    rows[0]["schema_version"] = 4
+    shutil.rmtree(manifest_uri)
+    lance.write_dataset(rows, manifest_uri, schema=manifest_schema)
+
+    with pytest.raises(RuntimeError, match="manifest schema is unsupported"):
+        backend.load(se.EmbeddingStore(make_cfg([dim])), uri)
+
+
+def test_partitioned_lance_custom_save_partition_is_not_modulo_checked(lance_tmp_uri):
+    uri, backend = lance_tmp_uri
+    dim = 2
+    keys = np.asarray([0, 1, 2, 3], dtype=np.uint64)
+    values = np.arange(keys.size * dim, dtype=np.float32).reshape(keys.size, dim)
+    backend.init_dataset(se.EmbeddingStore(make_cfg([dim])), uri)
+
+    artifacts = []
+    for worker_id, worker_keys in enumerate((keys[[1, 3]], keys[[0, 2]])):
+        store = se.EmbeddingStore(make_cfg([dim]))
+        positions = np.isin(keys, worker_keys)
+        store.assign(worker_keys, values[positions])
+        artifacts.append(
+            backend.export_fragments(
+                store,
+                uri,
+                snapshot_id=5,
+                worker_id=worker_id,
+                worker_count=2,
+                shard_count=2,
+            )
+        )
+    backend.commit_fragments(uri, artifacts)
+
+    restored = se.EmbeddingStore(make_cfg([dim]))
+    backend.load(restored, uri, snapshot_id=5)
+    np.testing.assert_array_equal(lookup_np(restored, keys, dim), values)
+
+
+def test_partitioned_lance_commit_rejects_cross_worker_duplicate_key(lance_tmp_uri):
+    uri, backend = lance_tmp_uri
+    dim = 2
+    key = np.asarray([11], dtype=np.uint64)
+    value = np.asarray([[1.0, 2.0]], dtype=np.float32)
+    backend.init_dataset(se.EmbeddingStore(make_cfg([dim])), uri)
+    artifacts = []
+    for worker_id in range(2):
+        store = se.EmbeddingStore(make_cfg([dim]))
+        store.assign(key, value + np.float32(worker_id))
+        artifacts.append(
+            backend.export_fragments(
+                store,
+                uri,
+                snapshot_id=9,
+                worker_id=worker_id,
+                worker_count=2,
+                shard_count=2,
+            )
+        )
+    with pytest.raises(ValueError, match="duplicate key across workers"):
+        backend.commit_fragments(uri, artifacts)
+
+    manifest_rows = lance.dataset(f"{uri}/snapshot_manifest").to_table().to_pylist()
+    assert all(row["snapshot_id"] != 9 for row in manifest_rows)
+
+
+def test_partitioned_lance_incremental_tombstone_and_page_dedup(
+    lance_tmp_uri, tmp_path
+):
+    import lance
+
+    base_uri, backend = lance_tmp_uri
+    child_uri = str(tmp_path / "incremental")
+    dim = 4
+    keys = np.arange(64, dtype=np.uint64)
+    values = np.arange(keys.size * dim, dtype=np.float32).reshape(-1, dim)
+    backend.init_dataset(se.EmbeddingStore(make_cfg([dim])), base_uri)
+    base = se.EmbeddingStore(make_cfg([dim]))
+    base.assign(keys, values)
+    base_artifact = backend.export_fragments(
+        base,
+        base_uri,
+        snapshot_id=1,
+        worker_id=0,
+        worker_count=1,
+        shard_count=1,
+    )
+    backend.commit_fragments(base_uri, [base_artifact])
+
+    backend.init_dataset(se.EmbeddingStore(make_cfg([dim])), child_uri)
+    child = se.EmbeddingStore(make_cfg([dim]))
+    changed = keys[:4]
+    changed_values = values[:4] + np.float32(1000)
+    child.assign(keys, values)
+    child.assign(changed, changed_values)
+    child.erase(keys[4:8])
+    child_artifact = backend.export_fragments(
+        child,
+        child_uri,
+        snapshot_id=2,
+        worker_id=0,
+        worker_count=1,
+        shard_count=1,
+        checkpoint_mode="incremental",
+        parent_snapshot_id=1,
+        parent_uri=base_uri,
+    )
+    backend.commit_fragments(child_uri, [child_artifact])
+    child_pages = lance.dataset(f"{child_uri}/page_images").to_table().to_pylist()
+    child_entries = lance.dataset(f"{child_uri}/entries").to_table().to_pylist()
+    assert any(row["operation"] == 2 for row in child_entries)
+    assert all(row["snapshot_id"] == 2 for row in child_entries)
+    assert len(child_pages) <= 1
+
+    restored = se.EmbeddingStore(make_cfg([dim]))
+    backend.load(restored, child_uri, snapshot_id=2)
+    actual = lookup_np(restored, keys[:4], dim)
+    np.testing.assert_array_equal(actual, changed_values)
+    exists = np.from_dlpack(restored.contains(keys[4:8]))
+    assert not exists.any()
+    np.testing.assert_array_equal(lookup_np(restored, keys[8:], dim), values[8:])
+
+
+def test_partitioned_lance_incremental_parent_lineage_reshards(lance_tmp_uri, tmp_path):
+    uri, backend = lance_tmp_uri
+    parent_uri = str(tmp_path / "parent")
+    child_uri = str(tmp_path / "child")
+    dim = 4
+    keys = np.arange(96, dtype=np.uint64)
+    values = np.arange(keys.size * dim, dtype=np.float32).reshape(-1, dim)
+    backend.init_dataset(se.EmbeddingStore(make_cfg([dim])), parent_uri)
+
+    async def save_parent(worker_id):
+        store = se.EmbeddingStore(make_cfg([dim]))
+        mask = (keys % np.uint64(4)) == worker_id
+        store.assign(keys[mask], values[mask])
+        return backend.export_fragments(
+            store,
+            parent_uri,
+            snapshot_id=11,
+            worker_id=worker_id,
+            worker_count=4,
+            shard_count=4,
+        )
+
+    async def gather_parent():
+        return await asyncio.gather(*[save_parent(i) for i in range(4)])
+
+    backend.commit_fragments(parent_uri, asyncio.run(gather_parent()))
+    backend.init_dataset(se.EmbeddingStore(make_cfg([dim])), child_uri)
+    changed = keys[:8]
+    updated_values = values[:8] + np.float32(700)
+
+    async def save_child(worker_id):
+        store = se.EmbeddingStore(make_cfg([dim]))
+        mask = (keys % np.uint64(4)) == worker_id
+        store.assign(keys[mask], values[mask])
+        owned_changed = changed[(changed % np.uint64(4)) == worker_id]
+        if owned_changed.size:
+            store.assign(
+                owned_changed,
+                updated_values[(changed % np.uint64(4)) == worker_id],
+            )
+        owned_deleted = keys[8:16][(keys[8:16] % np.uint64(4)) == worker_id]
+        if owned_deleted.size:
+            store.erase(owned_deleted)
+        return backend.export_fragments(
+            store,
+            child_uri,
+            snapshot_id=12,
+            worker_id=worker_id,
+            worker_count=4,
+            shard_count=4,
+            checkpoint_mode="incremental",
+            parent_snapshot_id=11,
+            parent_uri=parent_uri,
+        )
+
+    async def gather_child():
+        return await asyncio.gather(*[save_child(i) for i in range(4)])
+
+    backend.commit_fragments(child_uri, asyncio.run(gather_child()))
+    router = se.ModuloPartitioner(num_shards=3)
+    restored = []
+    for worker_id in range(3):
+        store = se.EmbeddingStore(make_cfg([dim]))
+        backend.load(
+            store,
+            child_uri,
+            snapshot_id=12,
+            filter_fn=router,
+            distributed=True,
+            target_shard_id=worker_id,
+        )
+        restored.append(store)
+    expected = values.copy()
+    expected[:8] = updated_values
+    present = np.ones(keys.size, dtype=bool)
+    present[8:16] = False
+    seen = set()
+    for worker_id, store in enumerate(restored):
+        mask = ((keys % np.uint64(3)) == worker_id) & present
+        np.testing.assert_array_equal(lookup_np(store, keys[mask], dim), expected[mask])
+        seen.update(keys[mask].tolist())
+    assert seen == set(keys[present].tolist())
+
+
+def test_partitioned_lance_page_images_preserve_physical_export(lance_tmp_uri):
+    import hashlib
+    import struct
+
+    import lance
+
+    uri, backend = lance_tmp_uri
+    worker_count = 4
+    snapshot_id = 37
+    dim = 8
+    all_keys = np.arange(8192, dtype=np.uint64)
+    all_values = np.arange(all_keys.size * dim, dtype=np.float32).reshape(
+        all_keys.size, dim
+    )
+    optimizer = se.Adam(lr=1e-3)
+    backend.init_dataset(se.EmbeddingStore(make_cfg([dim])), uri)
+    expected_pages = {}
+    expected_values = {}
+
+    def checksum(row):
+        digest = hashlib.sha256()
+        digest.update(
+            struct.pack(
+                "<IQIIII",
+                row["dim"],
+                row["physical_page_id"],
+                row["vector_dim"],
+                row["vector_stride"],
+                row["optimizer_state_stride"],
+                len(row["slot_ordinals"]),
+            )
+        )
+        for value, dtype in (
+            (row["slot_ordinals"], "<u4"),
+            (row["keys"], "<u8"),
+            (row["seq_counts"], "<u8"),
+            (row["values"], "<f4"),
+            (row["scores"], "<u8"),
+            (row["optimizer_states"], "<f4"),
+            (row["steps"], "<u4"),
+        ):
+            digest.update(np.asarray(value, dtype=dtype).tobytes(order="C"))
+        return digest.digest()
+
+    async def export_worker(worker_id: int):
+        store = se.EmbeddingStore(
+            make_cfg([dim]), score_policy="lfu", optimizer_config=optimizer
+        )
+        mask = (all_keys % np.uint64(worker_count)) == worker_id
+        store.assign(all_keys[mask], all_values[mask])
+        lookup_np(store, all_keys[mask], dim)
+        store.accumulate_gradients(
+            all_keys[mask], np.ones((mask.sum(), dim), dtype=np.float32)
+        )
+        store.optimizer_step()
+        expected_values[worker_id] = lookup_np(store, all_keys[mask], dim).copy()
+        for image in store.export_page_images():
+            expected_pages[(worker_id, image["physical_page_id"])] = image
+        return await asyncio.to_thread(
+            backend.export_fragments,
+            store,
+            uri,
+            snapshot_id=snapshot_id,
+            worker_id=worker_id,
+            worker_count=worker_count,
+            shard_count=worker_count,
+        )
+
+    async def export_all_workers():
+        return await asyncio.gather(
+            *(export_worker(worker) for worker in range(worker_count))
+        )
+
+    artifacts = asyncio.run(export_all_workers())
+    backend.commit_fragments(uri, artifacts)
+    manifest = next(
+        row
+        for row in lance.dataset(f"{uri}/snapshot_manifest").to_table().to_pylist()
+        if row["snapshot_id"] == snapshot_id
+    )
+    pages = (
+        lance.dataset(f"{uri}/page_images", version=manifest["page_images_version"])
+        .to_table(filter=f"snapshot_id = {snapshot_id}")
+        .to_pylist()
+    )
+    assert len(pages) == len(expected_pages)
+    for page in pages:
+        expected = expected_pages[(page["worker_id"], page["physical_page_id"])]
+        assert page["checksum"] == checksum(page)
+        for name in (
+            "dim",
+            "physical_page_id",
+            "vector_dim",
+            "vector_stride",
+            "slot_ordinals",
+            "keys",
+            "seq_counts",
+            "values",
+            "scores",
+            "optimizer_states",
+            "steps",
+        ):
+            assert page[name] == expected[name]
+
+    partitioner = se.ModuloPartitioner(num_shards=worker_count)
+
+    async def restore_worker(worker_id: int):
+        store = se.EmbeddingStore(
+            make_cfg([dim]), score_policy="lfu", optimizer_config=optimizer
+        )
+        await asyncio.to_thread(
+            backend.load,
+            store,
+            uri,
+            filter_fn=partitioner,
+            distributed=True,
+            target_shard_id=worker_id,
+            snapshot_id=snapshot_id,
+        )
+        return store
+
+    async def restore_all_workers():
+        return await asyncio.gather(
+            *(restore_worker(worker) for worker in range(worker_count))
+        )
+
+    restored = asyncio.run(restore_all_workers())
+    for worker_id, store in enumerate(restored):
+        mask = (all_keys % np.uint64(worker_count)) == worker_id
+        np.testing.assert_array_equal(
+            lookup_np(store, all_keys[mask], dim), expected_values[worker_id]
+        )
+
+    layout_restored = []
+    for worker_id in range(worker_count):
+        store = se.EmbeddingStore(
+            make_cfg([dim]), score_policy="lfu", optimizer_config=optimizer
+        )
+        backend.load(
+            store,
+            uri,
+            snapshot_id=snapshot_id,
+            restore_layout=True,
+            saved_worker_id=worker_id,
+            worker_count=worker_count,
+        )
+        actual = {
+            image["physical_page_id"]: image for image in store.export_page_images()
+        }
+        expected = {
+            page_id: image
+            for (owner, page_id), image in expected_pages.items()
+            if owner == worker_id
+        }
+        assert actual == expected
+        layout_restored.append(store)
+
+    with pytest.raises(ValueError, match="checkpoint worker topology"):
+        backend.load(
+            se.EmbeddingStore(make_cfg([dim])),
+            uri,
+            snapshot_id=snapshot_id,
+            restore_layout=True,
+            saved_worker_id=0,
+            worker_count=worker_count - 1,
+        )
+
+    with pytest.raises(ValueError, match="does not accept logical routing"):
+        backend.load(
+            se.EmbeddingStore(make_cfg([dim])),
+            uri,
+            filter_fn=partitioner,
+            distributed=True,
+            target_shard_id=1,
+            snapshot_id=snapshot_id,
+            restore_layout=True,
+            saved_worker_id=0,
+            worker_count=worker_count,
+        )
+
+
+def test_partitioned_lance_layout_restore_preserves_compaction_hole(lance_tmp_uri):
+    uri, backend = lance_tmp_uri
+    worker_count = 2
+    snapshot_id = 41
+    dim = 8
+    keys_per_worker = 8192
+    backend.init_dataset(se.EmbeddingStore(make_cfg([dim])), uri)
+    expected_images = {}
+    expected_values = {}
+
+    async def export_worker(worker_id: int):
+        keys = np.arange(keys_per_worker, dtype=np.uint64) * np.uint64(
+            worker_count
+        ) + np.uint64(worker_id)
+        values = np.arange(keys.size * dim, dtype=np.float32).reshape(keys.size, dim)
+        values += np.float32(worker_id * 1_000_000)
+        store = se.EmbeddingStore(make_cfg([dim]), score_policy="lfu")
+        store.assign(keys, values)
+        assert store.compact_page(dim, 0) == 4096
+        actual = lookup_np(store, keys, dim)
+        np.testing.assert_array_equal(actual, values)
+        images = {
+            image["physical_page_id"]: image for image in store.export_page_images()
+        }
+        assert set(images) == {1, 2}
+        expected_images[worker_id] = images
+        expected_values[worker_id] = (keys, values)
+        return await asyncio.to_thread(
+            backend.export_fragments,
+            store,
+            uri,
+            snapshot_id=snapshot_id,
+            worker_id=worker_id,
+            worker_count=worker_count,
+            shard_count=worker_count,
+        )
+
+    async def export_all_workers():
+        return await asyncio.gather(
+            *(export_worker(worker) for worker in range(worker_count))
+        )
+
+    backend.commit_fragments(uri, asyncio.run(export_all_workers()))
+    for worker_id in range(worker_count):
+        restored = se.EmbeddingStore(make_cfg([dim]), score_policy="lfu")
+        backend.load(
+            restored,
+            uri,
+            snapshot_id=snapshot_id,
+            restore_layout=True,
+            saved_worker_id=worker_id,
+            worker_count=worker_count,
+        )
+        actual_images = {
+            image["physical_page_id"]: image for image in restored.export_page_images()
+        }
+        assert actual_images == expected_images[worker_id]
+        keys, values = expected_values[worker_id]
+        np.testing.assert_array_equal(lookup_np(restored, keys, dim), values)
+
+
+@pytest.mark.parametrize("saved_workers,restored_workers", [(8, 3), (3, 8)])
+def test_partitioned_lance_restore_uses_current_fluxway_router(
+    lance_tmp_uri, saved_workers, restored_workers
+):
+    uri, backend = lance_tmp_uri
+    snapshot_id = 29
+    dim = 8
+    keys = np.arange(6144, dtype=np.uint64)
+    values = np.arange(keys.size * dim, dtype=np.float32).reshape(keys.size, dim)
+    backend.init_dataset(se.EmbeddingStore(make_cfg([dim])), uri)
+
+    async def save_worker(worker_id: int):
+        store = se.EmbeddingStore(make_cfg([dim]))
+        saved_mask = (keys % np.uint64(saved_workers)) == worker_id
+        store.assign(keys[saved_mask], values[saved_mask])
+        return await asyncio.to_thread(
+            backend.export_fragments,
+            store,
+            uri,
+            snapshot_id=snapshot_id,
+            worker_id=worker_id,
+            worker_count=saved_workers,
+            shard_count=saved_workers,
+        )
+
+    async def save_all_workers():
+        return await asyncio.gather(
+            *(save_worker(worker_id) for worker_id in range(saved_workers))
+        )
+
+    backend.commit_fragments(uri, asyncio.run(save_all_workers()))
+    fluxway_router = se.ModuloPartitioner(num_shards=restored_workers)
+
+    async def restore_worker(worker_id: int):
+        store = se.EmbeddingStore(make_cfg([dim]))
+        await asyncio.to_thread(
+            backend.load,
+            store,
+            uri,
+            filter_fn=fluxway_router,
+            distributed=True,
+            target_shard_id=worker_id,
+            snapshot_id=snapshot_id,
+        )
+        return store
+
+    async def restore_all_workers():
+        return await asyncio.gather(
+            *(restore_worker(worker_id) for worker_id in range(restored_workers))
+        )
+
+    restored = asyncio.run(restore_all_workers())
+    seen = set()
+    for worker_id, store in enumerate(restored):
+        current_mask = (keys % np.uint64(restored_workers)) == worker_id
+        worker_keys = keys[current_mask]
+        actual = lookup_np(store, worker_keys, dim)
+        np.testing.assert_array_equal(actual, values[current_mask])
+        assert not seen.intersection(worker_keys.tolist())
+        seen.update(worker_keys.tolist())
+    assert seen == set(keys.tolist())
+
+
+def test_distributed_load_requires_explicit_filter_fn(lance_tmp_uri):
+    uri, backend = lance_tmp_uri
+    backend.init_dataset(se.EmbeddingStore(make_cfg([2])), uri)
+    store = se.EmbeddingStore(make_cfg([2]))
+    artifact = backend.export_fragments(
+        store, uri, snapshot_id=1, worker_id=0, worker_count=1, shard_count=1
+    )
+    backend.commit_fragments(uri, [artifact])
+    with pytest.raises(ValueError, match="requires filter_fn"):
+        backend.load(store, uri, distributed=True)
+
+
+def test_filter_fn_requires_explicit_distributed_load(lance_tmp_uri):
+    uri, backend = lance_tmp_uri
+    backend.init_dataset(se.EmbeddingStore(make_cfg([2])), uri)
+    store = se.EmbeddingStore(make_cfg([2]))
+    artifact = backend.export_fragments(
+        store, uri, snapshot_id=1, worker_id=0, worker_count=1, shard_count=1
+    )
+    backend.commit_fragments(uri, [artifact])
+    with pytest.raises(ValueError, match="requires distributed=True"):
+        backend.load(
+            store,
+            uri,
+            filter_fn=se.ModuloPartitioner(num_shards=1),
+            target_shard_id=0,
+        )
+
+
 def test_single_shard_roundtrip_value_correctness(lance_tmp_uri):
     uri, backend = lance_tmp_uri
     truth = make_ground_truth()
@@ -447,6 +1226,23 @@ def test_single_shard_roundtrip_value_correctness(lance_tmp_uri):
         )
 
 
+def test_single_node_lance_save_persists_shard_watermark(lance_tmp_uri):
+    import lance
+
+    uri, backend = lance_tmp_uri
+    dim = 4
+    keys = np.arange(3, dtype=np.uint64)
+    values = np.arange(keys.size * dim, dtype=np.float32).reshape(-1, dim)
+    store = se.EmbeddingStore(make_cfg([dim]))
+    store.assign(keys, values)
+
+    backend.save(store, uri)
+
+    manifest = lance.dataset(f"{uri}/snapshot_manifest").to_table().to_pylist()
+    assert len(manifest) == 1
+    assert manifest[0]["shard_high_watermarks"] == [keys.size]
+
+
 def test_signed_int64_keys_checkpoint_and_reshard(lance_tmp_uri):
     uri, backend = lance_tmp_uri
     keys = np.asarray(
@@ -463,7 +1259,9 @@ def test_signed_int64_keys_checkpoint_and_reshard(lance_tmp_uri):
     source = se.EmbeddingStore(config)
     backend.init_dataset(source, uri)
     source.assign(keys, values)
-    metadata = backend.export_fragments(source, uri)
+    metadata = backend.export_fragments(
+        source, uri, snapshot_id=1, worker_id=0, worker_count=1, shard_count=1
+    )
     backend.commit_fragments(uri, [metadata])
 
     partitioner = se.ModuloPartitioner(num_shards=3)
@@ -473,6 +1271,7 @@ def test_signed_int64_keys_checkpoint_and_reshard(lance_tmp_uri):
             restored,
             uri,
             filter_fn=partitioner,
+            distributed=True,
             target_shard_id=shard_id,
         )
         mask = np.mod(keys, np.int64(3)) == shard_id

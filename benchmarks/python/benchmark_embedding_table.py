@@ -32,14 +32,14 @@ class BenchmarkRunner:
 
 
 class EmbeddingTableBenchmark:
-    def __init__(self, dim: int = 128, num_threads: int = 4):
+    def __init__(self, dim: int = 128, thread_budget: int = 4):
         self.dim = dim
-        self.num_threads = num_threads
+        self.thread_budget = thread_budget
         self.store = self._create_store()
 
     def _create_store(self) -> sparse_embedding.EmbeddingStore:
         config = sparse_embedding.EmbeddingConfig(
-            dims=[self.dim], num_threads=self.num_threads, value_dtype="float32"
+            dims=[self.dim], thread_budget=self.thread_budget, value_dtype="float32"
         )
         initializer = sparse_embedding.Zeros()
         return sparse_embedding.EmbeddingStore(
@@ -48,7 +48,7 @@ class EmbeddingTableBenchmark:
 
     def benchmark_insertion(self, batch_sizes: list[int], iters: int = 10):
         print(
-            f"\n=== Insertion Benchmark (lookup_or_insert) [Threads: {self.num_threads}] ==="
+            f"\n=== Insertion Benchmark (lookup_or_insert) [Threads: {self.thread_budget}] ==="
         )
         for batch_size in batch_sizes:
             runner = BenchmarkRunner("Insert", iters=iters)
@@ -63,7 +63,7 @@ class EmbeddingTableBenchmark:
             )
 
     def benchmark_query(self, batch_sizes: list[int], iters: int = 10):
-        print(f"\n=== Query Benchmark (lookup) [Threads: {self.num_threads}] ===")
+        print(f"\n=== Query Benchmark (lookup) [Threads: {self.thread_budget}] ===")
         max_batch = max(batch_sizes) if batch_sizes else 1000000
         num_keys = max(2000000, max_batch * 2)
 
@@ -81,7 +81,7 @@ class EmbeddingTableBenchmark:
 
     def benchmark_assign(self, batch_sizes: list[int], iters: int = 10):
         print(
-            f"\n=== Assign Benchmark (Raw Compute throughput) [Threads: {self.num_threads}] ==="
+            f"\n=== Assign Benchmark (Raw Compute throughput) [Threads: {self.thread_budget}] ==="
         )
         for batch_size in batch_sizes:
             runner = BenchmarkRunner("Assign", iters=iters)
@@ -95,7 +95,7 @@ class EmbeddingTableBenchmark:
             runner.run(lambda: self.store.assign(keys, values), batch_size)
 
     def benchmark_end_to_end(self, batch_sizes: list[int], iters: int = 10):
-        print(f"\n=== End-to-End Step Benchmark [Threads: {self.num_threads}] ===")
+        print(f"\n=== End-to-End Step Benchmark [Threads: {self.thread_budget}] ===")
         for batch_size in batch_sizes:
             runner = BenchmarkRunner("E2E Step", iters=iters)
             keys = np.random.randint(
@@ -119,11 +119,11 @@ def main():
     thread_counts = [8, 16, 32]
     batch_sizes = [65536, 131072]
 
-    for num_threads in thread_counts:
+    for thread_budget in thread_counts:
         print("\n\n===============================================")
-        print(f"Testing with {num_threads} Threads")
+        print(f"Testing with {thread_budget} Threads")
         print("===============================================")
-        benchmark = EmbeddingTableBenchmark(dim=128, num_threads=num_threads)
+        benchmark = EmbeddingTableBenchmark(dim=128, thread_budget=thread_budget)
         benchmark.benchmark_assign(batch_sizes, iters=10)
         benchmark.benchmark_insertion(batch_sizes, iters=10)
         benchmark.benchmark_query(batch_sizes, iters=10)

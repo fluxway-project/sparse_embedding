@@ -1,0 +1,11 @@
+load("@rules_cc//cc:defs.bzl", "cc_library")
+
+cc_library(
+    name = "execution",
+    hdrs = [
+        "dispatch_budget.hpp",
+        "locality_policy.hpp",
+        "reusable_workspace_pool.hpp",
+    ],
+    visibility = ["//visibility:public"],
+)

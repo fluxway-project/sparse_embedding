@@ -1,0 +1,8 @@
+load("@rules_cc//cc:cc_library.bzl", "cc_library")
+
+cc_library(
+    name = "topology",
+    hdrs = ["thread_affinity.hpp"],
+    visibility = ["//visibility:public"],
+    deps = ["//sparse_embedding/src/execution"],
+)

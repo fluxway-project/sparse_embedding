@@ -3,16 +3,101 @@ BUILD file for hogwild
 """
 
 load("@rules_cc//cc:cc_library.bzl", "cc_library")
+load(":instantiation/hogwild_instantiation.bzl", "hogwild_instantiation_library")
+
+cc_library(
+    name = "operation_dispatch_policy",
+    srcs = ["operation_dispatch_policy.cpp"],
+    hdrs = ["operation_dispatch_policy.hpp"],
+    visibility = ["//visibility:public"],
+)
+
+cc_library(
+    name = "hogwild_partition_topology",
+    hdrs = ["partition/hogwild_partition_topology.hpp"],
+    visibility = ["//visibility:public"],
+    deps = [
+        "//sparse_embedding/src/concurrency",
+        "//sparse_embedding/src/execution",
+        "//sparse_embedding/src/execution/topology",
+        "//sparse_embedding/src/memory",
+        "@numactl//:libnuma",
+    ],
+)
+
+cc_test(
+    name = "hogwild_partition_topology_test",
+    srcs = ["partition/hogwild_partition_topology_test.cpp"],
+    deps = [":hogwild_partition_topology"],
+)
+
+cc_library(
+    name = "hogwild_compaction_headers",
+    hdrs = ["compaction/page_compaction_profile.hpp"],
+    visibility = ["//visibility:public"],
+)
+
+cc_library(
+    name = "hogwild_io_headers",
+    hdrs = ["io/hogwild_page_image_codec.hpp"],
+    visibility = ["//visibility:public"],
+    deps = ["//sparse_embedding/src/interface"],
+)
+
+cc_test(
+    name = "hogwild_page_image_codec_test",
+    srcs = ["io/hogwild_page_image_codec_test.cpp"],
+    deps = [":hogwild_io_headers"],
+)
+
+cc_library(
+    name = "hogwild_partition_headers",
+    hdrs = [
+        "partition/hogwild_partition_topology.hpp",
+        "partition/shard_owner_scheduler.hpp",
+    ],
+    visibility = ["//visibility:public"],
+    deps = [":hogwild_partition_topology"],
+)
+
+cc_library(
+    name = "store_page_eviction_proxy",
+    srcs = ["store_page_eviction_proxy.cpp"],
+    hdrs = ["store_page_eviction_proxy.hpp"],
+    visibility = ["//visibility:public"],
+    deps = ["//sparse_embedding/src/storage"],
+)
+
+cc_library(
+    name = "cohort_page_allocator",
+    hdrs = ["core/cohort_page_allocator.hpp"],
+    visibility = ["//visibility:public"],
+)
+
+cc_library(
+    name = "cohort_arena_allocation",
+    hdrs = ["core/cohort_arena_allocation.hpp"],
+    visibility = ["//visibility:public"],
+)
 
 cc_library(
     name = "hogwild_headers",
-    hdrs = glob(["*.hpp"]),
+    hdrs = [
+        "hogwild_embedding_store.hpp",
+        "public/hogwild_store_options.hpp",
+    ],
     visibility = ["//visibility:public"],
     deps = [
+        ":hogwild_io_headers",
+        ":hogwild_partition_topology",
+        ":hogwild_support_headers",
+        ":operation_dispatch_policy",
+        ":store_page_eviction_proxy",
         "//sparse_embedding/src/arena",
         "//sparse_embedding/src/checkpoint",
         "//sparse_embedding/src/common",
         "//sparse_embedding/src/eviction",
+        "//sparse_embedding/src/execution",
         "//sparse_embedding/src/initializer",
         "//sparse_embedding/src/interface",
         "//sparse_embedding/src/optimizer",
@@ -25,10 +110,95 @@ cc_library(
 )
 
 cc_library(
-    name = "hogwild_embedding_store",
-    srcs = ["hogwild_embedding_store.cpp"],
+    name = "hogwild_support_headers",
+    hdrs = [
+        "compaction/page_compaction_profile.hpp",
+        "core/cohort_arena_allocation.hpp",
+        "core/cohort_page_allocator.hpp",
+        "core/segmented_locator_table.hpp",
+        "operation_dispatch_policy.hpp",
+        "partition/shard_owner_scheduler.hpp",
+    ],
     visibility = ["//visibility:public"],
+    deps = [
+        ":hogwild_partition_topology",
+        ":operation_dispatch_policy",
+        "//sparse_embedding/src/execution",
+        "//sparse_embedding/src/execution/topology",
+        "//sparse_embedding/src/memory",
+        "//sparse_embedding/src/observability",
+        "//sparse_embedding/src/storage",
+        "@parlayhash",
+        "@stdexec",
+    ],
+)
+
+cc_library(
+    name = "hogwild_embedding_store_arenas",
+    srcs = ["hogwild_embedding_store.cpp"],
     deps = [":hogwild_headers"],
+)
+
+hogwild_instantiation_library(
+    name = "hogwild_store_bfloat16_bfloat16",
+    src = "instantiation/hogwild_embedding_store_instantiation_bfloat16_bfloat16.cpp",
+)
+
+hogwild_instantiation_library(
+    name = "hogwild_store_bfloat16_float",
+    src = "instantiation/hogwild_embedding_store_instantiation_bfloat16_float.cpp",
+)
+
+hogwild_instantiation_library(
+    name = "hogwild_store_bfloat16_float16",
+    src = "instantiation/hogwild_embedding_store_instantiation_bfloat16_float16.cpp",
+)
+
+hogwild_instantiation_library(
+    name = "hogwild_store_float_bfloat16",
+    src = "instantiation/hogwild_embedding_store_instantiation_float_bfloat16.cpp",
+)
+
+hogwild_instantiation_library(
+    name = "hogwild_store_float_float",
+    src = "instantiation/hogwild_embedding_store_instantiation_float_float.cpp",
+)
+
+hogwild_instantiation_library(
+    name = "hogwild_store_float_float16",
+    src = "instantiation/hogwild_embedding_store_instantiation_float_float16.cpp",
+)
+
+hogwild_instantiation_library(
+    name = "hogwild_store_float16_bfloat16",
+    src = "instantiation/hogwild_embedding_store_instantiation_float16_bfloat16.cpp",
+)
+
+hogwild_instantiation_library(
+    name = "hogwild_store_float16_float",
+    src = "instantiation/hogwild_embedding_store_instantiation_float16_float.cpp",
+)
+
+hogwild_instantiation_library(
+    name = "hogwild_store_float16_float16",
+    src = "instantiation/hogwild_embedding_store_instantiation_float16_float16.cpp",
+)
+
+cc_library(
+    name = "hogwild_embedding_store",
+    visibility = ["//visibility:public"],
+    deps = [
+        ":hogwild_embedding_store_arenas",
+        ":hogwild_store_bfloat16_bfloat16",
+        ":hogwild_store_bfloat16_float",
+        ":hogwild_store_bfloat16_float16",
+        ":hogwild_store_float16_bfloat16",
+        ":hogwild_store_float16_float",
+        ":hogwild_store_float16_float16",
+        ":hogwild_store_float_bfloat16",
+        ":hogwild_store_float_float",
+        ":hogwild_store_float_float16",
+    ],
 )
 
 cc_test(
@@ -46,6 +216,156 @@ cc_test(
 cc_test(
     name = "hogwild_storage_test",
     srcs = ["hogwild_storage_test.cpp"],
+    defines = ["HOGWILD_EXPLICIT_INSTANTIATION"],
+    linkopts = ["-pthread"],
+    deps = [
+        ":hogwild_headers",
+        "//sparse_embedding/src/storage",
+    ],
+)
+
+cc_test(
+    name = "forward_allocation_test",
+    srcs = ["forward_allocation_test.cpp"],
+    defines = ["HOGWILD_EXPLICIT_INSTANTIATION"],
+    linkopts = ["-pthread"],
+    deps = [
+        ":hogwild_headers",
+        "//sparse_embedding/src/storage",
+    ],
+)
+
+cc_test(
+    name = "numa_forward_test",
+    srcs = ["numa_forward_test.cpp"],
+    defines = ["HOGWILD_EXPLICIT_INSTANTIATION"],
+    linkopts = ["-pthread"],
+    deps = [
+        ":hogwild_headers",
+        "//sparse_embedding/src/storage",
+    ],
+)
+
+cc_test(
+    name = "hogwild_signed_key_test",
+    srcs = ["hogwild_signed_key_test.cpp"],
+    defines = ["HOGWILD_EXPLICIT_INSTANTIATION"],
+    linkopts = ["-pthread"],
+    deps = [
+        ":hogwild_headers",
+        "//sparse_embedding/src/storage",
+    ],
+)
+
+cc_test(
+    name = "operation_dispatch_policy_test",
+    srcs = ["operation_dispatch_policy_test.cpp"],
+    deps = [":operation_dispatch_policy"],
+)
+
+cc_test(
+    name = "store_page_eviction_proxy_test",
+    srcs = ["store_page_eviction_proxy_test.cpp"],
+    linkopts = ["-pthread"],
+    deps = [":store_page_eviction_proxy"],
+)
+
+cc_test(
+    name = "reusable_workspace_pool_test",
+    srcs = ["reusable_workspace_pool_test.cpp"],
+    linkopts = ["-pthread"],
+    deps = ["//sparse_embedding/src/execution"],
+)
+
+cc_test(
+    name = "cohort_page_allocator_test",
+    srcs = ["cohort_page_allocator_test.cpp"],
+    linkopts = ["-pthread"],
+    deps = [":cohort_page_allocator"],
+)
+
+cc_test(
+    name = "cohort_arena_allocation_test",
+    srcs = ["cohort_arena_allocation_test.cpp"],
+    linkopts = ["-pthread"],
+    deps = [":cohort_arena_allocation"],
+)
+
+cc_test(
+    name = "segmented_locator_table_test",
+    srcs = ["segmented_locator_table_test.cpp"],
+    deps = [":hogwild_support_headers"],
+)
+
+cc_test(
+    name = "mutation_contract_test",
+    srcs = ["mutation_contract_test.cpp"],
+    copts = ["-UNDEBUG"],
+    defines = ["HOGWILD_EXPLICIT_INSTANTIATION"],
+    deps = [":hogwild_headers"],
+)
+
+cc_test(
+    name = "hogwild_cohort_arena_allocation_test",
+    srcs = ["hogwild_cohort_arena_allocation_test.cpp"],
+    defines = ["HOGWILD_EXPLICIT_INSTANTIATION"],
+    linkopts = ["-pthread"],
+    deps = [
+        ":hogwild_headers",
+        "//sparse_embedding/src/storage",
+    ],
+)
+
+cc_test(
+    name = "shard_owner_scheduler_test",
+    srcs = ["shard_owner_scheduler_test.cpp"],
+    linkopts = ["-pthread"],
+    deps = [":hogwild_support_headers"],
+)
+
+cc_test(
+    name = "test_eviction",
+    srcs = ["test_eviction.cpp"],
+    defines = ["HOGWILD_EXPLICIT_INSTANTIATION"],
+    linkopts = ["-pthread"],
+    deps = [
+        ":hogwild_headers",
+        "//sparse_embedding/src/storage",
+    ],
+)
+
+cc_binary(
+    name = "benchmark_eviction",
+    srcs = ["benchmark_eviction.cpp"],
+    defines = ["HOGWILD_EXPLICIT_INSTANTIATION"],
+    linkopts = ["-pthread"],
+    deps = [
+        ":hogwild_headers",
+        "//sparse_embedding/src/storage",
+    ],
+)
+
+cc_binary(
+    name = "benchmark_cohort_page_allocator",
+    srcs = ["benchmark_cohort_page_allocator.cpp"],
+    linkopts = ["-pthread"],
+    deps = [":cohort_page_allocator"],
+)
+
+cc_binary(
+    name = "sustained_pressure_benchmark",
+    srcs = ["sustained_pressure_benchmark.cpp"],
+    defines = ["HOGWILD_EXPLICIT_INSTANTIATION"],
+    linkopts = ["-pthread"],
+    deps = [
+        ":hogwild_headers",
+        "//sparse_embedding/src/storage",
+    ],
+)
+
+cc_test(
+    name = "small_memory_all_paths_pressure_test",
+    srcs = ["small_memory_all_paths_pressure_test.cpp"],
     defines = ["HOGWILD_EXPLICIT_INSTANTIATION"],
     linkopts = ["-pthread"],
     deps = [
