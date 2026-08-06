@@ -2,14 +2,47 @@ load("@rules_cc//cc:defs.bzl", "cc_library", "cc_test")
 
 cc_library(
     name = "storage",
-    srcs = ["page_storage.cpp"],
-    hdrs = ["page_storage.hpp"],
+    srcs = [
+        "page_registry.cpp",
+        "page_storage.cpp",
+        "spill_allocator.cpp",
+        "swap_scheduler.cpp",
+    ],
+    hdrs = [
+        "page_eviction_selection.hpp",
+        "page_registry.hpp",
+        "page_storage.hpp",
+        "retirement_pressure.hpp",
+        "spill_allocator.hpp",
+        "swap_scheduler.hpp",
+    ],
     visibility = ["//visibility:public"],
-    deps = ["@proxy"],
+    deps = [
+        "@numactl//:libnuma",
+        "@proxy",
+    ],
+)
+
+cc_test(
+    name = "retirement_pressure_test",
+    srcs = ["retirement_pressure_test.cpp"],
+    deps = [":storage"],
 )
 
 cc_test(
     name = "page_storage_test",
     srcs = ["page_storage_test.cpp"],
+    deps = [":storage"],
+)
+
+cc_test(
+    name = "swap_scheduler_test",
+    srcs = ["swap_scheduler_test.cpp"],
+    deps = [":storage"],
+)
+
+cc_test(
+    name = "page_registry_test",
+    srcs = ["page_registry_test.cpp"],
     deps = [":storage"],
 )

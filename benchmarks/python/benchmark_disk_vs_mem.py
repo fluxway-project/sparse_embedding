@@ -17,18 +17,22 @@ def benchmark(
     if backend == "disk":
         tmp_dir = tempfile.mkdtemp()
         # Allocate a large enough disk space for spill (e.g. 100GB)
-        storage = sparse_embedding.DiskSpill(tmp_dir, 1024 * 1024 * 1024 * 100)
+        storage = sparse_embedding.AutoStorage(
+            memory_limit_bytes=0,
+            spill_directory=tmp_dir,
+            max_spill_bytes=1024 * 1024 * 1024 * 100,
+        )
     elif backend == "memory":
         storage = sparse_embedding.MemoryOnly()
     else:
         raise ValueError(f"Unknown backend {backend}")
 
-    # Set internal num_threads to concurrency as well, to allow the C++ backend
+    # Set the local thread budget to concurrency as well, to allow the C++ backend
     # to utilize parallel processing. We can also just use os.cpu_count()
-    num_threads = min(128, os.cpu_count() or 16)
+    thread_budget = min(128, os.cpu_count() or 16)
 
     config = sparse_embedding.EmbeddingConfig(
-        dims=[dim], num_threads=num_threads, storage=storage
+        dims=[dim], thread_budget=thread_budget, storage=storage
     )
 
     store = sparse_embedding.EmbeddingStore(

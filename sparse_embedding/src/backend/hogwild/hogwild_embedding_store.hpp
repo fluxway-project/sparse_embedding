@@ -18,10 +18,11 @@
 #ifndef SPARSE_EMBEDDING_HOGWILD_EMBEDDING_STORE_HPP_
 #define SPARSE_EMBEDDING_HOGWILD_EMBEDDING_STORE_HPP_
 
-#include <parlay_hash/unordered_map.h>
+#include <parlay/parallel.h>
 
 #include <algorithm>
 #include <atomic>
+#include <bit>
 #include <cstdint>
 #include <cstdlib>
 #include <cstring>
@@ -32,22 +33,40 @@
 #include <numeric>
 #include <optional>
 #include <ranges>
-#include <shared_mutex>
 #include <span>
 #include <stdexcept>
 #include <stdexec/execution.hpp>
 #include <string>
+#include <string_view>
 #include <system_error>
 #include <thread>
+#include <type_traits>
+#include <unistd.h>
 #include <unordered_map>
+#include <unordered_set>
 #include <utility>
 #include <vector>
 
 #include "sparse_embedding/src/arena/transient_arena.hpp"
+#include "sparse_embedding/src/backend/hogwild/compaction/page_compaction_profile.hpp"
+#include "sparse_embedding/src/backend/hogwild/core/cohort_arena_allocation.hpp"
+#include "sparse_embedding/src/backend/hogwild/core/segmented_locator_table.hpp"
+#include "sparse_embedding/src/backend/hogwild/io/hogwild_page_image_codec.hpp"
+#include "sparse_embedding/src/backend/hogwild/operation_dispatch_policy.hpp"
+#include "sparse_embedding/src/backend/hogwild/partition/hogwild_partition_topology.hpp"
+#include "sparse_embedding/src/backend/hogwild/public/hogwild_store_options.hpp"
+#include "sparse_embedding/src/backend/hogwild/store_page_eviction_proxy.hpp"
 #include "sparse_embedding/src/common/function.hpp"
+#include "sparse_embedding/src/concurrency/epoch_retirement.hpp"
+#include "sparse_embedding/src/eviction/adaptive_sealed_page_planner.hpp"
+#include "sparse_embedding/src/eviction/page_telemetry.hpp"
 #include "sparse_embedding/src/eviction/score_policy.hpp"
+#include "sparse_embedding/src/execution/reusable_workspace_pool.hpp"
+#include "sparse_embedding/src/execution/topology/thread_affinity.hpp"
+#include "sparse_embedding/src/interface/embedding_table_interface.hpp"
 #include "sparse_embedding/src/interface/initializer_interface.hpp"
 #include "sparse_embedding/src/interface/optimizer_interface.hpp"
+#include "sparse_embedding/src/observability/telemetry_ring.hpp"
 #include "sparse_embedding/src/simd/simd_ops.hpp"
 #include "sparse_embedding/src/storage/page_storage.hpp"
 
@@ -55,14 +74,46 @@ namespace se {
 
 // =============================================================================
 // EmbeddingArena: Lock-free, 64-byte cache-line aligned region allocator.
-// Index allocation uses atomic fetch_add. Page growth uses mutex
-// (amortized rare). Score stored separately to keep data() SIMD-aligned.
+// Index allocation uses atomic ranges. Page readiness is published per physical
+// page. Score stored separately to keep data() SIMD-aligned.
 // =============================================================================
 
 template <typename ValT> class EmbeddingArena {
+public:
   static constexpr size_t kCacheLineSize = 64;
   static constexpr size_t kEntriesPerPage = 4096;
   static constexpr size_t kMaxPages = 8192;
+  static constexpr size_t kCohortSize = 16;
+  using PageAllocationObserver = void (*)(void *, uint64_t);
+
+  struct OwnerSnapshot {
+    uint64_t key;
+    uint64_t seq_count;
+    uint32_t shard_id;
+  };
+
+private:
+  struct OwnerRecord {
+    std::atomic<uint64_t> seq_count{0};
+    std::atomic<uint64_t> key{0};
+    std::atomic<uint32_t> shard_id{0};
+    std::atomic<bool> live{false};
+  };
+
+  enum class PageAllocationPhase : uint8_t {
+    kUnallocated,
+    kAllocating,
+    kReady,
+    kRetiring,
+    kRetired,
+  };
+
+  struct alignas(kCacheLineSize) PageAllocationState {
+    std::atomic<uint8_t> phase;
+
+    PageAllocationState()
+        : phase(static_cast<uint8_t>(PageAllocationPhase::kUnallocated)) {}
+  };
 
   struct PageTable {
     std::atomic<std::byte *> data[kMaxPages];
@@ -75,14 +126,51 @@ template <typename ValT> class EmbeddingArena {
     }
   };
 
+  struct ArenaPageState {
+    std::unique_ptr<PageAllocationState[]> states =
+        std::make_unique<PageAllocationState[]>(kMaxPages);
+    CohortArenaAllocation allocation;
+
+    ArenaPageState(size_t partition_count, size_t cohort_size)
+        : allocation(partition_count, cohort_size, kEntriesPerPage, kMaxPages) {
+    }
+  };
+
 public:
-  explicit EmbeddingArena(size_t dim, bool enable_score, PageStorage storage)
+  explicit EmbeddingArena(
+      size_t dim, bool enable_score, PageStorage storage,
+      std::shared_ptr<RetirementPressure> retirement_pressure,
+      PageAllocationObserver page_allocation_observer = nullptr,
+      void *page_allocation_context = nullptr, size_t partition_count = 1,
+      bool numa_aware_pages = false)
       : dim_(dim), enable_score_(enable_score),
-        pages_(std::make_unique<PageTable>()), storage_(std::move(storage)),
+        pages_(std::make_shared<PageTable>()), storage_(std::move(storage)),
+        retirement_pressure_(std::move(retirement_pressure)),
+        partition_count_(partition_count), numa_aware_pages_(numa_aware_pages),
+        page_cohort_size_(
+            numa_page_cohort_size(partition_count_, numa_aware_pages_)),
         data_pages_(std::make_unique<StoragePage[]>(kMaxPages)),
-        score_pages_(std::make_unique<StoragePage[]>(kMaxPages)) {
+        score_pages_(std::make_unique<StoragePage[]>(kMaxPages)),
+        page_state_(std::make_shared<ArenaPageState>(partition_count_,
+                                                     page_cohort_size_)),
+        page_allocation_observer_(page_allocation_observer),
+        page_allocation_context_(page_allocation_context),
+        live_words_(
+            std::make_unique<std::atomic<uint64_t>[]>(live_word_count())) {
+    if ((page_allocation_observer_ == nullptr) !=
+        (page_allocation_context_ == nullptr)) {
+      throw std::invalid_argument(
+          "embedding arena page allocation observer is incomplete");
+    }
+    if (!retirement_pressure_)
+      throw std::invalid_argument(
+          "embedding arena retirement pressure is null");
+    if (numa_aware_pages_ && !NumaTopology::available())
+      throw std::runtime_error("NUMA-aware pages require libnuma support");
     data_stride_ =
         (dim * sizeof(ValT) + kCacheLineSize - 1) & ~(kCacheLineSize - 1);
+    for (size_t i = 0; i < live_word_count(); ++i)
+      live_words_[i].store(0, std::memory_order_relaxed);
   }
 
   ~EmbeddingArena() = default;
@@ -94,6 +182,7 @@ public:
 
   size_t dim() const { return dim_; }
   bool score_enabled() const { return enable_score_; }
+  bool numa_aware_pages() const noexcept { return numa_aware_pages_; }
 
   template <typename Prepare> uint32_t allocate(Prepare &&prepare) {
     uint32_t idx = next_index_.load(std::memory_order_relaxed);
@@ -103,8 +192,7 @@ public:
       if (next_index_.compare_exchange_weak(idx, idx + 1,
                                             std::memory_order_relaxed,
                                             std::memory_order_relaxed)) {
-        if (enable_score_)
-          score_raw(idx) = 0;
+        prepare_unpublished(idx);
         return idx;
       }
     }
@@ -114,21 +202,110 @@ public:
     return allocate([](uint32_t) {});
   }
 
+  template <typename Prepare>
+  uint32_t allocate_fresh(uint32_t shard_id, Prepare &&prepare) {
+    return allocate_fresh(shard_id, std::forward<Prepare>(prepare),
+                          [](uint32_t) { return true; });
+  }
+
+  template <typename Prepare, typename Accept>
+  uint32_t allocate_fresh(uint32_t shard_id, Prepare &&prepare,
+                          Accept &&accept) {
+    while (true) {
+      const auto allocation = page_state_->allocation.acquire_fresh(shard_id);
+      ensure_page_ready(allocation.page_id, numa_node_for_shard(shard_id));
+      if (!accept(allocation.index))
+        continue;
+      if (allocation.slot == 0)
+        advance_allocation_watermark_past_page(allocation.page_id);
+      prepare(allocation.index);
+      prepare_unpublished(allocation.index);
+      return allocation.index;
+    }
+  }
+
+  void bind_exact(uint32_t index, uint32_t shard_id) {
+    ensure_page_ready(index / kEntriesPerPage, numa_node_for_shard(shard_id));
+    page_state_->allocation.bind_exact(index, shard_id);
+    advance_allocation_watermark_past_page(index / kEntriesPerPage);
+  }
+
+  template <typename Prepare>
+  uint32_t allocate_range(size_t count, Prepare &&prepare) {
+    if (count == 0)
+      throw std::invalid_argument("embedding arena range must not be empty");
+    if (count > max_entries())
+      throw std::length_error("embedding arena range exceeds capacity");
+    if (numa_aware_pages_)
+      throw std::logic_error(
+          "NUMA-aware arena does not support unsharded range allocation");
+    uint32_t first = next_index_.load(std::memory_order_relaxed);
+    while (true) {
+      if (first > max_entries() - count)
+        throw std::length_error("embedding arena range exceeds capacity");
+      const uint32_t end = static_cast<uint32_t>(first + count);
+      if (!next_index_.compare_exchange_weak(first, end,
+                                             std::memory_order_acq_rel,
+                                             std::memory_order_acquire)) {
+        continue;
+      }
+      page_state_->allocation.reserve_contiguous_range(first, end);
+      ensure_range_ready(first, end - 1);
+      prepare(first, end);
+      return first;
+    }
+  }
+
   void reserve_entries(size_t capacity) {
     if (capacity == 0)
       return;
     if (capacity > static_cast<size_t>(std::numeric_limits<uint32_t>::max())) {
       throw std::overflow_error("embedding arena capacity exceeds uint32_t");
     }
-    ensure_capacity(static_cast<uint32_t>(capacity - 1));
+    if (numa_aware_pages_)
+      throw std::logic_error(
+          "NUMA-aware arena does not support unsharded capacity reservation");
+    ensure_range_ready(0, static_cast<uint32_t>(capacity - 1));
   }
 
-  [[carries_dependency]] uint64_t &score_raw(uint32_t index) const {
+  void reserve_exact_page(uint64_t page_id) {
+    if (page_id >= kMaxPages)
+      throw std::out_of_range("embedding arena page id is out of range");
+    if (numa_aware_pages_)
+      throw std::logic_error(
+          "NUMA-aware arena page-image import requires shard placement");
+    ensure_page_ready(static_cast<size_t>(page_id), 0);
+  }
+
+  void reserve_exact_page(uint64_t page_id, uint32_t shard_id) {
+    if (page_id >= kMaxPages)
+      throw std::out_of_range("embedding arena page id is out of range");
+    ensure_page_ready(static_cast<size_t>(page_id),
+                      numa_node_for_shard(shard_id));
+  }
+
+  void set_allocation_count(uint32_t count) {
+    if (count > static_cast<uint64_t>(kMaxPages) * kEntriesPerPage)
+      throw std::length_error(
+          "embedding arena allocation count exceeds capacity");
+    if (count != 0)
+      ensure_capacity(count - 1);
+    next_index_.store(count, std::memory_order_release);
+  }
+
+  uint64_t &score_raw(uint32_t index) const {
     return pages_->score[index / kEntriesPerPage].load(
         std::memory_order_consume)[index % kEntriesPerPage];
   }
 
   ValT *data(uint32_t index) const {
+    if (pages_->data[index / kEntriesPerPage].load(std::memory_order_acquire) ==
+        nullptr)
+      throw std::logic_error("embedding arena index belongs to a retired page");
+    return data_trusted(index);
+  }
+
+  ValT *data_trusted(uint32_t index) const noexcept {
     return reinterpret_cast<ValT *>(data_raw(index));
   }
 
@@ -140,14 +317,97 @@ public:
     return num_pages_.load(std::memory_order_acquire) * kEntriesPerPage;
   }
 
+  size_t page_count() const {
+    return num_pages_.load(std::memory_order_acquire);
+  }
+
+  bool page_allocated(uint64_t page_id) const {
+    return page_id < page_count() &&
+           page_state_->states[page_id].phase.load(std::memory_order_acquire) ==
+               page_phase(PageAllocationPhase::kReady);
+  }
+
+  void advance_allocation_past_page(uint64_t page_id) {
+    if (page_id >= kMaxPages)
+      throw std::out_of_range("arena allocation page id is out of range");
+    const uint64_t end = (page_id + 1) * kEntriesPerPage;
+    if (end > std::numeric_limits<uint32_t>::max())
+      throw std::overflow_error("arena allocation watermark overflows");
+    ensure_capacity(static_cast<uint32_t>(end));
+    advance_allocation_watermark_past_page(page_id);
+  }
+
+  bool page_has_live_entries(uint64_t page_id) const {
+    if (page_id >= page_count())
+      throw std::out_of_range("arena live-page id is out of range");
+    constexpr size_t kLiveWordsPerPage = kEntriesPerPage / 64;
+    const size_t first_word = page_id * kLiveWordsPerPage;
+    for (size_t word = 0; word < kLiveWordsPerPage; ++word) {
+      if (live_words_[first_word + word].load(std::memory_order_acquire) != 0)
+        return true;
+    }
+    return false;
+  }
+
+  template <typename OnReclaimed>
+  void retire_empty_page(uint64_t page_id, OnReclaimed &&on_reclaimed) {
+    if (page_id >= page_count())
+      throw std::out_of_range("arena retire page id is out of range");
+    if (page_has_live_entries(page_id))
+      throw std::logic_error("arena page still has live entries");
+    using Reclaim = std::decay_t<OnReclaimed>;
+    static_assert(noexcept(std::declval<Reclaim &>()()));
+    struct DeferredPageRelease {
+      std::shared_ptr<PageTable> page_table;
+      std::shared_ptr<ArenaPageState> page_state;
+      uint64_t page_id;
+      StoragePage data;
+      StoragePage score;
+      Reclaim on_reclaimed;
+
+      ~DeferredPageRelease() noexcept {
+        page_table->data[page_id].store(nullptr, std::memory_order_release);
+        page_table->score[page_id].store(nullptr, std::memory_order_release);
+        data = StoragePage{};
+        score = StoragePage{};
+        page_state->states[page_id].phase.store(
+            page_phase(PageAllocationPhase::kUnallocated),
+            std::memory_order_release);
+        page_state->allocation.release_page(static_cast<uint32_t>(page_id));
+        on_reclaimed();
+      }
+    };
+    const size_t retired_bytes = data_pages_[page_id].allocated_size() +
+                                 score_pages_[page_id].allocated_size();
+    se::concurrency::EpochRetirement<DeferredPageRelease> release(
+        retirement_pressure_, retired_bytes);
+    PageAllocationState &state = page_state_->states[page_id];
+    uint8_t expected = page_phase(PageAllocationPhase::kReady);
+    if (!state.phase.compare_exchange_strong(
+            expected, page_phase(PageAllocationPhase::kRetiring),
+            std::memory_order_acq_rel, std::memory_order_acquire)) {
+      throw std::logic_error("arena page is not ready for retirement");
+    }
+    release.emplace(pages_, page_state_, page_id,
+                    std::move(data_pages_[page_id]),
+                    std::move(score_pages_[page_id]),
+                    std::forward<OnReclaimed>(on_reclaimed));
+    release.publish();
+    state.phase.store(page_phase(PageAllocationPhase::kRetired),
+                      std::memory_order_release);
+  }
+
   void reset() {
-    std::lock_guard lock(grow_mtx_);
+    pages_ = std::make_shared<PageTable>();
+    page_state_ =
+        std::make_shared<ArenaPageState>(partition_count_, page_cohort_size_);
     for (size_t i = 0; i < kMaxPages; ++i) {
-      pages_->data[i].store(nullptr, std::memory_order_relaxed);
-      pages_->score[i].store(nullptr, std::memory_order_relaxed);
       data_pages_[i] = StoragePage{};
       score_pages_[i] = StoragePage{};
+      owner_pages_[i].reset();
     }
+    for (size_t i = 0; i < live_word_count(); ++i)
+      live_words_[i].store(0, std::memory_order_relaxed);
     num_pages_.store(0, std::memory_order_relaxed);
     next_index_.store(0, std::memory_order_relaxed);
   }
@@ -156,48 +416,98 @@ public:
 
   static constexpr size_t max_entries() { return kEntriesPerPage * kMaxPages; }
 
-  void prepare_reused(uint32_t index) {
+  static constexpr size_t live_word_count() {
+    return (max_entries() + 63) / 64;
+  }
+
+  void mark_live(uint32_t index, bool live) {
+    const uint64_t mask = uint64_t{1} << (index % 64);
+    OwnerRecord &owner =
+        owner_pages_[index / kEntriesPerPage][index % kEntriesPerPage];
+    if (live) {
+      live_words_[index / 64].fetch_or(mask, std::memory_order_release);
+      owner.live.store(true, std::memory_order_release);
+    } else {
+      owner.live.store(false, std::memory_order_release);
+      live_words_[index / 64].fetch_and(~mask, std::memory_order_release);
+    }
+  }
+
+  void mark_owner_not_live(uint32_t index) {
+    OwnerRecord &owner =
+        owner_pages_[index / kEntriesPerPage][index % kEntriesPerPage];
+    owner.live.store(false, std::memory_order_release);
+  }
+
+  void clear_live_mask(size_t word_index, uint64_t mask) {
+    if (word_index >= live_word_count())
+      throw std::out_of_range("embedding arena live word is out of range");
+    if (mask == 0)
+      throw std::invalid_argument("embedding arena live mask is empty");
+    live_words_[word_index].fetch_and(~mask, std::memory_order_release);
+  }
+
+  bool is_live(uint32_t index) const {
+    const uint64_t mask = uint64_t{1} << (index % 64);
+    return (live_words_[index / 64].load(std::memory_order_acquire) & mask) !=
+           0;
+  }
+
+  void prepare_reused(uint32_t index) { prepare_unpublished(index); }
+
+  void prepare_unpublished(uint32_t index) {
     if (enable_score_)
       score_raw(index) = 0;
+    mark_live(index, false);
+  }
+
+  void publish_owner(uint32_t index, uint64_t key, uint32_t shard_id) {
+    OwnerRecord &owner =
+        owner_pages_[index / kEntriesPerPage][index % kEntriesPerPage];
+    uint64_t seq_count = owner.seq_count.load(std::memory_order_relaxed);
+    if ((seq_count & 1U) != 0)
+      throw std::logic_error("embedding arena owner seq_count is unstable");
+    owner.seq_count.store(seq_count + 1, std::memory_order_release);
+    owner.key.store(key, std::memory_order_relaxed);
+    owner.shard_id.store(shard_id, std::memory_order_relaxed);
+    owner.seq_count.store(seq_count + 2, std::memory_order_release);
+  }
+
+  void publish_owner_exact(uint32_t index, uint64_t key, uint32_t shard_id,
+                           uint64_t seq_count) {
+    if (seq_count == 0 || (seq_count & 1U) != 0)
+      throw std::invalid_argument("page-image owner seq_count is invalid");
+    OwnerRecord &owner =
+        owner_pages_[index / kEntriesPerPage][index % kEntriesPerPage];
+    if (owner.live.load(std::memory_order_acquire))
+      throw std::logic_error("page-image owner slot is already live");
+    owner.seq_count.store(seq_count - 1, std::memory_order_release);
+    owner.key.store(key, std::memory_order_relaxed);
+    owner.shard_id.store(shard_id, std::memory_order_relaxed);
+    owner.seq_count.store(seq_count, std::memory_order_release);
+  }
+
+  std::optional<OwnerSnapshot> owner_snapshot(uint32_t index) const {
+    const OwnerRecord &owner =
+        owner_pages_[index / kEntriesPerPage][index % kEntriesPerPage];
+    if (!is_live(index) || !owner.live.load(std::memory_order_acquire))
+      return std::nullopt;
+    for (size_t attempt = 0; attempt < 8; ++attempt) {
+      const uint64_t before = owner.seq_count.load(std::memory_order_acquire);
+      if ((before & 1U) != 0)
+        continue;
+      const uint64_t key = owner.key.load(std::memory_order_relaxed);
+      const uint32_t shard_id = owner.shard_id.load(std::memory_order_relaxed);
+      const uint64_t after = owner.seq_count.load(std::memory_order_acquire);
+      if (before == after && (after & 1U) == 0 &&
+          owner.live.load(std::memory_order_acquire) && is_live(index))
+        return OwnerSnapshot{key, after, shard_id};
+    }
+    throw std::runtime_error(
+        "embedding arena owner snapshot did not stabilize");
   }
 
 private:
-  void ensure_capacity(uint32_t idx) {
-    size_t page_needed = idx / kEntriesPerPage;
-    if (page_needed >= kMaxPages) {
-      throw std::length_error("embedding arena page capacity exceeded");
-    }
-    if (page_needed < num_pages_.load(std::memory_order_acquire))
-      return;
-    std::lock_guard lock(grow_mtx_);
-    while (page_needed >= num_pages_.load(std::memory_order_relaxed)) {
-      size_t pg = num_pages_.load(std::memory_order_relaxed);
-      PageEvaluator evaluator;
-      if (enable_score_)
-        evaluator = [this, pg] { return page_score(pg); };
-      const PageEvictionMode eviction_mode = enable_score_
-                                                 ? PageEvictionMode::kEnabled
-                                                 : PageEvictionMode::kDisabled;
-      auto data_page =
-          storage_->allocate(kEntriesPerPage * data_stride_, kCacheLineSize,
-                             evaluator, eviction_mode);
-      StoragePage score_page;
-      if (enable_score_) {
-        score_page = storage_->allocate(
-            kEntriesPerPage * sizeof(uint64_t), kCacheLineSize,
-            [] { return uint64_t{0}; }, PageEvictionMode::kEnabled);
-      }
-      data_pages_[pg] = std::move(data_page);
-      score_pages_[pg] = std::move(score_page);
-      pages_->data[pg].store(data_pages_[pg].data(), std::memory_order_release);
-      if (enable_score_)
-        pages_->score[pg].store(
-            reinterpret_cast<uint64_t *>(score_pages_[pg].data()),
-            std::memory_order_release);
-      num_pages_.store(pg + 1, std::memory_order_release);
-    }
-  }
-
   uint64_t page_score(size_t page) const {
     size_t first = page * kEntriesPerPage;
     size_t allocated = allocated_count();
@@ -207,6 +517,8 @@ private:
     uint64_t total = 0;
     for (auto index : std::views::iota(static_cast<uint32_t>(first),
                                        static_cast<uint32_t>(first + count))) {
+      if (!is_live(index))
+        continue;
       uint64_t score = std::atomic_ref<uint64_t>(score_raw(index))
                            .load(std::memory_order_relaxed);
       if (total > std::numeric_limits<uint64_t>::max() - score)
@@ -216,22 +528,222 @@ private:
     return total;
   }
 
-  [[carries_dependency]] std::byte *data_raw(uint32_t index) const {
+private:
+  std::byte *data_raw(uint32_t index) const {
     return pages_->data[index / kEntriesPerPage].load(
                std::memory_order_consume) +
            (index % kEntriesPerPage) * data_stride_;
   }
 
+  static constexpr uint8_t page_phase(PageAllocationPhase phase) {
+    return static_cast<uint8_t>(phase);
+  }
+
+  static size_t numa_page_cohort_size(size_t shard_count,
+                                      bool numa_aware_pages) {
+    if (shard_count == 0 || !std::has_single_bit(shard_count))
+      throw std::invalid_argument("arena shard count is not a power of two");
+    if (!numa_aware_pages)
+      return std::min(kCohortSize, shard_count);
+    if (!NumaTopology::available())
+      throw std::runtime_error("NUMA-aware pages require libnuma support");
+    const size_t nodes = NumaTopology::node_count();
+    if (nodes == 0 || !std::has_single_bit(nodes) || shard_count < nodes ||
+        shard_count % nodes != 0) {
+      throw std::invalid_argument(
+          "NUMA-aware pages require a power-of-two node count that divides "
+          "the shard count");
+    }
+    return shard_count / nodes;
+  }
+
+  int numa_node_for_shard(uint32_t shard_id) const {
+    if (!numa_aware_pages_)
+      return 0;
+    return NumaTopology::node_for_shard(shard_id, partition_count_);
+  }
+
+  int numa_node_for_page(size_t page_id) const {
+    if (!numa_aware_pages_)
+      return 0;
+    const uint32_t cohort =
+        page_state_->allocation.page_cohort(static_cast<uint32_t>(page_id));
+    const size_t shard = static_cast<size_t>(cohort) * page_cohort_size_;
+    return numa_node_for_shard(static_cast<uint32_t>(shard));
+  }
+
+  static void bind_page_to_numa_node(void *address, size_t bytes, int node) {
+    if (address == nullptr || bytes == 0)
+      throw std::invalid_argument(
+          "NUMA page binding requires allocated memory");
+    const std::vector<int> nodes = NumaTopology::node_ids();
+    if (node < 0 || std::ranges::find(nodes, node) == nodes.end())
+      throw std::out_of_range("NUMA page binding node is out of range");
+    numa_tonode_memory(address, bytes, node);
+    const long page_size = sysconf(_SC_PAGESIZE);
+    if (page_size <= 0)
+      throw std::runtime_error("NUMA page size query failed");
+    const size_t stride = static_cast<size_t>(page_size);
+    const size_t page_count = (bytes + stride - 1) / stride;
+    std::array<void *, 2> pages{};
+    std::array<int, 2> placement{-1, -1};
+    auto *base = static_cast<std::byte *>(address);
+    pages[0] = base;
+    pages[1] = base + (page_count - 1) * stride;
+    static_cast<std::byte *>(pages[0])[0] = std::byte{0};
+    static_cast<std::byte *>(pages[1])[0] = std::byte{0};
+    if (numa_move_pages(0, pages.size(), pages.data(), nullptr,
+                        placement.data(), 0) != 0)
+      throw std::runtime_error("NUMA page placement query failed");
+    if (std::ranges::find_if(placement, [node](int observed) {
+          return observed != node;
+        }) != placement.end()) {
+      throw std::runtime_error("NUMA page placement does not match shard node");
+    }
+  }
+
+  void advance_allocation_watermark_past_page(uint64_t page_id) {
+    if (page_id >= kMaxPages)
+      throw std::out_of_range("arena allocation page id is out of range");
+    const uint64_t end = (page_id + 1) * kEntriesPerPage;
+    if (end > std::numeric_limits<uint32_t>::max())
+      throw std::overflow_error("arena allocation watermark overflows");
+    uint32_t observed = next_index_.load(std::memory_order_acquire);
+    while (observed < end &&
+           !next_index_.compare_exchange_weak(
+               observed, static_cast<uint32_t>(end), std::memory_order_acq_rel,
+               std::memory_order_acquire)) {
+    }
+  }
+
+  void ensure_range_ready(uint32_t first, uint32_t last) {
+    if (last >= max_entries())
+      throw std::length_error("embedding arena page capacity exceeded");
+    const size_t first_page = first / kEntriesPerPage;
+    const size_t last_page = last / kEntriesPerPage;
+    for (size_t page_id = first_page; page_id <= last_page; ++page_id)
+      ensure_page_ready(page_id, numa_node_for_page(page_id));
+  }
+
+  void ensure_capacity(uint32_t idx) {
+    ensure_page_ready(idx / kEntriesPerPage,
+                      numa_node_for_page(idx / kEntriesPerPage));
+  }
+
+  void ensure_page_ready(size_t page_id, int numa_node) {
+    const size_t page_needed = page_id;
+    if (page_needed >= kMaxPages) {
+      throw std::length_error("embedding arena page capacity exceeded");
+    }
+
+    PageAllocationState &state = page_state_->states[page_needed];
+    uint8_t observed = state.phase.load(std::memory_order_acquire);
+    while (true) {
+      if (observed == page_phase(PageAllocationPhase::kReady))
+        return;
+      if (observed == page_phase(PageAllocationPhase::kAllocating)) {
+        state.phase.wait(observed, std::memory_order_acquire);
+        observed = state.phase.load(std::memory_order_acquire);
+        continue;
+      }
+      if (observed == page_phase(PageAllocationPhase::kUnallocated)) {
+        if (!state.phase.compare_exchange_weak(
+                observed, page_phase(PageAllocationPhase::kAllocating),
+                std::memory_order_acq_rel, std::memory_order_acquire)) {
+          continue;
+        }
+        try {
+          allocate_page(page_needed, numa_node);
+          publish_page_count(page_needed + 1);
+          state.phase.store(page_phase(PageAllocationPhase::kReady),
+                            std::memory_order_release);
+          state.phase.notify_all();
+          return;
+        } catch (...) {
+          state.phase.store(page_phase(PageAllocationPhase::kUnallocated),
+                            std::memory_order_release);
+          state.phase.notify_all();
+          throw;
+        }
+      }
+      if (observed == page_phase(PageAllocationPhase::kRetiring)) {
+        throw std::logic_error("arena page ready transition was lost");
+      }
+      if (observed == page_phase(PageAllocationPhase::kRetired)) {
+        throw std::logic_error("arena page is retired");
+      }
+      throw std::logic_error("arena page has an invalid readiness state");
+    }
+  }
+
+  void publish_page_count(size_t minimum_page_count) {
+    size_t current = num_pages_.load(std::memory_order_acquire);
+    while (current < minimum_page_count &&
+           !num_pages_.compare_exchange_weak(current, minimum_page_count,
+                                             std::memory_order_release,
+                                             std::memory_order_acquire)) {
+    }
+  }
+
+  void allocate_page(size_t page_id, int numa_node) {
+    PageEvaluator evaluator;
+    if (enable_score_)
+      evaluator = [this, page_id] { return page_score(page_id); };
+    const PageEvictionMode eviction_mode = enable_score_
+                                               ? PageEvictionMode::kEnabled
+                                               : PageEvictionMode::kDisabled;
+    const PagePlacementMode placement_mode =
+        numa_aware_pages_ ? PagePlacementMode::kPageAlignedMapping
+                          : PagePlacementMode::kDefault;
+    auto data_page =
+        storage_->allocate(kEntriesPerPage * data_stride_, kCacheLineSize,
+                           evaluator, eviction_mode, placement_mode);
+    StoragePage score_page;
+    if (enable_score_) {
+      score_page = storage_->allocate(
+          kEntriesPerPage * sizeof(uint64_t), kCacheLineSize,
+          [] { return uint64_t{0}; }, PageEvictionMode::kEnabled,
+          placement_mode);
+    }
+    auto owner_page = std::make_unique<OwnerRecord[]>(kEntriesPerPage);
+    if (numa_aware_pages_) {
+      bind_page_to_numa_node(data_page.data(), data_page.allocated_size(),
+                             numa_node);
+      if (enable_score_)
+        bind_page_to_numa_node(score_page.data(), score_page.allocated_size(),
+                               numa_node);
+    }
+    if (page_allocation_observer_ != nullptr)
+      page_allocation_observer_(page_allocation_context_, page_id);
+    data_pages_[page_id] = std::move(data_page);
+    score_pages_[page_id] = std::move(score_page);
+    owner_pages_[page_id] = std::move(owner_page);
+    pages_->data[page_id].store(data_pages_[page_id].data(),
+                                std::memory_order_release);
+    if (enable_score_)
+      pages_->score[page_id].store(
+          reinterpret_cast<uint64_t *>(score_pages_[page_id].data()),
+          std::memory_order_release);
+  }
+
   size_t dim_;
   size_t data_stride_;
   bool enable_score_;
-  std::unique_ptr<PageTable> pages_;
+  std::shared_ptr<PageTable> pages_;
   PageStorage storage_;
+  std::shared_ptr<RetirementPressure> retirement_pressure_;
+  size_t partition_count_;
+  bool numa_aware_pages_;
+  size_t page_cohort_size_;
   std::unique_ptr<StoragePage[]> data_pages_;
   std::unique_ptr<StoragePage[]> score_pages_;
+  std::shared_ptr<ArenaPageState> page_state_;
+  PageAllocationObserver page_allocation_observer_;
+  void *page_allocation_context_;
+  std::unique_ptr<OwnerRecord[]> owner_pages_[kMaxPages];
+  std::unique_ptr<std::atomic<uint64_t>[]> live_words_;
   std::atomic<uint32_t> next_index_{0};
   std::atomic<size_t> num_pages_{0};
-  std::mutex grow_mtx_;
 };
 
 // =============================================================================
@@ -250,6 +762,175 @@ public:
   using Initializer = pro::proxy<InitializerFacade<ParamT>>;
   using OptimizerFactory =
       se::Function<pro::proxy<OptimizerFacade<ParamT, OptT>>(size_t)>;
+
+private:
+  struct InvocationGate {
+    enum class State : uint8_t {
+      kAccepting,
+      kReconfiguring,
+      kClosed,
+    };
+
+    std::atomic<State> state{State::kAccepting};
+    std::atomic<size_t> active{0};
+
+    void begin_reconfiguration_and_wait() noexcept {
+      state.store(State::kReconfiguring, std::memory_order_release);
+      size_t observed = active.load(std::memory_order_acquire);
+      while (observed != 0) {
+        active.wait(observed, std::memory_order_acquire);
+        observed = active.load(std::memory_order_acquire);
+      }
+    }
+
+    void resume_accepting() noexcept {
+      state.store(State::kAccepting, std::memory_order_release);
+      state.notify_all();
+    }
+
+    void close_and_wait() noexcept {
+      state.store(State::kClosed, std::memory_order_release);
+      state.notify_all();
+      size_t observed = active.load(std::memory_order_acquire);
+      while (observed != 0) {
+        active.wait(observed, std::memory_order_acquire);
+        observed = active.load(std::memory_order_acquire);
+      }
+    }
+  };
+
+  class ActiveInvocationGuard {
+  public:
+    explicit ActiveInvocationGuard(InvocationGate &gate) : gate_(&gate) {
+      size_t observed = gate_->active.load(std::memory_order_acquire);
+      while (true) {
+        const typename InvocationGate::State state =
+            gate_->state.load(std::memory_order_acquire);
+        if (state == InvocationGate::State::kClosed)
+          throw std::runtime_error("store is not accepting invocations");
+        if (state == InvocationGate::State::kReconfiguring) {
+          gate_->state.wait(state, std::memory_order_acquire);
+          observed = gate_->active.load(std::memory_order_acquire);
+          continue;
+        }
+        if (observed == std::numeric_limits<size_t>::max())
+          throw std::overflow_error("active invocation count overflows");
+        if (gate_->active.compare_exchange_weak(observed, observed + 1,
+                                                std::memory_order_acq_rel,
+                                                std::memory_order_acquire)) {
+          if (gate_->state.load(std::memory_order_acquire) !=
+              InvocationGate::State::kAccepting) {
+            if (gate_->active.fetch_sub(1, std::memory_order_acq_rel) == 1)
+              gate_->active.notify_all();
+            observed = gate_->active.load(std::memory_order_acquire);
+            continue;
+          }
+          count_ = observed + 1;
+          return;
+        }
+      }
+    }
+
+    ~ActiveInvocationGuard() {
+      const size_t previous =
+          gate_->active.fetch_sub(1, std::memory_order_acq_rel);
+      if (previous == 0)
+        std::terminate();
+      if (previous == 1)
+        gate_->active.notify_all();
+    }
+
+    ActiveInvocationGuard(const ActiveInvocationGuard &) = delete;
+    ActiveInvocationGuard &operator=(const ActiveInvocationGuard &) = delete;
+
+    size_t count() const noexcept { return count_; }
+
+  private:
+    InvocationGate *gate_;
+    size_t count_ = 0;
+  };
+
+public:
+  class PageReuseState {
+  public:
+    enum class State : uint8_t {
+      kAvailable,
+      kDraining,
+      kRetired,
+    };
+
+    struct alignas(EmbeddingArena<ParamT>::kCacheLineSize) PageState {
+      std::atomic<uint8_t> state;
+
+      PageState() : state(static_cast<uint8_t>(State::kAvailable)) {}
+    };
+
+    PageReuseState()
+        : page_states_(std::make_unique<PageState[]>(
+              EmbeddingArena<ParamT>::kMaxPages)) {}
+
+    bool unavailable(uint32_t index) const noexcept {
+      return page_states_[index / EmbeddingArena<ParamT>::kEntriesPerPage]
+                 .state.load(std::memory_order_acquire) !=
+             static_cast<uint8_t>(State::kAvailable);
+    }
+
+    bool destination_available(uint32_t index) const noexcept {
+      const size_t page_id = index / EmbeddingArena<ParamT>::kEntriesPerPage;
+      return page_states_[page_id].state.load(std::memory_order_acquire) ==
+             static_cast<uint8_t>(State::kAvailable);
+    }
+
+    void begin_draining(uint64_t page_id) {
+      if (page_id >= EmbeddingArena<ParamT>::kMaxPages)
+        throw std::out_of_range("arena page drain id is out of range");
+      uint8_t expected = static_cast<uint8_t>(State::kAvailable);
+      if (page_states_[page_id].state.compare_exchange_strong(
+              expected, static_cast<uint8_t>(State::kDraining),
+              std::memory_order_acq_rel, std::memory_order_acquire))
+        return;
+      if (expected == static_cast<uint8_t>(State::kRetired))
+        throw std::logic_error("arena page was already retired");
+      throw std::logic_error("arena page is already draining");
+    }
+
+    void cancel_draining(uint64_t page_id) noexcept {
+      uint8_t expected = static_cast<uint8_t>(State::kDraining);
+      if (page_states_[page_id].state.compare_exchange_strong(
+              expected, static_cast<uint8_t>(State::kAvailable),
+              std::memory_order_acq_rel, std::memory_order_acquire))
+        return;
+      if (expected != static_cast<uint8_t>(State::kRetired))
+        std::terminate();
+    }
+
+    void retire(uint64_t page_id) {
+      uint8_t expected = static_cast<uint8_t>(State::kDraining);
+      if (!page_states_[page_id].state.compare_exchange_strong(
+              expected, static_cast<uint8_t>(State::kRetired),
+              std::memory_order_acq_rel, std::memory_order_acquire))
+        throw std::logic_error("arena page was not draining before retirement");
+    }
+
+    void make_available(uint64_t page_id) noexcept {
+      uint8_t expected = static_cast<uint8_t>(State::kRetired);
+      if (!page_states_[page_id].state.compare_exchange_strong(
+              expected, static_cast<uint8_t>(State::kAvailable),
+              std::memory_order_release, std::memory_order_acquire) &&
+          expected != static_cast<uint8_t>(State::kAvailable))
+        std::terminate();
+    }
+
+    void reset() noexcept {
+      for (size_t page = 0; page < EmbeddingArena<ParamT>::kMaxPages; ++page) {
+        page_states_[page].state.store(static_cast<uint8_t>(State::kAvailable),
+                                       std::memory_order_relaxed);
+      }
+    }
+
+  private:
+    std::unique_ptr<PageState[]> page_states_;
+  };
 
   template <typename K> struct SplitMixHash {
     size_t operator()(K x) const {
@@ -276,40 +957,302 @@ public:
 #endif
   };
 
-  using MapData =
-      parlay::MapData<KeyT, uint32_t, SplitMixHash<KeyT>, std::equal_to<KeyT>>;
-
-  using Key = parlay::IndirectEntries<MapData>;
-  using KeyMap = parlay::parlay_hash<Key>;
-
   struct KeyShard {
     static constexpr size_t kInitialRecycleCapacity = 64;
-    static constexpr size_t kParlayHashCapacityMultiplier = 4;
+    static constexpr size_t kDirectoryCapacityMultiplier = 4;
 
     struct MapBundle {
-      Key entries;
-      KeyMap key_map;
-      explicit MapBundle(size_t capacity)
-          : entries(false), key_map(capacity, &entries, false) {}
+      explicit MapBundle(size_t capacity, unsigned hash_shift)
+          : bucket_count(next_power_of_two(capacity)), mask(bucket_count - 1),
+            hash_shift(hash_shift),
+            keys(std::make_unique<uint64_t[]>(bucket_count)),
+            metadata(std::make_unique<uint32_t[]>(bucket_count)) {}
+
+      std::optional<uint32_t> find(uint64_t key) const noexcept {
+        return find_hashed(key, SplitMixHash<KeyT>{}(static_cast<KeyT>(key)));
+      }
+
+      std::optional<uint32_t> find_hashed(uint64_t key,
+                                          size_t hash) const noexcept {
+        size_t position = hashed_bucket_position(hash);
+        for (size_t probe = 0; probe < bucket_count; ++probe) {
+          const uint32_t bucket_metadata = metadata[position];
+          if (bucket_metadata == kEmptyMetadata)
+            return std::nullopt;
+          if ((bucket_metadata & kOccupiedMetadata) != 0 &&
+              keys[position] == key)
+            return bucket_metadata & kSlotMask;
+          position = (position + 1) & mask;
+        }
+        return std::nullopt;
+      }
+
+      void insert(uint64_t key, uint32_t slot_id) {
+        if (slot_id == 0)
+          throw std::invalid_argument("key directory slot id is zero");
+        size_t position = bucket_position(key);
+        size_t first_tombstone = bucket_count;
+        for (size_t probe = 0; probe < bucket_count; ++probe) {
+          const uint32_t bucket_metadata = metadata[position];
+          if ((bucket_metadata & kStateMask) == kOccupiedMetadata) {
+            if (keys[position] == key)
+              throw std::logic_error("key directory has a duplicate key");
+          } else if ((bucket_metadata & kStateMask) == kTombstoneMetadata) {
+            if (first_tombstone == bucket_count)
+              first_tombstone = position;
+          } else {
+            publish(first_tombstone == bucket_count ? position
+                                                    : first_tombstone,
+                    key, slot_id);
+            return;
+          }
+          position = (position + 1) & mask;
+        }
+        if (first_tombstone != bucket_count) {
+          publish(first_tombstone, key, slot_id);
+          return;
+        }
+        throw std::overflow_error("key directory is full");
+      }
+
+      std::optional<uint32_t> remove(uint64_t key) noexcept {
+        size_t position = bucket_position(key);
+        for (size_t probe = 0; probe < bucket_count; ++probe) {
+          const uint32_t bucket_metadata = metadata[position];
+          if (bucket_metadata == kEmptyMetadata)
+            return std::nullopt;
+          if ((bucket_metadata & kStateMask) == kOccupiedMetadata &&
+              keys[position] == key) {
+            const uint32_t slot_id = bucket_metadata & kSlotMask;
+            metadata[position] = kTombstoneMetadata;
+            --entry_count;
+            return slot_id;
+          }
+          position = (position + 1) & mask;
+        }
+        return std::nullopt;
+      }
+
+      template <typename Fn> void for_each(Fn &&fn) const {
+        for (size_t index = 0; index < bucket_count; ++index) {
+          const uint32_t bucket_metadata = metadata[index];
+          if ((bucket_metadata & kStateMask) == kOccupiedMetadata)
+            fn(keys[index], bucket_metadata & kSlotMask);
+        }
+      }
+
+      size_t retirement_bytes() const {
+        return checked_bytes_add(
+            sizeof(MapBundle),
+            checked_bytes_add(
+                checked_bytes_product(bucket_count, sizeof(uint64_t)),
+                checked_bytes_product(bucket_count, sizeof(uint32_t))));
+      }
+
+      size_t directory_mask_value() const noexcept { return mask; }
+
+    private:
+      static constexpr uint32_t kStateMask = 0xC0000000U;
+      static constexpr uint32_t kSlotMask = 0x3FFFFFFFU;
+      static constexpr uint32_t kEmptyMetadata = 0;
+      static constexpr uint32_t kTombstoneMetadata = 0x40000000U;
+      static constexpr uint32_t kOccupiedMetadata = 0x80000000U;
+      static_assert(hogwild_internal::SegmentedLocatorTable::kMaximumSlotId <=
+                    kSlotMask);
+
+      static size_t next_power_of_two(size_t value) {
+        if (value < 2)
+          value = 2;
+        size_t result = 1;
+        while (result < value) {
+          if (result > std::numeric_limits<size_t>::max() / 2)
+            throw std::overflow_error("key directory capacity overflow");
+          result <<= 1;
+        }
+        return result;
+      }
+
+      static size_t checked_bytes_add(size_t total, size_t increment) {
+        if (increment > std::numeric_limits<size_t>::max() - total)
+          throw std::overflow_error("key directory byte count overflow");
+        return total + increment;
+      }
+
+      static size_t checked_bytes_product(size_t count, size_t element) {
+        if (count != 0 && element > std::numeric_limits<size_t>::max() / count)
+          throw std::overflow_error("key directory byte count overflow");
+        return count * element;
+      }
+
+      size_t bucket_position(uint64_t key) const noexcept {
+        return hashed_bucket_position(
+            SplitMixHash<KeyT>{}(static_cast<KeyT>(key)));
+      }
+
+      size_t hashed_bucket_position(size_t hash) const noexcept {
+        return (hash >> hash_shift) & mask;
+      }
+
+      void publish(size_t position, uint64_t key, uint32_t slot_id) noexcept {
+        keys[position] = key;
+        metadata[position] = kOccupiedMetadata | slot_id;
+        ++entry_count;
+      }
+
+      size_t bucket_count;
+      size_t mask;
+      unsigned hash_shift;
+      size_t entry_count = 0;
+      std::unique_ptr<uint64_t[]> keys;
+      std::unique_ptr<uint32_t[]> metadata;
+    };
+
+    struct RecycleState {
+      std::mutex mutex;
+      std::vector<uint32_t> ready_indices;
+      std::atomic<size_t> ready_count{0};
+      std::atomic<size_t> reserved_capacity{0};
+      std::shared_ptr<PageReuseState> page_reuse;
+
+      explicit RecycleState(std::shared_ptr<PageReuseState> reuse)
+          : page_reuse(std::move(reuse)) {}
+
+      void release(uint32_t index) noexcept {
+        if (page_reuse->unavailable(index))
+          return;
+        std::lock_guard lock(mutex);
+        if (page_reuse->unavailable(index))
+          return;
+        if (ready_indices.size() == ready_indices.capacity())
+          std::terminate();
+        ready_indices.push_back(index);
+        ready_count.store(ready_indices.size(), std::memory_order_release);
+      }
+    };
+
+    struct DeferredRecycle {
+      std::shared_ptr<RecycleState> state;
+      uint32_t index;
+
+      DeferredRecycle(std::shared_ptr<RecycleState> recycle_state,
+                      uint32_t recycle_index)
+          : state(std::move(recycle_state)), index(recycle_index) {}
+
+      ~DeferredRecycle() noexcept { state->release(index); }
+    };
+
+    struct DeferredBundle {
+      MapBundle *bundle;
+      explicit DeferredBundle(MapBundle *retired) : bundle(retired) {}
+      ~DeferredBundle() { delete bundle; }
+    };
+
+    struct DeferredSlotRecycle {
+      std::shared_ptr<hogwild_internal::SegmentedLocatorTable> table;
+      uint32_t slot_id;
+
+      DeferredSlotRecycle(
+          std::shared_ptr<hogwild_internal::SegmentedLocatorTable>
+              locator_table,
+          uint32_t retired_slot_id)
+          : table(std::move(locator_table)), slot_id(retired_slot_id) {}
+
+      ~DeferredSlotRecycle() noexcept { table->release_after_epoch(slot_id); }
+    };
+
+    struct alignas(EmbeddingArena<ParamT>::kCacheLineSize) ShardReadView {
+      std::atomic<MapBundle *> bundle;
+      hogwild_internal::SegmentedLocatorTable *locators;
+      uint64_t directory_mask;
+      uint64_t table_identity;
+      std::atomic<uint64_t> generation{1};
+
+      ShardReadView(MapBundle *initial,
+                    hogwild_internal::SegmentedLocatorTable *locator_table,
+                    uint64_t identity)
+          : bundle(initial), locators(locator_table),
+            directory_mask(initial->directory_mask_value()),
+            table_identity(identity) {}
     };
 
     size_t reserved_keys;
-    size_t count = 0;
-    std::unique_ptr<MapBundle> bundle;
-    mutable std::shared_mutex map_mutex;
-    std::vector<uint32_t> recycled_indices;
-    size_t owned_index_count = 0;
+    unsigned hash_shift_;
+    std::unique_ptr<ShardReadView> read_view;
+    std::atomic<size_t> count{0};
+    std::mutex compaction_mutex;
+    std::mutex writer_mutex;
+    std::shared_ptr<RecycleState> recycle_state;
+    std::shared_ptr<RetirementPressure> retirement_pressure;
+    size_t index_retirement_bytes;
+    std::atomic<size_t> owned_index_count{0};
+    std::shared_ptr<hogwild_internal::SegmentedLocatorTable> locators;
 
-    explicit KeyShard(size_t requested_keys)
-        : reserved_keys(requested_keys),
-          bundle(std::make_unique<MapBundle>(map_capacity(requested_keys))) {}
+    explicit KeyShard(size_t requested_keys,
+                      std::shared_ptr<PageReuseState> page_reuse,
+                      std::shared_ptr<RetirementPressure> pressure,
+                      size_t retired_index_bytes, unsigned hash_shift)
+        : reserved_keys(requested_keys), hash_shift_(hash_shift),
+          recycle_state(std::make_shared<RecycleState>(std::move(page_reuse))),
+          retirement_pressure(std::move(pressure)),
+          index_retirement_bytes(retired_index_bytes),
+          locators(
+              std::make_shared<hogwild_internal::SegmentedLocatorTable>()) {
+      if (!retirement_pressure)
+        throw std::invalid_argument("key shard retirement pressure is null");
+      auto initial = std::make_unique<MapBundle>(map_capacity(requested_keys),
+                                                 hash_shift_);
+      read_view = std::make_unique<ShardReadView>(
+          initial.release(), locators.get(), reinterpret_cast<uintptr_t>(this));
+    }
+
+    ~KeyShard() { delete read_view->bundle.load(std::memory_order_relaxed); }
+
+    MapBundle *bundle_unlocked() const noexcept {
+      return read_view->bundle.load(std::memory_order_acquire);
+    }
+
+    static size_t checked_bundle_bytes_add(size_t total, size_t increment) {
+      if (increment > std::numeric_limits<size_t>::max() - total)
+        throw std::overflow_error("map bundle retirement bytes overflow");
+      return total + increment;
+    }
+
+    static size_t checked_bundle_bytes_product(size_t count, size_t element) {
+      if (count != 0 && element > std::numeric_limits<size_t>::max() / count)
+        throw std::overflow_error("map bundle retirement bytes overflow");
+      return count * element;
+    }
+
+    static size_t bundle_retirement_bytes(const MapBundle &map_bundle) {
+      return map_bundle.retirement_bytes();
+    }
+
+    void publish_bundle_unlocked(MapBundle *next) {
+      MapBundle *current = bundle_unlocked();
+      se::concurrency::EpochRetirement<DeferredBundle> retirement(
+          retirement_pressure, bundle_retirement_bytes(*current));
+      MapBundle *retired =
+          read_view->bundle.exchange(next, std::memory_order_acq_rel);
+      read_view->directory_mask = next->directory_mask_value();
+      retirement.emplace(retired);
+      retirement.publish();
+      read_view->generation.fetch_add(1, std::memory_order_acq_rel);
+    }
+
+    MapBundle *clone_bundle_unlocked(size_t capacity) const {
+      MapBundle *current = bundle_unlocked();
+      auto next = std::make_unique<MapBundle>(capacity, hash_shift_);
+      current->for_each(
+          [&](uint64_t key, uint32_t slot_id) { next->insert(key, slot_id); });
+      return next.release();
+    }
 
     static size_t map_capacity(size_t keys_count) {
       if (keys_count >
-          std::numeric_limits<size_t>::max() / kParlayHashCapacityMultiplier) {
+          std::numeric_limits<size_t>::max() / kDirectoryCapacityMultiplier) {
         throw std::overflow_error("key shard capacity overflow");
       }
-      return std::max(size_t(1024), keys_count * kParlayHashCapacityMultiplier);
+      return std::max(size_t(1), keys_count * kDirectoryCapacityMultiplier);
     }
 
     static size_t compute_next_capacity(size_t current, size_t required) {
@@ -326,79 +1269,371 @@ public:
       return next;
     }
 
+    struct LocatorRef {
+      uint32_t slot_id;
+      uint32_t index;
+    };
+
     std::optional<uint32_t> find_unlocked(uint64_t key) {
-      return bundle->key_map.Find(
-          Key::Entry::make_key(key),
-          [](const auto &entry) { return entry.get_entry().second; });
+      auto slot_id = find_slot_unlocked(key);
+      return slot_id ? locators->load(*slot_id) : std::nullopt;
     }
 
-    std::optional<uint32_t> find(uint64_t key) {
-      std::shared_lock lock(map_mutex);
-      return find_unlocked(key);
+    std::optional<uint32_t> find_slot_unlocked(uint64_t key) const {
+      return bundle_unlocked()->find(key);
     }
+
+    std::optional<uint32_t> find_slot_hashed_unlocked(uint64_t key,
+                                                      size_t hash) const {
+      MapBundle *bundle = read_view->bundle.load(std::memory_order_acquire);
+      return bundle->find_hashed(key, hash);
+    }
+
+    std::optional<LocatorRef> find_locator_unlocked(uint64_t key) {
+      auto slot_id = find_slot_unlocked(key);
+      if (!slot_id)
+        return std::nullopt;
+      auto index = locators->load(*slot_id);
+      if (!index)
+        throw std::logic_error(
+            "key directory references an empty locator slot");
+      return LocatorRef{*slot_id, *index};
+    }
+
+    std::optional<uint32_t> find(uint64_t key) { return find_unlocked(key); }
 
     void expand(size_t target_keys) {
       if (target_keys <= reserved_keys)
         return;
-      auto new_bundle = std::make_unique<MapBundle>(map_capacity(target_keys));
-      bundle->key_map.for_each([&](const auto &entry) {
-        auto [k, idx] = entry.get_entry();
-        auto map_key = Key::Entry::make_key(k);
-        new_bundle->key_map.Insert(
-            map_key,
-            [&] {
-              return new_bundle->entries.make_entry(map_key,
-                                                    std::make_pair(k, idx));
-            },
-            [](const auto &e) { return e.get_entry().second; });
-      });
-      bundle = std::move(new_bundle);
+      auto *next = clone_bundle_unlocked(map_capacity(target_keys));
+      publish_bundle_unlocked(next);
       reserved_keys = target_keys;
     }
 
-    void prepare_new_index() {
-      if (owned_index_count == std::numeric_limits<size_t>::max()) {
-        throw std::overflow_error("key shard index count overflow");
-      }
-      size_t required_capacity = owned_index_count + 1;
-      if (recycled_indices.capacity() < required_capacity) {
-        size_t next_capacity = compute_next_capacity(
-            recycled_indices.capacity(), required_capacity);
-        recycled_indices.reserve(next_capacity);
+    void reserve_new_indices(size_t count) {
+      if (count == 0)
+        throw std::invalid_argument("key shard reserve count is zero");
+      size_t owned = owned_index_count.load(std::memory_order_acquire);
+      while (true) {
+        if (count > std::numeric_limits<size_t>::max() - owned)
+          throw std::overflow_error("key shard index count overflow");
+        const size_t required_capacity = owned + count;
+        if (required_capacity <=
+            recycle_state->reserved_capacity.load(std::memory_order_acquire)) {
+          if (owned_index_count.compare_exchange_weak(
+                  owned, required_capacity, std::memory_order_acq_rel,
+                  std::memory_order_acquire)) {
+            return;
+          }
+          continue;
+        }
+        std::lock_guard lock(recycle_state->mutex);
+        while (true) {
+          owned = owned_index_count.load(std::memory_order_acquire);
+          if (count > std::numeric_limits<size_t>::max() - owned)
+            throw std::overflow_error("key shard index count overflow");
+          const size_t locked_required_capacity = owned + count;
+          if (locked_required_capacity > recycle_state->reserved_capacity.load(
+                                             std::memory_order_acquire)) {
+            const size_t next_capacity =
+                compute_next_capacity(recycle_state->ready_indices.capacity(),
+                                      locked_required_capacity);
+            recycle_state->ready_indices.reserve(next_capacity);
+            recycle_state->reserved_capacity.store(
+                recycle_state->ready_indices.capacity(),
+                std::memory_order_release);
+          }
+          if (owned_index_count.compare_exchange_weak(
+                  owned, locked_required_capacity, std::memory_order_acq_rel,
+                  std::memory_order_acquire)) {
+            return;
+          }
+        }
       }
     }
 
-    void insert_existing(uint64_t key, uint32_t idx) {
-      auto map_key = Key::Entry::make_key(key);
-      auto read_idx = [](const auto &e) { return e.get_entry().second; };
-      auto existing = bundle->key_map.Insert(
-          map_key,
-          [&] {
-            return bundle->entries.make_entry(map_key,
-                                              std::make_pair(key, idx));
-          },
-          read_idx);
-      if (existing.has_value()) {
-        throw std::logic_error("duplicate key while rebuilding key shard");
+    void reserve_new_index() { reserve_new_indices(1); }
+
+    std::optional<uint32_t> take_recycled_index() {
+      if (recycle_state->ready_count.load(std::memory_order_acquire) == 0)
+        return std::nullopt;
+      std::lock_guard lock(recycle_state->mutex);
+      while (!recycle_state->ready_indices.empty()) {
+        uint32_t index = recycle_state->ready_indices.back();
+        recycle_state->ready_indices.pop_back();
+        if (recycle_state->page_reuse->unavailable(index))
+          continue;
+        recycle_state->ready_count.store(recycle_state->ready_indices.size(),
+                                         std::memory_order_release);
+        return index;
       }
+      recycle_state->ready_count.store(0, std::memory_order_release);
+      return std::nullopt;
+    }
+
+    void recycle_unpublished_index(uint32_t index) noexcept {
+      recycle_state->release(index);
+    }
+
+    void retire_published_index(uint32_t index) {
+      se::concurrency::EpochRetirement<DeferredRecycle> retirement(
+          retirement_pressure, index_retirement_bytes);
+      retirement.emplace(recycle_state, index);
+      retirement.publish();
+    }
+
+    se::concurrency::EpochRetirement<DeferredSlotRecycle>
+    prepare_slot_retirement(uint32_t slot_id) {
+      return {retirement_pressure, sizeof(hogwild_internal::LocatorSlot)};
+    }
+
+    LocatorRef rotate_locator_unlocked(uint64_t key,
+                                       uint32_t expected_slot_id) {
+      auto current = find_locator_unlocked(key);
+      if (!current.has_value())
+        throw std::logic_error("key disappeared before locator rotation");
+      if (current->slot_id != expected_slot_id)
+        return *current;
+      if (!locators->requires_rotation(expected_slot_id))
+        return *current;
+
+      auto next = std::unique_ptr<MapBundle>(
+          clone_bundle_unlocked(map_capacity(reserved_keys)));
+      const auto removed = next->remove(key);
+      if (!removed || *removed != expected_slot_id)
+        throw std::logic_error(
+            "locator rotation rebuilt the wrong key mapping");
+      const uint32_t replacement_slot_id = locators->allocate(current->index);
+      next->insert(key, replacement_slot_id);
+
+      auto retirement = prepare_slot_retirement(expected_slot_id);
+      publish_bundle_unlocked(next.release());
+      retirement.emplace(locators, expected_slot_id);
+      retirement.publish();
+      return LocatorRef{replacement_slot_id, current->index};
+    }
+
+    void insert_index_unlocked(uint64_t key, uint32_t idx) {
+      const std::array<uint64_t, 1> keys{key};
+      const std::array<uint32_t, 1> indices{idx};
+      publish_indices_batch_unlocked(keys, indices);
+    }
+
+    void publish_indices_batch_unlocked(std::span<const uint64_t> keys,
+                                        std::span<const uint32_t> indices) {
+      if (keys.empty() || keys.size() != indices.size())
+        throw std::invalid_argument("key shard publication batch is invalid");
+      const size_t current_count = count.load(std::memory_order_acquire);
+      if (keys.size() > std::numeric_limits<size_t>::max() - current_count)
+        throw std::overflow_error("key shard publication count overflows");
+      const size_t next_count = current_count + keys.size();
+      const size_t next_reserved =
+          next_count > reserved_keys
+              ? compute_next_capacity(reserved_keys, next_count)
+              : reserved_keys;
+      auto next = std::unique_ptr<MapBundle>(
+          clone_bundle_unlocked(map_capacity(next_reserved)));
+      for (size_t index = 0; index < keys.size(); ++index) {
+        const uint64_t key = keys[index];
+        auto existing = next->find(key);
+        if (existing.has_value())
+          throw std::logic_error("key shard batch contains duplicate key");
+        const uint32_t slot_id = locators->allocate(indices[index]);
+        next->insert(key, slot_id);
+      }
+      publish_bundle_unlocked(next.release());
+      reserved_keys = next_reserved;
+      count.store(next_count, std::memory_order_release);
+    }
+
+    std::optional<uint32_t> erase_index_unlocked(uint64_t key) {
+      MapBundle *current = bundle_unlocked();
+      auto slot_id = current->find(key);
+      if (!slot_id)
+        return std::nullopt;
+      auto index = locators->load(*slot_id);
+      if (!index)
+        throw std::logic_error("removed key references an empty locator slot");
+      auto next = std::unique_ptr<MapBundle>(
+          clone_bundle_unlocked(map_capacity(reserved_keys)));
+      auto removed = next->remove(key);
+      if (!removed)
+        throw std::logic_error("key disappeared while rebuilding directory");
+      if (*removed != *slot_id)
+        throw std::logic_error(
+            "rebuilt directory returned the wrong locator slot");
+      auto slot_retirement = prepare_slot_retirement(*slot_id);
+      publish_bundle_unlocked(next.release());
+      slot_retirement.emplace(locators, *slot_id);
+      slot_retirement.publish();
+      count.fetch_sub(1, std::memory_order_release);
+      read_view->generation.fetch_add(1, std::memory_order_acq_rel);
+      return *index;
+    }
+
+    std::vector<uint32_t>
+    erase_indices_unlocked(std::span<const uint64_t> keys) {
+      if (keys.empty())
+        return {};
+      MapBundle *current = bundle_unlocked();
+      auto next = std::unique_ptr<MapBundle>(
+          clone_bundle_unlocked(map_capacity(reserved_keys)));
+      struct Removed {
+        uint32_t index;
+        uint32_t slot_id;
+      };
+      std::vector<Removed> removed;
+      removed.reserve(keys.size());
+      for (uint64_t key : keys) {
+        auto slot_id = current->find(key);
+        if (!slot_id)
+          continue;
+        auto index = locators->load(*slot_id);
+        if (!index)
+          throw std::logic_error(
+              "removed key references an empty locator slot");
+        auto erased = next->remove(key);
+        if (!erased)
+          continue;
+        if (*erased != *slot_id)
+          throw std::logic_error(
+              "rebuilt directory returned the wrong locator slot");
+        removed.push_back({*index, *slot_id});
+      }
+      if (removed.empty())
+        return {};
+      publish_bundle_unlocked(next.release());
+      for (const Removed entry : removed) {
+        auto slot_retirement = prepare_slot_retirement(entry.slot_id);
+        slot_retirement.emplace(locators, entry.slot_id);
+        slot_retirement.publish();
+      }
+      count.fetch_sub(removed.size(), std::memory_order_release);
+      std::vector<uint32_t> indices;
+      indices.reserve(removed.size());
+      for (const Removed entry : removed)
+        indices.push_back(entry.index);
+      return indices;
     }
   };
 
   struct SlotStore {
-    static constexpr size_t kInitialKeysPerShard = 2048;
+    static constexpr size_t kInitialKeysPerShard = 1;
+    static constexpr size_t kLiveWordsPerPage =
+        EmbeddingArena<ParamT>::kEntriesPerPage / 64;
+
+    class SinkImage {
+    public:
+      explicit SinkImage(size_t dim) : dim_(dim) {
+        if (dim_ == 0)
+          throw std::invalid_argument("sink image dimension is zero");
+        if (dim_ > std::numeric_limits<size_t>::max() / sizeof(ParamT)) {
+          throw std::overflow_error("sink image byte count overflows");
+        }
+        data_ = static_cast<ParamT *>(
+            ::operator new[](dim_ * sizeof(ParamT), std::align_val_t{64}));
+        try {
+          std::uninitialized_value_construct_n(data_, dim_);
+        } catch (...) {
+          ::operator delete[](data_, std::align_val_t{64});
+          throw;
+        }
+      }
+
+      ~SinkImage() {
+        std::destroy_n(data_, dim_);
+        ::operator delete[](data_, std::align_val_t{64});
+      }
+
+      SinkImage(const SinkImage &) = delete;
+      SinkImage &operator=(const SinkImage &) = delete;
+
+      ParamT *data() noexcept { return data_; }
+      const ParamT *data() const noexcept { return data_; }
+
+    private:
+      size_t dim_;
+      ParamT *data_ = nullptr;
+    };
+
+    struct PendingKey {
+      uint64_t key;
+      uint64_t seq_count;
+      uint32_t source_index;
+      uint32_t shard_id;
+      uint32_t source_page_position;
+      uint8_t cluster;
+    };
+
+    struct CompactionWorkspace {
+      std::vector<uint64_t> sorted_page_ids;
+      std::vector<PendingKey> pending;
+      std::vector<std::array<uint64_t, kLiveWordsPerPage>> source_clear_masks;
+      std::vector<uint32_t> source_cohort_shards;
+      std::vector<size_t> shard_counts;
+      std::vector<uint32_t> destination_indices;
+      std::vector<uint8_t> destination_pending;
+      std::vector<OptT> optimizer_state;
+      std::vector<size_t> migration_order;
+      std::vector<size_t> shard_offsets;
+      std::vector<size_t> shard_positions;
+      std::vector<uint8_t> pending_shards;
+      std::vector<size_t> next_shard_order;
+    };
 
     size_t dim;
+    std::atomic<uint64_t> lookup_generation{1};
+    std::shared_ptr<PageReuseState> page_reuse =
+        std::make_shared<PageReuseState>();
+    std::shared_ptr<RetirementPressure> retirement_pressure;
+    SinkImage sink;
     std::vector<std::unique_ptr<KeyShard>> key_shards;
     size_t shard_mask;
+    PageResidencyTelemetry page_telemetry;
+    StripedPageAccessTelemetry access_telemetry;
     EmbeddingArena<ParamT> arena;
+    SealedHotPagePool<ParamT> sealed_pages;
     pro::proxy<OptimizerFacade<ParamT, OptT>> optimizer;
     std::vector<std::unique_ptr<TransientArena<ParamT>>> transient_shards;
     OptimizerFactory opt_factory;
     uint64_t global_step = 0;
+    std::atomic<uint64_t> sealed_page_layout_generation{0};
+    std::shared_ptr<const SealedHotPage<ParamT>> last_promoted_hot_page;
+    mutable std::mutex promoted_hot_page_mutex;
+    execution::ReusableWorkspacePool<CompactionWorkspace> compaction_workspaces;
 
-    SlotStore(size_t d, OptimizerFactory opt_factory_in, size_t num_threads,
-              bool enable_score, PageStorage storage)
-        : dim(d), shard_mask(num_threads - 1), arena(d, enable_score, storage),
+    static void register_arena_page(void *context, uint64_t page_id) {
+      if (page_id > std::numeric_limits<uint32_t>::max())
+        throw std::overflow_error("arena page telemetry id overflows uint32");
+      static_cast<PageResidencyTelemetry *>(context)->register_resident(
+          static_cast<uint32_t>(page_id));
+    }
+
+    size_t index_retirement_bytes() const {
+      size_t bytes = arena.data_stride();
+      if constexpr (ScorePolicyT::kHasScore)
+        bytes += sizeof(uint64_t);
+      if (optimizer.has_value())
+        bytes += optimizer->allocation_bytes_per_entry();
+      return bytes;
+    }
+
+    SlotStore(size_t d, OptimizerFactory opt_factory_in, size_t partition_count,
+              size_t transient_shard_count, bool enable_score,
+              PageStorage storage,
+              std::shared_ptr<RetirementPressure> retirement_pressure,
+              bool numa_aware_pages)
+        : dim(d), retirement_pressure(std::move(retirement_pressure)), sink(d),
+          shard_mask(partition_count - 1),
+          page_telemetry(EmbeddingArena<ParamT>::kMaxPages),
+          access_telemetry(EmbeddingArena<ParamT>::kMaxPages, 4096,
+                           transient_shard_count),
+          arena(d, enable_score, storage, this->retirement_pressure,
+                &SlotStore::register_arena_page, &page_telemetry,
+                partition_count, numa_aware_pages),
+          sealed_pages(EmbeddingArena<ParamT>::kMaxPages,
+                       EmbeddingArena<ParamT>::kEntriesPerPage,
+                       static_cast<uint32_t>(d)),
           opt_factory(std::move(opt_factory_in)) {
       if (opt_factory.has_value()) {
         optimizer = (*opt_factory)(d);
@@ -407,27 +1642,37 @@ public:
               "dynamic learning-rate policy requires score storage");
         }
       }
+      if (!this->retirement_pressure)
+        throw std::invalid_argument("slot retirement pressure is null");
       if (optimizer.has_value())
         optimizer->set_page_eviction_enabled(enable_score);
-      for (size_t i = 0; i < num_threads; ++i) {
-        key_shards.push_back(std::make_unique<KeyShard>(kInitialKeysPerShard));
+      for (size_t i = 0; i < partition_count; ++i) {
+        key_shards.push_back(std::make_unique<KeyShard>(
+            kInitialKeysPerShard, page_reuse, this->retirement_pressure,
+            index_retirement_bytes(),
+            static_cast<unsigned>(std::countr_zero(partition_count))));
       }
-      for (size_t i = 0; i < num_threads; ++i) {
+      for (size_t i = 0; i < transient_shard_count; ++i) {
         transient_shards.push_back(
             std::make_unique<TransientArena<ParamT>>(d, storage, enable_score));
       }
+#if defined(PAGE_COMPACTION_SHARD_PROFILE)
+      configure_page_compaction_shard_profile(key_shards.size());
+#endif
     }
 
+    size_t shard_id_for_key(uint64_t key) const {
+      return SplitMixHash<KeyT>{}(static_cast<KeyT>(key)) & shard_mask;
+    }
+
+    size_t shard_id_for_hash(size_t hash) const { return hash & shard_mask; }
+
     KeyShard &shard_for_key(uint64_t key) {
-      size_t shard_id =
-          SplitMixHash<KeyT>{}(static_cast<KeyT>(key)) & shard_mask;
-      return *key_shards[shard_id];
+      return *key_shards[shard_id_for_key(key)];
     }
 
     const KeyShard &shard_for_key(uint64_t key) const {
-      size_t shard_id =
-          SplitMixHash<KeyT>{}(static_cast<KeyT>(key)) & shard_mask;
-      return *key_shards[shard_id];
+      return *key_shards[shard_id_for_key(key)];
     }
 
     std::optional<uint32_t> find(uint64_t key) {
@@ -435,30 +1680,576 @@ public:
       return shard.find(key);
     }
 
+    void observe_page_access(size_t worker, uint32_t index,
+                             uint32_t weight) noexcept {
+      access_telemetry.observe(
+          worker, index / EmbeddingArena<ParamT>::kEntriesPerPage, weight);
+    }
+
+    void observe_coaccess(size_t worker, std::span<const uint64_t> keys,
+                          uint32_t weight) noexcept {
+      access_telemetry.observe_coaccess_batch(worker, keys, weight);
+    }
+
+    static void consume_telemetry(void *context,
+                                  const TelemetryRing::Event &event) noexcept {
+      auto *slot = static_cast<SlotStore *>(context);
+      for (uint32_t index = 0; index < event.page_count; ++index)
+        slot->access_telemetry.observe(event.stripe, event.page_ids[index],
+                                       event.weight);
+      if (event.key_count != 0)
+        slot->access_telemetry.observe_coaccess_batch(
+            event.stripe,
+            std::span<const uint64_t>(event.keys.data(), event.key_count),
+            event.weight);
+    }
+
+    struct StablePageSnapshot {
+      uint64_t physical_page_id;
+      uint64_t bytes;
+      PageThermalSignal signal;
+      std::vector<uint64_t> keys;
+      std::vector<uint64_t> seq_counts;
+      std::vector<ParamT> values;
+    };
+
+    std::optional<StablePageSnapshot> snapshot_page(uint64_t page_id) {
+      if (page_id >= arena.page_count())
+        throw std::out_of_range("arena page snapshot id is out of range");
+      if (!arena.page_allocated(page_id))
+        return std::nullopt;
+      StablePageSnapshot snapshot{
+          page_id,
+          static_cast<uint64_t>(EmbeddingArena<ParamT>::kEntriesPerPage *
+                                arena.data_stride()),
+          {static_cast<float>(
+               access_telemetry.hits(static_cast<uint32_t>(page_id))),
+           0.0F, page_telemetry.residency_age(static_cast<uint32_t>(page_id))},
+          {},
+          {},
+          {}};
+      snapshot.keys.reserve(EmbeddingArena<ParamT>::kEntriesPerPage);
+      snapshot.seq_counts.reserve(EmbeddingArena<ParamT>::kEntriesPerPage);
+      snapshot.values.reserve(EmbeddingArena<ParamT>::kEntriesPerPage * dim);
+      const uint32_t first = static_cast<uint32_t>(
+          page_id * EmbeddingArena<ParamT>::kEntriesPerPage);
+      const uint32_t limit = static_cast<uint32_t>(
+          std::min(arena.allocated_count(),
+                   static_cast<size_t>(first) +
+                       EmbeddingArena<ParamT>::kEntriesPerPage));
+      for (uint32_t index = first; index < limit; ++index) {
+        auto owner = arena.owner_snapshot(index);
+        if (!owner.has_value())
+          continue;
+        bool copied = false;
+        with_shared_entry(owner->key, [&](uint32_t current) {
+          if (current != index)
+            return;
+          auto validated = arena.owner_snapshot(current);
+          if (!validated.has_value() ||
+              validated->seq_count != owner->seq_count ||
+              validated->key != owner->key ||
+              validated->shard_id != owner->shard_id)
+            return;
+          snapshot.keys.push_back(owner->key);
+          snapshot.seq_counts.push_back(owner->seq_count);
+          const ParamT *source = arena.data(current);
+          snapshot.values.insert(snapshot.values.end(), source, source + dim);
+          copied = true;
+        });
+        if (!copied)
+          continue;
+      }
+      if (snapshot.keys.empty())
+        return std::nullopt;
+      std::array<uint64_t, CoaccessSketch::kMaximumBatchSample> sample{};
+      const size_t sample_count = std::min(snapshot.keys.size(), sample.size());
+      std::copy_n(snapshot.keys.begin(), sample_count, sample.begin());
+      snapshot.signal.coaccess_density = access_telemetry.coaccess_density(
+          std::span<const uint64_t>(sample.data(), sample_count));
+      return snapshot;
+    }
+
+    std::vector<PageImageExport<ParamT, OptT>> materialize_page_images() {
+      const size_t optimizer_state_dim =
+          optimizer.has_value() ? optimizer->state_dim() : 0;
+      std::unordered_map<uint64_t, size_t> page_positions;
+      std::vector<PageImageExport<ParamT, OptT>> images;
+      std::mutex materialization_mutex;
+
+      const auto image_for_index =
+          [&](uint32_t index) -> PageImageExport<ParamT, OptT> & {
+        const uint64_t page_id =
+            index / EmbeddingArena<ParamT>::kEntriesPerPage;
+        const auto [position, inserted] =
+            page_positions.try_emplace(page_id, images.size());
+        if (inserted) {
+          images.push_back({page_id,
+                            static_cast<uint32_t>(dim),
+                            static_cast<uint32_t>(arena.data_stride()),
+                            {},
+                            {},
+                            {},
+                            {},
+                            {},
+                            {},
+                            {}});
+          auto &image = images.back();
+          image.slot_ordinals.reserve(EmbeddingArena<ParamT>::kEntriesPerPage);
+          image.keys.reserve(EmbeddingArena<ParamT>::kEntriesPerPage);
+          image.seq_counts.reserve(EmbeddingArena<ParamT>::kEntriesPerPage);
+          image.values.reserve(EmbeddingArena<ParamT>::kEntriesPerPage * dim);
+          if constexpr (ScorePolicyT::kHasScore)
+            image.scores.reserve(EmbeddingArena<ParamT>::kEntriesPerPage);
+          if (optimizer_state_dim != 0) {
+            image.optimizer_states.reserve(
+                EmbeddingArena<ParamT>::kEntriesPerPage * optimizer_state_dim);
+            image.steps.reserve(EmbeddingArena<ParamT>::kEntriesPerPage);
+          }
+        }
+        return images[position->second];
+      };
+
+      for (const auto &key_shard : key_shards) {
+        typename KeyShard::MapBundle *bundle = key_shard->bundle_unlocked();
+        bundle->for_each([&](uint64_t key, uint32_t slot_id) {
+          struct CapturedEntry {
+            uint32_t index = 0;
+            uint64_t seq_count = 0;
+            uint64_t score = 0;
+            uint32_t step = 0;
+            bool mapped = false;
+            std::vector<ParamT> values;
+            std::vector<OptT> optimizer_state;
+          } captured;
+          key_shard->locators->read(slot_id, [&](uint32_t index) {
+            captured.mapped = false;
+            const auto owner = arena.owner_snapshot(index);
+            if (!owner.has_value() || owner->key != key ||
+                owner->shard_id != shard_id_for_key(key))
+              return;
+
+            captured.index = index;
+            captured.seq_count = owner->seq_count;
+            captured.values.resize(dim);
+            const ParamT *source = arena.data(index);
+            simd::simd_copy(source, captured.values.data(), dim);
+            if constexpr (ScorePolicyT::kHasScore) {
+              captured.score = std::atomic_ref<uint64_t>(arena.score_raw(index))
+                                   .load(std::memory_order_relaxed);
+            }
+            if (optimizer_state_dim != 0) {
+              captured.optimizer_state.resize(optimizer_state_dim);
+              optimizer->state_data(index, captured.optimizer_state);
+              captured.step = optimizer->step_data(index);
+            }
+            captured.mapped = true;
+          });
+          if (!captured.mapped)
+            return;
+
+          std::lock_guard materialization_lock(materialization_mutex);
+          auto &image = image_for_index(captured.index);
+          image.slot_ordinals.push_back(
+              captured.index % EmbeddingArena<ParamT>::kEntriesPerPage);
+          image.keys.push_back(key);
+          image.seq_counts.push_back(captured.seq_count);
+          image.values.insert(image.values.end(), captured.values.begin(),
+                              captured.values.end());
+          if constexpr (ScorePolicyT::kHasScore)
+            image.scores.push_back(captured.score);
+          if (optimizer_state_dim != 0) {
+            image.optimizer_states.insert(image.optimizer_states.end(),
+                                          captured.optimizer_state.begin(),
+                                          captured.optimizer_state.end());
+            image.steps.push_back(captured.step);
+          }
+        });
+      }
+
+      for (auto &image : images) {
+        std::vector<size_t> order(image.slot_ordinals.size());
+        std::iota(order.begin(), order.end(), size_t{0});
+        std::ranges::sort(order, [&image](size_t left, size_t right) {
+          return image.slot_ordinals[left] < image.slot_ordinals[right];
+        });
+        const auto reorder = [&order](auto &column, size_t stride) {
+          if (column.empty())
+            return;
+          if (stride == 0 || column.size() != order.size() * stride)
+            throw std::logic_error("page-image column stride is inconsistent");
+          using Column = std::remove_reference_t<decltype(column)>;
+          Column reordered;
+          reordered.reserve(column.size());
+          for (size_t source : order) {
+            const auto first = column.begin() + source * stride;
+            reordered.insert(reordered.end(), first, first + stride);
+          }
+          column = std::move(reordered);
+        };
+        reorder(image.slot_ordinals, 1);
+        reorder(image.keys, 1);
+        reorder(image.seq_counts, 1);
+        reorder(image.values, dim);
+        reorder(image.scores, 1);
+        reorder(image.optimizer_states, optimizer_state_dim);
+        reorder(image.steps, 1);
+      }
+      std::ranges::sort(images, [](const auto &left, const auto &right) {
+        return left.physical_page_id < right.physical_page_id;
+      });
+      return images;
+    }
+
+    void
+    import_page_images(std::span<const PageImageImport<ParamT, OptT>> images) {
+      if (images.empty())
+        throw std::invalid_argument("page-image import requires images");
+      if (arena.allocated_count() != 0 || size() != 0)
+        throw std::logic_error("page-image import requires an empty slot");
+
+      uint64_t maximum_page_id = 0;
+      std::vector<uint64_t> page_ids;
+      page_ids.reserve(images.size());
+      std::unordered_set<uint64_t> imported_keys;
+      std::unordered_set<uint64_t> imported_slots;
+      size_t entry_count = 0;
+      for (const auto &import : images) {
+        const auto &image = import.image;
+        if (import.dim != dim || image.vector_dim != dim ||
+            image.vector_stride != arena.data_stride())
+          throw std::invalid_argument("page-image layout does not match slot");
+        const size_t optimizer_state_dim =
+            optimizer.has_value() ? optimizer->state_dim() : 0;
+        const size_t count = hogwild::io::validate_page_image(
+            import, dim, arena.data_stride(), ScorePolicyT::kHasScore,
+            optimizer_state_dim, EmbeddingArena<ParamT>::kEntriesPerPage);
+        page_ids.push_back(image.physical_page_id);
+        maximum_page_id = std::max(maximum_page_id, image.physical_page_id);
+        for (size_t offset = 0; offset < count; ++offset) {
+          const uint32_t ordinal = image.slot_ordinals[offset];
+          const uint64_t physical_slot =
+              image.physical_page_id * EmbeddingArena<ParamT>::kEntriesPerPage +
+              ordinal;
+          if (!imported_keys.insert(image.keys[offset]).second)
+            throw std::invalid_argument("page-image import has duplicate key");
+          if (!imported_slots.insert(physical_slot).second)
+            throw std::invalid_argument("page-image import has duplicate slot");
+        }
+        entry_count += count;
+      }
+      std::ranges::sort(page_ids);
+      if (std::ranges::adjacent_find(page_ids) != page_ids.end())
+        throw std::invalid_argument("page-image import has duplicate page ids");
+      if (maximum_page_id >= EmbeddingArena<ParamT>::kMaxPages)
+        throw std::out_of_range("page-image physical page id is out of range");
+
+      for (const auto &import : images) {
+        if (import.image.keys.empty())
+          throw std::invalid_argument(
+              "page-image has no keys for NUMA placement");
+        arena.reserve_exact_page(
+            import.image.physical_page_id,
+            static_cast<uint32_t>(shard_id_for_key(import.image.keys.front())));
+      }
+      for (const auto &import : images) {
+        const auto &image = import.image;
+        for (size_t offset = 0; offset < image.keys.size(); ++offset) {
+          const uint32_t index = static_cast<uint32_t>(
+              image.physical_page_id * EmbeddingArena<ParamT>::kEntriesPerPage +
+              image.slot_ordinals[offset]);
+          arena.bind_exact(index, static_cast<uint32_t>(
+                                      shard_id_for_key(image.keys[offset])));
+        }
+      }
+      const uint64_t allocation_count =
+          (maximum_page_id + 1) * EmbeddingArena<ParamT>::kEntriesPerPage;
+      if (allocation_count > std::numeric_limits<uint32_t>::max())
+        throw std::overflow_error("page-image allocation watermark overflows");
+      if (optimizer.has_value())
+        optimizer->reserve(static_cast<size_t>(allocation_count));
+
+      for (const auto &import : images) {
+        const auto &image = import.image;
+        for (size_t offset = 0; offset < image.keys.size(); ++offset) {
+          const uint32_t ordinal = image.slot_ordinals[offset];
+          if (ordinal >= EmbeddingArena<ParamT>::kEntriesPerPage)
+            throw std::out_of_range("page-image slot ordinal is out of range");
+          const uint32_t index = static_cast<uint32_t>(
+              image.physical_page_id * EmbeddingArena<ParamT>::kEntriesPerPage +
+              ordinal);
+          auto &key_shard = shard_for_key(image.keys[offset]);
+          std::unique_lock map_lock(key_shard.writer_mutex);
+          if (key_shard.find_unlocked(image.keys[offset]).has_value())
+            throw std::logic_error("page-image import has duplicate key");
+          if (arena.is_live(index))
+            throw std::logic_error("page-image import has duplicate slot");
+          if (optimizer.has_value())
+            optimizer->allocate(index);
+          arena.publish_owner_exact(
+              index, image.keys[offset],
+              static_cast<uint32_t>(shard_id_for_key(image.keys[offset])),
+              image.seq_counts[offset]);
+          simd::simd_copy(image.values.data() + offset * dim, arena.data(index),
+                          dim);
+          if constexpr (ScorePolicyT::kHasScore) {
+            const uint64_t score =
+                image.scores.empty() ? 0 : image.scores[offset];
+            std::atomic_ref<uint64_t>(arena.score_raw(index))
+                .store(score, std::memory_order_relaxed);
+          }
+          if (optimizer.has_value() && optimizer->state_dim() != 0) {
+            const size_t state_dim = optimizer->state_dim();
+            optimizer->set_state(
+                index, std::span<const OptT>(image.optimizer_states.data() +
+                                                 offset * state_dim,
+                                             state_dim));
+            optimizer->set_step(index, image.steps[offset]);
+          }
+          key_shard.insert_index_unlocked(image.keys[offset], index);
+          arena.mark_live(index, true);
+          key_shard.reserve_new_index();
+        }
+      }
+      arena.set_allocation_count(static_cast<uint32_t>(allocation_count));
+      if (size() != entry_count)
+        throw std::logic_error("page-image import entry count mismatch");
+    }
+
+    std::vector<std::shared_ptr<const SealedHotPage<ParamT>>>
+    seal_adaptive_pages(float memory_pressure,
+                        const AdaptivePageSelectorConfig &config,
+                        PageThermalTier tier, uint32_t cluster_id,
+                        uint64_t page_layout_generation) {
+      page_telemetry.advance_residency_epoch();
+      std::vector<StablePageSnapshot> snapshots;
+      snapshots.reserve(arena.page_count());
+      for (uint64_t page_id = 0; page_id < arena.page_count(); ++page_id) {
+        auto snapshot = snapshot_page(page_id);
+        if (snapshot.has_value())
+          snapshots.push_back(std::move(*snapshot));
+      }
+      if (snapshots.empty())
+        throw std::runtime_error("adaptive sealing has no live arena pages");
+      std::vector<std::vector<PageLayoutEntryView<ParamT>>> entries;
+      entries.reserve(snapshots.size());
+      std::vector<PageLayoutInput<ParamT>> inputs;
+      inputs.reserve(snapshots.size());
+      for (const StablePageSnapshot &snapshot : snapshots) {
+        auto &page_entries = entries.emplace_back();
+        page_entries.reserve(snapshot.keys.size());
+        for (size_t entry = 0; entry < snapshot.keys.size(); ++entry) {
+          page_entries.push_back(
+              {snapshot.keys[entry], snapshot.seq_counts[entry],
+               std::span<const ParamT>(snapshot.values.data() + entry * dim,
+                                       dim)});
+        }
+        inputs.push_back({snapshot.physical_page_id, snapshot.bytes,
+                          snapshot.signal, page_entries});
+      }
+      AdaptiveSealedPagePlanner<ParamT> planner(AdaptivePageSelector{},
+                                                sealed_pages);
+      return planner
+          .plan(inputs, memory_pressure, config, tier, cluster_id,
+                page_layout_generation)
+          .pages;
+    }
+
+    std::vector<uint64_t>
+    select_adaptive_pages(float memory_pressure,
+                          const AdaptivePageSelectorConfig &config) {
+      std::vector<uint64_t> ids;
+      std::vector<uint64_t> bytes;
+      std::vector<PageThermalSignal> signals;
+      for (uint64_t page_id = 0; page_id < arena.page_count(); ++page_id) {
+        if (page_reuse->unavailable(static_cast<uint32_t>(
+                page_id * EmbeddingArena<ParamT>::kEntriesPerPage)))
+          continue;
+        auto snapshot = snapshot_page(page_id);
+        if (!snapshot.has_value())
+          continue;
+        ids.push_back(snapshot->physical_page_id);
+        bytes.push_back(snapshot->bytes);
+        signals.push_back(snapshot->signal);
+      }
+      if (ids.empty())
+        throw std::runtime_error("adaptive compaction has no eligible pages");
+      return AdaptivePageSelector{}
+          .select(ids, signals, bytes, memory_pressure, config)
+          .page_ids;
+    }
+
+    size_t compact_adaptive_pages(float memory_pressure,
+                                  const AdaptivePageSelectorConfig &config) {
+      page_telemetry.advance_residency_epoch();
+      const std::vector<uint64_t> page_ids =
+          select_adaptive_pages(memory_pressure, config);
+      access_telemetry.decay(1);
+      return compact_pages(page_ids, true);
+    }
+
+    template <typename Visit>
+    bool with_shared_entry(uint64_t key, Visit &&visit) {
+      const size_t hash = SplitMixHash<KeyT>{}(static_cast<KeyT>(key));
+      return with_shared_entry_hashed(key, hash, std::forward<Visit>(visit));
+    }
+
+    template <typename Visit>
+    bool with_shared_entry_hashed(uint64_t key, size_t hash, Visit &&visit) {
+      auto &shard = *key_shards[hash & shard_mask];
+      struct TlsLookupEntry {
+        const SlotStore *owner = nullptr;
+        uint64_t key = 0;
+        uint32_t slot_id = 0;
+        const hogwild_internal::LocatorSlot *slot = nullptr;
+        uint64_t packed = 0;
+        uint64_t generation = 0;
+        uint64_t shard_generation = 0;
+        uint64_t table_identity = 0;
+      };
+      constexpr size_t kTlsLookupEntries = 1024;
+      thread_local std::array<TlsLookupEntry, kTlsLookupEntries> tls_cache{};
+      const unsigned kShardBits =
+          std::countr_zero(static_cast<size_t>(shard_mask + 1));
+      TlsLookupEntry &cached =
+          tls_cache[(hash >> kShardBits) & (kTlsLookupEntries - 1)];
+      const uint64_t generation =
+          lookup_generation.load(std::memory_order_acquire);
+      const uint64_t shard_generation =
+          shard.read_view->generation.load(std::memory_order_acquire);
+      const uint64_t table_identity = shard.read_view->table_identity;
+      if (cached.owner == this && cached.key == key && cached.slot_id != 0 &&
+          cached.generation == generation &&
+          cached.shard_generation == shard_generation &&
+          cached.table_identity == table_identity) {
+        const uint64_t before =
+            hogwild_internal::SegmentedLocatorTable::load_packed_at(
+                cached.slot);
+        if (before == cached.packed && (before >> 32 & 1U) == 0U) {
+          const auto index =
+              hogwild_internal::SegmentedLocatorTable::decode_packed(before);
+          if (!index.has_value())
+            throw std::logic_error("TLS locator cache references empty slot");
+          __builtin_prefetch(arena.data_trusted(*index), 0, 1);
+          visit(*index);
+          return true;
+        }
+      }
+      auto slot_id = shard.find_slot_hashed_unlocked(key, hash);
+      if (!slot_id.has_value())
+        return false;
+      const auto *locator = shard.read_view->locators->slot_address(*slot_id);
+      const uint64_t packed =
+          hogwild_internal::SegmentedLocatorTable::load_packed_at(locator);
+      const auto index =
+          hogwild_internal::SegmentedLocatorTable::decode_packed(packed);
+      if (!index.has_value())
+        throw std::logic_error(
+            "key directory references an empty locator slot");
+      __builtin_prefetch(arena.data_trusted(*index), 0, 1);
+      visit(*index);
+      cached = {this,   key,        *slot_id,         locator,
+                packed, generation, shard_generation, table_identity};
+      return true;
+    }
+
+    template <typename Visit>
+    bool with_read_view_entry_hashed(uint64_t key, size_t hash,
+                                     Visit &&visit) const {
+      const auto &shard = *key_shards[hash & shard_mask];
+      const auto slot_id = shard.find_slot_hashed_unlocked(key, hash);
+      if (!slot_id.has_value())
+        return false;
+      const uint64_t packed = shard.read_view->locators->load_packed(*slot_id);
+      const auto index =
+          hogwild_internal::SegmentedLocatorTable::decode_packed(packed);
+      if (!index.has_value())
+        throw std::logic_error(
+            "key directory references an empty locator slot");
+      visit(*index);
+      return true;
+    }
+
+    template <typename Visit>
+    bool with_shared_write_entry(uint64_t key, Visit &&visit) {
+      const size_t hash = SplitMixHash<KeyT>{}(static_cast<KeyT>(key));
+      return with_shared_write_entry_hashed(key, hash,
+                                            std::forward<Visit>(visit));
+    }
+
+    template <typename Visit>
+    bool with_shared_write_entry_hashed(uint64_t key, size_t hash,
+                                        Visit &&visit) {
+      auto &shard = *key_shards[hash & shard_mask];
+      while (true) {
+        auto slot_id = shard.find_slot_hashed_unlocked(key, hash);
+        if (!slot_id.has_value())
+          return false;
+        if (shard.locators->requires_rotation(*slot_id)) {
+          std::unique_lock lock(shard.writer_mutex);
+          const auto current = shard.find_locator_unlocked(key);
+          if (!current.has_value())
+            return false;
+          if (current->slot_id != *slot_id ||
+              !shard.locators->requires_rotation(current->slot_id))
+            continue;
+          shard.rotate_locator_unlocked(key, current->slot_id);
+          continue;
+        }
+        try {
+          shard.locators->write(
+              *slot_id,
+              [&](uint32_t index, std::atomic<uint64_t> &) { visit(index); });
+          return true;
+        } catch (const hogwild_internal::LocatorSequenceExhausted &) {
+        }
+      }
+    }
+
+    template <typename Visit>
+    bool assign_existing(uint64_t key, Visit &&visit) {
+      return with_shared_write_entry(key, std::forward<Visit>(visit));
+    }
+
+    template <typename Visit>
+    bool assign_existing_hashed(uint64_t key, size_t hash, Visit &&visit) {
+      return with_shared_write_entry_hashed(key, hash,
+                                            std::forward<Visit>(visit));
+    }
+
     template <typename Fn> void for_each(Fn &&fn) {
       for (auto &shard : key_shards) {
-        std::shared_lock lock(shard->map_mutex);
-        shard->bundle->key_map.for_each(fn);
+        typename KeyShard::MapBundle *bundle = shard->bundle_unlocked();
+        bundle->for_each([&](uint64_t key, uint32_t slot_id) {
+          auto index = shard->locators->load(slot_id);
+          if (!index)
+            throw std::logic_error(
+                "key directory references an empty locator slot");
+          fn(key, *index);
+        });
       }
     }
 
     size_t size() {
       size_t total = 0;
       for (auto &shard : key_shards) {
-        std::shared_lock lock(shard->map_mutex);
-        total += shard->count;
+        total += shard->count.load(std::memory_order_acquire);
       }
       return total;
     }
 
     void clear_keys() {
+      lookup_generation.fetch_add(1, std::memory_order_acq_rel);
       for (auto &shard : key_shards) {
-        shard = std::make_unique<KeyShard>(shard->reserved_keys);
+        shard = std::make_unique<KeyShard>(
+            shard->reserved_keys, page_reuse, retirement_pressure,
+            index_retirement_bytes(),
+            static_cast<unsigned>(std::countr_zero(shard_mask + 1)));
       }
     }
 
-    uint32_t allocate_entry() {
-      uint32_t idx = arena.allocate([&](uint32_t candidate) {
+    uint32_t allocate_entry(uint32_t shard_id) {
+      uint32_t idx = arena.allocate_fresh(shard_id, [&](uint32_t candidate) {
         if (optimizer.has_value() && optimizer->capacity() <= candidate) {
           optimizer->reserve(static_cast<size_t>(candidate) + 1);
         }
@@ -468,75 +2259,222 @@ public:
       return idx;
     }
 
-    template <typename Initialize>
-    std::pair<uint32_t, bool> find_or_insert(uint64_t key,
-                                             Initialize &&initialize) {
-      auto &key_shard = shard_for_key(key);
-      if (auto existing = key_shard.find(key))
-        return {*existing, false};
+    uint32_t allocate_compaction_destination(uint32_t shard_id) {
+      uint32_t idx = arena.allocate_fresh(
+          shard_id,
+          [&](uint32_t candidate) {
+            if (optimizer.has_value() && optimizer->capacity() <= candidate)
+              optimizer->reserve(static_cast<size_t>(candidate) + 1);
+          },
+          [&](uint32_t candidate) {
+            return page_reuse->destination_available(candidate);
+          });
+      if (optimizer.has_value())
+        optimizer->allocate(idx);
+      return idx;
+    }
 
-      std::unique_lock map_lock(key_shard.map_mutex);
-      if (auto existing = key_shard.find_unlocked(key))
-        return {*existing, false};
+    uint32_t allocate_entry_range(size_t count) {
+#if defined(PAGE_COMPACTION_DEEP_PROFILE)
+      const auto destination_ready_started = std::chrono::steady_clock::now();
+#endif
+      const uint32_t first =
+          arena.allocate_range(count, [&](uint32_t, uint32_t end) {
+            if (optimizer.has_value() && optimizer->capacity() < end)
+              optimizer->reserve(end);
+          });
+#if defined(PAGE_COMPACTION_DEEP_PROFILE)
+      const uint32_t last = static_cast<uint32_t>(first + count - 1);
+      page_compaction_profile.destination_ready_ns.fetch_add(
+          std::chrono::duration_cast<std::chrono::nanoseconds>(
+              std::chrono::steady_clock::now() - destination_ready_started)
+              .count(),
+          std::memory_order_relaxed);
+      page_compaction_profile.destination_ready_calls.fetch_add(
+          1, std::memory_order_relaxed);
+      page_compaction_profile.destination_ready_pages.fetch_add(
+          last / EmbeddingArena<ParamT>::kEntriesPerPage -
+              first / EmbeddingArena<ParamT>::kEntriesPerPage + 1,
+          std::memory_order_relaxed);
+#endif
+      return first;
+    }
 
-      if (key_shard.count >= key_shard.reserved_keys) {
-        size_t new_size = KeyShard::compute_next_capacity(
-            key_shard.reserved_keys, key_shard.count + 1);
-        key_shard.expand(new_size);
+    struct BatchEntry {
+      uint64_t key;
+      size_t hash;
+      size_t position;
+    };
+
+    template <typename Initialize, typename Visit>
+    void find_or_insert_batch(std::span<const BatchEntry> entries,
+                              Initialize &&initialize, Visit &&visit,
+                              bool write_existing_payload) {
+      if (entries.empty())
+        return;
+      struct ExistingEntry {
+        BatchEntry entry;
+        uint32_t slot_id;
+      };
+      struct ShardBatch {
+        std::vector<ExistingEntry> existing;
+        std::vector<BatchEntry> candidates;
+        std::vector<BatchEntry> inserted;
+        std::vector<BatchEntry> sink_entries;
+        std::vector<uint64_t> inserted_keys;
+        std::vector<uint32_t> inserted_indices;
+        struct PendingAllocation {
+          BatchEntry entry;
+          uint32_t index;
+          bool recycled = false;
+        };
+        std::vector<PendingAllocation> allocations;
+      };
+      std::vector<ShardBatch> by_shard(key_shards.size());
+      for (ShardBatch &batch : by_shard) {
+        batch.existing.reserve(entries.size() / by_shard.size() + 1);
+        batch.candidates.reserve(entries.size() / by_shard.size() + 1);
+        batch.inserted.reserve(entries.size() / by_shard.size() + 1);
+        batch.sink_entries.reserve(entries.size() / by_shard.size() + 1);
+        batch.inserted_keys.reserve(entries.size() / by_shard.size() + 1);
+        batch.inserted_indices.reserve(entries.size() / by_shard.size() + 1);
+        batch.allocations.reserve(entries.size() / by_shard.size() + 1);
       }
-
-      std::optional<uint32_t> preallocated_idx;
-      bool was_inserted = false;
-      auto upsert = [&](std::optional<uint32_t> existing) -> uint32_t {
-        was_inserted = !existing.has_value();
-        if (existing.has_value())
-          return *existing;
-        uint32_t idx;
-        if (preallocated_idx.has_value()) {
-          idx = *preallocated_idx;
-        } else if (!key_shard.recycled_indices.empty()) {
-          idx = key_shard.recycled_indices.back();
-          key_shard.recycled_indices.pop_back();
-          preallocated_idx = idx;
-          arena.prepare_reused(idx);
-          if (optimizer.has_value())
-            optimizer->allocate(idx);
-        } else {
-          key_shard.prepare_new_index();
-          idx = allocate_entry();
-          ++key_shard.owned_index_count;
-          preallocated_idx = idx;
-        }
-        initialize(idx);
-        return idx;
-      };
-      auto update = [&](std::optional<typename Key::Entry> entry) {
-        return std::make_pair(
-            key, upsert(entry ? std::optional(entry->get_entry().second)
-                              : std::nullopt));
-      };
-      auto construct = [&](const auto &entry) {
-        auto map_key = Key::Entry::make_key(key);
-        return key_shard.bundle->entries.make_entry(map_key, update(entry));
-      };
-      std::optional<std::pair<uint64_t, uint32_t>> published;
+      auto pressure_call = retirement_pressure->writer_call();
+      pressure_call.apply();
+      auto retirement_admission = retirement_pressure->try_control_plane_call();
+      for (const BatchEntry &entry : entries)
+        by_shard[shard_id_for_hash(entry.hash)].candidates.push_back(entry);
       try {
-        published = key_shard.bundle->key_map.Upsert(Key::Entry::make_key(key),
-                                                     construct, update);
+        for (size_t shard_id = 0; shard_id < by_shard.size(); ++shard_id) {
+          ShardBatch &batch = by_shard[shard_id];
+          if (batch.candidates.empty())
+            continue;
+          auto &key_shard = *key_shards[shard_id];
+          std::unique_lock writer_lock(key_shard.writer_mutex);
+          for (const BatchEntry &entry : batch.candidates) {
+            auto located =
+                key_shard.find_slot_hashed_unlocked(entry.key, entry.hash);
+            std::optional<typename KeyShard::LocatorRef> resolved;
+            if (located.has_value()) {
+              auto index = key_shard.locators->load(*located);
+              if (!index)
+                throw std::logic_error(
+                    "key directory references an empty locator slot");
+              resolved = typename KeyShard::LocatorRef{*located, *index};
+            }
+            if (resolved.has_value()) {
+              if (key_shard.locators->requires_rotation(resolved->slot_id))
+                resolved = key_shard.rotate_locator_unlocked(entry.key,
+                                                             resolved->slot_id);
+              batch.existing.push_back({entry, resolved->slot_id});
+              continue;
+            }
+            if (!retirement_admission.admitted()) {
+              retirement_pressure->record_sink_hit();
+              batch.sink_entries.push_back(entry);
+              continue;
+            }
+            batch.inserted.push_back(entry);
+          }
+        }
+
+        struct AllocationOrder {
+          size_t shard_id;
+          const BatchEntry *entry;
+        };
+        std::vector<AllocationOrder> allocation_order;
+        allocation_order.reserve(entries.size());
+        for (size_t shard_id = 0; shard_id < by_shard.size(); ++shard_id) {
+          for (const BatchEntry &entry : by_shard[shard_id].inserted)
+            allocation_order.push_back({shard_id, &entry});
+        }
+        std::ranges::sort(
+            allocation_order, {},
+            [](const AllocationOrder &item) { return item.entry->position; });
+        for (const AllocationOrder &item : allocation_order) {
+          auto &key_shard = *key_shards[item.shard_id];
+          uint32_t arena_index;
+          if (auto recycled = key_shard.take_recycled_index()) {
+            arena_index = *recycled;
+            arena.prepare_reused(arena_index);
+            if (optimizer.has_value())
+              optimizer->allocate(arena_index);
+          } else {
+            key_shard.reserve_new_index();
+            arena_index = allocate_entry(static_cast<uint32_t>(item.shard_id));
+          }
+          by_shard[item.shard_id].allocations.push_back(
+              {*item.entry, arena_index});
+        }
+
+        for (size_t shard_id = 0; shard_id < by_shard.size(); ++shard_id) {
+          ShardBatch &batch = by_shard[shard_id];
+          if (batch.allocations.empty())
+            continue;
+          auto &key_shard = *key_shards[shard_id];
+          std::unique_lock writer_lock(key_shard.writer_mutex);
+          batch.inserted.clear();
+          for (auto &allocation : batch.allocations) {
+            auto located = key_shard.find_slot_hashed_unlocked(
+                allocation.entry.key, allocation.entry.hash);
+            if (located.has_value()) {
+              auto index = key_shard.locators->load(*located);
+              if (!index)
+                throw std::logic_error(
+                    "key directory references an empty locator slot");
+              batch.existing.push_back({allocation.entry, *located});
+              key_shard.recycle_unpublished_index(allocation.index);
+              allocation.recycled = true;
+              continue;
+            }
+            arena.publish_owner(allocation.index, allocation.entry.key,
+                                static_cast<uint32_t>(shard_id));
+            initialize(allocation.entry, allocation.index);
+            batch.inserted.push_back(allocation.entry);
+            batch.inserted_keys.push_back(allocation.entry.key);
+            batch.inserted_indices.push_back(allocation.index);
+          }
+          if (batch.inserted_keys.empty())
+            continue;
+          key_shards[shard_id]->publish_indices_batch_unlocked(
+              batch.inserted_keys, batch.inserted_indices);
+          for (uint32_t index : batch.inserted_indices)
+            arena.mark_live(index, true);
+        }
       } catch (...) {
-        if (preallocated_idx.has_value())
-          key_shard.recycled_indices.push_back(*preallocated_idx);
+        for (size_t shard_id = 0; shard_id < by_shard.size(); ++shard_id) {
+          ShardBatch &batch = by_shard[shard_id];
+          for (auto &allocation : batch.allocations) {
+            if (allocation.recycled)
+              continue;
+            arena.mark_live(allocation.index, false);
+            key_shards[shard_id]->recycle_unpublished_index(allocation.index);
+          }
+        }
         throw;
       }
-
-      if (was_inserted) {
-        ++key_shard.count;
+      for (size_t shard_id = 0; shard_id < by_shard.size(); ++shard_id) {
+        ShardBatch &batch = by_shard[shard_id];
+        auto &key_shard = *key_shards[shard_id];
+        for (const ExistingEntry &entry : batch.existing) {
+          if (write_existing_payload) {
+            key_shard.locators->write(
+                entry.slot_id, [&](uint32_t index, std::atomic<uint64_t> &) {
+                  visit(entry.entry, index, false, false);
+                });
+          } else {
+            key_shard.locators->read(entry.slot_id, [&](uint32_t index) {
+              visit(entry.entry, index, false, false);
+            });
+          }
+        }
+        for (size_t index = 0; index < batch.inserted.size(); ++index)
+          visit(batch.inserted[index], batch.inserted_indices[index], true,
+                false);
+        for (const BatchEntry &entry : batch.sink_entries)
+          visit(entry, 0, false, true);
       }
-
-      if (preallocated_idx.has_value() && !was_inserted)
-        key_shard.recycled_indices.push_back(*preallocated_idx);
-      return {was_inserted ? *preallocated_idx : published->second,
-              was_inserted};
     }
 
     void reserve(size_t keys_count) {
@@ -554,8 +2492,8 @@ public:
       }
       size_t total_keys = 0;
       for (size_t i = 0; i < counts.size(); ++i) {
-        std::shared_lock map_lock(key_shards[i]->map_mutex);
-        size_t current_size = key_shards[i]->count;
+        size_t current_size =
+            key_shards[i]->count.load(std::memory_order_acquire);
         size_t target_keys = std::max(counts[i], current_size);
         if (target_keys > std::numeric_limits<size_t>::max() - total_keys) {
           throw std::overflow_error(
@@ -564,8 +2502,9 @@ public:
         total_keys += target_keys;
       }
       for (size_t i = 0; i < counts.size(); ++i) {
-        std::unique_lock map_lock(key_shards[i]->map_mutex);
-        size_t current_size = key_shards[i]->count;
+        std::unique_lock map_lock(key_shards[i]->writer_mutex);
+        size_t current_size =
+            key_shards[i]->count.load(std::memory_order_acquire);
         size_t target_keys = std::max(counts[i], current_size);
         if (target_keys <= key_shards[i]->reserved_keys) {
           continue;
@@ -574,93 +2513,823 @@ public:
       }
       size_t arena_capacity =
           std::max(total_keys, static_cast<size_t>(arena.allocated_count()));
-      arena.reserve_entries(arena_capacity);
+      if (!arena.numa_aware_pages())
+        arena.reserve_entries(arena_capacity);
       if (optimizer.has_value()) {
         optimizer->reserve(arena_capacity);
       }
     }
-  };
 
-  // =========================================================================
-  // StorePageEvictionProxy — PageEvictionProxy implementation that aggregates
-  // per-entry scores within each 4096-entry Arena page to produce a page-level
-  // heat score.  Registered with PageStorage so the background swap thread
-  // can determine cold pages without any hot-path overhead.
-  //
-  // page_idx is the monotonically-assigned index stored in PageRecord. Each
-  // arena data and score page registers its own evaluator under that index.
-  // =========================================================================
-  class StorePageEvictionProxy {
-  public:
-    explicit StorePageEvictionProxy(
-        std::shared_ptr<std::shared_mutex> lifecycle_mutex)
-        : lifecycle_mutex_(std::move(lifecycle_mutex)) {}
-
-    bool evaluate_page(size_t page_idx, uint64_t &score) {
-      std::function<uint64_t()> evaluator;
-      {
-        std::lock_guard lock(mutex_);
-        auto it = evaluators_.find(page_idx);
-        if (it == evaluators_.end())
+    bool relocate_key_to_destination(
+        uint64_t key, uint32_t destination, bool initialize_destination,
+        std::optional<std::pair<uint32_t, uint64_t>> expected_source =
+            std::nullopt,
+        bool retire_source_slot = true) {
+      auto &key_shard = shard_for_key(key);
+      bool locator_published = false;
+      try {
+        if (initialize_destination) {
+          arena.prepare_unpublished(destination);
+          if (optimizer.has_value())
+            optimizer->allocate(destination);
+        }
+        std::optional<std::pair<uint32_t, uint64_t>> source = expected_source;
+        if (!source.has_value()) {
+          with_shared_entry(key, [&](uint32_t index) {
+            auto owner = arena.owner_snapshot(index);
+            if (!owner.has_value() || owner->key != key ||
+                owner->shard_id != shard_id_for_key(key)) {
+              throw std::logic_error(
+                  "live entry owner does not match key shard");
+            }
+            source = std::make_pair(index, owner->seq_count);
+          });
+        }
+        if (!source.has_value()) {
+          key_shard.recycle_unpublished_index(destination);
           return false;
-        evaluator = it->second;
+        }
+        const size_t optimizer_state_dim =
+            optimizer.has_value() ? optimizer->state_dim() : 0;
+        std::vector<OptT> optimizer_state(optimizer_state_dim);
+        std::unique_lock map_lock(key_shard.writer_mutex);
+        auto current = key_shard.find_locator_unlocked(key);
+        if (!current.has_value() || current->index != source->first) {
+          key_shard.recycle_unpublished_index(destination);
+          return false;
+        }
+        auto current_owner = arena.owner_snapshot(current->index);
+        if (!current_owner.has_value() || current_owner->key != key ||
+            current_owner->shard_id != shard_id_for_key(key) ||
+            current_owner->seq_count != source->second) {
+          key_shard.recycle_unpublished_index(destination);
+          return false;
+        }
+        if (key_shard.locators->requires_rotation(current->slot_id))
+          current = key_shard.rotate_locator_unlocked(key, current->slot_id);
+        const bool relocated = key_shard.locators->relocate(
+            current->slot_id, source->first, destination,
+            [&](uint32_t locked_index) {
+              arena.publish_owner(destination, key,
+                                  static_cast<uint32_t>(shard_id_for_key(key)));
+              simd::simd_copy(arena.data(locked_index), arena.data(destination),
+                              dim);
+              if constexpr (ScorePolicyT::kHasScore) {
+                const uint64_t score =
+                    std::atomic_ref<uint64_t>(arena.score_raw(locked_index))
+                        .load(std::memory_order_relaxed);
+                std::atomic_ref<uint64_t>(arena.score_raw(destination))
+                    .store(score, std::memory_order_relaxed);
+              }
+              if (optimizer.has_value()) {
+                if (optimizer_state_dim != 0) {
+                  optimizer->state_data(locked_index,
+                                        std::span<OptT>(optimizer_state));
+                  optimizer->set_state(destination,
+                                       std::span<const OptT>(optimizer_state));
+                }
+                optimizer->set_step(destination,
+                                    optimizer->step_data(locked_index));
+              }
+              arena.mark_live(destination, true);
+            });
+        if (!relocated) {
+          key_shard.recycle_unpublished_index(destination);
+          return false;
+        }
+
+        locator_published = true;
+        arena.mark_live(current->index, false);
+        if (retire_source_slot)
+          key_shard.retire_published_index(current->index);
+        return true;
+      } catch (...) {
+        if (!locator_published) {
+          arena.mark_live(destination, false);
+          key_shard.recycle_unpublished_index(destination);
+        }
+        throw;
       }
-      score = evaluator();
+    }
+
+    void copy_source_key_to_destination(uint64_t key, uint32_t source_index,
+                                        uint32_t destination,
+                                        uint32_t expected_shard_id,
+                                        std::span<OptT> optimizer_state) {
+#if defined(PAGE_COMPACTION_DEEP_PROFILE)
+      const auto owner_publish_started = std::chrono::steady_clock::now();
+#endif
+      arena.publish_owner(destination, key, expected_shard_id);
+#if defined(PAGE_COMPACTION_DEEP_PROFILE)
+      page_compaction_profile.owner_publish_ns.fetch_add(
+          std::chrono::duration_cast<std::chrono::nanoseconds>(
+              std::chrono::steady_clock::now() - owner_publish_started)
+              .count(),
+          std::memory_order_relaxed);
+      page_compaction_profile.owner_publish_calls.fetch_add(
+          1, std::memory_order_relaxed);
+#endif
+      simd::simd_copy(arena.data(source_index), arena.data(destination), dim);
+      if constexpr (ScorePolicyT::kHasScore) {
+        const uint64_t score =
+            std::atomic_ref<uint64_t>(arena.score_raw(source_index))
+                .load(std::memory_order_relaxed);
+        std::atomic_ref<uint64_t>(arena.score_raw(destination))
+            .store(score, std::memory_order_relaxed);
+      }
+      if (optimizer.has_value()) {
+        if (!optimizer_state.empty()) {
+          optimizer->state_data(source_index, optimizer_state);
+          optimizer->set_state(destination, optimizer_state);
+        }
+        optimizer->set_step(destination, optimizer->step_data(source_index));
+      }
+    }
+
+    bool relocate_expected_key_with_locked_shard(
+        uint64_t key, uint32_t source_index, uint64_t source_seq_count,
+        uint32_t destination, uint32_t expected_shard_id, KeyShard &key_shard,
+        std::span<OptT> optimizer_state, bool &locator_published) {
+#if defined(PAGE_COMPACTION_DEEP_PROFILE)
+      const auto locator_lookup_started = std::chrono::steady_clock::now();
+#endif
+      auto current = key_shard.find_locator_unlocked(key);
+#if defined(PAGE_COMPACTION_DEEP_PROFILE)
+      page_compaction_profile.locator_lookup_ns.fetch_add(
+          std::chrono::duration_cast<std::chrono::nanoseconds>(
+              std::chrono::steady_clock::now() - locator_lookup_started)
+              .count(),
+          std::memory_order_relaxed);
+      page_compaction_profile.locator_lookup_calls.fetch_add(
+          1, std::memory_order_relaxed);
+#endif
+      if (!current.has_value() || current->index != source_index)
+        return false;
+#if defined(PAGE_COMPACTION_DEEP_PROFILE)
+      const auto owner_validate_started = std::chrono::steady_clock::now();
+#endif
+      auto current_owner = arena.owner_snapshot(current->index);
+#if defined(PAGE_COMPACTION_DEEP_PROFILE)
+      page_compaction_profile.owner_validate_ns.fetch_add(
+          std::chrono::duration_cast<std::chrono::nanoseconds>(
+              std::chrono::steady_clock::now() - owner_validate_started)
+              .count(),
+          std::memory_order_relaxed);
+      page_compaction_profile.owner_validate_calls.fetch_add(
+          1, std::memory_order_relaxed);
+#endif
+      if (!current_owner.has_value() || current_owner->key != key ||
+          current_owner->shard_id != expected_shard_id ||
+          current_owner->seq_count != source_seq_count) {
+        return false;
+      }
+      if (key_shard.locators->requires_rotation(current->slot_id))
+        current = key_shard.rotate_locator_unlocked(key, current->slot_id);
+#if defined(PAGE_COMPACTION_DEEP_PROFILE)
+      const auto locator_publish_started = std::chrono::steady_clock::now();
+#endif
+      if (!key_shard.locators->relocate(
+              current->slot_id, source_index, destination,
+              [&](uint32_t locked_index) {
+                copy_source_key_to_destination(key, locked_index, destination,
+                                               expected_shard_id,
+                                               optimizer_state);
+                arena.mark_live(destination, true);
+              }))
+        return false;
+#if defined(PAGE_COMPACTION_DEEP_PROFILE)
+      page_compaction_profile.locator_publish_ns.fetch_add(
+          std::chrono::duration_cast<std::chrono::nanoseconds>(
+              std::chrono::steady_clock::now() - locator_publish_started)
+              .count(),
+          std::memory_order_relaxed);
+      page_compaction_profile.locator_publish_calls.fetch_add(
+          1, std::memory_order_relaxed);
+#endif
+      locator_published = true;
       return true;
     }
 
-    void register_page(size_t page_idx, std::function<uint64_t()> evaluator) {
-      std::lock_guard lock(mutex_);
-      evaluators_[page_idx] = std::move(evaluator);
+    bool compact_key(uint64_t key) {
+      auto &key_shard = shard_for_key(key);
+      if (!with_shared_entry(key, [](uint32_t) {}))
+        return false;
+      uint32_t destination;
+      if (auto recycled = key_shard.take_recycled_index()) {
+        destination = *recycled;
+        try {
+          arena.prepare_reused(destination);
+          if (optimizer.has_value())
+            optimizer->allocate(destination);
+        } catch (...) {
+          key_shard.recycle_unpublished_index(destination);
+          throw;
+        }
+      } else {
+        key_shard.reserve_new_index();
+        destination =
+            allocate_entry(static_cast<uint32_t>(shard_id_for_key(key)));
+      }
+      return relocate_key_to_destination(key, destination, false);
     }
 
-    void unregister_page(size_t page_idx) noexcept {
-      std::lock_guard lock(mutex_);
-      evaluators_.erase(page_idx);
+    size_t compact_page(uint64_t page_id) {
+      return compact_pages(std::span<const uint64_t>(&page_id, 1), false);
     }
 
-    bool score_enabled() const noexcept { return true; }
+    // Promote only the hottest keys from one physical page.  The source page
+    // is put into draining state so no new allocation can reuse its slots,
+    // but it is deliberately not retired: cold keys remain addressable in
+    // that page.  The authoritative shard directory is updated by the same
+    // relocation transaction used by full compaction.
+    size_t promote_hot_keys(uint64_t page_id, size_t maximum_keys,
+                            uint64_t minimum_score) {
+      if constexpr (!ScorePolicyT::kHasScore) {
+        throw std::runtime_error(
+            "hot-key promotion requires a score-enabled policy");
+      } else {
+        if (maximum_keys == 0)
+          throw std::invalid_argument("hot-key promotion maximum is zero");
+        if (page_id >= arena.page_count())
+          throw std::out_of_range("hot-key promotion page id is out of range");
+        if (!arena.page_allocated(page_id))
+          throw std::logic_error("hot-key promotion source page is retired");
 
-    void lock_shared() { lifecycle_mutex_->lock_shared(); }
-    void unlock_shared() noexcept { lifecycle_mutex_->unlock_shared(); }
-    void lock() { lifecycle_mutex_->lock(); }
-    void unlock() noexcept { lifecycle_mutex_->unlock(); }
+        struct Candidate {
+          uint64_t key;
+          uint64_t score;
+        };
+        std::vector<Candidate> candidates;
+        candidates.reserve(EmbeddingArena<ParamT>::kEntriesPerPage);
+        const uint32_t first = static_cast<uint32_t>(
+            page_id * EmbeddingArena<ParamT>::kEntriesPerPage);
+        const uint32_t limit = static_cast<uint32_t>(
+            std::min(arena.allocated_count(),
+                     static_cast<size_t>(first) +
+                         EmbeddingArena<ParamT>::kEntriesPerPage));
+        for (uint32_t index = first; index < limit; ++index) {
+          auto owner = arena.owner_snapshot(index);
+          if (!owner.has_value())
+            continue;
+          const uint64_t score =
+              std::atomic_ref<uint64_t>(arena.score_raw(index))
+                  .load(std::memory_order_relaxed);
+          if (score >= minimum_score)
+            candidates.push_back({owner->key, score});
+        }
+        std::ranges::sort(candidates,
+                          [](const Candidate &left, const Candidate &right) {
+                            if (left.score != right.score)
+                              return left.score > right.score;
+                            return left.key < right.key;
+                          });
+        if (candidates.size() > maximum_keys)
+          candidates.resize(maximum_keys);
+        if (candidates.empty())
+          return 0;
 
-  private:
-    std::shared_ptr<std::shared_mutex> lifecycle_mutex_;
-    std::mutex mutex_;
-    std::unordered_map<size_t, std::function<uint64_t()>> evaluators_;
+        page_reuse->begin_draining(page_id);
+        arena.advance_allocation_past_page(page_id);
+        auto reservation = sealed_pages.reserve(
+            PageThermalTier::kHot, static_cast<uint32_t>(page_id),
+            sealed_page_layout_generation.fetch_add(1,
+                                                    std::memory_order_relaxed) +
+                1);
+        size_t promoted = 0;
+        for (const Candidate &candidate : candidates) {
+          if (!compact_key(candidate.key))
+            continue;
+          with_shared_entry(candidate.key, [&](uint32_t index) {
+            auto owner = arena.owner_snapshot(index);
+            if (!owner.has_value() || owner->key != candidate.key)
+              throw std::logic_error("promoted hot-key owner is unstable");
+            reservation.builder.append(
+                candidate.key, owner->seq_count,
+                std::span<const ParamT>(arena.data(index), dim));
+          });
+          ++promoted;
+        }
+        if (promoted != 0) {
+          auto published = sealed_pages.publish(std::move(reservation));
+          std::lock_guard lock(promoted_hot_page_mutex);
+          last_promoted_hot_page = std::move(published);
+        }
+        return promoted;
+      }
+    }
+
+    size_t promoted_hot_page_size() const {
+      std::lock_guard lock(promoted_hot_page_mutex);
+      if (last_promoted_hot_page == nullptr)
+        return 0;
+      return last_promoted_hot_page->layout().entry_count;
+    }
+
+    size_t compact_pages(std::span<const uint64_t> page_ids,
+                         bool cluster_by_coaccess) {
+#if defined(PAGE_COMPACTION_PROFILE)
+      const auto enumeration_started = std::chrono::steady_clock::now();
+#endif
+      if (page_ids.empty())
+        throw std::invalid_argument("compaction requires at least one page");
+      auto pressure_call = retirement_pressure->writer_call();
+      pressure_call.apply();
+      [[maybe_unused]] auto retirement_admission =
+          retirement_pressure->control_plane_call();
+      auto workspace_lease = compaction_workspaces.acquire();
+      CompactionWorkspace &workspace = *workspace_lease;
+      workspace.sorted_page_ids.assign(page_ids.begin(), page_ids.end());
+      auto &sorted_page_ids = workspace.sorted_page_ids;
+      std::ranges::sort(sorted_page_ids);
+      if (std::ranges::adjacent_find(sorted_page_ids) != sorted_page_ids.end())
+        throw std::invalid_argument("compaction pages contain duplicate ids");
+      const uint64_t last_page_id = sorted_page_ids.back();
+      if (last_page_id >= arena.page_count())
+        throw std::out_of_range("compaction page id is out of range");
+      for (uint64_t page_id : sorted_page_ids) {
+        if (!arena.page_allocated(page_id))
+          throw std::logic_error("compaction source page is not allocated");
+      }
+      size_t drained_count = 0;
+      try {
+        for (uint64_t page_id : sorted_page_ids) {
+          page_reuse->begin_draining(page_id);
+          ++drained_count;
+        }
+      } catch (...) {
+        while (drained_count != 0)
+          page_reuse->cancel_draining(sorted_page_ids[--drained_count]);
+        throw;
+      }
+      struct DrainResolution {
+        PageReuseState &reuse;
+        std::span<const uint64_t> page_ids;
+        bool completed = false;
+
+        ~DrainResolution() {
+          if (!completed) {
+            for (uint64_t page_id : page_ids)
+              reuse.cancel_draining(page_id);
+          }
+        }
+      } drain_resolution{*page_reuse, sorted_page_ids};
+      arena.advance_allocation_past_page(last_page_id);
+
+      auto &pending = workspace.pending;
+      pending.clear();
+      pending.reserve(sorted_page_ids.size() *
+                      EmbeddingArena<ParamT>::kEntriesPerPage);
+      workspace.source_cohort_shards.assign(
+          sorted_page_ids.size(), std::numeric_limits<uint32_t>::max());
+      auto &source_cohort_shards = workspace.source_cohort_shards;
+      std::array<uint64_t, CoaccessSketch::kMaximumBatchSample> anchors{};
+      size_t anchor_count = 0;
+      for (size_t source_page_position = 0;
+           source_page_position < sorted_page_ids.size();
+           ++source_page_position) {
+        const uint64_t page_id = sorted_page_ids[source_page_position];
+        const uint32_t first = static_cast<uint32_t>(
+            page_id * EmbeddingArena<ParamT>::kEntriesPerPage);
+        const uint32_t limit = static_cast<uint32_t>(
+            std::min(arena.allocated_count(),
+                     static_cast<size_t>(first) +
+                         EmbeddingArena<ParamT>::kEntriesPerPage));
+        for (uint32_t index = first; index < limit; ++index) {
+          auto owner = arena.owner_snapshot(index);
+          if (!owner.has_value())
+            continue;
+          if (owner->shard_id >= key_shards.size() ||
+              owner->shard_id != shard_id_for_key(owner->key)) {
+            throw std::logic_error(
+                "arena source owner does not match key shard");
+          }
+          uint32_t &source_shard = source_cohort_shards[source_page_position];
+          if (source_shard == std::numeric_limits<uint32_t>::max()) {
+            source_shard = owner->shard_id;
+          } else if (source_shard / EmbeddingArena<ParamT>::kCohortSize !=
+                     owner->shard_id / EmbeddingArena<ParamT>::kCohortSize) {
+            throw std::logic_error(
+                "compaction source page mixes shard cohorts");
+          }
+          pending.push_back({owner->key, owner->seq_count, index,
+                             owner->shard_id,
+                             static_cast<uint32_t>(source_page_position), 0});
+          if (anchor_count < anchors.size())
+            anchors[anchor_count++] = owner->key;
+        }
+      }
+      for (size_t source_page_position = 0;
+           source_page_position < sorted_page_ids.size();
+           ++source_page_position) {
+        const uint32_t source_shard =
+            source_cohort_shards[source_page_position];
+        if (source_shard == std::numeric_limits<uint32_t>::max())
+          continue;
+        arena.bind_exact(
+            static_cast<uint32_t>(sorted_page_ids[source_page_position] *
+                                  EmbeddingArena<ParamT>::kEntriesPerPage),
+            source_shard);
+      }
+      if (cluster_by_coaccess && anchor_count > 1) {
+        for (PendingKey &entry : pending) {
+          uint32_t strongest = 0;
+          uint8_t cluster = static_cast<uint8_t>(anchor_count);
+          for (size_t candidate = 0; candidate < anchor_count; ++candidate) {
+            if (entry.key == anchors[candidate]) {
+              cluster = static_cast<uint8_t>(candidate);
+              break;
+            }
+            const uint64_t affinity = access_telemetry.coaccess_estimate(
+                entry.key, anchors[candidate]);
+            if (affinity > strongest) {
+              strongest = affinity;
+              cluster = static_cast<uint8_t>(candidate);
+            }
+          }
+          entry.cluster = cluster;
+        }
+        std::ranges::stable_sort(
+            pending, [](const PendingKey &left, const PendingKey &right) {
+              if (left.cluster != right.cluster)
+                return left.cluster < right.cluster;
+              return left.key < right.key;
+            });
+      }
+#if defined(PAGE_COMPACTION_PROFILE)
+      page_compaction_profile.enumeration_ns.fetch_add(
+          std::chrono::duration_cast<std::chrono::nanoseconds>(
+              std::chrono::steady_clock::now() - enumeration_started)
+              .count(),
+          std::memory_order_relaxed);
+      const auto preparation_started = std::chrono::steady_clock::now();
+#endif
+      size_t migrated = 0;
+      workspace.source_clear_masks.assign(sorted_page_ids.size(), {});
+      auto &source_clear_masks = workspace.source_clear_masks;
+      if (!pending.empty()) {
+        workspace.shard_counts.assign(key_shards.size(), 0);
+        auto &shard_counts = workspace.shard_counts;
+        for (const PendingKey &entry : pending)
+          ++shard_counts[entry.shard_id];
+        for (size_t shard_id = 0; shard_id < key_shards.size(); ++shard_id) {
+          if (shard_counts[shard_id] != 0)
+            key_shards[shard_id]->reserve_new_indices(shard_counts[shard_id]);
+        }
+        workspace.destination_indices.resize(pending.size());
+        auto &destination_indices = workspace.destination_indices;
+        workspace.destination_pending.assign(pending.size(), 0);
+        auto &destination_pending = workspace.destination_pending;
+        try {
+          for (size_t pending_index = 0; pending_index < pending.size();
+               ++pending_index) {
+            const PendingKey &entry = pending[pending_index];
+            KeyShard &key_shard = *key_shards[entry.shard_id];
+            uint32_t destination;
+            if (auto recycled = key_shard.take_recycled_index()) {
+              destination = *recycled;
+              try {
+                if (!page_reuse->destination_available(destination))
+                  throw std::logic_error(
+                      "recycled compaction destination is unavailable");
+                arena.prepare_reused(destination);
+                if (optimizer.has_value())
+                  optimizer->allocate(destination);
+              } catch (...) {
+                key_shard.recycle_unpublished_index(destination);
+                throw;
+              }
+            } else {
+              destination = allocate_compaction_destination(entry.shard_id);
+            }
+            destination_indices[pending_index] = destination;
+            destination_pending[pending_index] = 1;
+          }
+#if defined(PAGE_COMPACTION_PROFILE)
+          page_compaction_profile.reservation_ns.fetch_add(
+              std::chrono::duration_cast<std::chrono::nanoseconds>(
+                  std::chrono::steady_clock::now() - preparation_started)
+                  .count(),
+              std::memory_order_relaxed);
+#endif
+          const size_t optimizer_state_dim =
+              optimizer.has_value() ? optimizer->state_dim() : 0;
+          workspace.optimizer_state.resize(optimizer_state_dim);
+          auto &optimizer_state = workspace.optimizer_state;
+#if defined(PAGE_COMPACTION_PROFILE)
+          page_compaction_profile.preparation_ns.fetch_add(
+              std::chrono::duration_cast<std::chrono::nanoseconds>(
+                  std::chrono::steady_clock::now() - preparation_started)
+                  .count(),
+              std::memory_order_relaxed);
+          const auto publication_started = std::chrono::steady_clock::now();
+#endif
+          workspace.migration_order.resize(pending.size());
+          workspace.shard_offsets.assign(key_shards.size() + 1, 0);
+          auto &migration_order = workspace.migration_order;
+          auto &shard_offsets = workspace.shard_offsets;
+          for (size_t shard_id = 0; shard_id < key_shards.size(); ++shard_id)
+            shard_offsets[shard_id + 1] =
+                shard_offsets[shard_id] + shard_counts[shard_id];
+          workspace.shard_positions.assign(shard_offsets.begin(),
+                                           shard_offsets.end() - 1);
+          auto &shard_positions = workspace.shard_positions;
+          for (size_t pending_index = 0; pending_index < pending.size();
+               ++pending_index) {
+            const uint32_t shard_id = pending[pending_index].shard_id;
+            migration_order[shard_positions[shard_id]++] = pending_index;
+          }
+          workspace.pending_shards.assign(key_shards.size(), 0);
+          workspace.next_shard_order.assign(shard_offsets.begin(),
+                                            shard_offsets.end() - 1);
+          auto &pending_shards = workspace.pending_shards;
+          auto &next_shard_order = workspace.next_shard_order;
+          size_t remaining_shards = 0;
+          for (size_t shard_id = 0; shard_id < key_shards.size(); ++shard_id) {
+            if (shard_offsets[shard_id] == shard_offsets[shard_id + 1])
+              continue;
+            pending_shards[shard_id] = 1;
+            ++remaining_shards;
+          }
+          constexpr size_t kPublicationPagesPerChunk = 1;
+          const size_t publication_chunk_size =
+              std::max(size_t{1}, kPublicationPagesPerChunk *
+                                      EmbeddingArena<ParamT>::kEntriesPerPage /
+                                      key_shards.size());
+          const size_t rotation = sorted_page_ids.front() & shard_mask;
+          while (remaining_shards != 0) {
+            bool progressed = false;
+            for (size_t shard_offset = 0; shard_offset < key_shards.size();
+                 ++shard_offset) {
+              const size_t shard_id = (rotation + shard_offset) & shard_mask;
+              if (pending_shards[shard_id] == 0)
+                continue;
+              auto &key_shard = *key_shards[shard_id];
+              std::unique_lock compaction_lock(key_shard.compaction_mutex,
+                                               std::try_to_lock);
+              if (!compaction_lock.owns_lock()) {
+#if defined(PAGE_COMPACTION_ADMISSION_PROFILE)
+                page_compaction_profile.publication_admission_misses.fetch_add(
+                    1, std::memory_order_relaxed);
+#endif
+#if defined(PAGE_COMPACTION_SHARD_PROFILE)
+                record_page_compaction_shard_compaction_miss(shard_id);
+#endif
+                continue;
+              }
+#if defined(PAGE_COMPACTION_SHARD_PROFILE)
+              const auto shard_hold_started = std::chrono::steady_clock::now();
+#endif
+              std::unique_lock map_lock(key_shard.writer_mutex,
+                                        std::try_to_lock);
+              if (!map_lock.owns_lock()) {
+#if defined(PAGE_COMPACTION_ADMISSION_PROFILE)
+                page_compaction_profile.publication_map_misses.fetch_add(
+                    1, std::memory_order_relaxed);
+#endif
+#if defined(PAGE_COMPACTION_SHARD_PROFILE)
+                const auto shard_hold_ended = std::chrono::steady_clock::now();
+                compaction_lock.unlock();
+                record_page_compaction_shard_map_miss(
+                    shard_id,
+                    static_cast<uint64_t>(
+                        std::chrono::duration_cast<std::chrono::nanoseconds>(
+                            shard_hold_ended - shard_hold_started)
+                            .count()));
+#endif
+                continue;
+              }
+              const size_t order_begin = next_shard_order[shard_id];
+              const size_t order_end =
+                  std::min(order_begin + publication_chunk_size,
+                           shard_offsets[shard_id + 1]);
+              for (size_t order_index = order_begin; order_index < order_end;
+                   ++order_index) {
+                const size_t pending_index = migration_order[order_index];
+                const PendingKey &entry = pending[pending_index];
+                const uint32_t destination = destination_indices[pending_index];
+                bool locator_published = false;
+                try {
+                  if (relocate_expected_key_with_locked_shard(
+                          entry.key, entry.source_index, entry.seq_count,
+                          destination, entry.shard_id, key_shard,
+                          std::span<OptT>(optimizer_state),
+                          locator_published)) {
+                    ++migrated;
+#if defined(PAGE_COMPACTION_DEEP_PROFILE)
+                    const auto owner_clear_started =
+                        std::chrono::steady_clock::now();
+#endif
+                    arena.mark_owner_not_live(entry.source_index);
+#if defined(PAGE_COMPACTION_DEEP_PROFILE)
+                    page_compaction_profile.owner_clear_ns.fetch_add(
+                        std::chrono::duration_cast<std::chrono::nanoseconds>(
+                            std::chrono::steady_clock::now() -
+                            owner_clear_started)
+                            .count(),
+                        std::memory_order_relaxed);
+                    page_compaction_profile.owner_clear_calls.fetch_add(
+                        1, std::memory_order_relaxed);
+#endif
+                    const size_t source_slot =
+                        entry.source_index %
+                        EmbeddingArena<ParamT>::kEntriesPerPage;
+                    source_clear_masks[entry.source_page_position]
+                                      [source_slot / 64] |=
+                        uint64_t{1} << (source_slot % 64);
+                  } else {
+                    key_shard.recycle_unpublished_index(destination);
+                  }
+                  destination_pending[pending_index] = 0;
+                } catch (...) {
+                  if (!locator_published)
+                    key_shard.recycle_unpublished_index(destination);
+                  destination_pending[pending_index] = 0;
+                  throw;
+                }
+              }
+              next_shard_order[shard_id] = order_end;
+              if (order_end == shard_offsets[shard_id + 1]) {
+                pending_shards[shard_id] = 0;
+                --remaining_shards;
+              }
+#if defined(PAGE_COMPACTION_SHARD_PROFILE)
+              const auto shard_hold_ended = std::chrono::steady_clock::now();
+              map_lock.unlock();
+              compaction_lock.unlock();
+              record_page_compaction_shard_acquisition(
+                  shard_id, order_end - order_begin,
+                  static_cast<uint64_t>(
+                      std::chrono::duration_cast<std::chrono::nanoseconds>(
+                          shard_hold_ended - shard_hold_started)
+                          .count()));
+#endif
+              progressed = true;
+            }
+            if (!progressed) {
+#if defined(PAGE_COMPACTION_ADMISSION_PROFILE)
+              page_compaction_profile.publication_yields.fetch_add(
+                  1, std::memory_order_relaxed);
+#endif
+              std::this_thread::yield();
+            }
+          }
+#if defined(PAGE_COMPACTION_PROFILE)
+          page_compaction_profile.publication_ns.fetch_add(
+              std::chrono::duration_cast<std::chrono::nanoseconds>(
+                  std::chrono::steady_clock::now() - publication_started)
+                  .count(),
+              std::memory_order_relaxed);
+#endif
+        } catch (...) {
+          for (size_t remaining = 0; remaining < pending.size(); ++remaining) {
+            if (destination_pending[remaining] == 0)
+              continue;
+            const uint32_t destination = destination_indices[remaining];
+            key_shards[pending[remaining].shard_id]->recycle_unpublished_index(
+                destination);
+          }
+          throw;
+        }
+      }
+#if defined(PAGE_COMPACTION_PROFILE)
+      const auto retirement_started = std::chrono::steady_clock::now();
+#endif
+      for (size_t source_page_position = 0;
+           source_page_position < sorted_page_ids.size();
+           ++source_page_position) {
+        const uint32_t first =
+            static_cast<uint32_t>(sorted_page_ids[source_page_position] *
+                                  EmbeddingArena<ParamT>::kEntriesPerPage);
+        for (size_t word = 0; word < kLiveWordsPerPage; ++word) {
+          const uint64_t mask = source_clear_masks[source_page_position][word];
+          if (mask != 0)
+            arena.clear_live_mask(first / 64 + word, mask);
+        }
+      }
+      for (uint64_t page_id : sorted_page_ids) {
+        if (arena.page_has_live_entries(page_id))
+          throw std::runtime_error("draining arena page retained a live entry");
+        page_reuse->retire(page_id);
+        arena.retire_empty_page(page_id,
+                                [reuse = page_reuse, page_id]() noexcept {
+                                  reuse->make_available(page_id);
+                                });
+      }
+#if defined(PAGE_COMPACTION_PROFILE)
+      page_compaction_profile.retirement_ns.fetch_add(
+          std::chrono::duration_cast<std::chrono::nanoseconds>(
+              std::chrono::steady_clock::now() - retirement_started)
+              .count(),
+          std::memory_order_relaxed);
+#endif
+      drain_resolution.completed = true;
+      return migrated;
+    }
   };
 
+  struct StoreSnapshot {
+    StoreSnapshot(std::vector<SlotStore *> dims,
+                  std::vector<SlotStore *> slot_list)
+        : dim_to_slot(std::move(dims)), slots(std::move(slot_list)) {}
+
+    size_t retirement_bytes() const {
+      const size_t pointer_capacity = dim_to_slot.capacity() + slots.capacity();
+      if (pointer_capacity < dim_to_slot.capacity() ||
+          pointer_capacity >
+              (std::numeric_limits<size_t>::max() - sizeof(StoreSnapshot)) /
+                  sizeof(SlotStore *)) {
+        throw std::overflow_error("store snapshot retirement bytes overflow");
+      }
+      return sizeof(StoreSnapshot) + pointer_capacity * sizeof(SlotStore *);
+    }
+
+    std::vector<SlotStore *> dim_to_slot;
+    std::vector<SlotStore *> slots;
+  };
+
+  struct DeferredSnapshot {
+    StoreSnapshot *snapshot;
+
+    explicit DeferredSnapshot(StoreSnapshot *retired) : snapshot(retired) {}
+
+    ~DeferredSnapshot() { delete snapshot; }
+  };
+
+  struct NumaForwardWorkspace {
+    std::vector<std::vector<uint32_t>> indices_by_node;
+    std::vector<size_t> hashes;
+  };
+
+  StoreSnapshot *make_store_snapshot() const {
+    std::vector<SlotStore *> slots;
+    slots.reserve(slot_storage_.size());
+    for (const auto &slot : slot_storage_)
+      slots.push_back(slot.get());
+    return new StoreSnapshot(dim_to_slot_, std::move(slots));
+  }
+
+  void publish_store_snapshot() {
+    std::unique_ptr<StoreSnapshot> next(make_store_snapshot());
+    StoreSnapshot *current = snapshot_.load(std::memory_order_acquire);
+    if (current == nullptr)
+      throw std::logic_error("store snapshot is unavailable");
+    se::concurrency::EpochRetirement<DeferredSnapshot> retirement(
+        retirement_pressure_, current->retirement_bytes());
+    StoreSnapshot *retired =
+        snapshot_.exchange(next.release(), std::memory_order_acq_rel);
+    retirement.emplace(retired);
+    retirement.publish();
+  }
+
+  static PageStorage require_storage(PageStorage storage) {
+    if (!storage)
+      throw std::invalid_argument("hogwild storage is empty");
+    return storage;
+  }
+
   explicit HogwildEmbeddingStore(const std::vector<size_t> &table_dims,
-                                 size_t num_threads = 0,
-                                 Initializer initializer = {},
-                                 OptimizerFactory opt_factory = nullptr,
-                                 ScorePolicyT score_policy = {},
-                                 uint8_t slot_bits = 16,
-                                 PageStorage storage = create_page_storage())
-      : num_threads_(num_threads > 0
-                         ? num_threads
-                         : std::max(1u, std::thread::hardware_concurrency())),
-        pool_(static_cast<uint32_t>(num_threads_)),
+                                 Initializer initializer,
+                                 OptimizerFactory opt_factory,
+                                 ScorePolicyT score_policy,
+                                 HogwildStoreOptions options = {})
+      : partition_topology_(HogwildPartitionTopology::derive(
+            options.thread_budget, options.locality)),
+        num_threads_(partition_topology_.execution_workers()),
+        operation_dispatch_topology_(OperationDispatchPolicy::make_topology(
+            num_threads_, options.dispatch_config())),
+        pool_(static_cast<uint32_t>(
+            operation_dispatch_topology_.physical_threads)),
         initializer_(std::move(initializer)),
-        score_policy_(std::move(score_policy)), storage_(std::move(storage)),
+        score_policy_(std::move(score_policy)),
+        storage_(require_storage(std::move(options.storage))),
+        retirement_pressure_(storage_->stats().retirement_pressure_domain),
         background_page_eviction_enabled_(
             ScorePolicyT::kHasScore &&
             storage_->supports_background_page_eviction()),
-        lifecycle_mutex_(background_page_eviction_enabled_
-                             ? storage_->lifecycle_mutex()
-                             : std::make_shared<std::shared_mutex>()) {
-    uint32_t p2 = 1;
-    while (p2 < num_threads_) {
-      p2 <<= 1;
-    }
-    num_threads_ = p2;
-
+        bind_worker_affinity_(partition_topology_.numa_execution()),
+        numa_memory_locality_(partition_topology_.numa_memory()),
+        telemetry_ring_(1024,
+                        bind_worker_affinity_
+                            ? std::optional<int>(
+                                  ThreadAffinity::cpu_for_worker(num_threads_))
+                            : std::nullopt) {
     bool enable_score = ScorePolicyT::kHasScore;
 
     if (table_dims.empty()) {
       throw std::invalid_argument("table_dims must not be empty");
+    }
+    if (numa_memory_locality_) {
+      if (!NumaTopology::available())
+        throw std::runtime_error(
+            "NUMA-aware sharding requires libnuma support");
+      const size_t nodes = NumaTopology::node_count();
+      if (nodes == 0 || !std::has_single_bit(nodes) ||
+          partition_topology_.partition_count() < nodes ||
+          partition_topology_.partition_count() % nodes != 0) {
+        throw std::invalid_argument(
+            "NUMA-aware sharding requires a power-of-two node count that "
+            "divides the directory shard count");
+      }
     }
 
     size_t max_d = std::ranges::max(table_dims);
@@ -676,24 +3345,30 @@ public:
       }
       if (dim_to_slot_[dim] == nullptr) {
         slot_storage_.push_back(std::make_unique<SlotStore>(
-            dim, opt_factory, num_threads_, enable_score, storage_));
+            dim, opt_factory, partition_topology_.partition_count(),
+            num_threads_, enable_score, storage_, retirement_pressure_,
+            partition_topology_.numa_memory()));
         dim_to_slot_[dim] = slot_storage_.back().get();
       }
     }
+    snapshot_.store(make_store_snapshot(), std::memory_order_release);
+
+    telemetry_ring_.start();
 
     if (background_page_eviction_enabled_) {
-      auto proxy =
-          pro::make_proxy_shared<PageEvictionProxyFacade,
-                                 StorePageEvictionProxy>(lifecycle_mutex_);
+      auto proxy = pro::make_proxy_shared<PageEvictionProxyFacade,
+                                          StorePageEvictionProxy>();
       page_eviction_registration_ =
           storage_->set_page_eviction_proxy(std::move(proxy));
     }
   }
 
   ~HogwildEmbeddingStore() {
+    telemetry_ring_.stop();
+    invocation_gate_.close_and_wait();
     if (page_eviction_registration_.value != 0)
       storage_->clear_page_eviction_proxy(page_eviction_registration_);
-    std::unique_lock lifecycle_lock(*lifecycle_mutex_);
+    delete snapshot_.exchange(nullptr, std::memory_order_acq_rel);
     slot_storage_.clear();
     dim_to_slot_.clear();
   }
@@ -712,49 +3387,216 @@ public:
   std::error_code forward_lookup(std::span<const K> keys,
                                  std::span<ParamT> out_flat_values,
                                  std::span<const int64_t> row_lengths) {
-    std::shared_lock lifecycle_lock(*lifecycle_mutex_);
+    ActiveInvocationGuard invocation(invocation_gate_);
+    StoreSnapshot *snapshot = snapshot_.load(std::memory_order_acquire);
+    if (snapshot == nullptr)
+      throw std::runtime_error("store snapshot is unavailable");
     size_t n = keys.size();
-    auto offsets = compute_offsets(row_lengths);
+    thread_local std::vector<size_t> forward_offsets;
+    const std::optional<size_t> fixed_dim = fixed_row_length(row_lengths);
+    if (!fixed_dim.has_value())
+      compute_offsets_into(row_lengths, forward_offsets);
+    const std::span<const size_t> offsets(forward_offsets);
+    const size_t bytes_per_entry =
+        n == 0                  ? sizeof(ParamT)
+        : fixed_dim.has_value() ? checked_row_payload_bytes(*fixed_dim)
+                                : row_payload_bytes(row_lengths, offsets);
+    const size_t logical_worker_count =
+        n == 0 ? 1
+               : operation_worker_count(HogwildOperation::kForwardLookup, n,
+                                        bytes_per_entry);
+    const size_t requested_task_count =
+        n == 0 ? 1
+               : OperationDispatchPolicy::task_count(
+                     HogwildOperation::kForwardLookup, n, logical_worker_count,
+                     operation_dispatch_topology_);
+    const size_t payload_capped_task_count =
+        cap_forward_tasks_by_row_granularity(requested_task_count, n,
+                                             bytes_per_entry);
+    const size_t worker_count =
+        OperationDispatchPolicy::concurrency_limited_thread_count(
+            payload_capped_task_count,
+            operation_dispatch_topology_.memory_parallelism,
+            invocation.count());
+    constexpr size_t kTelemetrySamplingPeriod = 64;
+    const uint64_t telemetry_sequence =
+        telemetry_sample_sequence_.fetch_add(1, std::memory_order_relaxed);
+    const bool collect_telemetry =
+        telemetry_sequence % kTelemetrySamplingPeriod == 0;
 
-    auto do_range = [&](size_t begin, size_t end) {
+    const size_t telemetry_partition_base = n / worker_count;
+    const size_t telemetry_partition_remainder = n % worker_count;
+    const auto telemetry_partition_offset = [&](size_t partition) {
+      return partition * telemetry_partition_base +
+             std::min(partition, telemetry_partition_remainder);
+    };
+    std::span<const size_t> routed_hashes;
+    auto do_indices = [&](size_t worker, auto &&index_at, size_t count) {
       epoch::with_epoch([&] {
-        for (size_t i = begin; i < end; ++i) {
-          if (i + 16 < end) {
-            __builtin_prefetch(&keys[i + 16], 0, 1);
-            __builtin_prefetch(&row_lengths[i + 16], 0, 1);
-            __builtin_prefetch(&offsets[i + 16], 0, 1);
-            __builtin_prefetch(out_flat_values.data() + offsets[i + 16], 1, 1);
+        std::array<uint64_t, CoaccessSketch::kMaximumBatchSample> sampled_keys;
+        std::array<SlotStore *, CoaccessSketch::kMaximumBatchSample>
+            sampled_slots;
+        std::array<uint32_t, CoaccessSketch::kMaximumBatchSample>
+            sampled_indices;
+        size_t sampled_count = 0;
+        for (size_t position = 0; position < count; ++position) {
+          const size_t i = index_at(position);
+          const bool collects_telemetry =
+              collect_telemetry && i >= telemetry_partition_offset(worker) &&
+              i < telemetry_partition_offset(worker + 1);
+          const size_t prefetch_distance =
+              operation_dispatch_topology_.forward_prefetch_distance;
+          if (prefetch_distance != 0 && position + prefetch_distance < count) {
+            const size_t prefetch_index =
+                index_at(position + prefetch_distance);
+            __builtin_prefetch(&keys[prefetch_index], 0, 1);
+            __builtin_prefetch(&row_lengths[prefetch_index], 0, 1);
+            if (fixed_dim.has_value()) {
+              __builtin_prefetch(
+                  out_flat_values.data() + prefetch_index * *fixed_dim, 1, 1);
+            } else {
+              __builtin_prefetch(&offsets[prefetch_index], 0, 1);
+              __builtin_prefetch(
+                  out_flat_values.data() + offsets[prefetch_index], 1, 1);
+            }
           }
           uint64_t key = static_cast<uint64_t>(keys[i]);
-          size_t dim = static_cast<size_t>(row_lengths[i]);
-          if (dim >= dim_to_slot_.size() || dim_to_slot_[dim] == nullptr)
-              [[unlikely]] {
+          size_t dim = fixed_dim.value_or(static_cast<size_t>(row_lengths[i]));
+          if (dim >= snapshot->dim_to_slot.size() ||
+              snapshot->dim_to_slot[dim] == nullptr) [[unlikely]] {
             throw std::runtime_error(
                 "invalid dim access: no physical table for dim " +
                 std::to_string(dim));
           }
-          auto &slot = *dim_to_slot_[dim];
-          ParamT *out = out_flat_values.data() + offsets[i];
+          auto &slot = *snapshot->dim_to_slot[dim];
+          ParamT *out = out_flat_values.data() +
+                        (fixed_dim.has_value() ? i * *fixed_dim : offsets[i]);
 
-          auto found = slot.find(key);
-          if (found.has_value()) {
-            const ParamT *src = slot.arena.data(*found);
+          auto visit = [&](uint32_t index) {
+            const ParamT *src = slot.arena.data_trusted(index);
             if constexpr (simd::is_simd_supported_v<ParamT>) {
               simd::simd_copy(src, out, dim);
             } else {
               std::copy_n(src, dim, out);
             }
             if constexpr (ScorePolicyT::kHasScore) {
-              score_policy_.on_access(&slot.arena.score_raw(*found));
+              score_policy_.on_access(&slot.arena.score_raw(index));
             }
-          } else {
+            if (collects_telemetry && sampled_count < sampled_keys.size()) {
+              sampled_keys[sampled_count] = key;
+              sampled_slots[sampled_count] = &slot;
+              sampled_indices[sampled_count] = index;
+              ++sampled_count;
+            }
+          };
+          const bool found = [&] {
+            if (!routed_hashes.empty() && !ScorePolicyT::kHasScore) {
+              return slot.with_read_view_entry_hashed(key, routed_hashes[i],
+                                                      visit);
+            }
+            if (!routed_hashes.empty()) {
+              if constexpr (ScorePolicyT::kHasScore)
+                return slot.with_shared_write_entry_hashed(
+                    key, routed_hashes[i], visit);
+              return slot.with_shared_entry_hashed(key, routed_hashes[i],
+                                                   visit);
+            }
+            if constexpr (ScorePolicyT::kHasScore)
+              return slot.with_shared_write_entry(key, visit);
+            return slot.with_shared_entry(key, visit);
+          }();
+          if (!found) {
             std::fill_n(out, dim, ParamT{0});
           }
         }
+        if (sampled_count == 0)
+          return;
+        for (size_t sample = 0; sample < sampled_count; ++sample) {
+          bool first_for_slot = true;
+          for (size_t earlier = 0; earlier < sample; ++earlier) {
+            if (sampled_slots[earlier] == sampled_slots[sample]) {
+              first_for_slot = false;
+              break;
+            }
+          }
+          if (!first_for_slot)
+            continue;
+          TelemetryRing::Event event;
+          event.target = sampled_slots[sample];
+          event.consume = &SlotStore::consume_telemetry;
+          event.stripe = static_cast<uint32_t>(worker);
+          event.weight =
+              static_cast<uint32_t>(worker_count * kTelemetrySamplingPeriod);
+          for (size_t other = 0; other < sampled_count; ++other) {
+            if (sampled_slots[other] != sampled_slots[sample])
+              continue;
+            event.page_ids[event.page_count++] =
+                sampled_indices[other] /
+                EmbeddingArena<ParamT>::kEntriesPerPage;
+            event.keys[event.key_count++] = sampled_keys[other];
+          }
+          telemetry_ring_.try_publish(event);
+        }
       });
     };
+    auto do_range = [&](size_t worker, size_t begin, size_t end) {
+      do_indices(
+          worker, [begin](size_t position) { return begin + position; },
+          end - begin);
+    };
 
-    dispatch_parallel(n, do_range);
+    const size_t node_count =
+        numa_memory_locality_ ? NumaTopology::node_count() : 1;
+    constexpr size_t kMinimumPayloadForNumaRouting = 512 * 1024;
+    const bool payload_is_large_enough_for_numa_routing =
+        n >
+        kMinimumPayloadForNumaRouting / std::max<size_t>(1, bytes_per_entry);
+    if (!numa_memory_locality_ || !payload_is_large_enough_for_numa_routing ||
+        worker_count < node_count || worker_count % node_count != 0) {
+      dispatch_parallel_with_worker_limited(n, do_range, worker_count);
+      return {};
+    }
+    auto workspace_lease = numa_forward_workspaces_.acquire();
+    NumaForwardWorkspace &workspace = *workspace_lease;
+    workspace.hashes.resize(n);
+    workspace.indices_by_node.resize(node_count);
+    for (auto &indices : workspace.indices_by_node)
+      indices.clear();
+    for (size_t i = 0; i < n; ++i) {
+      const size_t hash = SplitMixHash<K>{}(keys[i]);
+      workspace.hashes[i] = hash;
+      const size_t shard = hash & partition_topology_.shard_mask();
+      workspace
+          .indices_by_node[NumaTopology::node_ordinal_for_shard(
+              shard, partition_topology_.partition_count())]
+          .push_back(static_cast<uint32_t>(i));
+    }
+    routed_hashes = std::span<const size_t>(workspace.hashes);
+    dispatch_parallel_with_worker_limited(
+        worker_count,
+        [&](size_t worker, size_t worker_begin, size_t worker_end) {
+          for (size_t logical_worker = worker_begin;
+               logical_worker < worker_end; ++logical_worker) {
+            const size_t node = logical_worker % node_count;
+            const auto &indices = workspace.indices_by_node[node];
+            const size_t workers_per_node = worker_count / node_count;
+            const size_t local_worker = logical_worker / node_count;
+            const size_t base = indices.size() / workers_per_node;
+            const size_t remainder = indices.size() % workers_per_node;
+            const size_t begin =
+                local_worker * base + std::min(local_worker, remainder);
+            const size_t end = begin + base + (local_worker < remainder);
+            if (begin < end)
+              do_indices(
+                  worker,
+                  [&indices, begin](size_t routed_position) {
+                    return static_cast<size_t>(
+                        indices[begin + routed_position]);
+                  },
+                  end - begin);
+          }
+        },
+        worker_count, 1);
     return {};
   }
 
@@ -766,12 +3608,23 @@ public:
   std::error_code accumulate_gradients(std::span<const K> keys,
                                        std::span<const ParamT> flat_grads,
                                        std::span<const int64_t> row_lengths) {
-    std::shared_lock lifecycle_lock(*lifecycle_mutex_);
+    ActiveInvocationGuard invocation(invocation_gate_);
+    StoreSnapshot *snapshot = snapshot_.load(std::memory_order_acquire);
+    if (snapshot == nullptr)
+      throw std::runtime_error("store snapshot is unavailable");
     std::lock_guard training_lock(training_mutex_);
     size_t n = keys.size();
     auto offsets = compute_offsets(row_lengths);
+    const size_t worker_count =
+        n == 0
+            ? 1
+            : operation_worker_count(HogwildOperation::kAccumulateGradients, n,
+                                     row_payload_bytes(row_lengths, offsets));
 
     size_t num_shards = num_threads_;
+    for (SlotStore *slot : snapshot->slots)
+      for (auto &transient : slot->transient_shards)
+        transient->reserve(n / std::max<size_t>(1, num_shards));
 
     if (num_shards > std::numeric_limits<size_t>::max() / num_shards ||
         num_shards * num_shards >
@@ -785,45 +3638,47 @@ public:
 
     SplitMixHash<K> hasher;
 
-    // Shared SIMD and scalar visitor keeps both paths identical.
-    auto process_keys_simd = [&](size_t start, size_t end, auto &&visitor) {
+    thread_local std::unique_ptr<uint64_t[]> gradient_hashes_buf;
+    thread_local size_t gradient_hashes_cap = 0;
+    if (n > gradient_hashes_cap) {
+      const size_t next_cap = std::max(n, gradient_hashes_cap * 2);
+      gradient_hashes_buf = std::unique_ptr<uint64_t[]>(new uint64_t[next_cap]);
+      gradient_hashes_cap = next_cap;
+    }
+    std::span<uint64_t> gradient_hashes(gradient_hashes_buf.get(), n);
+
+    auto hash_keys_simd = [&](size_t start, size_t end) {
       size_t i = start;
       if constexpr (sizeof(K) == 8) {
 #if defined(__AVX512F__) && defined(__AVX512DQ__)
-        __m512i v_mask = _mm512_set1_epi64(num_shards - 1);
         for (; i + 8 <= end; i += 8) {
           __m512i v_keys =
               _mm512_loadu_si512(reinterpret_cast<const void *>(&keys[i]));
           __m512i v_hash = hasher.simd_hash(v_keys);
-          __m512i v_shards = _mm512_and_si512(v_hash, v_mask);
-
-          uint64_t extracted[8] __attribute__((aligned(64)));
-          _mm512_storeu_si512(extracted, v_shards);
-
-          for (int j = 0; j < 8; ++j) {
-            visitor(i + j, static_cast<uint32_t>(extracted[j]));
-          }
+          _mm512_storeu_si512(gradient_hashes.data() + i, v_hash);
         }
 #endif
       }
       for (; i < end; ++i) {
         uint64_t key = static_cast<uint64_t>(keys[i]);
-        uint32_t shard = hasher(key) & (num_shards - 1);
-        visitor(i, shard);
+        gradient_hashes[i] = hasher(key);
       }
     };
 
-    // 1. Parallel Count
-    auto do_count = [&](size_t t_begin, size_t t_end) {
+    auto do_hash_and_count = [&](size_t t_begin, size_t t_end) {
+      for (size_t t = t_begin; t < t_end; ++t)
+        hash_keys_simd(t * n / num_shards, (t + 1) * n / num_shards);
       for (size_t t = t_begin; t < t_end; ++t) {
         size_t start = t * n / num_shards;
         size_t end = (t + 1) * n / num_shards;
-        process_keys_simd(start, end, [&](size_t /*idx*/, uint32_t shard) {
+        for (size_t idx = start; idx < end; ++idx) {
+          const uint32_t shard =
+              static_cast<uint32_t>(gradient_hashes[idx] & (num_shards - 1));
           gradient_thread_counts_[t * num_shards + shard]++;
-        });
+        }
       }
     };
-    dispatch_parallel(num_shards, do_count, 1);
+    dispatch_parallel_limited(num_shards, do_hash_and_count, worker_count, 1);
 
     // 2. Prefix Sum (Sequential)
     gradient_thread_offsets_.resize(workspace_size);
@@ -853,13 +3708,15 @@ public:
       for (size_t t = t_begin; t < t_end; ++t) {
         size_t start = t * n / num_shards;
         size_t end = (t + 1) * n / num_shards;
-        process_keys_simd(start, end, [&](size_t idx, uint32_t shard) {
+        for (size_t idx = start; idx < end; ++idx) {
+          const uint32_t shard =
+              static_cast<uint32_t>(gradient_hashes[idx] & (num_shards - 1));
           shuffled_indices[gradient_thread_offsets_[t * num_shards + shard]++] =
-              idx;
-        });
+              static_cast<uint32_t>(idx);
+        }
       }
     };
-    dispatch_parallel(num_shards, do_scatter, 1);
+    dispatch_parallel_limited(num_shards, do_scatter, worker_count, 1);
 
     auto do_shard = [&](size_t shard_begin, size_t shard_end) {
       for (size_t shard_id = shard_begin; shard_id < shard_end; ++shard_id) {
@@ -876,22 +3733,23 @@ public:
           uint32_t i = shuffled_indices[idx];
           uint64_t key = static_cast<uint64_t>(keys[i]);
           size_t dim = static_cast<size_t>(row_lengths[i]);
-          if (dim >= dim_to_slot_.size() || dim_to_slot_[dim] == nullptr)
-              [[unlikely]] {
+          if (dim >= snapshot->dim_to_slot.size() ||
+              snapshot->dim_to_slot[dim] == nullptr) [[unlikely]] {
             throw std::runtime_error(
                 "invalid dim access: no physical table for dim " +
                 std::to_string(dim));
           }
-          auto &slot = *dim_to_slot_[dim];
+          auto &slot = *snapshot->dim_to_slot[dim];
           const ParamT *grad_src = flat_grads.data() + offsets[i];
           uint32_t t_idx =
-              slot.transient_shards[shard_id]->get_or_allocate(key);
+              slot.transient_shards[shard_id]->get_or_allocate_hashed(
+                  key, gradient_hashes[i]);
           slot.transient_shards[shard_id]->accumulate(t_idx, grad_src);
         }
       }
     };
 
-    dispatch_parallel(num_shards, do_shard, 1);
+    dispatch_parallel_limited(num_shards, do_shard, worker_count, 1);
 
     // Manual step requirement: optimizer_step() must be called explicitly
 
@@ -910,48 +3768,52 @@ public:
   // =========================================================================
 
   std::error_code optimizer_step() {
-    std::shared_lock lifecycle_lock(*lifecycle_mutex_);
+    ActiveInvocationGuard invocation(invocation_gate_);
+    StoreSnapshot *snapshot = snapshot_.load(std::memory_order_acquire);
+    if (snapshot == nullptr)
+      throw std::runtime_error("store snapshot is unavailable");
     std::lock_guard training_lock(training_mutex_);
-    for (const auto &slot_ptr : slot_storage_) {
-      auto *slot = slot_ptr.get();
+    for (SlotStore *slot : snapshot->slots) {
       if (slot->optimizer.has_value()) {
         slot->global_step++;
       }
     }
 
     size_t num_shards = num_threads_;
+    const size_t worker_count = operation_worker_count(
+        HogwildOperation::kOptimizerStep,
+        std::max(size_t{1}, accumulated_gradient_count()),
+        std::max(size_t{1}, max_dim_) * sizeof(ParamT));
 
     auto do_shard = [&](size_t shard_begin, size_t shard_end) {
       epoch::with_epoch([&] {
         for (size_t shard_id = shard_begin; shard_id < shard_end; ++shard_id) {
-          for (const auto &slot_ptr : slot_storage_) {
-            auto *slot = slot_ptr.get();
+          for (SlotStore *slot : snapshot->slots) {
             auto &shard = slot->transient_shards[shard_id];
             shard->for_each_accumulated([&](uint64_t feature_id,
+                                            uint64_t feature_hash,
                                             const ParamT *accumulated_grad) {
-              auto found = slot->find(feature_id);
-              if (!found.has_value())
-                return;
-
-              uint32_t arena_idx = *found;
-              ParamT *param = slot->arena.data(arena_idx);
-
-              if (slot->optimizer.has_value()) {
-                if constexpr (ScorePolicyT::kHasScore) {
-                  const uint64_t score = std::atomic_ref<uint64_t>(
-                                             slot->arena.score_raw(arena_idx))
-                                             .load(std::memory_order_relaxed);
-                  slot->optimizer->step(
-                      arena_idx, std::span<ParamT>(param, slot->dim),
-                      std::span<const ParamT>(accumulated_grad, slot->dim),
-                      slot->global_step, score);
-                } else {
-                  slot->optimizer->step(
-                      arena_idx, std::span<ParamT>(param, slot->dim),
-                      std::span<const ParamT>(accumulated_grad, slot->dim),
-                      slot->global_step, 0);
-                }
-              }
+              slot->with_shared_write_entry_hashed(
+                  feature_id, feature_hash, [&](uint32_t arena_idx) {
+                    ParamT *param = slot->arena.data(arena_idx);
+                    if (!slot->optimizer.has_value())
+                      return;
+                    if constexpr (ScorePolicyT::kHasScore) {
+                      const uint64_t score =
+                          std::atomic_ref<uint64_t>(
+                              slot->arena.score_raw(arena_idx))
+                              .load(std::memory_order_relaxed);
+                      slot->optimizer->step(
+                          arena_idx, std::span<ParamT>(param, slot->dim),
+                          std::span<const ParamT>(accumulated_grad, slot->dim),
+                          slot->global_step, score);
+                    } else {
+                      slot->optimizer->step(
+                          arena_idx, std::span<ParamT>(param, slot->dim),
+                          std::span<const ParamT>(accumulated_grad, slot->dim),
+                          slot->global_step, 0);
+                    }
+                  });
             });
             shard->clear();
           }
@@ -959,7 +3821,7 @@ public:
       });
     };
 
-    dispatch_parallel(num_shards, do_shard, 1);
+    dispatch_parallel_limited(num_shards, do_shard, worker_count, 1);
 
     return {};
   }
@@ -979,31 +3841,80 @@ public:
   std::error_code assign(std::span<const K> keys,
                          std::span<const ParamT> flat_values,
                          std::span<const int64_t> row_lengths) {
-    std::shared_lock lifecycle_lock(*lifecycle_mutex_);
+    ActiveInvocationGuard invocation(invocation_gate_);
+    StoreSnapshot *snapshot = snapshot_.load(std::memory_order_acquire);
+    if (snapshot == nullptr)
+      throw std::runtime_error("store snapshot is unavailable");
     size_t n = keys.size();
+    validate_unique_mutation_batch(keys, row_lengths);
     auto offsets = compute_offsets(row_lengths);
+    const size_t worker_count =
+        n == 0
+            ? 1
+            : operation_worker_count(HogwildOperation::kAssign, n,
+                                     row_payload_bytes(row_lengths, offsets));
 
     auto do_range = [&](size_t begin, size_t end) {
       epoch::with_epoch([&] {
+        struct MissingBatch {
+          SlotStore *slot;
+          std::vector<typename SlotStore::BatchEntry> entries;
+        };
+        std::vector<MissingBatch> missing_batches;
         for (size_t i = begin; i < end; ++i) {
           uint64_t key = static_cast<uint64_t>(keys[i]);
+          const size_t hash = SplitMixHash<KeyT>{}(static_cast<KeyT>(key));
           size_t dim = static_cast<size_t>(row_lengths[i]);
-          if (dim >= dim_to_slot_.size() || dim_to_slot_[dim] == nullptr)
-              [[unlikely]] {
+          if (dim >= snapshot->dim_to_slot.size() ||
+              snapshot->dim_to_slot[dim] == nullptr) [[unlikely]] {
             throw std::runtime_error("invalid dim access");
           }
-          auto &slot = *dim_to_slot_[dim];
+          auto &slot = *snapshot->dim_to_slot[dim];
           const ParamT *src = flat_values.data() + offsets[i];
-          auto [arena_idx, inserted] =
-              slot.find_or_insert(key, [&](uint32_t idx) {
-                std::copy_n(src, slot.dim, slot.arena.data(idx));
-              });
-          if (!inserted)
-            std::copy_n(src, slot.dim, slot.arena.data(arena_idx));
+          if (slot.assign_existing_hashed(key, hash, [&](uint32_t index) {
+                if constexpr (simd::is_simd_supported_v<ParamT>)
+                  simd::simd_copy(src, slot.arena.data(index), slot.dim);
+                else
+                  std::copy_n(src, slot.dim, slot.arena.data(index));
+              }))
+            continue;
+          auto batch =
+              std::ranges::find(missing_batches, &slot, &MissingBatch::slot);
+          if (batch == missing_batches.end()) {
+            missing_batches.push_back({&slot, {}});
+            batch = std::prev(missing_batches.end());
+          }
+          batch->entries.push_back({key, hash, i});
+        }
+        for (MissingBatch &batch : missing_batches) {
+          SlotStore &slot = *batch.slot;
+          slot.find_or_insert_batch(
+              batch.entries,
+              [&](const typename SlotStore::BatchEntry &entry,
+                  uint32_t new_index) {
+                const ParamT *src =
+                    flat_values.data() + offsets[entry.position];
+                if constexpr (simd::is_simd_supported_v<ParamT>)
+                  simd::simd_copy(src, slot.arena.data(new_index), slot.dim);
+                else
+                  std::copy_n(src, slot.dim, slot.arena.data(new_index));
+              },
+              [&](const typename SlotStore::BatchEntry &entry, uint32_t index,
+                  bool, bool sink) {
+                if (sink)
+                  return;
+                const ParamT *src =
+                    flat_values.data() + offsets[entry.position];
+                if constexpr (simd::is_simd_supported_v<ParamT>)
+                  simd::simd_copy(src, slot.arena.data(index), slot.dim);
+                else
+                  std::copy_n(src, slot.dim, slot.arena.data(index));
+              },
+              true);
         }
       });
     };
-    dispatch_parallel(n, do_range);
+    dispatch_parallel_limited(n, do_range, worker_count);
     return {};
   }
 
@@ -1012,51 +3923,82 @@ public:
                                    std::span<ParamT> out_flat_values,
                                    std::span<const int64_t> row_lengths,
                                    std::span<uint8_t> out_inserted_mask) {
-    std::shared_lock lifecycle_lock(*lifecycle_mutex_);
+    ActiveInvocationGuard invocation(invocation_gate_);
+    StoreSnapshot *snapshot = snapshot_.load(std::memory_order_acquire);
+    if (snapshot == nullptr)
+      throw std::runtime_error("store snapshot is unavailable");
     size_t n = keys.size();
+    validate_unique_mutation_batch(keys, row_lengths);
     auto offsets = compute_offsets(row_lengths);
-
-    auto do_range = [&](size_t begin, size_t end) {
-      epoch::with_epoch([&] {
-        for (size_t i = begin; i < end; ++i) {
-          uint64_t key = static_cast<uint64_t>(keys[i]);
-          size_t dim = static_cast<size_t>(row_lengths[i]);
-          if (dim >= dim_to_slot_.size() || dim_to_slot_[dim] == nullptr)
-              [[unlikely]] {
-            throw std::runtime_error("invalid dim access");
-          }
-          auto &slot = *dim_to_slot_[dim];
-          ParamT *out = out_flat_values.data() + offsets[i];
-          auto [arena_idx, inserted] =
-              slot.find_or_insert(key, [&](uint32_t idx) {
-                if (initializer_.has_value()) {
-                  initializer_->initialize(
-                      std::span<ParamT>(slot.arena.data(idx), dim), key);
-                } else {
-                  std::fill_n(slot.arena.data(idx), dim, ParamT{0});
-                }
-              });
-          out_inserted_mask[i] = inserted;
-          std::copy_n(slot.arena.data(arena_idx), dim, out);
-        }
-      });
+    struct DimensionBatch {
+      SlotStore *slot;
+      std::vector<typename SlotStore::BatchEntry> entries;
     };
-    dispatch_parallel(n, do_range);
+    std::vector<DimensionBatch> batches;
+    for (size_t i = 0; i < n; ++i) {
+      const size_t dim = static_cast<size_t>(row_lengths[i]);
+      if (dim >= snapshot->dim_to_slot.size() ||
+          snapshot->dim_to_slot[dim] == nullptr)
+        throw std::runtime_error("invalid dim access");
+      SlotStore *slot = snapshot->dim_to_slot[dim];
+      auto batch = std::ranges::find(batches, slot, &DimensionBatch::slot);
+      if (batch == batches.end()) {
+        batches.push_back({slot, {}});
+        batch = std::prev(batches.end());
+      }
+      const uint64_t key = static_cast<uint64_t>(keys[i]);
+      batch->entries.push_back(
+          {key, SplitMixHash<KeyT>{}(static_cast<KeyT>(key)), i});
+    }
+    epoch::with_epoch([&] {
+      for (DimensionBatch &batch : batches) {
+        SlotStore &slot = *batch.slot;
+        slot.find_or_insert_batch(
+            batch.entries,
+            [&](const typename SlotStore::BatchEntry &entry, uint32_t index) {
+              const size_t dim =
+                  static_cast<size_t>(row_lengths[entry.position]);
+              if (initializer_.has_value()) {
+                initializer_->initialize(
+                    std::span<ParamT>(slot.arena.data(index), dim), entry.key);
+              } else {
+                std::fill_n(slot.arena.data(index), dim, ParamT{0});
+              }
+            },
+            [&](const typename SlotStore::BatchEntry &entry, uint32_t index,
+                bool inserted, bool sink) {
+              const size_t dim =
+                  static_cast<size_t>(row_lengths[entry.position]);
+              const ParamT *source =
+                  sink ? slot.sink.data() : slot.arena.data(index);
+              std::copy_n(source, dim,
+                          out_flat_values.data() + offsets[entry.position]);
+              out_inserted_mask[entry.position] =
+                  inserted ? uint8_t{1} : uint8_t{0};
+            },
+            false);
+      }
+    });
     return {};
   }
 
   template <typename K>
   std::error_code contains(std::span<const K> keys,
                            std::span<uint8_t> out_exists) {
-    std::shared_lock lifecycle_lock(*lifecycle_mutex_);
+    ActiveInvocationGuard invocation(invocation_gate_);
+    StoreSnapshot *snapshot = snapshot_.load(std::memory_order_acquire);
+    if (snapshot == nullptr)
+      throw std::runtime_error("store snapshot is unavailable");
     size_t n = keys.size();
+    const size_t worker_count =
+        operation_worker_count(HogwildOperation::kContains, n, sizeof(K));
     auto do_range = [&](size_t begin, size_t end) {
       epoch::with_epoch([&] {
         for (size_t i = begin; i < end; ++i) {
           uint64_t key = static_cast<uint64_t>(keys[i]);
           bool found = false;
-          for (const auto &slot_ptr : slot_storage_) {
-            if (slot_ptr->find(key).has_value()) {
+          for (SlotStore *slot : snapshot->slots) {
+            if (slot->find(key).has_value()) {
               found = true;
               break;
             }
@@ -1065,39 +4007,66 @@ public:
         }
       });
     };
-    dispatch_parallel(n, do_range);
+    dispatch_parallel_limited(n, do_range, worker_count);
     return {};
   }
 
   template <typename K> std::error_code erase(std::span<const K> keys) {
-    std::unique_lock lifecycle_lock(*lifecycle_mutex_);
+    ActiveInvocationGuard invocation(invocation_gate_);
+    StoreSnapshot *snapshot = snapshot_.load(std::memory_order_acquire);
+    if (snapshot == nullptr)
+      throw std::runtime_error("store snapshot is unavailable");
+    auto pressure_call = retirement_pressure_->writer_call();
+    pressure_call.apply();
+    [[maybe_unused]] auto retirement_admission =
+        retirement_pressure_->control_plane_call();
     size_t n = keys.size();
+    const size_t worker_count =
+        operation_worker_count(HogwildOperation::kErase, n, sizeof(K));
     auto do_range = [&](size_t begin, size_t end) {
       epoch::with_epoch([&] {
-        for (size_t i = begin; i < end; ++i) {
-          uint64_t key = static_cast<uint64_t>(keys[i]);
-          for (const auto &slot_ptr : slot_storage_) {
-            auto &shard = slot_ptr->shard_for_key(key);
-            std::unique_lock map_lock(shard.map_mutex);
-            auto removed = shard.bundle->key_map.Remove(
-                Key::Entry::make_key(key),
-                [](const auto &entry) { return entry.get_entry().second; });
-            if (removed.has_value()) {
-              shard.recycled_indices.push_back(*removed);
-              --shard.count;
+        for (SlotStore *slot : snapshot->slots) {
+          std::vector<std::vector<uint64_t>> keys_by_shard(
+              slot->key_shards.size());
+          for (size_t i = begin; i < end; ++i) {
+            const uint64_t key = static_cast<uint64_t>(keys[i]);
+            keys_by_shard[slot->shard_id_for_key(key)].push_back(key);
+          }
+          for (size_t shard_id = 0; shard_id < keys_by_shard.size();
+               ++shard_id) {
+            auto &shard_keys = keys_by_shard[shard_id];
+            if (shard_keys.empty())
+              continue;
+            auto &shard = *slot->key_shards[shard_id];
+            std::unique_lock map_lock(shard.writer_mutex);
+            auto removed = shard.erase_indices_unlocked(shard_keys);
+            for (uint32_t index : removed) {
+              slot->arena.mark_live(index, false);
+              shard.retire_published_index(index);
             }
           }
         }
       });
     };
-    dispatch_parallel(n, do_range);
+    dispatch_parallel_limited(n, do_range, worker_count);
     return {};
   }
 
   std::error_code clear() {
-    std::unique_lock lifecycle_lock(*lifecycle_mutex_);
+    std::lock_guard control_plane_lock(control_plane_mutex_);
+    [[maybe_unused]] auto retirement_admission =
+        retirement_pressure_->control_plane_call();
+    invocation_gate_.begin_reconfiguration_and_wait();
+    struct InvocationResume {
+      InvocationGate &gate;
+
+      ~InvocationResume() { gate.resume_accepting(); }
+    } invocation_resume{invocation_gate_};
     for (const auto &slot_ptr : slot_storage_) {
       auto *slot = slot_ptr.get();
+      slot->page_reuse->reset();
+      slot->page_telemetry.reset();
+      slot->access_telemetry.reset();
       slot->clear_keys();
       if (slot->optimizer.has_value()) {
         slot->optimizer->clear();
@@ -1114,28 +4083,62 @@ public:
       if (slot->optimizer.has_value())
         slot->optimizer->set_page_eviction_enabled(ScorePolicyT::kHasScore);
     }
+    publish_store_snapshot();
     return {};
   }
 
   std::error_code reserve(size_t keys_count, size_t dim) {
-    std::unique_lock lifecycle_lock(*lifecycle_mutex_);
-    slot_for_dim(dim).reserve(keys_count);
+    std::lock_guard control_plane_lock(control_plane_mutex_);
+    auto pressure_call = retirement_pressure_->writer_call();
+    pressure_call.apply();
+    [[maybe_unused]] auto retirement_admission =
+        retirement_pressure_->control_plane_call();
+    invocation_gate_.begin_reconfiguration_and_wait();
+    struct InvocationResume {
+      InvocationGate &gate;
+
+      ~InvocationResume() { gate.resume_accepting(); }
+    } invocation_resume{invocation_gate_};
+    StoreSnapshot *snapshot = snapshot_.load(std::memory_order_acquire);
+    if (snapshot == nullptr)
+      throw std::runtime_error("store snapshot is unavailable");
+    snapshot_slot_for_dim(*snapshot, dim).reserve(keys_count);
+    publish_store_snapshot();
     return {};
   }
 
   std::error_code reserve_per_shard(std::span<const size_t> counts,
                                     size_t dim) {
-    std::unique_lock lifecycle_lock(*lifecycle_mutex_);
-    slot_for_dim(dim).reserve_per_shard(counts);
+    std::lock_guard control_plane_lock(control_plane_mutex_);
+    auto pressure_call = retirement_pressure_->writer_call();
+    pressure_call.apply();
+    [[maybe_unused]] auto retirement_admission =
+        retirement_pressure_->control_plane_call();
+    invocation_gate_.begin_reconfiguration_and_wait();
+    struct InvocationResume {
+      InvocationGate &gate;
+
+      ~InvocationResume() { gate.resume_accepting(); }
+    } invocation_resume{invocation_gate_};
+    StoreSnapshot *snapshot = snapshot_.load(std::memory_order_acquire);
+    if (snapshot == nullptr)
+      throw std::runtime_error("store snapshot is unavailable");
+    snapshot_slot_for_dim(*snapshot, dim).reserve_per_shard(counts);
+    publish_store_snapshot();
     return {};
   }
 
-  size_t internal_shard_count() const { return num_threads_; }
+  size_t internal_shard_count() const {
+    return partition_topology_.partition_count();
+  }
 
   template <typename K>
   std::error_code assign_scores(std::span<const K> keys,
                                 std::span<const uint64_t> scores) {
-    std::shared_lock lifecycle_lock(*lifecycle_mutex_);
+    ActiveInvocationGuard invocation(invocation_gate_);
+    StoreSnapshot *snapshot = snapshot_.load(std::memory_order_acquire);
+    if (snapshot == nullptr)
+      throw std::runtime_error("store snapshot is unavailable");
     if constexpr (!ScorePolicyT::kHasScore) {
       throw std::runtime_error("assign_scores requires a score-enabled policy");
     }
@@ -1144,14 +4147,11 @@ public:
       for (size_t i = begin; i < end; ++i) {
         uint64_t key = static_cast<uint64_t>(keys[i]);
 
-        for (const auto &slot_ptr : slot_storage_) {
-          auto *slot = slot_ptr.get();
-          auto found = slot->find(key);
-
-          if (found.has_value()) {
-            uint32_t idx = *found;
-            std::atomic_ref<uint64_t>(slot->arena.score_raw(idx))
-                .store(scores[i], std::memory_order_relaxed);
+        for (SlotStore *slot : snapshot->slots) {
+          if (slot->with_shared_write_entry(key, [&](uint32_t idx) {
+                std::atomic_ref<uint64_t>(slot->arena.score_raw(idx))
+                    .store(scores[i], std::memory_order_relaxed);
+              })) {
             break; // Key found and updated, proceed to next key
           }
         }
@@ -1162,17 +4162,58 @@ public:
   }
 
   size_t size() const {
-    std::shared_lock lifecycle_lock(*lifecycle_mutex_);
+    ActiveInvocationGuard invocation(invocation_gate_);
+    StoreSnapshot *snapshot = snapshot_.load(std::memory_order_acquire);
+    if (snapshot == nullptr)
+      throw std::runtime_error("store snapshot is unavailable");
     size_t s = 0;
-    for (const auto &slot_ptr : slot_storage_) {
-      s += slot_ptr->size();
-    }
+    for (SlotStore *slot : snapshot->slots)
+      s += slot->size();
     return s;
   }
 
-  size_t num_slots() const { return slot_storage_.size(); }
+  size_t num_slots() const {
+    ActiveInvocationGuard invocation(invocation_gate_);
+    StoreSnapshot *snapshot = snapshot_.load(std::memory_order_acquire);
+    if (snapshot == nullptr)
+      throw std::runtime_error("store snapshot is unavailable");
+    return snapshot->slots.size();
+  }
 
 private:
+  template <typename K>
+  static void validate_unique_mutation_batch(std::span<const K> keys,
+                                             std::span<const int64_t> dims) {
+#ifndef NDEBUG
+    if (keys.size() != dims.size())
+      throw std::invalid_argument(
+          "mutation batch key and dimension counts differ");
+    struct BatchKey {
+      uint64_t key;
+      int64_t dim;
+      bool operator==(const BatchKey &) const = default;
+    };
+    struct BatchKeyHash {
+      size_t operator()(const BatchKey &value) const noexcept {
+        return SplitMixHash<uint64_t>{}(value.key) ^
+               (SplitMixHash<uint64_t>{}(static_cast<uint64_t>(value.dim))
+                << 1U);
+      }
+    };
+    std::unordered_set<BatchKey, BatchKeyHash> seen;
+    seen.reserve(keys.size());
+    for (size_t i = 0; i < keys.size(); ++i) {
+      if (!seen.emplace(BatchKey{static_cast<uint64_t>(keys[i]), dims[i]})
+               .second)
+        throw std::invalid_argument(
+            "mutation batch contains duplicate dimension and key");
+    }
+#else
+    (void)keys;
+    (void)dims;
+#endif
+  }
+
   SlotStore &slot_for_dim(size_t dim) {
     if (dim >= dim_to_slot_.size() || dim_to_slot_[dim] == nullptr) {
       throw std::runtime_error(
@@ -1182,15 +4223,163 @@ private:
     return *dim_to_slot_[dim];
   }
 
+  static SlotStore &snapshot_slot_for_dim(const StoreSnapshot &snapshot,
+                                          size_t dim) {
+    if (dim >= snapshot.dim_to_slot.size() ||
+        snapshot.dim_to_slot[dim] == nullptr) {
+      throw std::runtime_error(
+          "invalid dim access: no physical table for dim " +
+          std::to_string(dim));
+    }
+    return *snapshot.dim_to_slot[dim];
+  }
+
+  static size_t row_payload_bytes(std::span<const int64_t> row_lengths,
+                                  std::span<const size_t> offsets) {
+    if (row_lengths.empty())
+      throw std::invalid_argument("row payload bytes require one row");
+    const int64_t last_length = row_lengths.back();
+    if (last_length <= 0)
+      throw std::invalid_argument("row length must be positive");
+    const size_t last = static_cast<size_t>(last_length);
+    if (offsets.back() > std::numeric_limits<size_t>::max() - last)
+      throw std::overflow_error("row payload scalar count overflows size_t");
+    const size_t total_scalars = offsets.back() + last;
+    const size_t average_scalars = total_scalars / row_lengths.size() +
+                                   (total_scalars % row_lengths.size() != 0);
+    if (average_scalars > std::numeric_limits<size_t>::max() / sizeof(ParamT))
+      throw std::overflow_error("row payload byte count overflows size_t");
+    return average_scalars * sizeof(ParamT);
+  }
+
+  static size_t checked_row_payload_bytes(size_t scalars) {
+    if (scalars == 0)
+      throw std::invalid_argument("row length must be positive");
+    if (scalars > std::numeric_limits<size_t>::max() / sizeof(ParamT))
+      throw std::overflow_error("row payload byte count overflows size_t");
+    return scalars * sizeof(ParamT);
+  }
+
+  static std::optional<size_t>
+  fixed_row_length(std::span<const int64_t> row_lengths) {
+    if (row_lengths.empty())
+      return std::nullopt;
+    const int64_t first = row_lengths.front();
+    if (first <= 0)
+      throw std::invalid_argument("row length must be positive");
+    for (const int64_t length : row_lengths) {
+      if (length <= 0)
+        throw std::invalid_argument("row length must be positive");
+      if (length != first)
+        return std::nullopt;
+    }
+    return static_cast<size_t>(first);
+  }
+
+  static size_t cap_forward_tasks_by_row_granularity(size_t requested_tasks,
+                                                     size_t batch_size,
+                                                     size_t bytes_per_row) {
+    if (requested_tasks == 0)
+      throw std::invalid_argument("forward task count is zero");
+    if (batch_size == 0 || bytes_per_row == 0)
+      return 1;
+    constexpr size_t kMinimumBytesPerForwardTask = 64 * 1024;
+    const size_t minimum_rows =
+        std::max(size_t{1}, (kMinimumBytesPerForwardTask + bytes_per_row - 1) /
+                                bytes_per_row);
+    const size_t row_limited_tasks =
+        std::max(size_t{1}, batch_size / minimum_rows);
+    return std::min(requested_tasks, row_limited_tasks);
+  }
+
+  size_t accumulated_gradient_count() const {
+    size_t count = 0;
+    for (const auto &slot_ptr : slot_storage_) {
+      for (const auto &shard : slot_ptr->transient_shards) {
+        if (count > std::numeric_limits<size_t>::max() - shard->active_slots())
+          throw std::overflow_error("accumulated gradient count overflows");
+        count += shard->active_slots();
+      }
+    }
+    return count;
+  }
+
+  size_t operation_worker_count(HogwildOperation operation, size_t batch_size,
+                                size_t bytes_per_entry) const {
+    if (batch_size == 0)
+      return 1;
+    return OperationDispatchPolicy::thread_count(
+        operation, batch_size, bytes_per_entry, operation_dispatch_topology_);
+  }
+
+  void validate_dispatch_worker_count(size_t worker_count) const {
+    if (worker_count == 0 || worker_count > num_threads_) {
+      throw std::invalid_argument("dispatch worker count is outside the pool");
+    }
+  }
+
+  void bind_worker_if_requested(size_t worker) const {
+    if (!bind_worker_affinity_)
+      return;
+    const int target_cpu = numa_memory_locality_
+                               ? NumaTopology::cpu_for_worker(worker)
+                               : ThreadAffinity::cpu_for_worker(worker);
+    thread_local int bound_cpu = -1;
+    if (bound_cpu == target_cpu)
+      return;
+    ThreadAffinity::bind_current_thread_to_cpu(target_cpu);
+    bound_cpu = target_cpu;
+  }
+
+  template <typename Fn>
+  void dispatch_parallel_with_worker(size_t n, Fn &&fn,
+                                     size_t threshold = kParallelThreshold) {
+    dispatch_parallel_with_worker_limited(n, std::forward<Fn>(fn), num_threads_,
+                                          threshold);
+  }
+
+  template <typename Fn>
+  void
+  dispatch_parallel_with_worker_limited(size_t n, Fn &&fn, size_t worker_count,
+                                        size_t threshold = kParallelThreshold) {
+    if (n == 0)
+      return;
+    validate_dispatch_worker_count(worker_count);
+    if (n >= threshold && worker_count > 1) {
+      const size_t chunk_size = (n + worker_count - 1) / worker_count;
+      stdexec::sync_wait(
+          stdexec::schedule(pool_.get_scheduler()) |
+          stdexec::bulk(stdexec::par, worker_count,
+                        [this, &fn, n, chunk_size](size_t worker) {
+                          bind_worker_if_requested(worker);
+                          const size_t begin = std::min(worker * chunk_size, n);
+                          const size_t end = std::min(begin + chunk_size, n);
+                          if (begin < end)
+                            fn(worker, begin, end);
+                        }));
+      return;
+    }
+    fn(0, 0, n);
+  }
+
   template <typename Fn>
   void dispatch_parallel(size_t n, Fn &&fn,
                          size_t threshold = kParallelThreshold) {
-    if (n >= threshold) {
-      size_t num_threads = num_threads_;
-      size_t chunk_size = (n + num_threads - 1) / num_threads;
+    dispatch_parallel_limited(n, std::forward<Fn>(fn), num_threads_, threshold);
+  }
+
+  template <typename Fn>
+  void dispatch_parallel_limited(size_t n, Fn &&fn, size_t worker_count,
+                                 size_t threshold = kParallelThreshold) {
+    if (n == 0)
+      return;
+    validate_dispatch_worker_count(worker_count);
+    if (n >= threshold && worker_count > 1) {
+      size_t chunk_size = (n + worker_count - 1) / worker_count;
       stdexec::sync_wait(stdexec::schedule(pool_.get_scheduler()) |
-                         stdexec::bulk(stdexec::par, num_threads,
-                                       [&fn, n, chunk_size](size_t i) {
+                         stdexec::bulk(stdexec::par, worker_count,
+                                       [this, &fn, n, chunk_size](size_t i) {
+                                         bind_worker_if_requested(i);
                                          size_t begin =
                                              std::min(i * chunk_size, n);
                                          size_t end =
@@ -1199,19 +4388,25 @@ private:
                                            fn(begin, end);
                                          }
                                        }));
-    } else {
-      fn(0, n);
+      return;
     }
+    fn(0, n);
   }
 
-  std::vector<size_t>
-  compute_offsets(std::span<const int64_t> row_lengths) const {
-    std::vector<size_t> offsets(row_lengths.size());
+  static void compute_offsets_into(std::span<const int64_t> row_lengths,
+                                   std::vector<size_t> &offsets) {
+    offsets.resize(row_lengths.size());
     auto casted = row_lengths | std::views::transform([](int64_t v) {
                     return static_cast<size_t>(v);
                   });
     std::exclusive_scan(casted.begin(), casted.end(), offsets.begin(),
                         size_t{0});
+  }
+
+  std::vector<size_t>
+  compute_offsets(std::span<const int64_t> row_lengths) const {
+    std::vector<size_t> offsets;
+    compute_offsets_into(row_lengths, offsets);
     return offsets;
   }
 
@@ -1219,9 +4414,11 @@ private:
 
   template <typename K, ExportOwnership Policy, typename VisitorFn>
   void export_with_opt_impl(VisitorFn &&visitor, size_t batch_size) {
-    std::shared_lock lifecycle_lock(*lifecycle_mutex_);
-    for (const auto &slot_ptr : slot_storage_) {
-      auto *slot = slot_ptr.get();
+    ActiveInvocationGuard invocation(invocation_gate_);
+    StoreSnapshot *snapshot = snapshot_.load(std::memory_order_acquire);
+    if (snapshot == nullptr)
+      throw std::runtime_error("store snapshot is unavailable");
+    for (SlotStore *slot : snapshot->slots) {
       size_t emb_dim = slot->dim;
       size_t opt_dim =
           slot->optimizer.has_value() ? slot->optimizer->state_dim() : 0;
@@ -1293,12 +4490,11 @@ private:
         }
       };
 
-      slot->for_each([&](const auto &entry) {
+      slot->for_each([&](uint64_t key, uint32_t idx) {
         if (stopped.load(std::memory_order_relaxed))
           return;
 
         int w = parlay::worker_id();
-        auto [key, idx] = entry.get_entry();
         auto &lb = local_bufs[w];
 
         lb.keys.push_back(static_cast<K>(key));
@@ -1401,17 +4597,28 @@ private:
     }
   }
 
+  HogwildPartitionTopology partition_topology_;
   std::vector<SlotStore *> dim_to_slot_;
   std::vector<std::unique_ptr<SlotStore>> slot_storage_;
+  std::atomic<StoreSnapshot *> snapshot_{nullptr};
+  mutable InvocationGate invocation_gate_;
   size_t num_threads_ = 0;
+  DispatchTopology operation_dispatch_topology_;
   exec::static_thread_pool pool_;
   Initializer initializer_;
   [[no_unique_address]] ScorePolicyT score_policy_;
   PageStorage storage_;
+  std::shared_ptr<RetirementPressure> retirement_pressure_;
   bool background_page_eviction_enabled_;
-  std::shared_ptr<std::shared_mutex> lifecycle_mutex_;
+  std::mutex control_plane_mutex_;
   PageEvictionRegistration page_eviction_registration_;
+  std::atomic<uint64_t> telemetry_sample_sequence_{0};
+  bool bind_worker_affinity_ = false;
+  bool numa_memory_locality_ = false;
+  TelemetryRing telemetry_ring_;
   std::mutex training_mutex_;
+  execution::ReusableWorkspacePool<NumaForwardWorkspace>
+      numa_forward_workspaces_;
   std::vector<uint32_t> gradient_thread_counts_;
   std::vector<uint32_t> gradient_thread_offsets_;
   std::vector<uint32_t> gradient_shard_offsets_;
@@ -1422,8 +4629,13 @@ public:
   bool has_score_policy() const { return ScorePolicyT::kHasScore; }
 
   std::vector<size_t> table_dims() const {
+    ActiveInvocationGuard invocation(invocation_gate_);
+    StoreSnapshot *snapshot = snapshot_.load(std::memory_order_acquire);
+    if (snapshot == nullptr)
+      throw std::runtime_error("store snapshot is unavailable");
     std::vector<size_t> result;
-    for (const auto &slot : slot_storage_) {
+    result.reserve(snapshot->slots.size());
+    for (SlotStore *slot : snapshot->slots) {
       result.push_back(slot->dim);
     }
     return result;
@@ -1444,11 +4656,13 @@ public:
                         std::span<const uint64_t>)>
           visitor,
       size_t batch_size) {
-    std::shared_lock lifecycle_lock(*lifecycle_mutex_);
+    ActiveInvocationGuard invocation(invocation_gate_);
+    StoreSnapshot *snapshot = snapshot_.load(std::memory_order_acquire);
+    if (snapshot == nullptr)
+      throw std::runtime_error("store snapshot is unavailable");
     bool has_score = ScorePolicyT::kHasScore;
 
-    for (const auto &slot_ptr : slot_storage_) {
-      auto *slot = slot_ptr.get();
+    for (SlotStore *slot : snapshot->slots) {
       size_t dim = slot->dim;
       int num_workers = static_cast<int>(parlay::num_workers());
 
@@ -1491,12 +4705,11 @@ public:
         return cont;
       };
 
-      slot->for_each([&](const auto &entry) {
+      slot->for_each([&](uint64_t key, uint32_t idx) {
         if (stopped.load(std::memory_order_relaxed))
           return;
 
         int w = parlay::worker_id();
-        auto [key, idx] = entry.get_entry();
         auto &lb = local_buffers[w];
 
         lb.keys.push_back(static_cast<K>(key));
@@ -1605,12 +4818,17 @@ public:
   void assign_opt_states(size_t dim, std::span<const KeyT> keys,
                          std::span<const OptT> opt_states,
                          std::span<const uint32_t> steps) {
-    std::shared_lock lifecycle_lock(*lifecycle_mutex_);
+    ActiveInvocationGuard invocation(invocation_gate_);
+    StoreSnapshot *snapshot = snapshot_.load(std::memory_order_acquire);
+    if (snapshot == nullptr)
+      throw std::runtime_error("store snapshot is unavailable");
     size_t n = keys.size();
-    if (dim >= dim_to_slot_.size() || dim_to_slot_[dim] == nullptr)
+    if (dim >= snapshot->dim_to_slot.size() ||
+        snapshot->dim_to_slot[dim] == nullptr) {
       throw std::invalid_argument(
           "assign_opt_states dimension has no physical table");
-    auto &slot = *dim_to_slot_[dim];
+    }
+    auto &slot = *snapshot->dim_to_slot[dim];
     if (!slot.optimizer.has_value())
       throw std::invalid_argument(
           "assign_opt_states dimension has no optimizer");
@@ -1627,15 +4845,17 @@ public:
     epoch::with_epoch([&] {
       for (size_t i = 0; i < n; ++i) {
         uint64_t key = keys[i];
-        auto found = slot.find(key);
-        if (!found.has_value())
+        const bool found =
+            slot.with_shared_write_entry(key, [&](uint32_t index) {
+              slot.optimizer->set_state(
+                  index, std::span<const OptT>(opt_states.data() + i * opt_dim,
+                                               opt_dim));
+              if (!steps.empty())
+                slot.optimizer->set_step(index, steps[i]);
+            });
+        if (!found)
           throw std::invalid_argument(
               "assign_opt_states key is absent from dimension table");
-        slot.optimizer->set_state(
-            *found,
-            std::span<const OptT>(opt_states.data() + i * opt_dim, opt_dim));
-        if (!steps.empty())
-          slot.optimizer->set_step(*found, steps[i]);
       }
     });
   }
@@ -1679,6 +4899,139 @@ public:
         batch_size);
   }
 
+  bool compact_one(size_t dim, KeyT key) {
+    ActiveInvocationGuard invocation(invocation_gate_);
+    StoreSnapshot *snapshot = snapshot_.load(std::memory_order_acquire);
+    if (snapshot == nullptr)
+      throw std::runtime_error("store snapshot is unavailable");
+    SlotStore &slot = snapshot_slot_for_dim(*snapshot, dim);
+    bool compacted = false;
+    epoch::with_epoch(
+        [&] { compacted = slot.compact_key(static_cast<uint64_t>(key)); });
+    return compacted;
+  }
+
+  size_t compact_page(size_t dim, uint64_t page_id) {
+    ActiveInvocationGuard invocation(invocation_gate_);
+    StoreSnapshot *snapshot = snapshot_.load(std::memory_order_acquire);
+    if (snapshot == nullptr)
+      throw std::runtime_error("store snapshot is unavailable");
+    SlotStore &slot = snapshot_slot_for_dim(*snapshot, dim);
+    return epoch::with_epoch([&] { return slot.compact_page(page_id); });
+  }
+
+  size_t compact_pages(size_t dim, std::span<const uint64_t> page_ids) {
+    ActiveInvocationGuard invocation(invocation_gate_);
+    StoreSnapshot *snapshot = snapshot_.load(std::memory_order_acquire);
+    if (snapshot == nullptr)
+      throw std::runtime_error("store snapshot is unavailable");
+    SlotStore &slot = snapshot_slot_for_dim(*snapshot, dim);
+    return epoch::with_epoch(
+        [&] { return slot.compact_pages(page_ids, false); });
+  }
+
+  size_t promote_hot_keys(size_t dim, uint64_t page_id, size_t maximum_keys,
+                          uint64_t minimum_score) {
+    ActiveInvocationGuard invocation(invocation_gate_);
+    StoreSnapshot *snapshot = snapshot_.load(std::memory_order_acquire);
+    if (snapshot == nullptr)
+      throw std::runtime_error("store snapshot is unavailable");
+    SlotStore &slot = snapshot_slot_for_dim(*snapshot, dim);
+    return epoch::with_epoch([&] {
+      return slot.promote_hot_keys(page_id, maximum_keys, minimum_score);
+    });
+  }
+
+  size_t promoted_hot_page_size(size_t dim) const {
+    ActiveInvocationGuard invocation(invocation_gate_);
+    StoreSnapshot *snapshot = snapshot_.load(std::memory_order_acquire);
+    if (snapshot == nullptr)
+      throw std::runtime_error("store snapshot is unavailable");
+    return snapshot_slot_for_dim(*snapshot, dim).promoted_hot_page_size();
+  }
+
+  size_t compact_adaptive_pages(size_t dim, float memory_pressure,
+                                const AdaptivePageSelectorConfig &config) {
+    ActiveInvocationGuard invocation(invocation_gate_);
+    StoreSnapshot *snapshot = snapshot_.load(std::memory_order_acquire);
+    if (snapshot == nullptr)
+      throw std::runtime_error("store snapshot is unavailable");
+    SlotStore &slot = snapshot_slot_for_dim(*snapshot, dim);
+    return epoch::with_epoch(
+        [&] { return slot.compact_adaptive_pages(memory_pressure, config); });
+  }
+
+  template <typename Visitor> void export_page_images(Visitor &&visitor) {
+    ActiveInvocationGuard invocation(invocation_gate_);
+    StoreSnapshot *snapshot = snapshot_.load(std::memory_order_acquire);
+    if (snapshot == nullptr)
+      throw std::runtime_error("store snapshot is unavailable");
+    epoch::with_epoch([&] {
+      bool keep_exporting = true;
+      for (SlotStore *slot : snapshot->slots) {
+        auto images = slot->materialize_page_images();
+        for (auto &image : images) {
+          if (!keep_exporting)
+            break;
+          keep_exporting = visitor(slot->dim, std::move(image));
+        }
+      }
+    });
+  }
+
+  void export_page_images(
+      se::Function<bool(size_t, PageImageExport<ParamT, OptT> &&)> visitor) {
+    export_page_images(
+        [&visitor](size_t dim, PageImageExport<ParamT, OptT> &&image) {
+          return (*visitor)(dim, std::move(image));
+        });
+  }
+
+  void
+  import_page_images(std::span<const PageImageImport<ParamT, OptT>> images) {
+    std::lock_guard control_plane_lock(control_plane_mutex_);
+    [[maybe_unused]] auto retirement_admission =
+        retirement_pressure_->control_plane_call();
+    invocation_gate_.begin_reconfiguration_and_wait();
+    struct InvocationResume {
+      InvocationGate &gate;
+
+      ~InvocationResume() { gate.resume_accepting(); }
+    } invocation_resume{invocation_gate_};
+    epoch::with_epoch([&] {
+      std::vector<std::vector<PageImageImport<ParamT, OptT>>> by_dimension(
+          dim_to_slot_.size());
+      for (const auto &import : images) {
+        if (import.dim >= dim_to_slot_.size() ||
+            dim_to_slot_[import.dim] == nullptr)
+          throw std::invalid_argument(
+              "page-image import dimension has no physical table");
+        by_dimension[import.dim].push_back(import);
+      }
+      for (size_t dim = 0; dim < by_dimension.size(); ++dim) {
+        if (!by_dimension[dim].empty())
+          dim_to_slot_[dim]->import_page_images(by_dimension[dim]);
+      }
+    });
+    publish_store_snapshot();
+  }
+
+  std::vector<std::shared_ptr<const SealedHotPage<ParamT>>>
+  seal_adaptive_pages(size_t dim, float memory_pressure,
+                      const AdaptivePageSelectorConfig &config,
+                      PageThermalTier tier, uint32_t cluster_id,
+                      uint64_t page_layout_generation) {
+    ActiveInvocationGuard invocation(invocation_gate_);
+    StoreSnapshot *snapshot = snapshot_.load(std::memory_order_acquire);
+    if (snapshot == nullptr)
+      throw std::runtime_error("store snapshot is unavailable");
+    SlotStore &slot = snapshot_slot_for_dim(*snapshot, dim);
+    return epoch::with_epoch([&] {
+      return slot.seal_adaptive_pages(memory_pressure, config, tier, cluster_id,
+                                      page_layout_generation);
+    });
+  }
+
   // =========================================================================
   // evict_by_score — GC operation, decoupled from insertion.
   //
@@ -1691,105 +5044,113 @@ public:
                                  std::span<K> out_evicted_keys,
                                  std::span<ParamT> out_evicted_values,
                                  size_t &out_evicted_count) {
-    std::unique_lock lifecycle_lock(*lifecycle_mutex_);
     if constexpr (!ScorePolicyT::kHasScore)
       throw std::runtime_error(
           "evict_by_score requires a score-enabled policy");
+    if (out_evicted_keys.size() < max_evict_count) {
+      throw std::invalid_argument("eviction output spans are too small");
+    }
+    if (max_evict_count == 0)
+      return {};
 
+    ActiveInvocationGuard invocation(invocation_gate_);
+    StoreSnapshot *snapshot = snapshot_.load(std::memory_order_acquire);
+    if (snapshot == nullptr)
+      throw std::runtime_error("store snapshot is unavailable");
+    auto pressure_call = retirement_pressure_->writer_call();
+    pressure_call.apply();
+    [[maybe_unused]] auto retirement_admission =
+        retirement_pressure_->control_plane_call();
     out_evicted_count = 0;
 
-    for (const auto &slot_ptr : slot_storage_) {
-      auto *slot = slot_ptr.get();
-      if (out_evicted_count >= max_evict_count)
-        break;
+    struct Candidate {
+      uint64_t key;
+      uint64_t score;
+      SlotStore *slot;
+    };
 
-      size_t dim = slot->dim;
-      int num_workers = static_cast<int>(parlay::num_workers());
-      size_t slot_budget = max_evict_count - out_evicted_count;
-
-      struct LocalEvictBuffer {
-        std::vector<std::pair<uint64_t, uint64_t>> candidates;
+    std::vector<Candidate> candidates;
+    candidates.reserve(max_evict_count);
+    const int num_workers = static_cast<int>(parlay::num_workers());
+    std::vector<std::vector<Candidate>> local_candidates(num_workers);
+    for (auto &local : local_candidates)
+      local.reserve(std::min(max_evict_count, size_t{256}));
+    auto add_candidate = [max_evict_count](std::vector<Candidate> &target,
+                                           Candidate candidate) {
+      auto colder = [](const Candidate &left, const Candidate &right) {
+        return left.score < right.score;
       };
-      std::vector<LocalEvictBuffer> local_buffers(num_workers);
-      for (int i = 0; i < num_workers; ++i) {
-        local_buffers[i].candidates.reserve(1024);
+      if (target.size() < max_evict_count) {
+        target.push_back(candidate);
+        if (target.size() == max_evict_count)
+          std::make_heap(target.begin(), target.end(), colder);
+      } else if (candidate.score < target.front().score) {
+        std::pop_heap(target.begin(), target.end(), colder);
+        target.back() = candidate;
+        std::push_heap(target.begin(), target.end(), colder);
       }
-
-      std::mutex m;
-      std::vector<std::pair<uint64_t, uint64_t>> global_candidates;
-      global_candidates.reserve(slot_budget);
-
-      auto merge_global =
-          [&](std::vector<std::pair<uint64_t, uint64_t>> &local_cands) {
-            std::lock_guard<std::mutex> lock(m);
-            for (auto &cand : local_cands) {
-              if (global_candidates.size() < slot_budget) {
-                global_candidates.push_back(cand);
-                if (global_candidates.size() == slot_budget) {
-                  std::make_heap(global_candidates.begin(),
-                                 global_candidates.end());
-                }
-              } else if (cand.first < global_candidates.front().first) {
-                std::pop_heap(global_candidates.begin(),
-                              global_candidates.end());
-                global_candidates.back() = cand;
-                std::push_heap(global_candidates.begin(),
-                               global_candidates.end());
-              }
-            }
-            local_cands.clear();
-          };
-
-      slot->for_each([&](const auto &entry) {
-        int w = parlay::worker_id();
-        auto [key, idx] = entry.get_entry();
-        uint64_t s = std::atomic_ref<uint64_t>(slot->arena.score_raw(idx))
-                         .load(std::memory_order_relaxed);
-        if (s <= max_score) {
-          local_buffers[w].candidates.emplace_back(s, key);
-          if (local_buffers[w].candidates.size() >= 1024) {
-            merge_global(local_buffers[w].candidates);
-          }
-        }
-      });
-
-      for (int w = 0; w < num_workers; ++w) {
-        if (!local_buffers[w].candidates.empty()) {
-          merge_global(local_buffers[w].candidates);
-        }
-      }
-
-      // Sort ascending by score — lowest score evicted first.
-      std::ranges::sort(global_candidates);
-
-      epoch::with_epoch([&] {
-        for (auto &[score, key] : global_candidates) {
-          if (out_evicted_count >= max_evict_count)
-            break;
-
-          auto found = slot->find(key);
-          if (!found.has_value())
-            continue;
-
-          uint32_t idx = *found;
-          if (out_evicted_count < out_evicted_keys.size()) {
-            out_evicted_keys[out_evicted_count] = static_cast<K>(key);
-            std::copy_n(slot->arena.data(idx), dim,
-                        out_evicted_values.data() + out_evicted_count * dim);
-          }
-          auto &shard = slot->shard_for_key(key);
-          std::unique_lock map_lock(shard.map_mutex);
-          auto removed = shard.bundle->key_map.Remove(
-              Key::Entry::make_key(key),
-              [](const auto &entry) { return entry.get_entry().second; });
-          if (removed.has_value()) {
-            shard.recycled_indices.push_back(*removed);
-            --shard.count;
-          }
-          ++out_evicted_count;
-        }
+    };
+    for (SlotStore *slot : snapshot->slots) {
+      slot->for_each([&](uint64_t key, uint32_t idx) {
+        auto &local = local_candidates[parlay::worker_id()];
+        if (!slot->arena.is_live(idx))
+          return;
+        uint64_t score = std::atomic_ref<uint64_t>(slot->arena.score_raw(idx))
+                             .load(std::memory_order_relaxed);
+        if (score > max_score)
+          return;
+        add_candidate(local, Candidate{key, score, slot});
       });
     }
+    for (auto &local : local_candidates) {
+      for (const Candidate &candidate : local)
+        add_candidate(candidates, candidate);
+    }
+
+    size_t required_dim = 0;
+    for (const Candidate &candidate : candidates) {
+      if (required_dim == 0) {
+        required_dim = candidate.slot->dim;
+      } else if (candidate.slot->dim != required_dim) {
+        throw std::invalid_argument(
+            "eviction output cannot represent mixed dimensions");
+      }
+    }
+    if (required_dim != 0 &&
+        max_evict_count > std::numeric_limits<size_t>::max() / required_dim) {
+      throw std::overflow_error("eviction output size overflow");
+    }
+    if (out_evicted_values.size() < max_evict_count * required_dim)
+      throw std::invalid_argument("eviction value span is too small");
+
+    epoch::with_epoch([&] {
+      for (const Candidate &candidate : candidates) {
+        if (out_evicted_count >= max_evict_count)
+          break;
+
+        auto &slot = *candidate.slot;
+        auto &shard = slot.shard_for_key(candidate.key);
+        std::unique_lock map_lock(shard.writer_mutex);
+        auto found = shard.find_unlocked(candidate.key);
+        if (!found.has_value())
+          continue;
+        uint32_t idx = *found;
+        uint64_t score = std::atomic_ref<uint64_t>(slot.arena.score_raw(idx))
+                             .load(std::memory_order_relaxed);
+        if (score > max_score || !slot.arena.is_live(idx))
+          continue;
+
+        std::copy_n(slot.arena.data(idx), slot.dim,
+                    out_evicted_values.data() + out_evicted_count * slot.dim);
+        out_evicted_keys[out_evicted_count] = static_cast<K>(candidate.key);
+        auto removed = shard.erase_index_unlocked(candidate.key);
+        if (!removed.has_value())
+          continue;
+        slot.arena.mark_live(*removed, false);
+        shard.retire_published_index(*removed);
+        ++out_evicted_count;
+      }
+    });
     return {};
   }
 };

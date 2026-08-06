@@ -50,6 +50,23 @@ struct CheckpointLoadOptions {
   size_t batch_size = 65536;
 };
 
+struct PartitionedCheckpointOptions {
+  uint32_t worker_count = 1;
+  uint32_t shard_count = 1;
+  uint64_t snapshot_id = 0;
+  uint64_t page_layout_generation = 0;
+  bool include_page_images = false;
+};
+
+struct PartitionedCheckpointReadOptions {
+  uint32_t worker_id = 0;
+  uint32_t worker_count = 1;
+  uint32_t shard_count = 1;
+  uint64_t snapshot_id = 0;
+  uint64_t backend_version = 0;
+  size_t batch_size = 65536;
+};
+
 struct CheckpointVersion {
   uint64_t version_id;
   uint64_t timestamp_ms;

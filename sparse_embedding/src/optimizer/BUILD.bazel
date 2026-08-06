@@ -12,5 +12,15 @@ cc_library(
         "//sparse_embedding/src/interface",
         "//sparse_embedding/src/simd",
         "//sparse_embedding/src/storage",
+        "@proxy",
+    ],
+)
+
+cc_test(
+    name = "optimizer_extension_contract_test",
+    srcs = ["optimizer_extension_contract_test.cpp"],
+    deps = [
+        ":optimizer",
+        "@proxy",
     ],
 )

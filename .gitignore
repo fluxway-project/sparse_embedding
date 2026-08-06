@@ -29,3 +29,4 @@ sparse_embedding/_core.pyi
 .DS_Store
 
 tmp/
+maintenance/

@@ -35,6 +35,7 @@ PRO_DEF_MEM_DISPATCH(OptMemClear, clear);
 PRO_DEF_MEM_DISPATCH(OptMemStep, step);
 PRO_DEF_MEM_DISPATCH(OptMemStateData, state_data);
 PRO_DEF_MEM_DISPATCH(OptMemStateDim, state_dim);
+PRO_DEF_MEM_DISPATCH(OptMemAllocationBytesPerEntry, allocation_bytes_per_entry);
 PRO_DEF_MEM_DISPATCH(OptMemSetState, set_state);
 PRO_DEF_MEM_DISPATCH(OptMemStepData, step_data);
 PRO_DEF_MEM_DISPATCH(OptMemSetStep, set_step);
@@ -59,6 +60,8 @@ struct OptimizerFacade
       ::add_convention<pro::weak_dispatch<OptMemStateData>,
                        void(uint32_t idx, std::span<OptT> out) const> //
       ::add_convention<pro::weak_dispatch<OptMemStateDim>,
+                       size_t() const> //
+      ::add_convention<pro::weak_dispatch<OptMemAllocationBytesPerEntry>,
                        size_t() const> //
       ::add_convention<pro::weak_dispatch<OptMemSetState>,
                        void(uint32_t idx, std::span<const OptT> state)> //

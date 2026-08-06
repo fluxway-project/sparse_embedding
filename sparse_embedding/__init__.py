@@ -60,13 +60,6 @@ class MemoryOnly:
         self._native = _StorageOptions.memory_only()
 
 
-class DiskSpill:
-    def __init__(self, directory: os.PathLike[str] | str, max_bytes: int) -> None:
-        if max_bytes <= 0:
-            raise ValueError("max_bytes must be greater than zero")
-        self._native = _StorageOptions.disk_spill(os.fspath(directory), max_bytes)
-
-
 def _to_str(dt: Any) -> str:
     if dt is None:
         return ""
@@ -89,16 +82,16 @@ class EmbeddingConfig(_EmbeddingConfig):
     def __init__(
         self,
         dims: Sequence[int],
-        num_threads: int = 0,
+        thread_budget: int = 0,
         value_dtype: Any = "float32",
         optimizer_dtype: Any = "",
         key_dtype: Any = "int64",
-        storage: AutoStorage | MemoryOnly | DiskSpill | None = None,
+        storage: AutoStorage | MemoryOnly | None = None,
     ):
         resolved_storage = AutoStorage() if storage is None else storage
         super().__init__(
             dims,
-            num_threads,
+            thread_budget,
             _to_str(value_dtype),
             _to_str(optimizer_dtype),
             _to_str(key_dtype),
@@ -138,7 +131,6 @@ __all__ = [
     "Uniform",
     "Initializer",
     "EmbeddingStore",
-    "DiskSpill",
     "async_unique",
     "encode_keys",
     "decode_keys",

@@ -19,6 +19,7 @@
 #define SPARSE_EMBEDDING_UNIFORM_INITIALIZER_HPP_
 
 #include <cstdint>
+#include <ranges>
 #include <span>
 
 #include "sparse_embedding/src/simd/simd_ops.hpp"
@@ -38,13 +39,14 @@ template <typename ValT> struct UniformInitializer {
                                   key);
     } else {
       constexpr size_t kChunkSize = 256;
-      float buf[kChunkSize];
-      size_t count = param.size();
-      for (size_t i = 0; i < count; i += kChunkSize) {
-        size_t chunk = std::min(kChunkSize, count - i);
-        se::simd::simd_uniform_init(buf, chunk, min_val, max_val, key + i);
-        for (size_t j = 0; j < chunk; ++j) {
-          param[i + j] = static_cast<ValT>(buf[j]);
+      for (auto [chunk_idx, param_chunk] :
+           std::views::enumerate(param | std::views::chunk(kChunkSize))) {
+        float buf[kChunkSize];
+        size_t chunk_size = param_chunk.size();
+        se::simd::simd_uniform_init(buf, chunk_size, min_val, max_val,
+                                    key + chunk_idx * kChunkSize);
+        for (auto [j, val] : std::views::enumerate(param_chunk)) {
+          val = static_cast<ValT>(buf[j]);
         }
       }
     }

@@ -1,10 +1,18 @@
+from collections.abc import Callable
+
 from .base import CheckpointBackend, DistributedCheckpointBackend
 
-_BACKENDS = {}
+CheckpointBackendFactory = Callable[..., CheckpointBackend]
+
+_BACKENDS: dict[str, CheckpointBackendFactory] = {}
 
 
-def register_backend(name: str, backend_cls: type):
-    _BACKENDS[name] = backend_cls
+def register_backend(name: str, backend_factory: CheckpointBackendFactory) -> None:
+    if not name:
+        raise ValueError("checkpoint backend name must not be empty")
+    if name in _BACKENDS:
+        raise ValueError(f"Checkpoint backend already registered: {name}")
+    _BACKENDS[name] = backend_factory
 
 
 def get_checkpointer(name: str, **kwargs) -> CheckpointBackend:
@@ -17,12 +25,13 @@ def get_checkpointer(name: str, **kwargs) -> CheckpointBackend:
     return _BACKENDS[name](**kwargs)
 
 
-try:
+def _create_lance_backend(**kwargs) -> CheckpointBackend:
     from .lance_backend import LanceCheckpointBackend
 
-    register_backend("lance", LanceCheckpointBackend)
-except ImportError:
-    pass
+    return LanceCheckpointBackend(**kwargs)
+
+
+register_backend("lance", _create_lance_backend)
 
 __all__ = [
     "CheckpointBackend",

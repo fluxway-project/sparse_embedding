@@ -93,7 +93,8 @@ template <typename Policy>
 static HogwildEmbeddingStore<uint64_t, float, float, Policy>
 make_store(size_t dim = 4, size_t threads = 2) {
   return HogwildEmbeddingStore<uint64_t, float, float, Policy>(
-      {dim}, threads, {}, nullptr, Policy{});
+      {dim}, {}, nullptr, Policy{},
+      HogwildStoreOptions{.thread_budget = threads});
 }
 
 // ============================================================================
@@ -217,7 +218,8 @@ static void test_checkpoint_roundtrip() {
   CHECK(buf.values.size() == 3u * kDim);
 
   HogwildEmbeddingStore<uint64_t, float, float, LfuScorePolicy> store2(
-      {kDim}, 2, {}, nullptr, LfuScorePolicy{});
+      {kDim}, {}, nullptr, LfuScorePolicy{},
+      HogwildStoreOptions{.thread_budget = 2});
   apply_load(store2, buf, kDim);
   CHECK_EQ(store2.size(), 3u);
 

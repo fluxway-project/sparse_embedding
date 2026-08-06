@@ -26,7 +26,7 @@ namespace se {
 
 template <typename ValT> struct ZerosInitializer {
   void initialize(std::span<ValT> param, uint64_t key) const {
-    std::fill(param.begin(), param.end(), ValT{0});
+    std::ranges::fill(param, ValT{0});
   }
 };
 

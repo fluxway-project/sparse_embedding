@@ -23,7 +23,6 @@
 
 #include <algorithm>
 #include <cstdint>
-#include <format>
 #include <memory>
 #include <span>
 #include <stdexcept>
@@ -36,7 +35,7 @@
 #include "sparse_embedding/src/ops/partitioner.hpp"
 #include "sparse_embedding/src/ops/tensor_ops.hpp"
 #ifdef SE_ENABLE_LANCE_CHECKPOINTER
-#include "sparse_embedding/src/checkpoint/lance/lance_checkpoint.hpp"
+#include "sparse_embedding/src/checkpoint/checkpoint_registry.hpp"
 #endif
 
 namespace nb = nanobind;
@@ -54,26 +53,16 @@ EmbeddingStoreWrapper::EmbeddingStoreWrapper(
     const se::EmbeddingConfig &emb_cfg,
     std::optional<PyInitializer> init_cfg_opt,
     std::optional<PyOptimizer> opt_cfg_opt, std::string score_policy_name)
-    : async_pool_((emb_cfg.num_threads == 0)
+    : async_pool_((emb_cfg.thread_budget == 0)
                       ? std::max(1u, std::thread::hardware_concurrency())
-                      : emb_cfg.num_threads),
-      value_dtype_(emb_cfg.value_dtype),
-      optimizer_dtype_(emb_cfg.optimizer_dtype.empty()
-                           ? emb_cfg.value_dtype
-                           : emb_cfg.optimizer_dtype),
-      key_dtype_(emb_cfg.key_dtype),
+                      : emb_cfg.thread_budget),
+      value_dtype_code_(parse_value_dtype(emb_cfg.value_dtype, "dtype")),
+      optimizer_dtype_code_(parse_value_dtype(emb_cfg.optimizer_dtype.empty()
+                                                  ? emb_cfg.value_dtype
+                                                  : emb_cfg.optimizer_dtype,
+                                              "opt_dtype")),
+      key_type_enum_(parse_key_dtype(emb_cfg.key_dtype)),
       storage_(se::create_page_storage(emb_cfg.storage)) {
-  if (key_dtype_ == "int32" || key_dtype_ == "i32")
-    key_type_enum_ = KeyDType::kInt32;
-  else if (key_dtype_ == "uint32" || key_dtype_ == "u32")
-    key_type_enum_ = KeyDType::kUInt32;
-  else if (key_dtype_ == "int64" || key_dtype_ == "i64")
-    key_type_enum_ = KeyDType::kInt64;
-  else if (key_dtype_ == "uint64" || key_dtype_ == "u64" || key_dtype_.empty())
-    key_type_enum_ = KeyDType::kUInt64;
-  else
-    throw std::invalid_argument(
-        std::format("unsupported key_dtype: {}", key_dtype_));
   PyInitializer init_cfg = init_cfg_opt.value_or(
       PyInitializer{std::make_shared<pro::proxy<se::InitializerBuilderFacade>>(
           pro::make_proxy<se::InitializerBuilderFacade,
@@ -85,13 +74,13 @@ EmbeddingStoreWrapper::EmbeddingStoreWrapper(
   if (dims_.empty())
     throw std::invalid_argument("dims must not be empty");
 
-  size_t num_threads = (emb_cfg.num_threads == 0)
-                           ? std::max(1u, std::thread::hardware_concurrency())
-                           : emb_cfg.num_threads;
+  size_t thread_budget = (emb_cfg.thread_budget == 0)
+                             ? std::max(1u, std::thread::hardware_concurrency())
+                             : emb_cfg.thread_budget;
 
   dispatch_types([&]<typename P, typename O>() {
     ConstructOpsImpl<P, O>::construct(*this, init_cfg, opt_cfg,
-                                      score_policy_name, num_threads);
+                                      score_policy_name, thread_budget);
   });
 }
 
@@ -237,7 +226,10 @@ NB_MODULE(_core, m) {
              std::optional<std::string> spill_directory,
              std::optional<size_t> max_spill_bytes,
              std::optional<double> high_watermark,
-             std::optional<double> low_watermark) {
+             std::optional<double> low_watermark,
+             std::optional<double> backpressure_fraction,
+             std::optional<double> circuit_fraction,
+             std::optional<int64_t> epoch_stall_timeout_ms) {
             se::StorageOptions options;
             options.mode = se::StorageMode::kAuto;
             options.memory_limit_bytes = memory_limit_bytes;
@@ -252,40 +244,44 @@ NB_MODULE(_core, m) {
                 wm.low = *low_watermark;
               options.watermark = wm;
             }
+            if (backpressure_fraction)
+              options.retirement_pressure.backpressure_fraction =
+                  *backpressure_fraction;
+            if (circuit_fraction)
+              options.retirement_pressure.circuit_fraction = *circuit_fraction;
+            if (epoch_stall_timeout_ms) {
+              if (*epoch_stall_timeout_ms <= 0) {
+                throw std::invalid_argument(
+                    "epoch_stall_timeout_ms must be positive");
+              }
+              options.retirement_pressure.epoch_stall_timeout =
+                  std::chrono::milliseconds(*epoch_stall_timeout_ms);
+            }
             return options;
           },
           nb::arg("memory_limit_bytes") = nb::none(),
           nb::arg("spill_directory") = nb::none(),
           nb::arg("max_spill_bytes") = nb::none(),
           nb::arg("high_watermark") = nb::none(),
-          nb::arg("low_watermark") = nb::none())
-      .def_static("memory_only",
-                  []() {
-                    se::StorageOptions options;
-                    options.mode = se::StorageMode::kMemoryOnly;
-                    return options;
-                  })
-      .def_static(
-          "disk_spill",
-          [](const std::string &directory, size_t max_bytes) {
-            se::StorageOptions options;
-            options.mode = se::StorageMode::kDiskOnly;
-            options.memory_limit_bytes = 0;
-            options.spill_directory = directory;
-            options.max_spill_bytes = max_bytes;
-            return options;
-          },
-          nb::arg("directory"), nb::arg("max_bytes"));
+          nb::arg("low_watermark") = nb::none(),
+          nb::arg("backpressure_fraction") = nb::none(),
+          nb::arg("circuit_fraction") = nb::none(),
+          nb::arg("epoch_stall_timeout_ms") = nb::none())
+      .def_static("memory_only", []() {
+        se::StorageOptions options;
+        options.mode = se::StorageMode::kMemoryOnly;
+        return options;
+      });
 
   nb::class_<se::EmbeddingConfig>(m, "_EmbeddingConfig")
       .def(nb::init<std::vector<size_t>, size_t, std::string, std::string,
                     std::string, se::StorageOptions>(),
-           nb::arg("dims"), nb::arg("num_threads") = 0,
+           nb::arg("dims"), nb::arg("thread_budget") = 0,
            nb::arg("value_dtype") = "float32", nb::arg("optimizer_dtype") = "",
            nb::arg("key_dtype") = "int64",
            nb::arg("storage") = se::StorageOptions{})
       .def_rw("dims", &se::EmbeddingConfig::dims)
-      .def_rw("num_threads", &se::EmbeddingConfig::num_threads)
+      .def_rw("thread_budget", &se::EmbeddingConfig::thread_budget)
       .def_rw("value_dtype", &se::EmbeddingConfig::value_dtype)
       .def_rw("optimizer_dtype", &se::EmbeddingConfig::optimizer_dtype)
       .def_rw("key_dtype", &se::EmbeddingConfig::key_dtype);
@@ -482,6 +478,17 @@ NB_MODULE(_core, m) {
            nb::sig("def async_assign_scores(self, keys: object, scores: "
                    "object) -> typing.Awaitable[typing.Any]"))
 
+      .def("compact_page", &EmbeddingStoreWrapper::compact_page, nb::arg("dim"),
+           nb::arg("page_id"))
+      .def("promote_hot_keys", &EmbeddingStoreWrapper::promote_hot_keys,
+           nb::arg("dim"), nb::arg("page_id"), nb::arg("maximum_keys"),
+           nb::arg("minimum_score") = 0)
+      .def("promoted_hot_page_size",
+           &EmbeddingStoreWrapper::promoted_hot_page_size, nb::arg("dim"))
+      .def("export_page_images", &EmbeddingStoreWrapper::export_page_images)
+      .def("import_page_images", &EmbeddingStoreWrapper::import_page_images,
+           nb::arg("pages"))
+
       .def("export_batches_dlpack",
            &EmbeddingStoreWrapper::export_batches_dlpack, nb::arg("visitor"),
            nb::arg("batch_size") = 65536,
@@ -505,15 +512,9 @@ NB_MODULE(_core, m) {
            nb::arg("batch_size") = 65536)
       .def("set_checkpoint_factories",
            [](EmbeddingStoreWrapper &self, const std::string &backend) {
-             if (backend == "lance") {
-               auto wf = pro::make_proxy<se::CheckpointWriterFacade,
-                                         se::LanceCheckpointWriter>();
-               auto rf = pro::make_proxy<se::CheckpointReaderFacade,
-                                         se::LanceCheckpointReader>();
-               self.set_checkpoint_factories(std::move(wf), std::move(rf));
-               return;
-             }
-             throw std::runtime_error("Unsupported backend: " + backend);
+             auto factories = se::make_checkpoint_factories(backend);
+             self.set_checkpoint_factories(std::move(factories.writer),
+                                           std::move(factories.reader));
            })
 #endif // SE_ENABLE_LANCE_CHECKPOINTER
       ;

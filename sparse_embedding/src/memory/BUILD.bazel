@@ -1,0 +1,7 @@
+load("@rules_cc//cc:cc_library.bzl", "cc_library")
+
+cc_library(
+    name = "memory",
+    hdrs = ["x86_seqlock.hpp"],
+    visibility = ["//visibility:public"],
+)

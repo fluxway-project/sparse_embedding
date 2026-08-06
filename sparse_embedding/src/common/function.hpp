@@ -25,7 +25,8 @@ namespace se {
 PRO_DEF_MEM_DISPATCH(MemCall, operator());
 
 template <typename Signature>
-struct FunctionFacade : pro::facade_builder                               //
+struct FunctionFacade : pro                                               //
+                        ::facade_builder                                  //
                         ::add_convention<MemCall, Signature>              //
                         ::support_copy<pro::constraint_level::nontrivial> //
                         ::build {};

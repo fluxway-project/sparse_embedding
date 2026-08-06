@@ -88,19 +88,24 @@ public:
     if (out.size() < d * 2) {
       throw std::invalid_argument("Output buffer too small");
     }
-    std::copy_n(m_state.data(idx), d, out.data());
-    std::copy_n(v_state.data(idx), d, out.data() + d);
+    std::ranges::copy_n(m_state.data(idx), d, out.data());
+    std::ranges::copy_n(v_state.data(idx), d, out.data() + d);
   }
 
   constexpr size_t state_dim() const { return m_state.dim() * 2; }
+
+  size_t allocation_bytes_per_entry() const {
+    return m_state.row_stride() + v_state.row_stride() +
+           step_state.row_stride();
+  }
 
   void set_state(uint32_t idx, std::span<const OptT> state) {
     size_t d = m_state.dim();
     if (state.size() < d * 2) {
       throw std::invalid_argument("Input state span is too small.");
     }
-    std::copy_n(state.data(), d, m_state.data(idx));
-    std::copy_n(state.data() + d, d, v_state.data(idx));
+    std::ranges::copy_n(state.data(), d, m_state.data(idx));
+    std::ranges::copy_n(state.data() + d, d, v_state.data(idx));
   }
 
   uint32_t step_data(uint32_t idx) const { return *step_state.data(idx); }

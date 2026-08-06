@@ -18,6 +18,7 @@
 #ifndef SPARSE_EMBEDDING_SIMD_OPS_HPP_
 #define SPARSE_EMBEDDING_SIMD_OPS_HPP_
 
+#include <bit>
 #include <cmath>
 #include <cstddef>
 #include <cstdint>
@@ -120,28 +121,8 @@ inline void prefetch_l2(const void *addr) {
 template <typename ValT>
 inline void simd_copy(const ValT *__restrict__ src, ValT *__restrict__ dst,
                       size_t count) {
-  size_t i = 0;
-  [[assume(count > 0)]];
-#if defined(__AVX512F__)
-  if constexpr (is_simd_supported_v<ValT>) {
-    for (; i + 16 <= count; i += 16) {
-      store_from_ps(dst + i, load_to_ps(src + i));
-    }
-  }
-#elif defined(__AVX2__)
-  if constexpr (std::is_same_v<ValT, float>
-#if defined(__F16C__)
-                || std::is_same_v<ValT, float16_t>
-#endif
-  ) {
-    for (; i + 8 <= count; i += 8) {
-      store256_from_ps(dst + i, load256_to_ps(src + i));
-    }
-  }
-#endif
-  for (; i < count; ++i) {
-    dst[i] = src[i];
-  }
+  static_assert(std::is_trivially_copyable_v<ValT>);
+  std::memcpy(dst, src, count * sizeof(ValT));
 }
 
 template <typename ValT>
@@ -433,8 +414,7 @@ inline void simd_uniform_init(ValT *__restrict__ data, size_t count,
     h ^= h >> 16;
     uint32_t shf = h >> 9;
     uint32_t float_bits = shf | 0x3f800000;
-    float floats;
-    std::memcpy(&floats, &float_bits, sizeof(float));
+    float floats = std::bit_cast<float>(float_bits);
     if constexpr (std::is_same_v<ValT, float>) {
       data[i] = (floats - 1.0f) * (max_val - min_val) + min_val;
     } else {

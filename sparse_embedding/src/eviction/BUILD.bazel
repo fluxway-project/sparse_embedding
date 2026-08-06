@@ -14,6 +14,44 @@ cc_library(
 )
 
 cc_test(
+    name = "adaptive_boltzmann_policy_test",
+    srcs = ["adaptive_boltzmann_policy_test.cpp"],
+    deps = [":eviction"],
+)
+
+cc_test(
+    name = "coaccess_sketch_test",
+    srcs = ["coaccess_sketch_test.cpp"],
+    linkopts = ["-pthread"],
+    deps = [":eviction"],
+)
+
+cc_test(
+    name = "sealed_hot_page_test",
+    srcs = ["sealed_hot_page_test.cpp"],
+    deps = [":eviction"],
+)
+
+cc_test(
+    name = "adaptive_page_selector_test",
+    srcs = ["adaptive_page_selector_test.cpp"],
+    deps = [":eviction"],
+)
+
+cc_test(
+    name = "page_telemetry_test",
+    srcs = ["page_telemetry_test.cpp"],
+    linkopts = ["-pthread"],
+    deps = [":eviction"],
+)
+
+cc_test(
+    name = "adaptive_sealed_page_planner_test",
+    srcs = ["adaptive_sealed_page_planner_test.cpp"],
+    deps = [":eviction"],
+)
+
+cc_test(
     name = "score_policy_test",
     srcs = ["score_policy_test.cpp"],
     linkopts = ["-pthread"],

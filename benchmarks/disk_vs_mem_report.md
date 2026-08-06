@@ -1,6 +1,6 @@
 # Sparse Embedding Disk vs Memory Benchmark
 
-This report documents the performance evaluation of the `sparse_embedding` package when comparing pure memory storage (`MemoryOnly`) against pure disk storage (`DiskSpill` without memory cache).
+This report documents the performance evaluation of the `sparse_embedding` package when comparing pure memory storage (`MemoryOnly`) against Auto spill storage with no memory cache.
 
 ## Benchmark Configuration
 
@@ -11,7 +11,7 @@ The benchmark simulates a high-concurrency, multi-core environment accessing a m
 - **Embedding Dimension:** 128
 - **Concurrency (Threads):** 128
 - **Memory Storage:** `sparse_embedding.MemoryOnly()`
-- **Disk Storage:** `sparse_embedding.DiskSpill(tmp_dir, 100GB)` (Data forced to disk)
+- **Spill Storage:** `sparse_embedding.AutoStorage(memory_limit_bytes=0, spill_directory=tmp_dir, max_spill_bytes=100GB)`
 
 *Note on Reserve Capacity: Before inserting data, `store.reserve()` was explicitly called to pre-allocate capacity. This prevents the benchmark from measuring the overhead of page allocation and hash table rehashing, focusing purely on the raw insert/lookup memory vs disk overhead.*
 
@@ -35,7 +35,7 @@ The `lookup_or_insert` operation on disk drops to **49.28%** of the memory basel
 Unlike lookups, new insertions onto disk require dirtying pages and triggering physical disk IO operations (e.g., ext4/xfs block allocation, fsync constraints, and OS writeback). With 128 threads competing for disk-backed memory blocks, the IO contention and dirty page write-out become the primary bottleneck, resulting in approximately half the performance of pure memory allocations.
 
 ### 3. Effectiveness of Pre-reserving Capacity
-By using `store.reserve(10000000, 128)`, the benchmark cleanly separates data-path performance from control-path (resizing/warmup) overhead. The `SparseEmbeddingSpillWarning` during the initialization phase for DiskSpill confirms that the disk space was successfully pre-reserved before any timing started.
+By using `store.reserve(10000000, 128)`, the benchmark cleanly separates data-path performance from control-path (resizing/warmup) overhead. The `SparseEmbeddingSpillWarning` during the initialization phase confirms that the disk space was successfully pre-reserved before any timing started.
 
 ---
 

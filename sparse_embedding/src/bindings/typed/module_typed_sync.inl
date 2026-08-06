@@ -19,7 +19,7 @@ nb::tuple SyncOpsImpl<ParamT, OptT>::lookup(EmbeddingStoreWrapper &self,
 
   {
     nb::gil_scoped_release release;
-    dispatch_on_key(dlm_keys, self.key_dtype_, [&](auto ks) {
+    dispatch_on_key(dlm_keys, self.key_type_enum_, [&](auto ks) {
       size_t total = static_cast<size_t>(dim) * n;
       auto row_lengths = std::make_unique<int64_t[]>(n);
       fill_uniform_row_lengths({row_lengths.get(), n}, dim);
@@ -59,7 +59,7 @@ nb::tuple SyncOpsImpl<ParamT, OptT>::lookup_or_insert(
 
   {
     nb::gil_scoped_release release;
-    dispatch_on_key(dlm_keys, self.key_dtype_, [&](auto ks) {
+    dispatch_on_key(dlm_keys, self.key_type_enum_, [&](auto ks) {
       size_t total = static_cast<size_t>(dim) * n;
       auto row_lengths_buf = std::make_unique<int64_t[]>(n);
       fill_uniform_row_lengths({row_lengths_buf.get(), n}, dim);
@@ -104,7 +104,7 @@ void SyncOpsImpl<ParamT, OptT>::assign(EmbeddingStoreWrapper &self,
   std::error_code ec;
   {
     nb::gil_scoped_release release;
-    dispatch_on_key(dlm_keys, self.key_dtype_, [&](auto ks) {
+    dispatch_on_key(dlm_keys, self.key_type_enum_, [&](auto ks) {
       auto val_span = se::py::dlpack_to_span<const ParamT>(dlm_values);
       int64_t dim = 0;
       if (dlm_values->dl_tensor.ndim == 2) {
@@ -147,7 +147,7 @@ nb::object SyncOpsImpl<ParamT, OptT>::contains(EmbeddingStoreWrapper &self,
   std::error_code ec;
   {
     nb::gil_scoped_release release;
-    dispatch_on_key(dlm_keys, self.key_dtype_, [&](auto ks) {
+    dispatch_on_key(dlm_keys, self.key_type_enum_, [&](auto ks) {
       ec = self.get_store<ParamT, OptT>()->contains(
           ks, std::span<uint8_t>(out, n));
     });
@@ -185,7 +185,7 @@ void SyncOpsImpl<ParamT, OptT>::accumulate_gradients(
   {
     nb::gil_scoped_release release;
     auto grads_span = se::py::dlpack_to_span<const ParamT>(dlm_grads);
-    dispatch_on_key(dlm_keys, self.key_dtype_, [&](auto ks) {
+    dispatch_on_key(dlm_keys, self.key_type_enum_, [&](auto ks) {
       thread_local std::vector<int64_t> tls_row_lengths;
       tls_row_lengths.resize(n);
       fill_uniform_row_lengths(tls_row_lengths, dim);
@@ -211,7 +211,7 @@ void SyncOpsImpl<ParamT, OptT>::erase(EmbeddingStoreWrapper &self,
   std::error_code ec;
   {
     nb::gil_scoped_release release;
-    dispatch_on_key(dlm_keys, self.key_dtype_, [&](auto ks) {
+    dispatch_on_key(dlm_keys, self.key_type_enum_, [&](auto ks) {
       ec = self.get_store<ParamT, OptT>()->erase(ks);
     });
   }
@@ -234,7 +234,7 @@ void SyncOpsImpl<ParamT, OptT>::assign_scores(EmbeddingStoreWrapper &self,
   auto scores_span = se::py::dlpack_to_span<const uint64_t>(dlm_scores);
   {
     nb::gil_scoped_release release;
-    dispatch_on_key(dlm_keys, self.key_dtype_, [&](auto ks) {
+    dispatch_on_key(dlm_keys, self.key_type_enum_, [&](auto ks) {
       ec = self.get_store<ParamT, OptT>()->assign_scores(ks, scores_span);
     });
   }

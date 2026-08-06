@@ -2,20 +2,25 @@
 
 #include <proxy/proxy.h>
 
+#include <chrono>
 #include <cstddef>
 #include <cstdint>
 #include <exception>
 #include <functional>
 #include <memory>
 #include <optional>
-#include <shared_mutex>
 #include <string>
+#include <string_view>
+
+#include "sparse_embedding/src/storage/retirement_pressure.hpp"
 
 namespace se {
 
-enum class StorageMode : uint8_t { kAuto, kMemoryOnly, kDiskOnly };
+enum class StorageMode : uint8_t { kAuto, kMemoryOnly };
 
 enum class PageEvictionMode : uint8_t { kEnabled, kDisabled };
+
+enum class PagePlacementMode : uint8_t { kDefault, kPageAlignedMapping };
 
 // Watermark thresholds controlling when background swap-out is triggered.
 // high: fraction of memory_limit at which eviction begins [0.0, 1.0].
@@ -31,10 +36,12 @@ struct StorageOptions {
   std::optional<std::string> spill_directory;
   std::optional<size_t> max_spill_bytes;
   std::optional<WatermarkConfig> watermark;
+  RetirementPressureConfig retirement_pressure;
 };
 
 struct StorageStats {
   size_t memory_bytes;
+  size_t evictable_memory_bytes;
   size_t spill_bytes;
   size_t memory_limit_bytes;
   size_t spill_limit_bytes;
@@ -45,6 +52,13 @@ struct StorageStats {
   uint64_t eviction_evaluated_pages;
   uint64_t eviction_selection_ns;
   uint64_t eviction_candidate_invalidated_count;
+  size_t retired_bytes;
+  RetirementPressureState retirement_pressure_state;
+  uint64_t retirement_backpressure_count;
+  uint64_t retirement_sink_hit_count;
+  uint64_t oldest_unreclaimed_age_ns;
+  uint64_t epoch_stall_count;
+  std::shared_ptr<RetirementPressure> retirement_pressure_domain;
 };
 
 class StoragePage;
@@ -55,26 +69,17 @@ PRO_DEF_MEM_DISPATCH(MemEvaluatePage, evaluate_page);
 PRO_DEF_MEM_DISPATCH(MemRegisterPage, register_page);
 PRO_DEF_MEM_DISPATCH(MemUnregisterPage, unregister_page);
 PRO_DEF_MEM_DISPATCH(MemScoreEnabled, score_enabled);
-PRO_DEF_MEM_DISPATCH(MemLockShared, lock_shared);
-PRO_DEF_MEM_DISPATCH(MemUnlockShared, unlock_shared);
-PRO_DEF_MEM_DISPATCH(MemLock, lock);
-PRO_DEF_MEM_DISPATCH(MemUnlock, unlock);
 
 struct PageEvictionProxyFacade
-    : pro::facade_builder ::add_convention<
-          MemEvaluatePage,
-          bool(size_t, uint64_t &)>::add_convention<MemRegisterPage,
-                                                    void(size_t,
-                                                         PageEvaluator)>::
-          add_convention<MemUnregisterPage, void(size_t) noexcept>::
-              add_convention<MemScoreEnabled, bool() const noexcept>::
-                  add_convention<MemLockShared, void()>::add_convention<
-                      MemUnlockShared,
-                      void() noexcept>::add_convention<MemLock, void()>::
-                      add_convention<MemUnlock, void() noexcept>::support_copy<
-                          pro::constraint_level::nontrivial>::
-                          support_relocation<
-                              pro::constraint_level::nontrivial>::build {};
+    : pro                                                            //
+      ::facade_builder                                               //
+      ::add_convention<MemEvaluatePage, bool(size_t, uint64_t &)>    //
+      ::add_convention<MemRegisterPage, void(size_t, PageEvaluator)> //
+      ::add_convention<MemUnregisterPage, void(size_t) noexcept>     //
+      ::add_convention<MemScoreEnabled, bool() const noexcept>       //
+      ::support_copy<pro::constraint_level::nontrivial>              //
+      ::support_relocation<pro::constraint_level::nontrivial>        //
+      ::build {};
 
 using PageEvictionProxy = pro::proxy<PageEvictionProxyFacade>;
 
@@ -89,9 +94,9 @@ PRO_DEF_MEM_DISPATCH(MemAllocatePage, allocate);
 PRO_DEF_MEM_DISPATCH(MemStorageStats, stats);
 PRO_DEF_MEM_DISPATCH(MemSpillDirectory, spill_directory);
 PRO_DEF_MEM_DISPATCH(MemConsumeSpillWarning, consume_spill_warning);
+PRO_DEF_MEM_DISPATCH(MemDrainPageEvictionBacklog, drain_page_eviction_backlog);
 PRO_DEF_MEM_DISPATCH(MemSupportsPageEviction,
                      supports_background_page_eviction);
-PRO_DEF_MEM_DISPATCH(MemLifecycleMutex, lifecycle_mutex);
 PRO_DEF_MEM_DISPATCH(MemSetPageEvictionProxy, set_page_eviction_proxy);
 PRO_DEF_MEM_DISPATCH(MemClearPageEvictionProxy, clear_page_eviction_proxy);
 PRO_DEF_MEM_DISPATCH(MemReleasePage, release);
@@ -103,14 +108,17 @@ struct PageStorageFacade
                                                     size_t)> //
       ::add_convention<MemAllocatePage,
                        StoragePage(size_t, size_t, PageEvaluator,
-                                   PageEvictionMode)>                  //
-      ::add_convention<MemStorageStats, StorageStats() const noexcept> //
-      ::add_convention<MemSpillDirectory, std::string() const>         //
+                                   PageEvictionMode)> //
+      ::add_convention<MemAllocatePage,
+                       StoragePage(size_t, size_t, PageEvaluator,
+                                   PageEvictionMode, PagePlacementMode)> //
+      ::add_convention<MemStorageStats, StorageStats() const noexcept>   //
+      ::add_convention<MemSpillDirectory, std::string() const>           //
       ::add_convention<MemConsumeSpillWarning,
-                       bool() noexcept>                                //
+                       bool() noexcept> //
+      ::add_convention<MemDrainPageEvictionBacklog,
+                       void(std::chrono::nanoseconds)>                 //
       ::add_convention<MemSupportsPageEviction, bool() const noexcept> //
-      ::add_convention<MemLifecycleMutex,
-                       std::shared_ptr<std::shared_mutex>() const> //
       ::add_convention<MemSetPageEvictionProxy,
                        PageEvictionRegistration(PageEvictionProxy)> //
       ::add_convention<MemClearPageEvictionProxy,
@@ -136,6 +144,7 @@ public:
 
   std::byte *data() const noexcept { return data_; }
   size_t size() const noexcept { return size_; }
+  size_t allocated_size() const noexcept { return allocated_size_; }
   size_t page_index() const noexcept { return page_index_; }
   explicit operator bool() const noexcept { return data_ != nullptr; }
 

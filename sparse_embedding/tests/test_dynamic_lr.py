@@ -9,10 +9,10 @@ import sparse_embedding as se
 DIM = 16
 
 
-def make_store(policy, optimizer_type=se.Sgd, score_policy="manual", num_threads=1):
+def make_store(policy, optimizer_type=se.Sgd, score_policy="manual", thread_budget=1):
     return se.EmbeddingStore(
         embedding_config=se.EmbeddingConfig(
-            dims=[DIM], num_threads=num_threads, value_dtype="float32"
+            dims=[DIM], thread_budget=thread_budget, value_dtype="float32"
         ),
         initializer_config=se.Zeros(),
         optimizer_config=optimizer_type(lr=1.0, dynamic_lr_policy=policy),
@@ -162,7 +162,7 @@ def test_constant_policy_does_not_allocate_score_storage():
 def test_default_optimizer_uses_static_learning_rate_path():
     store = se.EmbeddingStore(
         embedding_config=se.EmbeddingConfig(
-            dims=[DIM], num_threads=1, value_dtype="float32"
+            dims=[DIM], thread_budget=1, value_dtype="float32"
         ),
         initializer_config=se.Zeros(),
         optimizer_config=se.Sgd(lr=0.25),
@@ -191,7 +191,7 @@ def test_reset_preserves_dynamic_policy():
 
 def test_parallel_score_updates_and_optimizer_step():
     key_count = 2048
-    store = make_store(se.CustomLutLrPolicy(lut=[0.25, 0.5, 1.0]), num_threads=8)
+    store = make_store(se.CustomLutLrPolicy(lut=[0.25, 0.5, 1.0]), thread_budget=8)
     keys = np.arange(key_count, dtype=np.int64)
     store.lookup_or_insert(keys, dim=DIM)
     store.assign_scores(keys, (keys % 3).astype(np.uint64))

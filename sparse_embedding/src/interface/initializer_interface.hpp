@@ -31,7 +31,8 @@ PRO_DEF_MEM_DISPATCH(MemInitialize, initialize);
 
 template <typename ValT>
 struct InitializerFacade
-    : pro::facade_builder //
+    : pro              //
+      ::facade_builder //
       ::add_convention<MemInitialize,
                        void(std::span<ValT> param, uint64_t key)> //
       ::build {};

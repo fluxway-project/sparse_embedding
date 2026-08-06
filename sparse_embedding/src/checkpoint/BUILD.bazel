@@ -5,8 +5,10 @@ BUILD file for checkpoint
 load("@rules_cc//cc:defs.bzl", "cc_library")
 
 cc_library(
-    name = "checkpoint",
-    hdrs = ["checkpoint_interface.hpp"],
+    name = "checkpoint_interface",
+    hdrs = [
+        "checkpoint_interface.hpp",
+    ],
     visibility = ["//visibility:public"],
     deps = [
         "@proxy",
@@ -14,13 +16,89 @@ cc_library(
 )
 
 cc_library(
+    name = "checkpoint_batch_filter",
+    hdrs = ["checkpoint_batch_filter.hpp"],
+    visibility = ["//visibility:public"],
+)
+
+cc_library(
+    name = "checkpoint_registry",
+    srcs = ["checkpoint_registry.cpp"],
+    hdrs = [
+        "checkpoint_registry.hpp",
+    ],
+    visibility = ["//visibility:public"],
+    deps = [
+        ":checkpoint_interface",
+    ],
+)
+
+cc_library(
+    name = "partitioned_checkpoint",
+    hdrs = [
+        "partitioned_checkpoint.hpp",
+    ],
+    visibility = ["//visibility:public"],
+)
+
+cc_library(
+    name = "checkpoint",
+    visibility = ["//visibility:public"],
+    deps = [
+        ":checkpoint_batch_filter",
+        ":checkpoint_interface",
+        ":checkpoint_registry",
+        ":partitioned_checkpoint",
+    ],
+)
+
+cc_test(
+    name = "checkpoint_batch_filter_test",
+    srcs = ["checkpoint_batch_filter_test.cpp"],
+    deps = [":checkpoint_batch_filter"],
+)
+
+cc_test(
+    name = "checkpoint_registry_test",
+    srcs = ["checkpoint_registry_test.cpp"],
+    deps = [":checkpoint_registry"],
+)
+
+cc_test(
+    name = "partitioned_checkpoint_test",
+    srcs = ["partitioned_checkpoint_test.cpp"],
+    deps = [":partitioned_checkpoint"],
+)
+
+cc_library(
     name = "checkpoint_lance",
-    srcs = ["lance/lance_checkpoint.cpp"],
-    hdrs = ["lance/lance_checkpoint.hpp"],
+    srcs = [
+        "lance/lance_checkpoint.cpp",
+        "lance/lance_checkpoint_registry.cpp",
+    ],
+    hdrs = [
+        "lance/arrow/c/abi.h",
+        "lance/lance_checkpoint.hpp",
+        "lance/layout_schema.hpp",
+    ],
     tags = ["manual"],
     visibility = ["//visibility:public"],
     deps = [
-        ":checkpoint",
+        ":checkpoint_interface",
+        ":checkpoint_registry",
         "@lance_c",
     ],
+    alwayslink = True,
+)
+
+cc_test(
+    name = "lance_checkpoint_registry_test",
+    srcs = ["lance/lance_checkpoint_registry_test.cpp"],
+    deps = [":checkpoint_lance"],
+)
+
+cc_test(
+    name = "lance_layout_schema_test",
+    srcs = ["lance/layout_schema_test.cpp"],
+    deps = [":checkpoint_lance"],
 )

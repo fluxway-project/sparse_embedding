@@ -1,0 +1,3 @@
+#include "sparse_embedding/src/backend/hogwild/instantiation/hogwild_explicit_instantiation.hpp"
+
+SE_INSTANTIATE_HOGWILD_PAIR(float, float)

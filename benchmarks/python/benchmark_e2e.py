@@ -17,7 +17,7 @@ def make_store(spill_directory: str) -> se.EmbeddingStore:
     return se.EmbeddingStore(
         embedding_config=se.EmbeddingConfig(
             dims=[DIM],
-            num_threads=4,
+            thread_budget=4,
             storage=se.AutoStorage(
                 memory_limit_bytes=256 << 10,
                 spill_directory=spill_directory,

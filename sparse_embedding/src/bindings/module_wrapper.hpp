@@ -37,12 +37,15 @@
 #include <string>
 #include <system_error>
 #include <thread>
+#include <type_traits>
+#include <utility>
 #include <variant>
 #include <vector>
 
 #include <exec/static_thread_pool.hpp>
 
 #include "sparse_embedding/src/bindings/dlpack_utils.hpp"
+#include "sparse_embedding/src/bindings/dtype_dispatch.hpp"
 #include "sparse_embedding/src/checkpoint/checkpoint_interface.hpp"
 #include "sparse_embedding/src/common/function.hpp"
 #include "sparse_embedding/src/common/numeric_types.hpp"
@@ -70,25 +73,9 @@ inline void check_error(std::error_code ec) {
     throw std::runtime_error(ec.message());
 }
 
-enum class KeyDType { kInt32, kUInt32, kInt64, kUInt64 };
-
-inline KeyDType detect_key_dtype(const DLManagedTensor *dlm) {
-  auto code = dlm->dl_tensor.dtype.code;
-  auto bits = dlm->dl_tensor.dtype.bits;
-  if (code == static_cast<uint8_t>(kDLInt) && bits == 32)
-    return KeyDType::kInt32;
-  if (code == static_cast<uint8_t>(kDLUInt) && bits == 32)
-    return KeyDType::kUInt32;
-  if (code == static_cast<uint8_t>(kDLInt) && bits == 64)
-    return KeyDType::kInt64;
-  if (code == static_cast<uint8_t>(kDLUInt) && bits == 64)
-    return KeyDType::kUInt64;
-  throw std::invalid_argument("keys must be int32, uint32, int64 or uint64");
-}
-
 template <typename Fn>
 auto dispatch_on_key(const DLManagedTensor *dlm,
-                     const std::string & /*expected_key_dtype*/, Fn &&fn) {
+                     KeyDType /*expected_key_dtype*/, Fn &&fn) {
   auto kdt = detect_key_dtype(dlm);
   switch (kdt) {
   case KeyDType::kInt32:
@@ -198,7 +185,7 @@ template <typename ParamT, typename OptT> struct ConstructOpsImpl {
                         const PyInitializer &init_cfg,
                         const PyOptimizer &opt_cfg,
                         const std::string &score_policy_name,
-                        size_t num_threads);
+                        size_t thread_budget);
 };
 
 template <typename ParamT, typename OptT> struct SyncOpsImpl {
@@ -282,9 +269,8 @@ class EmbeddingStoreWrapper {
       pro::proxy<se::EmbeddingTableFacade<se::bfloat16_t, se::bfloat16_t>>>;
   StoreProxyVariant store_;
   exec::static_thread_pool async_pool_;
-  std::string value_dtype_;
-  std::string optimizer_dtype_;
-  std::string key_dtype_;
+  ValueDType value_dtype_code_;
+  ValueDType optimizer_dtype_code_;
   KeyDType key_type_enum_;
   std::vector<size_t> dims_;
   se::PageStorage storage_;
@@ -299,48 +285,12 @@ class EmbeddingStoreWrapper {
   }
 
   template <typename Fn> auto dispatch_val(Fn &&fn) {
-    if (value_dtype_ == "float32" || value_dtype_ == "f32")
-      return fn.template operator()<float>();
-    if (value_dtype_ == "float16" || value_dtype_ == "f16")
-      return fn.template operator()<se::float16_t>();
-    if (value_dtype_ == "bfloat16" || value_dtype_ == "bf16")
-      return fn.template operator()<se::bfloat16_t>();
-    throw std::invalid_argument("unsupported dtype: " + value_dtype_);
+    return dispatch_value_dtype(value_dtype_code_, std::forward<Fn>(fn));
   }
 
   template <typename Fn> auto dispatch_types(Fn &&fn) {
-    auto code = [](const std::string &s) -> int {
-      if (s == "float32" || s == "f32")
-        return 0;
-      if (s == "float16" || s == "f16")
-        return 1;
-      if (s == "bfloat16" || s == "bf16")
-        return 2;
-      return -1;
-    };
-    int p = code(value_dtype_);
-    int o = code(optimizer_dtype_);
-    if (p < 0)
-      throw std::invalid_argument("unsupported dtype: " + value_dtype_);
-    if (o < 0)
-      throw std::invalid_argument("unsupported opt_dtype: " + optimizer_dtype_);
-    if (p == 0 && o == 0)
-      return fn.template operator()<float, float>();
-    if (p == 0 && o == 1)
-      return fn.template operator()<float, se::float16_t>();
-    if (p == 0 && o == 2)
-      return fn.template operator()<float, se::bfloat16_t>();
-    if (p == 1 && o == 0)
-      return fn.template operator()<se::float16_t, float>();
-    if (p == 1 && o == 1)
-      return fn.template operator()<se::float16_t, se::float16_t>();
-    if (p == 1 && o == 2)
-      return fn.template operator()<se::float16_t, se::bfloat16_t>();
-    if (p == 2 && o == 0)
-      return fn.template operator()<se::bfloat16_t, float>();
-    if (p == 2 && o == 1)
-      return fn.template operator()<se::bfloat16_t, se::float16_t>();
-    return fn.template operator()<se::bfloat16_t, se::bfloat16_t>();
+    return dispatch_dtype_pair(value_dtype_code_, optimizer_dtype_code_,
+                               std::forward<Fn>(fn));
   }
 
 public:
@@ -389,6 +339,7 @@ public:
     auto stats = storage_->stats();
     nb::dict result;
     result["memory_bytes"] = stats.memory_bytes;
+    result["evictable_memory_bytes"] = stats.evictable_memory_bytes;
     result["spill_bytes"] = stats.spill_bytes;
     result["memory_limit_bytes"] = stats.memory_limit_bytes;
     result["spill_limit_bytes"] = stats.spill_limit_bytes;
@@ -400,6 +351,23 @@ public:
     result["eviction_selection_ns"] = stats.eviction_selection_ns;
     result["eviction_candidate_invalidated_count"] =
         stats.eviction_candidate_invalidated_count;
+    result["retired_bytes"] = stats.retired_bytes;
+    switch (stats.retirement_pressure_state) {
+    case se::RetirementPressureState::kNormal:
+      result["retirement_pressure_state"] = "normal";
+      break;
+    case se::RetirementPressureState::kBackpressure:
+      result["retirement_pressure_state"] = "backpressure";
+      break;
+    case se::RetirementPressureState::kCircuitOpen:
+      result["retirement_pressure_state"] = "circuit";
+      break;
+    }
+    result["retirement_backpressure_count"] =
+        stats.retirement_backpressure_count;
+    result["retirement_sink_hit_count"] = stats.retirement_sink_hit_count;
+    result["oldest_unreclaimed_age_ns"] = stats.oldest_unreclaimed_age_ns;
+    result["epoch_stall_count"] = stats.epoch_stall_count;
     return result;
   }
 
@@ -481,6 +449,93 @@ public:
   void assign_scores(nb::object keys, nb::object scores) {
     dispatch_types([&]<typename P, typename O>() {
       SyncOpsImpl<P, O>::assign_scores(*this, keys, scores);
+    });
+  }
+
+  size_t compact_page(size_t dim, uint64_t page_id) {
+    return dispatch_types([&]<typename P, typename O>() {
+      return get_store<P, O>()->compact_page(dim, page_id);
+    });
+  }
+
+  size_t promote_hot_keys(size_t dim, uint64_t page_id, size_t maximum_keys,
+                          uint64_t minimum_score) {
+    return dispatch_types([&]<typename P, typename O>() {
+      return get_store<P, O>()->promote_hot_keys(dim, page_id, maximum_keys,
+                                                 minimum_score);
+    });
+  }
+
+  size_t promoted_hot_page_size(size_t dim) {
+    return dispatch_types([&]<typename P, typename O>() {
+      return get_store<P, O>()->promoted_hot_page_size(dim);
+    });
+  }
+
+  nb::list export_page_images() {
+    nb::list result;
+    dispatch_types([&]<typename P, typename O>() {
+      get_store<P, O>()->export_page_images(
+          pro::make_proxy<
+              se::FunctionFacade<bool(size_t, se::PageImageExport<P, O> &&)>>(
+              [&](size_t dim, se::PageImageExport<P, O> &&image) {
+                nb::dict page;
+                page["dim"] = dim;
+                page["physical_page_id"] = image.physical_page_id;
+                page["vector_dim"] = image.vector_dim;
+                page["vector_stride"] = image.vector_stride;
+                page["slot_ordinals"] = std::move(image.slot_ordinals);
+                page["keys"] = std::move(image.keys);
+                page["seq_counts"] = std::move(image.seq_counts);
+                page["scores"] = std::move(image.scores);
+                page["steps"] = std::move(image.steps);
+                std::vector<float> values;
+                values.reserve(image.values.size());
+                for (P value : image.values)
+                  values.push_back(static_cast<float>(value));
+                std::vector<float> optimizer_states;
+                optimizer_states.reserve(image.optimizer_states.size());
+                for (O value : image.optimizer_states)
+                  optimizer_states.push_back(static_cast<float>(value));
+                page["values"] = std::move(values);
+                page["optimizer_states"] = std::move(optimizer_states);
+                result.append(std::move(page));
+                return true;
+              }));
+    });
+    return result;
+  }
+
+  void import_page_images(nb::list pages) {
+    dispatch_types([&]<typename P, typename O>() {
+      std::vector<se::PageImageImport<P, O>> imports;
+      imports.reserve(nb::len(pages));
+      for (nb::handle handle : pages) {
+        nb::dict page = nb::cast<nb::dict>(handle);
+        se::PageImageExport<P, O> image{
+            nb::cast<uint64_t>(page["physical_page_id"]),
+            nb::cast<uint32_t>(page["vector_dim"]),
+            nb::cast<uint32_t>(page["vector_stride"]),
+            nb::cast<std::vector<uint32_t>>(page["slot_ordinals"]),
+            nb::cast<std::vector<uint64_t>>(page["keys"]),
+            nb::cast<std::vector<uint64_t>>(page["seq_counts"]),
+            {},
+            nb::cast<std::vector<uint64_t>>(page["scores"]),
+            {},
+            nb::cast<std::vector<uint32_t>>(page["steps"])};
+        const std::vector<float> values =
+            nb::cast<std::vector<float>>(page["values"]);
+        image.values.reserve(values.size());
+        for (float value : values)
+          image.values.push_back(static_cast<P>(value));
+        const std::vector<float> optimizer_states =
+            nb::cast<std::vector<float>>(page["optimizer_states"]);
+        image.optimizer_states.reserve(optimizer_states.size());
+        for (float value : optimizer_states)
+          image.optimizer_states.push_back(static_cast<O>(value));
+        imports.push_back({nb::cast<size_t>(page["dim"]), std::move(image)});
+      }
+      get_store<P, O>()->import_page_images(imports);
     });
   }
 
