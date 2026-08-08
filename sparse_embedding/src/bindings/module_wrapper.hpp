@@ -320,6 +320,30 @@ public:
 
   std::vector<size_t> table_dims() const { return dims_; }
 
+  std::string value_dtype() const {
+    switch (value_dtype_code_) {
+    case ValueDType::kFloat32:
+      return "float32";
+    case ValueDType::kFloat16:
+      return "float16";
+    case ValueDType::kBFloat16:
+      return "bfloat16";
+    }
+    throw std::invalid_argument("unsupported value dtype");
+  }
+
+  std::string optimizer_dtype() const {
+    switch (optimizer_dtype_code_) {
+    case ValueDType::kFloat32:
+      return "float32";
+    case ValueDType::kFloat16:
+      return "float16";
+    case ValueDType::kBFloat16:
+      return "bfloat16";
+    }
+    throw std::invalid_argument("unsupported optimizer dtype");
+  }
+
   size_t internal_shard_count() {
     size_t count = 0;
     dispatch_types([&]<typename P, typename O>() {

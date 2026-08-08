@@ -23,7 +23,7 @@ checkpoint。
 
 增量 checkpoint 只追加发生变化的 entry 行和删除 tombstone；每个 shard 都维护单调递增的
 sequence watermark。未变化 page 的 checksum 不会再次追加，manifest 会把该 delta 链接到已提交
-的父 snapshot。事务仍由 Fluxway 负责跨所有 sparse 组件全局协调。Worker 只导出 fragment，
+的父 snapshot。事务仍由外部 coordinator 负责跨所有 sparse 组件全局协调。Worker 只导出 fragment，
 不能独立 commit；全局 barrier 之后，每个组件 commit owner 将该组件所有 worker artifact
 传入唯一一次 `commit_fragments`，只有所有组件提交成功后全局 checkpoint 才发布。
 

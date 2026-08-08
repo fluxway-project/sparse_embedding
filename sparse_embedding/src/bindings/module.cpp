@@ -488,6 +488,8 @@ NB_MODULE(_core, m) {
       .def("export_page_images", &EmbeddingStoreWrapper::export_page_images)
       .def("import_page_images", &EmbeddingStoreWrapper::import_page_images,
            nb::arg("pages"))
+      .def("value_dtype", &EmbeddingStoreWrapper::value_dtype)
+      .def("optimizer_dtype", &EmbeddingStoreWrapper::optimizer_dtype)
 
       .def("export_batches_dlpack",
            &EmbeddingStoreWrapper::export_batches_dlpack, nb::arg("visitor"),

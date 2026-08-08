@@ -4,6 +4,8 @@
 
 [Performance and Reliability Report](performance_and_reliability_report.md)
 
+[Lance Storage and Gravitino Validation](lance_storage_and_gravitino.md)
+
 This document describes the storage, concurrency, and core mechanism contracts. The implementation is the source of truth for constants; the names
 below make those policy points searchable.
 
@@ -287,70 +289,31 @@ not change routing. Selector and planner APIs additionally accept reusable
 scratch objects, so a scheduler can retain vector capacities across control
 cycles rather than allocating temporary selection buffers each time.
 
-## Fluxway and Lance Checkpoint Protocol
+## Framework-neutral Lance Checkpoint Protocol
 
-Fluxway owns the global checkpoint transaction lifecycle across all SPMD components:
+Distributed integrations use `SparseCheckpointProtocol` and supply a
+`CheckpointSaveIdentity`, one `CheckpointParticipant` per writer, and one final
+commit call containing all fragments. `CheckpointCommitAuthority` carries an
+opaque scope, monotonic generation, and authority identity; it contains no type
+or identifier from a particular orchestration framework.
 
-1. Rank 0 prepares checkpoint artifacts.
-2. Workers persist local state and return checkpoint metadata.
-3. The Fluxway coordinator waits for every component and rank, then invokes each component commit hook exactly once for the transaction.
-4. Fluxway invokes abort on failure.
-5. Workers restore from the committed state.
+`LocalLanceStorage` and `GravitinoLanceStorage` share one Lance checkpoint
+transaction engine. It stores one materialized `(dim, key)` entry state,
+physical page images, and a snapshot manifest. Storage adapters only provide
+dataset locations, staging prefixes, durable records, and commit locking. The
+manifest is the visibility boundary and pins exact entries and page-image Lance
+versions. Duplicate keys across participants, incomplete participant coverage,
+schema disagreement, and stale commit authority fail explicitly.
 
-Sparse Embedding supplies worker artifacts and validation rules; it does not
-maintain a second global coordinator or mutable cross-component transaction
-state. Worker processes never call `commit_fragments`.
+Restore selects an exact `SparseCheckpointLocator`. `PhysicalRestore` requires
+the saved participant topology and rebuilds native page layout.
+`ElasticRestore` accepts the caller's stable `partition_fn(keys,
+partition_count)` and target partition. It first scans only keys and row state,
+then reads payload columns only for rows assigned to the target partition; no
+topology or routing fallback exists inside Sparse Embedding.
 
-The commit unit is a Fluxway checkpoint transaction, not an individual worker.
-For one Lance-backed component, all worker artifacts are passed to exactly one
-`commit_fragments` call by the component commit owner after the global barrier.
-Multiple sparse components may use separate Lance dataset roots, but their
-commits are part of the same Fluxway transaction: the global checkpoint is
-published only after every component commit succeeds. If several components
-must share one physical Lance dataset, the component identifier must be an
-explicit schema column; workers must not append independently.
-
-Each distributed `entries` row carries `snapshot_id`, `worker_id`, and
-`shard_id`; `page_images` carries the physical page id, per-slot layout,
-`seq_counts`, parameter payload, optional score, optimizer payload/step,
-per-key shard ids, and SHA-256 checksum. During save, `worker_id` is used only
-for artifact integrity: each worker must submit exactly one artifact, and a
-`(dim, key)` pair may not occur on multiple workers. The coordinator commits
-`entries` and `page_images`, then appends the snapshot manifest with both Lance
-versions and the checkpoint schema version. The manifest is the only checkpoint
-metadata record and the visibility boundary; no sidecar `metadata.json` is
-written. Restore pins those
-versions, verifies every page-image checksum, then assigns routed `entries`
-rows for elastic recovery. An explicit same-topology mode uses the same pinned
-`page_images` to restore exact native page/slot positions; it requires the saved
-worker identity and rejects topology mismatches instead of selecting a
-fallback.
-
-Restore resolves one manifest row for the requested `snapshot_id` and opens the
-exact Lance versions recorded there. The caller supplies the sole routing
-authority and the backend applies:
-
-```text
-target_rank = filter_fn(key)
-```
-
-The backend filters rows by `snapshot_id = S`; it does not filter by the saved
-`worker_id`. This lets a checkpoint saved with one worker count restore onto a
-different worker count. The semantic distributed-load inputs are the explicit
-`filter_fn` and `target_shard_id`; a separate `distributed=True` boolean merely
-duplicates the call mode and should not be required by the long-term interface.
-During compatibility, callers that pass `filter_fn` may still be required to
-pass `distributed=True`, but that flag must not alter routing or storage
-behavior. The backend does not create, serialize, or interpret a routing plan
-and has no topology fallback. `page_images` restore physical
-layout/state only; thermal tier, heat, coaccess, and residency scheduling
-metadata are intentionally omitted.
-
-`LanceCheckpointBackend` exports each live page by reading stable slot images
-under the native SeqLock protocol, then writes the materialized payload into
-Lance `page_images`. Checkpointing never clones spill files and never changes
-the training write path. Incremental entries continue to use per-shard
-sequence watermarks, delete tombstones, and checksum-addressed page references.
+Thermal tier, heat, coaccess, and residency scheduling metadata are intentionally
+not checkpointed. They are re-observed after restore.
 
 ## Telemetry
 
