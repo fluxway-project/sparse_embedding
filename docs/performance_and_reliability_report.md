@@ -31,7 +31,7 @@ checkpointed.
 Incremental checkpoints append only changed entry rows and delete tombstones.
 Each shard carries a monotonic sequence watermark. Unchanged page checksums are
 not appended again; a manifest links the delta to its committed parent
-snapshot. Fluxway is the global transaction coordinator across all sparse
+snapshot. An external coordinator is the global transaction coordinator across all sparse
 components. Workers export fragments only; after the cross-component barrier,
 each component commit owner invokes `commit_fragments` once with all of that
 component's worker artifacts. The global checkpoint is published only after

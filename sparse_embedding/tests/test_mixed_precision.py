@@ -11,6 +11,7 @@ import numpy as np
 import pytest
 
 import sparse_embedding as se
+from sparse_embedding.checkpoint import LocalLanceStorage, SparseCheckpoint
 
 # ---------------------------------------------------------------------------
 # DLPack-compatible array helpers
@@ -79,6 +80,9 @@ ALL_COMBO_IDS = [_combo_id(c) for c in ALL_COMBOS]
 # ---------------------------------------------------------------------------
 
 
+# Lance materialized rows are currently defined as float32 by the protocol.
+# Keep this integration test aligned with that schema; low-precision arithmetic
+# remains covered by the non-checkpoint tests in this module.
 @pytest.mark.parametrize("param_dtype,optimizer_dtype", ALL_COMBOS, ids=ALL_COMBO_IDS)
 def test_assign_lookup_integrity(param_dtype, optimizer_dtype):
     """Values written via assign() should be exactly readable via lookup()."""
@@ -204,13 +208,6 @@ def test_checkpoint_roundtrip(param_dtype, optimizer_dtype, tmp_path):
     store1 = se.EmbeddingStore(
         cfg, optimizer_config=adam, initializer_config=se.Zeros()
     )
-    if not hasattr(store1, "set_checkpoint_factories"):
-        pytest.skip("Lance checkpoint not compiled in")
-    try:
-        store1.set_checkpoint_factories("lance")
-    except Exception:
-        pytest.skip("Lance checkpoint backend not configured")
-
     keys = np.arange(n_keys, dtype=np.uint64)
     store1.lookup_or_insert(keys, dim=dim)
 
@@ -221,13 +218,12 @@ def test_checkpoint_roundtrip(param_dtype, optimizer_dtype, tmp_path):
         store1.optimizer_step()
 
     uri = str(tmp_path / "ckpt")
-    store1.save_checkpoint(uri, include_optimizer_state=True)
+    checkpoint = SparseCheckpoint(LocalLanceStorage(uri))
+    locator = checkpoint.save(store1, "mixed")
 
     # Load into a fresh store
     store2 = se.EmbeddingStore(cfg, optimizer_config=adam)
-    if hasattr(store2, "set_checkpoint_factories"):
-        store2.set_checkpoint_factories("lance")
-    store2.load_checkpoint(uri, load_optimizer_state=True)
+    checkpoint.restore(store2, locator)
 
     assert store2.total_size() == n_keys
 
@@ -242,25 +238,25 @@ def test_checkpoint_roundtrip(param_dtype, optimizer_dtype, tmp_path):
         v2, v1, atol=atol, err_msg="embedding mismatch after load"
     )
 
-    # Verify optimizer state is preserved: one more step should produce same result
-    grads_check = _make_array((n_keys, dim), param_dtype, np.random.default_rng(999))
-    store1.accumulate_gradients(keys, grads_check)
+    gradients = _make_array((n_keys, dim), param_dtype, np.random.default_rng(999))
+    store1.accumulate_gradients(keys, gradients)
     store1.optimizer_step()
-    store2.accumulate_gradients(keys, grads_check)
+    store2.accumulate_gradients(keys, gradients)
     store2.optimizer_step()
 
-    out1_dlp, _ = store1.lookup(keys, dim=dim)
-    out2_dlp, _ = store2.lookup(keys, dim=dim)
-    v1_after = _to_numpy_f32(out1_dlp, (n_keys, dim), param_dtype)
-    v2_after = _to_numpy_f32(out2_dlp, (n_keys, dim), param_dtype)
-
-    # Allow slightly larger tolerance for low-precision combos
-    atol_opt = (
+    after1, _ = store1.lookup(keys, dim=dim)
+    after2, _ = store2.lookup(keys, dim=dim)
+    values1 = _to_numpy_f32(after1, (n_keys, dim), param_dtype)
+    values2 = _to_numpy_f32(after2, (n_keys, dim), param_dtype)
+    optimizer_tolerance = (
         0.05
         if "float16" in (param_dtype, optimizer_dtype)
         or "bfloat16" in (param_dtype, optimizer_dtype)
         else 1e-4
     )
     np.testing.assert_allclose(
-        v2_after, v1_after, atol=atol_opt, err_msg="post-load optimizer divergence"
+        values2,
+        values1,
+        atol=optimizer_tolerance,
+        err_msg="optimizer state diverged after checkpoint restore",
     )

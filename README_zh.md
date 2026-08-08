@@ -11,7 +11,7 @@
 - **Hogwild! 梯度累积**：分片 TransientArena 实现无锁梯度聚合，避免跨线程同步
 - **C++23 标准并发**：基于 NVIDIA `stdexec` + `exec::static_thread_pool` 实现 Sender/Receiver 任务调度
 - **Epoch 内存安全**：通过 `epoch::with_epoch` 批次保护并发哈希表读写，避免 ABA 问题
-- **分布式 Lance Checkpoint**：由 Fluxway 协调两阶段提交，写入 manifest 固定版本的 `entries` 与物理 `page_images`，保存 slot 布局、`seq_count`、payload/state，并以 SHA-256 校验支持弹性恢复。Lance manifest 是唯一 checkpoint metadata 记录；分布式加载必须显式传入 `filter_fn`，路由唯一由调用方负责。
+- **分布式 Lance Checkpoint**：框架无关的 prepare/write/commit 协议写入 manifest 固定版本的 `entries` 与物理 `page_images`，保存 slot 布局、sequence、payload/state，并进行 SHA-256 校验。精确版本恢复支持 physical participant 或调用方提供的弹性 partition function；单调提交权会拒绝过期 coordinator，不依赖特定分布式框架。
 - **动态分片与路由 (Partitioner OP)**：新增底层 C++ Partitioner OPs (`ModuloPartitioner`, `HashPartitioner`, `FastRangePartitioner`)，支持多路特征高效路由，支持在 Checkpoint 加载阶段进行灵活的集群弹性扩缩容（Resharding）。
 - **驱逐与内存管理**：高效的打分策略（如 LFU），使用线程安全的 `std::atomic_ref` 实现无锁并发状态更新
 - **页级冷热数据置换 (Page-Level Hot/Cold Swapping)**：后台线程基于可配置的内存水位线，通过保持虚拟地址稳定的 `MAP_FIXED` 重映射将冷数据页置换至磁盘后备存储。

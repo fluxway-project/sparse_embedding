@@ -4,6 +4,8 @@
 
 [性能与可靠性报告](performance_and_reliability_report_zh.md)
 
+[Lance 存储与 Gravitino 验证](lance_storage_and_gravitino.md)
+
 本文档描述存储、并发与核心组件机制契约。实现代码是常量的唯一事实来源；下文保留常量名称，便于从文档直接定位策略实现。
 
 ## C++ API 契约
@@ -169,49 +171,26 @@ approximate_exp，它是有界的 base-2 加多项式 exp 近似；测试将相�
 
 `seal_adaptive_pages()` 生成 64-byte 对齐的不可变 page 快照，用于 checkpoint 与布局控制；它不是查询索引，不改变路由。selector 与 planner 还接收可复用 scratch 对象，因此调度器能够跨控制周期复用 vector 容量，避免反复分配临时选择 buffer。
 
-## Fluxway 与 Lance checkpoint 协议
+## 框架无关的 Lance checkpoint 协议
 
-Fluxway 是跨所有 SPMD 组件的全局 checkpoint 事务唯一协调者：
+分布式集成使用 `SparseCheckpointProtocol`，提供一个
+`CheckpointSaveIdentity`、每个 writer 对应的 `CheckpointParticipant`，以及一次包含
+全部 fragment 的最终 commit。`CheckpointCommitAuthority` 只包含 opaque scope、单调
+generation 和 authority identity，不包含任何特定编排框架的类型或标识。
 
-1. Rank 0 准备外部 artifact。
-2. Worker 保存本地状态并返回 checkpoint metadata。
-3. Fluxway coordinator 等待所有组件和 rank 完成后，为每个组件的 commit hook 各调用一次。
-4. 失败时由 Fluxway 执行 abort。
-5. Worker 从已提交状态恢复。
+`LocalLanceStorage` 与 `GravitinoLanceStorage` 复用唯一的 Lance checkpoint 事务引擎。
+该引擎保存物化的 `(dim, key)` entry 状态、物理 page image 和 snapshot manifest；两个
+storage adapter 只提供 dataset 定位、staging prefix、持久小记录和 commit lock。
+manifest 是唯一可见性边界，并固定 entries 与 page-image 的精确 Lance version。跨
+participant 重复 key、participant 覆盖不完整、schema 不一致和过期提交权都会显式失败。
 
-Sparse Embedding 只提供 worker artifact 和校验规则，不维护第二个全局 coordinator 或可变的
-跨组件事务状态。Worker 进程禁止调用 `commit_fragments`。
+恢复选择精确的 `SparseCheckpointLocator`。`PhysicalRestore` 要求保存时的 participant
+拓扑并重建原生 page 布局。`ElasticRestore` 接收调用方稳定的
+`partition_fn(keys, partition_count)` 和目标 partition；实现先只扫描 key 与 row state，
+再读取分配给当前 partition 的 payload 列。Sparse Embedding 内部不提供拓扑或路由
+fallback。
 
-提交单元是一个 Fluxway checkpoint 事务，而不是一个 worker。对于一个 Lance
-组件，所有 worker artifact 必须在全局 barrier 之后由该组件 commit owner
-传给唯一一次 `commit_fragments`。多个 sparse 组件可以使用各自的 Lance dataset
-root，但它们的提交属于同一个 Fluxway 事务：只有所有组件提交成功后全局 checkpoint
-才发布。如果多个组件必须共用一个物理 Lance dataset，schema 中必须显式增加组件
-标识列；Worker 不能各自独立 append。
-
-分布式 `entries` row 保存 `snapshot_id`、`worker_id` 与 `shard_id`；`page_images` 保存物理 page id、逐 slot 布局、`seq_counts`、参数、可选 score、optimizer state/step、逐 key shard id 以及 SHA-256 checksum。保存期 `worker_id` 只用于 artifact 完整性校验：每个 worker 必须且只能提交一个 artifact，且同一 `(dim,key)` 不得跨 worker 重复。协调者提交 `entries` 与 `page_images`，最后追加包含两个 Lance version 与 checkpoint schema version 的 snapshot manifest。manifest 是唯一 checkpoint metadata 记录，也是 checkpoint 的可见性边界；不会写 sidecar `metadata.json`。恢复时固定这些 version，校验全部 page-image checksum；弹性恢复对路由到当前 worker 的 `entries` 执行 assign。显式同拓扑模式则使用同一份 pinned `page_images` 恢复精确 native page/slot，必须提供保存时 worker 标识，且拓扑不匹配会直接抛异常。
-
-恢复时先解析目标 `snapshot_id` 的唯一 manifest row，以其中保存的 Lance versions 打开数据集，
-扫描完整已保存 snapshot，并应用调用方显式提供的 router：
-
-```text
-target_rank = filter_fn(key)
-```
-
-后端仅用 `snapshot_id = S` 过滤，不按保存时的 `worker_id` 过滤。因此 checkpoint
-可以在不同 worker 数量之间恢复。分布式加载的实质输入是调用方提供的 `filter_fn`
-和 `target_shard_id`；单独的 `distributed=True` 只是重复表达调用模式，不应成为长期
-接口的必填参数。在兼容期间，传入 `filter_fn` 的调用仍可能需要同时传入
-`distributed=True`，但这个 flag 不得改变路由或存储行为。Sparse Embedding 不创建、
-不序列化、不解释 routing plan，也不回退到任何固定拓扑路由。
-
-`page_images` 只恢复实际物理 page/slot/value/state 布局，不保存或恢复 `PageThermalTier`、
-热度、cluster、coaccess、residency 等调度态；新集群启动后重新观测这些状态。
-
-`LanceCheckpointBackend` 在 native SeqLock 协议下读取每个存活 slot 的稳定镜像，再把已
-物化的 payload 写入 Lance `page_images`。checkpoint 从不克隆 spill 文件，也不会改变训练
-写路径。增量 entries 仍使用 per-shard sequence watermark、delete tombstone 与按 checksum
-寻址的 page reference。
+thermal tier、热度、coaccess 和 residency 等调度态不进入 checkpoint，恢复后重新观测。
 
 ## 遥测字段
 
