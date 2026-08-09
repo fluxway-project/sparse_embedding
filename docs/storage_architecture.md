@@ -312,6 +312,11 @@ partition_count)` and target partition. It first scans only keys and row state,
 then reads payload columns only for rows assigned to the target partition; no
 topology or routing fallback exists inside Sparse Embedding.
 
+The native `ModuloPartitioner` follows the language-independent normalized
+modulo contract used by Python and NumPy: every owner is in
+`[0, partition_count)`, including for negative signed keys. Custom partition
+functions remain responsible for their own routing semantics.
+
 Thermal tier, heat, coaccess, and residency scheduling metadata are intentionally
 not checkpointed. They are re-observed after restore.
 

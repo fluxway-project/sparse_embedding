@@ -20,6 +20,7 @@
 
 #include <cstdint>
 #include <span>
+#include <stdexcept>
 #include <type_traits>
 
 #include <proxy/proxy.h>
@@ -69,15 +70,21 @@ class ModuloPartitioner {
   uint32_t num_shards_;
   bool is_power_of_two_;
 
-  template <typename KeyT> uint32_t shard_for(KeyT key) const {
+  template <typename KeyT> uint32_t normalized_modulo(KeyT key) const {
     if constexpr (std::is_signed_v<KeyT>) {
-      const auto divisor = static_cast<KeyT>(num_shards_);
-      const auto remainder = key % divisor;
-      return static_cast<uint32_t>(remainder < 0 ? remainder + divisor
-                                                 : remainder);
+      using ArithmeticT = std::int64_t;
+      const ArithmeticT divisor = static_cast<ArithmeticT>(num_shards_);
+      const ArithmeticT remainder = static_cast<ArithmeticT>(key) % divisor;
+      return static_cast<uint32_t>((remainder + divisor) % divisor);
     } else {
-      return static_cast<uint32_t>(key % static_cast<KeyT>(num_shards_));
+      using ArithmeticT = std::uint64_t;
+      const ArithmeticT divisor = static_cast<ArithmeticT>(num_shards_);
+      return static_cast<uint32_t>(static_cast<ArithmeticT>(key) % divisor);
     }
+  }
+
+  template <typename KeyT> uint32_t shard_for(KeyT key) const {
+    return normalized_modulo(key);
   }
 
 public:

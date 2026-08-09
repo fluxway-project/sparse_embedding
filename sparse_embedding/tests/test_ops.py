@@ -98,6 +98,32 @@ def test_modulo_partitioner_uses_signed_int64_remainder() -> None:
             np.testing.assert_array_equal(mask, expected == target_shard)
 
 
+def test_modulo_partitioner_matches_standard_modulo_for_all_key_dtypes() -> None:
+    cases = (
+        (np.int32, (-5, -1, 0, 1, 5)),
+        (np.uint32, (0, 1, 5, 2**32 - 1)),
+        (np.int64, (-(2**63), -5, -1, 0, 1, 5)),
+        (np.uint64, (0, 1, 5, 2**63 + 1, 2**64 - 1)),
+    )
+    for dtype, values in cases:
+        keys = np.asarray(values, dtype=dtype)
+        before = keys.copy()
+        partitioner = sparse_embedding.ModuloPartitioner(num_shards=3)
+        actual = np.from_dlpack(partitioner.partition(keys))
+        expected = np.asarray([int(value) % 3 for value in values], dtype=np.uint32)
+        np.testing.assert_array_equal(actual, expected)
+        np.testing.assert_array_equal(keys, before)
+        assert keys.dtype == before.dtype
+
+    keys = np.asarray([-1, 0, 1], dtype=np.int32)
+    actual = np.from_dlpack(
+        sparse_embedding.ModuloPartitioner(num_shards=2**32 - 1).partition(keys)
+    )
+    np.testing.assert_array_equal(
+        actual, np.asarray([2**32 - 2, 0, 1], dtype=np.uint32)
+    )
+
+
 # =============================================================================
 # encode_keys / decode_keys
 # =============================================================================

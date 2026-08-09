@@ -190,6 +190,9 @@ participant 重复 key、participant 覆盖不完整、schema 不一致和过期
 再读取分配给当前 partition 的 payload 列。Sparse Embedding 内部不提供拓扑或路由
 fallback。
 
+原生 `ModuloPartitioner` 遵循 Python/NumPy 的语言无关规范化求余约定：即使 key 为负数，
+owner 也始终位于 `[0, partition_count)`；用户自定义的 `partition_fn` 负责自身的路由语义。
+
 thermal tier、热度、coaccess 和 residency 等调度态不进入 checkpoint，恢复后重新观测。
 
 ## 遥测字段
