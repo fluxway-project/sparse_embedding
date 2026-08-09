@@ -49,10 +49,7 @@ int run() {
   std::iota(keys.begin(), keys.end(), uint64_t{700000});
   std::vector<int64_t> lengths(kKeyCount, kDimension);
   std::vector<float> values(kKeyCount * kDimension, 1.0F);
-  std::vector<uint8_t> inserted(kKeyCount);
-  store.lookup_or_insert<uint64_t>(keys, values, lengths, inserted);
-  if (!std::ranges::all_of(inserted, [](uint8_t value) { return value == 1; }))
-    throw std::runtime_error("topology benchmark did not populate every key");
+  store.lookup_or_insert<uint64_t>(keys, values, lengths);
 
   std::array<uint64_t, kPageCount> page_masks{};
   std::array<uint8_t, kPageCount> seen_pages{};

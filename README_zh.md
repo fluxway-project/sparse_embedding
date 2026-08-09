@@ -67,6 +67,17 @@ Bazel 配置使用 `-std=c++23` 编译 C++ 源码；当前验收构建使用 GCC
 
 相对单线程的 scaling ratio 为：2 线程 1.706x、4 线程 2.898x、8 线程 4.226x，超过当前 1.6x/2.5x/3.5x forward-scaling gate。
 
+### 同机重构后复测（2026-08-10）
+
+同一台测试机器上使用相同 workload，当前源码单次结果为 1/2/4/8/16/64 线程分别
+14.988/21.852/35.165/45.945/41.928/33.446 Mops/s。16 线程追加三次为
+36.557/39.012/39.973 Mops/s，存在明显调度和 NUMA 波动；固定物理核 affinity 与
+NUMA placement 后再作优化结论。8 producers 高并发 pressure proof 通过，未发生
+pressure page、spill 或 swap-out。
+
+`--numa-aware-sharding` 同时启用执行侧与内存侧 NUMA locality：worker 绑定物理核，arena
+page 按 shard 固定到对应 node。复现命令：`bazel run -c opt //benchmarks:embedding_store_benchmark -- --threads=16 --numa-aware-sharding --skip-pressure`。
+
 #### 持续 Retirement Pressure 与 Sink
 
 sustained-pressure proof 使用 8 个 producer、1,048,576 个总 key、dim=8、Auto storage、8 MiB 驻留内存限制、512 MiB spill 限制，以及 0.75/0.50 水位。该测试在压力阶段后校验已保留 payload，报告当前 retirement/Sink 契约，而不是 disk spill/swap 吞吐。

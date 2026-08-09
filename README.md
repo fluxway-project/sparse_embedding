@@ -67,6 +67,19 @@ The isolated forward proof uses a dimension-32 memory-only store with 128 alread
 
 The scaling ratios versus one thread are 1.706x at two threads, 2.898x at four threads, and 4.226x at eight threads, passing the current 1.6x/2.5x/3.5x forward-scaling gate.
 
+### Same-machine refactor rerun (2026-08-10)
+
+Using the same workload on the same machine, the current source measured
+14.988/21.852/35.165/45.945/41.928/33.446 Mops/s at 1/2/4/8/16/64 threads.
+Three additional 16-thread runs measured 36.557/39.012/39.973 Mops/s, showing
+substantial scheduler and NUMA variance. Optimization conclusions require fixed
+physical-core affinity and NUMA placement. The eight-producer pressure proof
+passed without pressure pages, spill, or swap-out.
+
+`--numa-aware-sharding` enables both execution and memory NUMA locality: workers
+bind to physical CPUs and arena pages are placed by shard on the corresponding
+node. Reproduce with `bazel run -c opt //benchmarks:embedding_store_benchmark -- --threads=16 --numa-aware-sharding --skip-pressure`.
+
 #### Sustained Retirement Pressure and Sink
 
 The sustained-pressure proof uses eight producers, 1,048,576 total keys, dimension 8, Auto storage, an 8 MiB resident-memory limit, a 512 MiB spill limit, and 0.75/0.50 watermarks. It validates retained payloads after the pressure phase and reports the current retirement/Sink contract, not disk spill/swap throughput.

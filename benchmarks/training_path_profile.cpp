@@ -119,10 +119,9 @@ int main(int argc, char **argv) {
   std::vector<float> values(kRows * kDimension, 0.25F);
   std::vector<float> output(kRows * kDimension);
   std::vector<float> gradients(kRows * kDimension, 0.001F);
-  std::vector<uint8_t> inserted(kRows);
   for (size_t index = 0; index < kRows; ++index)
     keys[index] = index + 1;
-  store.lookup_or_insert<uint64_t>(keys, output, lengths, inserted);
+  store.lookup_or_insert<uint64_t>(keys, output, lengths);
 
   if (mode == "assign") {
     store.assign<uint64_t>(keys, values, lengths);

@@ -78,7 +78,6 @@ int main() {
   std::vector<uint64_t> initial_keys(kInitialKeys);
   std::vector<int64_t> initial_lengths(kInitialKeys, kDimension);
   std::vector<float> initial_values(kInitialKeys * kDimension, 1.0F);
-  std::vector<uint8_t> initial_inserted(kInitialKeys);
   std::iota(initial_keys.begin(), initial_keys.end(), uint64_t{1});
   constexpr size_t kInitialBatch = 256;
   for (size_t begin = 0; begin < kInitialKeys; begin += kInitialBatch) {
@@ -87,17 +86,10 @@ int main() {
         std::span<const uint64_t>(initial_keys).subspan(begin, count),
         std::span<float>(initial_values)
             .subspan(begin * kDimension, count * kDimension),
-        std::span<const int64_t>(initial_lengths).subspan(begin, count),
-        std::span<uint8_t>(initial_inserted).subspan(begin, count));
+        std::span<const int64_t>(initial_lengths).subspan(begin, count));
   }
-  const size_t initial_inserted_count = std::accumulate(
-      initial_inserted.begin(), initial_inserted.end(), size_t{0});
-  if (initial_inserted_count != kInitialKeys) {
-    throw std::runtime_error(
-        "initial pressure population lost keys: inserted=" +
-        std::to_string(initial_inserted_count) +
-        " size=" + std::to_string(store.size()));
-  }
+  if (store.size() != kInitialKeys)
+    throw std::runtime_error("initial pressure population lost keys");
 
   std::vector<se::StoragePage> pressure_pages;
   pressure_pages.reserve(kPressurePageCount);
@@ -142,7 +134,7 @@ int main() {
             for (size_t i = 0; i < kBatch; ++i)
               keys[i] = 40'000 + i;
             std::fill(values.begin(), values.end(), 3.0F);
-            store.lookup_or_insert<uint64_t>(keys, values, lengths, inserted);
+            store.lookup_or_insert<uint64_t>(keys, values, lengths);
           } else {
             for (size_t i = 0; i < kBatch; ++i)
               keys[i] = 30'000 + (i % 64);

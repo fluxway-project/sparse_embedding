@@ -39,10 +39,7 @@ int main() {
   for (size_t row = 0; row < keys.size(); ++row)
     for (size_t column = 0; column < 8; ++column)
       inserted_values[row * 8 + column] = static_cast<float>(row * 8 + column);
-  std::array<uint8_t, 8> inserted{};
-  store.lookup_or_insert<uint64_t>(keys, inserted_values, lengths, inserted);
-  for (uint8_t result : inserted)
-    require(result == 1, "NUMA setup insert did not insert a unique key");
+  store.lookup_or_insert<uint64_t>(keys, inserted_values, lengths);
   std::array<float, 64> assigned_values{};
   for (size_t row = 0; row < keys.size(); ++row)
     for (size_t column = 0; column < 8; ++column)

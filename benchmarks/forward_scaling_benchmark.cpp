@@ -55,9 +55,7 @@ double run_forward(size_t threads, const std::vector<uint64_t> &batch,
     warmup_keys[index] = index + 1;
   std::vector<int64_t> warmup_lengths(kVocabulary, kDimension);
   std::vector<float> warmup_values(kVocabulary * kDimension);
-  std::vector<uint8_t> inserted(kVocabulary);
-  store.lookup_or_insert<uint64_t>(warmup_keys, warmup_values, warmup_lengths,
-                                   inserted);
+  store.lookup_or_insert<uint64_t>(warmup_keys, warmup_values, warmup_lengths);
 
   std::vector<float> output(kBatchSize * kDimension);
   store.forward_lookup<uint64_t>(batch, output, row_lengths);

@@ -142,7 +142,7 @@ storage facade 不接收 store 生命周期锁。启用 score 的 store 注销 p
 
 所有可能仍被旧 reader 看到的对象都通过同一个 epoch-backed `RetirementPressure` 域退休。该域统计已退休但未回收的 bundle、snapshot、page、arena index、locator slot 与 page image 字节。默认配置为 `backpressure_fraction = 0.15`、`circuit_fraction = 0.25`、`epoch_stall_timeout = 30s`；构造时拒绝非法比例，Auto storage 还要求 circuit 阈值低于 spill high watermark。
 
-低于 backpressure 时正常运行。处于 backpressure 与 circuit 之间时，每个 writer 或 compactor 调用最多 yield 一次。进入 circuit 后，凡是会产生新 retirement 的控制面 mutation，除非已在本次调用内获得 admission，否则直接抛异常。已有 key 继续正常读取和更新。缺失 key 的 lookup-or-insert 返回该 dimension 的 64-byte 对齐零值 `SinkImage`，`inserted_mask = 0`、`contains = false`，不增长容量，也不进入 checkpoint。对 sink key 的写操作是 no-op；压力降回 backpressure 阈值以下后，新插入恢复。
+低于 backpressure 时正常运行。处于 backpressure 与 circuit 之间时，每个 writer 或 compactor 调用最多 yield 一次。进入 circuit 后，凡是会产生新 retirement 的控制面 mutation，除非已在本次调用内获得 admission，否则直接抛异常。已有 key 继续正常读取和更新。缺失 key 的 lookup-or-insert 返回该 dimension 的 64-byte 对齐零值 `SinkImage`，`contains = false`，不增长容量，也不进入 checkpoint。对 sink key 的写操作是 no-op；压力降回 backpressure 阈值以下后，新插入恢复。
 
 ### 自适应局部性信号
 

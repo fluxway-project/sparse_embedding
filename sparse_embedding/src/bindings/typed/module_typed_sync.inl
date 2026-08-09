@@ -54,7 +54,6 @@ nb::tuple SyncOpsImpl<ParamT, OptT>::lookup_or_insert(
   size_t n = get_dlm_size(dlm_keys);
   DLManagedTensor *vals_dlm = nullptr;
   DLManagedTensor *lens_dlm = nullptr;
-  DLManagedTensor *mask_dlm = nullptr;
   std::error_code ec;
 
   {
@@ -70,14 +69,10 @@ nb::tuple SyncOpsImpl<ParamT, OptT>::lookup_or_insert(
 
       int64_t vals_shape[] = {static_cast<int64_t>(total)};
       vals_dlm = se::py::create_output_tensor<ParamT>(vals_shape);
-      int64_t mask_shape[] = {static_cast<int64_t>(n)};
-      mask_dlm = se::py::create_output_tensor<uint8_t>(mask_shape);
-
       auto vals_span = std::span<ParamT>(
           static_cast<ParamT *>(vals_dlm->dl_tensor.data), total);
-      auto *mask_out = static_cast<uint8_t *>(mask_dlm->dl_tensor.data);
       ec = self.get_store<ParamT, OptT>()->lookup_or_insert(
-          ks, vals_span, {lens_out, n}, std::span<uint8_t>(mask_out, n));
+          ks, vals_span, {lens_out, n});
     });
   }
 
@@ -86,13 +81,10 @@ nb::tuple SyncOpsImpl<ParamT, OptT>::lookup_or_insert(
       vals_dlm->deleter(vals_dlm);
     if (lens_dlm)
       lens_dlm->deleter(lens_dlm);
-    if (mask_dlm)
-      mask_dlm->deleter(mask_dlm);
     throw std::runtime_error(ec.message());
   }
   return nb::make_tuple(se::py::wrap_output_tensor(vals_dlm),
-                        se::py::wrap_output_tensor(lens_dlm),
-                        se::py::wrap_output_tensor(mask_dlm));
+                        se::py::wrap_output_tensor(lens_dlm));
 }
 
 template <typename ParamT, typename OptT>

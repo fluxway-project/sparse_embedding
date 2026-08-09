@@ -107,12 +107,7 @@ Result run_once(size_t workers, size_t store_threads,
     std::fill_n(values.data() + index * kDimension, kDimension,
                 static_cast<float>(index + 1));
   }
-  std::vector<uint8_t> inserted(key_count);
-  store.lookup_or_insert<uint64_t>(keys, values, lengths, inserted);
-  if (!std::all_of(inserted.begin(), inserted.end(),
-                   [](uint8_t value) { return value == 1; })) {
-    throw std::runtime_error("page-compaction benchmark did not fill sources");
-  }
+  store.lookup_or_insert<uint64_t>(keys, values, lengths);
   std::vector<uint64_t> source_page_ids;
   std::vector<size_t> source_key_counts;
   store.export_page_images(pro::make_proxy<se::FunctionFacade<bool(

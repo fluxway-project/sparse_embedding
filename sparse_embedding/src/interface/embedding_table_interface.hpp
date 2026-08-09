@@ -21,7 +21,6 @@
 #include <proxy/proxy.h>
 
 #include <span>
-#include <string>
 #include <system_error>
 #include <vector>
 
@@ -142,8 +141,7 @@ using WeakMemOptimizerStep = pro::weak_dispatch<MemOptimizerStep>;
 
 #define SE_LOOKUP_OR_INSERT_FACADE_SIG(key_t)                                  \
   std::error_code(std::span<const key_t> keys, std::span<ParamT> out_values,   \
-                  std::span<const int64_t> row_lengths,                        \
-                  std::span<uint8_t> out_inserted_mask)
+                  std::span<const int64_t> row_lengths)
 
 #define SE_ASSIGN_FACADE_SIG(key_t)                                            \
   std::error_code(std::span<const key_t> keys, std::span<const ParamT> values, \

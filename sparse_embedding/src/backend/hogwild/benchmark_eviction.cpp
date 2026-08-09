@@ -50,7 +50,6 @@ Result run_once(bool use_threshold_eviction, size_t repetition) {
   std::vector<uint64_t> keys(kBatchSize);
   std::vector<int64_t> lengths(kBatchSize, kDimension);
   std::vector<float> values(kBatchSize * kDimension, 1.0f);
-  std::vector<uint8_t> inserted(kBatchSize);
   std::vector<uint64_t> evicted_keys(kBatchSize);
   std::vector<float> evicted_values(kBatchSize * kDimension);
 
@@ -59,7 +58,7 @@ Result run_once(bool use_threshold_eviction, size_t repetition) {
     for (size_t offset = 0; offset < kResidentKeyBudget; offset += kBatchSize) {
       for (size_t index = 0; index < kBatchSize; ++index)
         keys[index] = epoch * kResidentKeyBudget + offset + index;
-      store.lookup_or_insert<uint64_t>(keys, values, lengths, inserted);
+      store.lookup_or_insert<uint64_t>(keys, values, lengths);
       store.forward_lookup<uint64_t>(
           std::span<const uint64_t>(keys.data(), kHotKeysPerBatch),
           std::span<float>(values.data(), kHotKeysPerBatch * kDimension),

@@ -27,14 +27,13 @@ int main() {
   std::vector<uint64_t> keys(batch_size);
   std::vector<int64_t> lengths(batch_size, 128);
   std::vector<float> values(batch_size * 128, 1.0f);
-  std::vector<uint8_t> inserted_mask(batch_size, 0);
 
   std::cout << "Inserting " << num_keys << " keys...\n";
   for (size_t i = 0; i < num_keys; i += batch_size) {
     for (size_t j = 0; j < batch_size; ++j) {
       keys[j] = i + j;
     }
-    store.lookup_or_insert<uint64_t>(keys, values, lengths, inserted_mask);
+    store.lookup_or_insert<uint64_t>(keys, values, lengths);
   }
 
   std::string uri = "/tmp/lance_checkpoint_bench.lance";

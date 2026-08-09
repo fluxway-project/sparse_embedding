@@ -26,6 +26,7 @@ sparse_embedding/_core.pyi
 .qoder/
 .idea/
 .vscode/
+.history/
 .DS_Store
 
 tmp/
