@@ -233,7 +233,7 @@ each writer or compactor yields at most once per call. At circuit pressure,
 control-plane mutations that would create new retirement throw unless already
 admitted. Existing keys continue to read and update normally. Missing
 lookup-or-insert keys return the dimension-sized, 64-byte-aligned zero
-`SinkImage`, set `inserted_mask = 0`, report `contains = false`, do not
+`SinkImage`, report `contains = false`, do not
 grow capacity, and do not enter checkpoints. Writes to sink keys are no-ops;
 after pressure falls below the backpressure threshold, new insertion resumes.
 

@@ -57,7 +57,7 @@ store = se.EmbeddingStore(
 # During the training loop, whenever features are queried, 
 # their LFU scores will be updated automatically.
 keys = np.array([1, 2, 3], dtype=np.int64)
-embeddings, valid_mask = store.lookup_or_insert(keys, dim=128)
+embeddings, lengths = store.lookup_or_insert(keys, dim=128)
 
 # Calculate gradients ...
 gradients = np.ones((3, 128), dtype=np.float32)

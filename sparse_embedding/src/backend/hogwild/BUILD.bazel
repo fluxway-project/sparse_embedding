@@ -106,6 +106,7 @@ cc_library(
         "@parlayhash",
         "@proxy",
         "@stdexec",
+        "@unordered_dense",
     ],
 )
 
@@ -302,6 +303,21 @@ cc_test(
     srcs = ["mutation_contract_test.cpp"],
     copts = ["-UNDEBUG"],
     defines = ["HOGWILD_EXPLICIT_INSTANTIATION"],
+    deps = [":hogwild_headers"],
+)
+
+cc_test(
+    name = "mutation_contract_opt_test",
+    srcs = ["mutation_contract_test.cpp"],
+    defines = ["HOGWILD_EXPLICIT_INSTANTIATION"],
+    deps = [":hogwild_headers"],
+)
+
+cc_binary(
+    name = "lookup_or_insert_maskless_benchmark",
+    srcs = ["lookup_or_insert_maskless_benchmark.cpp"],
+    defines = ["HOGWILD_EXPLICIT_INSTANTIATION"],
+    linkopts = ["-pthread"],
     deps = [":hogwild_headers"],
 )
 

@@ -202,7 +202,6 @@ void run_storage_pressure_benchmark() {
   std::vector<float> output(kPressureBatch * kDim);
   std::vector<float> values(kPressureBatch * kDim, 0.1F);
   std::vector<float> gradients(kPressureBatch * kDim, 0.001F);
-  std::vector<uint8_t> inserted(kPressureBatch);
   auto batch = generate_power_law_batch(kPressureBatch, kPressureKeys, gen);
   deduplicate_mutation_batch(batch);
   if (std::adjacent_find(batch.begin(), batch.end()) != batch.end())
@@ -211,9 +210,7 @@ void run_storage_pressure_benchmark() {
   std::vector<int64_t> insertion_lengths(batch.size(),
                                          static_cast<int64_t>(kDim));
   std::vector<float> insertion_output(batch.size() * kDim);
-  std::vector<uint8_t> insertion_mask(batch.size());
-  store.lookup_or_insert<uint64_t>(batch, insertion_output, insertion_lengths,
-                                   insertion_mask);
+  store.lookup_or_insert<uint64_t>(batch, insertion_output, insertion_lengths);
 
   Timer timer;
   timer.start();
@@ -374,7 +371,9 @@ int main(int argc, char **argv) {
                                 LocalityPolicy{store_dispatch_config.has_value()
                                                    ? LocalityMode::kNuma
                                                    : LocalityMode::kAuto,
-                                               LocalityMode::kAuto},
+                                               numa_aware_sharding
+                                                   ? LocalityMode::kNuma
+                                                   : LocalityMode::kAuto},
                             .storage = create_page_storage()});
     if (store.reserve(kUniqueKeys, kDim))
       throw std::runtime_error("benchmark reserve failed");
@@ -387,7 +386,6 @@ int main(int argc, char **argv) {
     std::vector<float> flat_values(kBatchSize * kDim, 0.1f);
     std::vector<float> flat_out(kBatchSize * kDim, 0.0f);
     std::vector<float> flat_grads(kBatchSize * kDim, 0.001f);
-    std::vector<uint8_t> inserted_mask(kBatchSize);
     std::vector<uint8_t> exists_mask(kBatchSize);
 
     // ── 1. lookup_or_insert (cold: all new keys) ───────────────────────────
@@ -397,8 +395,7 @@ int main(int argc, char **argv) {
       // warmup
       store.lookup_or_insert<uint64_t>(
           batch, std::span<float>(flat_out).first(batch.size() * kDim),
-          std::span<const int64_t>(row_lengths).first(batch.size()),
-          std::span<uint8_t>(inserted_mask).first(batch.size()));
+          std::span<const int64_t>(row_lengths).first(batch.size()));
 
       size_t reps = 10;
       size_t operation_count = 0;
@@ -409,8 +406,7 @@ int main(int argc, char **argv) {
         operation_count += b.size();
         store.lookup_or_insert<uint64_t>(
             b, std::span<float>(flat_out).first(b.size() * kDim),
-            std::span<const int64_t>(row_lengths).first(b.size()),
-            std::span<uint8_t>(inserted_mask).first(b.size()));
+            std::span<const int64_t>(row_lengths).first(b.size()));
       }
       double ms = timer.elapsed_ms() / reps;
       double mops = operation_count / (ms * reps) / 1e3;

@@ -63,11 +63,7 @@ int main() {
   constexpr std::array<uint64_t, 3> keys{11, 22, 33};
   constexpr std::array<int64_t, 3> lengths{8, 8, 8};
   std::array<float, 24> values{};
-  std::array<uint8_t, 3> inserted{};
-  store.lookup_or_insert<uint64_t>(keys, values, lengths, inserted);
-
-  require(inserted == std::array<uint8_t, 3>{1, 1, 1},
-          "keys were not inserted");
+  store.lookup_or_insert<uint64_t>(keys, values, lengths);
   require(store.size() == keys.size(), "store size mismatch");
   require(storage->stats().spill_bytes > 0,
           "store did not use shared spill storage");
@@ -79,9 +75,8 @@ int main() {
     constexpr std::array<uint64_t, 1> duplicate_key{9911};
     constexpr std::array<int64_t, 1> duplicate_length{8};
     std::array<float, 8> duplicate_values{};
-    std::array<uint8_t, 1> duplicate_inserted{};
     duplicate_gradient_store.lookup_or_insert<uint64_t>(
-        duplicate_key, duplicate_values, duplicate_length, duplicate_inserted);
+        duplicate_key, duplicate_values, duplicate_length);
     constexpr std::array<uint64_t, 3> repeated_keys{9911, 9911, 9911};
     constexpr std::array<int64_t, 3> repeated_lengths{8, 8, 8};
     std::array<float, 24> repeated_gradients{};
@@ -218,14 +213,9 @@ int main() {
     std::fill_n(page_compaction_values.data() + key_index * 8, 8,
                 static_cast<float>(key_index + 1));
   }
-  std::vector<uint8_t> page_compaction_inserted(page_compaction_keys);
-  page_compaction_store.lookup_or_insert<uint64_t>(
-      page_compaction_key_values, page_compaction_values,
-      page_compaction_lengths, page_compaction_inserted);
-  require(std::all_of(page_compaction_inserted.begin(),
-                      page_compaction_inserted.end(),
-                      [](uint8_t inserted) { return inserted == 1; }),
-          "page compaction source page was not fully populated");
+  page_compaction_store.lookup_or_insert<uint64_t>(page_compaction_key_values,
+                                                   page_compaction_values,
+                                                   page_compaction_lengths);
   require(page_compaction_store.compact_page(8, 0) == page_compaction_keys,
           "page compaction did not relocate every live source entry");
   std::vector<float> page_compaction_result(page_compaction_values.size());
@@ -275,14 +265,8 @@ int main() {
                     key_index * tight_compaction_dim,
                 tight_compaction_dim, static_cast<float>(key_index + 1));
   }
-  std::vector<uint8_t> tight_compaction_inserted(tight_compaction_key_count);
   tight_compaction_store.lookup_or_insert<uint64_t>(
-      tight_compaction_keys, tight_compaction_values, tight_compaction_lengths,
-      tight_compaction_inserted);
-  require(std::all_of(tight_compaction_inserted.begin(),
-                      tight_compaction_inserted.end(),
-                      [](uint8_t inserted) { return inserted == 1; }),
-          "tight page compaction source pages were not fully populated");
+      tight_compaction_keys, tight_compaction_values, tight_compaction_lengths);
   std::array<uint64_t, tight_compaction_page_count> tight_compaction_pages{};
   std::iota(tight_compaction_pages.begin(), tight_compaction_pages.end(),
             uint64_t{0});
@@ -315,9 +299,8 @@ int main() {
   std::iota(hot_keys.begin(), hot_keys.end(), uint64_t{90000});
   std::vector<int64_t> hot_lengths(hot_promotion_keys, 8);
   std::vector<float> hot_values(hot_promotion_keys * 8, 1.0F);
-  std::vector<uint8_t> hot_inserted(hot_promotion_keys);
   hot_promotion_store.lookup_or_insert<uint64_t>(hot_keys, hot_values,
-                                                 hot_lengths, hot_inserted);
+                                                 hot_lengths);
   std::vector<uint64_t> hot_scores(hot_promotion_keys, 1);
   hot_scores[0] = 1000;
   hot_scores[1] = 900;
@@ -386,10 +369,8 @@ int main() {
             uint64_t{200000});
   std::vector<int64_t> coaccess_lengths(coaccess_keys, 8);
   std::vector<float> coaccess_values(coaccess_keys * 8, 3.0F);
-  std::vector<uint8_t> coaccess_inserted(coaccess_keys);
   coaccess_compaction_store.lookup_or_insert<uint64_t>(
-      coaccess_key_values, coaccess_values, coaccess_lengths,
-      coaccess_inserted);
+      coaccess_key_values, coaccess_values, coaccess_lengths);
   std::vector<float> coaccess_result(coaccess_values.size());
   for (size_t repeat = 0; repeat < 8; ++repeat) {
     std::array<uint64_t, 2> pair{coaccess_key_values[0],
@@ -439,14 +420,8 @@ int main() {
     std::fill_n(parallel_page_values.data() + key_index * 8, 8,
                 static_cast<float>(key_index + 1));
   }
-  std::vector<uint8_t> parallel_page_inserted(parallel_page_key_count);
   parallel_page_store.lookup_or_insert<uint64_t>(
-      parallel_page_keys, parallel_page_values, parallel_page_lengths,
-      parallel_page_inserted);
-  require(std::all_of(parallel_page_inserted.begin(),
-                      parallel_page_inserted.end(),
-                      [](uint8_t inserted) { return inserted == 1; }),
-          "parallel page compaction source pages were not fully populated");
+      parallel_page_keys, parallel_page_values, parallel_page_lengths);
   std::barrier parallel_page_start(parallel_page_sources + 1);
   std::array<size_t, parallel_page_sources> parallel_page_migrated{};
   std::array<std::exception_ptr, parallel_page_sources> parallel_page_errors{};
@@ -517,9 +492,8 @@ int main() {
   std::iota(same_page_keys.begin(), same_page_keys.end(), uint64_t{500000});
   std::vector<int64_t> same_page_lengths(same_page_keys.size(), 8);
   std::vector<float> same_page_values(same_page_keys.size() * 8, 17.0F);
-  std::vector<uint8_t> same_page_inserted(same_page_keys.size());
-  same_page_store.lookup_or_insert<uint64_t>(
-      same_page_keys, same_page_values, same_page_lengths, same_page_inserted);
+  same_page_store.lookup_or_insert<uint64_t>(same_page_keys, same_page_values,
+                                             same_page_lengths);
   std::barrier same_page_start(3);
   std::array<size_t, 2> same_page_migrated{};
   std::array<std::exception_ptr, 2> same_page_errors{};
@@ -569,10 +543,8 @@ int main() {
             uint64_t{100000});
   std::vector<int64_t> concurrent_page_lengths(page_compaction_keys, 8);
   std::vector<float> concurrent_page_values(page_compaction_keys * 8, 1.0F);
-  std::vector<uint8_t> concurrent_page_inserted(page_compaction_keys);
   concurrent_page_store.lookup_or_insert<uint64_t>(
-      concurrent_page_keys, concurrent_page_values, concurrent_page_lengths,
-      concurrent_page_inserted);
+      concurrent_page_keys, concurrent_page_values, concurrent_page_lengths);
   std::atomic<bool> concurrent_page_ok{true};
   std::exception_ptr concurrent_page_writer_error;
   std::exception_ptr concurrent_page_reader_error;
@@ -721,9 +693,7 @@ int main() {
   constexpr std::array<uint64_t, 1> adam_key{71};
   constexpr std::array<int64_t, 1> adam_length{8};
   std::array<float, 8> adam_values{};
-  std::array<uint8_t, 1> adam_inserted{};
-  adam_store.lookup_or_insert<uint64_t>(adam_key, adam_values, adam_length,
-                                        adam_inserted);
+  adam_store.lookup_or_insert<uint64_t>(adam_key, adam_values, adam_length);
   std::array<float, 16> adam_state{};
   std::iota(adam_state.begin(), adam_state.end(), 1.0F);
   constexpr std::array<uint32_t, 1> adam_step{37};
@@ -920,10 +890,8 @@ int main() {
   std::array<int64_t, concurrent_key_count> concurrent_lengths{};
   concurrent_lengths.fill(8);
   std::array<float, concurrent_key_count * 8> concurrent_values{};
-  std::array<uint8_t, concurrent_key_count> concurrent_inserted{};
   concurrent_store.lookup_or_insert<uint64_t>(
-      concurrent_keys, concurrent_values, concurrent_lengths,
-      concurrent_inserted);
+      concurrent_keys, concurrent_values, concurrent_lengths);
   std::atomic<bool> concurrent_ok{true};
   std::array<std::thread, 4> concurrent_workers;
   for (size_t worker = 0; worker < concurrent_workers.size(); ++worker) {
@@ -981,18 +949,15 @@ int main() {
   constexpr std::array<uint64_t, 1> duplicate_key{44};
   constexpr std::array<int64_t, 1> duplicate_length{8};
   std::barrier duplicate_start(3);
-  std::array<uint8_t, 2> duplicate_inserted{};
   std::array<std::exception_ptr, 2> duplicate_errors{};
   std::array<std::thread, 2> duplicate_workers;
   for (size_t worker = 0; worker < duplicate_workers.size(); ++worker) {
     duplicate_workers[worker] = std::thread([&, worker] {
       try {
         std::array<float, 8> values{};
-        std::array<uint8_t, 1> inserted{};
         duplicate_start.arrive_and_wait();
         duplicate_store.lookup_or_insert<uint64_t>(duplicate_key, values,
-                                                   duplicate_length, inserted);
-        duplicate_inserted[worker] = inserted[0];
+                                                   duplicate_length);
       } catch (...) {
         duplicate_errors[worker] = std::current_exception();
       }
@@ -1005,9 +970,6 @@ int main() {
     if (error)
       std::rethrow_exception(error);
   }
-  require(std::accumulate(duplicate_inserted.begin(), duplicate_inserted.end(),
-                          size_t{0}) == 1,
-          "concurrent calls published more than one duplicate key");
   require(duplicate_store.size() == 1,
           "concurrent calls consumed active-key capacity twice");
 
@@ -1018,10 +980,8 @@ int main() {
   constexpr std::array<uint64_t, 1> memory_scored_key{55};
   constexpr std::array<int64_t, 1> memory_scored_length{8};
   std::array<float, 8> memory_scored_values{};
-  std::array<uint8_t, 1> memory_scored_inserted{};
   memory_scored_store.lookup_or_insert<uint64_t>(
-      memory_scored_key, memory_scored_values, memory_scored_length,
-      memory_scored_inserted);
+      memory_scored_key, memory_scored_values, memory_scored_length);
   constexpr std::array<uint64_t, 1> compact_score{99};
   memory_scored_store.assign_scores<uint64_t>(memory_scored_key, compact_score);
   require(memory_scored_store.compact_one(8, 55),
@@ -1096,8 +1056,9 @@ int main() {
                       [](uint8_t seen) { return seen == 1; }),
           "full-page score compaction lost a key");
 
+  std::array<uint8_t, 1> memory_scored_exists{};
   memory_scored_store.contains<uint64_t>(memory_scored_key,
-                                         memory_scored_inserted);
+                                         memory_scored_exists);
 
   se::StorageOptions reuse_options;
   reuse_options.memory_limit_bytes = 0;
@@ -1110,11 +1071,10 @@ int main() {
   std::array<uint64_t, 1> reuse_key{};
   constexpr std::array<int64_t, 1> reuse_length{8};
   std::array<float, 8> reuse_value{};
-  std::array<uint8_t, 1> reuse_inserted{};
   for (uint64_t key = 1; key <= 10000; ++key) {
     reuse_key[0] = key;
-    reuse_store.lookup_or_insert<uint64_t>(reuse_key, reuse_value, reuse_length,
-                                           reuse_inserted);
+    reuse_store.lookup_or_insert<uint64_t>(reuse_key, reuse_value,
+                                           reuse_length);
     reuse_store.erase<uint64_t>(reuse_key);
   }
   require(reuse_storage->stats().spill_count == 1,
@@ -1162,9 +1122,8 @@ int main() {
   std::array<int64_t, 32> snapshot_lengths{};
   snapshot_lengths.fill(8);
   std::array<float, 32 * 8> snapshot_values{};
-  std::array<uint8_t, 32> snapshot_inserted{};
-  snapshot_store.lookup_or_insert<uint64_t>(
-      snapshot_keys, snapshot_values, snapshot_lengths, snapshot_inserted);
+  snapshot_store.lookup_or_insert<uint64_t>(snapshot_keys, snapshot_values,
+                                            snapshot_lengths);
   std::atomic<bool> reader_ok{true};
   std::thread reader([&] {
     try {
@@ -1178,8 +1137,8 @@ int main() {
   });
   for (size_t i = 0; i < 50; ++i) {
     snapshot_store.clear();
-    snapshot_store.lookup_or_insert<uint64_t>(
-        snapshot_keys, snapshot_values, snapshot_lengths, snapshot_inserted);
+    snapshot_store.lookup_or_insert<uint64_t>(snapshot_keys, snapshot_values,
+                                              snapshot_lengths);
   }
   reader.join();
   require(reader_ok.load(std::memory_order_relaxed),
@@ -1206,9 +1165,8 @@ int main() {
   constexpr std::array<uint64_t, 1> watermark_key{91};
   constexpr std::array<int64_t, 1> watermark_length{8};
   std::array<float, 8> watermark_values{};
-  std::array<uint8_t, 1> watermark_inserted{};
-  watermark_store.lookup_or_insert<uint64_t>(
-      watermark_key, watermark_values, watermark_length, watermark_inserted);
+  watermark_store.lookup_or_insert<uint64_t>(watermark_key, watermark_values,
+                                             watermark_length);
   for (size_t attempt = 0;
        attempt < 100 && watermark_storage->stats().swap_out_count == 0;
        ++attempt) {
@@ -1248,7 +1206,6 @@ int main() {
   constexpr std::array<uint64_t, 1> shared_key{123};
   constexpr std::array<int64_t, 1> shared_length{8};
   std::array<float, 8> shared_values{};
-  std::array<uint8_t, 1> shared_inserted{};
   {
     auto first = std::make_unique<ScoredStore>(
         std::vector<size_t>{8}, ScoredStore::Initializer{}, nullptr,
@@ -1258,10 +1215,9 @@ int main() {
         std::vector<size_t>{8}, ScoredStore::Initializer{}, nullptr,
         se::ManualScorePolicy{},
         se::HogwildStoreOptions{.thread_budget = 1, .storage = shared_storage});
-    first->lookup_or_insert<uint64_t>(shared_key, shared_values, shared_length,
-                                      shared_inserted);
-    second->lookup_or_insert<uint64_t>(shared_key, shared_values, shared_length,
-                                       shared_inserted);
+    first->lookup_or_insert<uint64_t>(shared_key, shared_values, shared_length);
+    second->lookup_or_insert<uint64_t>(shared_key, shared_values,
+                                       shared_length);
     first.reset();
     shared_values.fill(3.0F);
     second->assign<uint64_t>(shared_key, shared_values, shared_length);
@@ -1277,12 +1233,12 @@ int main() {
         se::HogwildStoreOptions{.thread_budget = 1, .storage = shared_storage});
     std::array<uint64_t, 1> memory_key{456};
     std::array<float, 8> memory_values{};
-    std::array<uint8_t, 1> memory_inserted{};
     memory_store->lookup_or_insert<uint64_t>(memory_key, memory_values,
-                                             shared_length, memory_inserted);
-    require(memory_inserted[0] == 1,
+                                             shared_length);
+    std::array<uint8_t, 1> memory_exists{};
+    memory_store->contains<uint64_t>(memory_key, memory_exists);
+    require(memory_exists[0] == 1,
             "pure memory store could not share a scored storage");
-    memory_store->contains<uint64_t>(memory_key, memory_inserted);
   }
 
   se::StorageOptions stress_options;
@@ -1297,22 +1253,13 @@ int main() {
   std::vector<uint64_t> stress_keys(stress_batch_size);
   std::vector<int64_t> stress_lengths(stress_batch_size, 8);
   std::vector<float> stress_values(stress_batch_size * 8);
-  std::vector<uint8_t> stress_inserted(stress_batch_size);
-  size_t stress_inserted_total = 0;
   for (size_t round = 0; round < stress_rounds; ++round) {
     for (size_t i = 0; i < stress_batch_size; ++i)
       stress_keys[i] = round * stress_batch_size + i;
     stress_store.lookup_or_insert<uint64_t>(stress_keys, stress_values,
-                                            stress_lengths, stress_inserted);
-    stress_inserted_total += std::accumulate(stress_inserted.begin(),
-                                             stress_inserted.end(), size_t{0});
+                                            stress_lengths);
   }
   const size_t expected_stress_size = stress_batch_size * stress_rounds;
-  if (stress_inserted_total != expected_stress_size)
-    throw std::runtime_error("8-thread unique insertion mask mismatch: got " +
-                             std::to_string(stress_inserted_total) +
-                             " expected " +
-                             std::to_string(expected_stress_size));
   const size_t observed_stress_size = stress_store.size();
   if (observed_stress_size != expected_stress_size)
     throw std::runtime_error("8-thread unique insertion lost keys: got " +
@@ -1325,11 +1272,8 @@ int main() {
       se::HogwildStoreOptions{.thread_budget = 8, .storage = stress_storage});
   for (size_t i = 0; i < stress_batch_size; ++i)
     stress_keys[i] = i;
-  scored_stress_store.lookup_or_insert<uint64_t>(
-      stress_keys, stress_values, stress_lengths, stress_inserted);
-  require(std::accumulate(stress_inserted.begin(), stress_inserted.end(),
-                          size_t{0}) == stress_batch_size,
-          "admitted scored insertion batch was interrupted by pressure");
+  scored_stress_store.lookup_or_insert<uint64_t>(stress_keys, stress_values,
+                                                 stress_lengths);
   require(scored_stress_store.size() == stress_batch_size,
           "admitted scored insertion batch lost keys");
 
@@ -1346,13 +1290,11 @@ int main() {
   constexpr std::array<int64_t, 1> sink_length{8};
   std::array<float, 8> sink_values;
   sink_values.fill(7.0F);
-  std::array<uint8_t, 1> sink_inserted{1};
-  sink_store.lookup_or_insert<uint64_t>(sink_key, sink_values, sink_length,
-                                        sink_inserted);
+  sink_store.lookup_or_insert<uint64_t>(sink_key, sink_values, sink_length);
   require(std::ranges::all_of(sink_values,
                               [](float value) { return value == 0.0F; }),
           "circuit lookup-or-insert did not return the zero sink image");
-  require(sink_inserted[0] == 0 && sink_store.size() == 0,
+  require(sink_store.size() == 0,
           "circuit lookup-or-insert grew the key directory");
   std::array<uint8_t, 1> sink_exists{1};
   sink_store.contains<uint64_t>(sink_key, sink_exists);
@@ -1365,8 +1307,7 @@ int main() {
   require(sink_storage->stats().retirement_sink_hit_count >= 2,
           "circuit sink hits were not recorded");
   pressure->complete_retirement(circuit_retirement);
-  sink_store.lookup_or_insert<uint64_t>(sink_key, sink_values, sink_length,
-                                        sink_inserted);
-  require(sink_inserted[0] == 1 && sink_store.size() == 1,
+  sink_store.lookup_or_insert<uint64_t>(sink_key, sink_values, sink_length);
+  require(sink_store.size() == 1,
           "key insertion did not resume after circuit recovery");
 }

@@ -18,6 +18,7 @@
 #ifndef SPARSE_EMBEDDING_HOGWILD_EMBEDDING_STORE_HPP_
 #define SPARSE_EMBEDDING_HOGWILD_EMBEDDING_STORE_HPP_
 
+#include <ankerl/unordered_dense.h>
 #include <parlay/parallel.h>
 
 #include <algorithm>
@@ -2309,7 +2310,8 @@ public:
     template <typename Initialize, typename Visit>
     void find_or_insert_batch(std::span<const BatchEntry> entries,
                               Initialize &&initialize, Visit &&visit,
-                              bool write_existing_payload) {
+                              bool write_existing_payload,
+                              bool coalesce_duplicates = false) {
       if (entries.empty())
         return;
       struct ExistingEntry {
@@ -2319,22 +2321,42 @@ public:
       struct ShardBatch {
         std::vector<ExistingEntry> existing;
         std::vector<BatchEntry> candidates;
+        struct AliasEntry {
+          uint32_t candidate_index;
+          uint32_t winner_order;
+        };
+        std::vector<AliasEntry> aliases;
         std::vector<BatchEntry> inserted;
+        std::vector<BatchEntry> published;
+        std::vector<uint32_t> winner_candidates;
         std::vector<BatchEntry> sink_entries;
         std::vector<uint64_t> inserted_keys;
         std::vector<uint32_t> inserted_indices;
         struct PendingAllocation {
           BatchEntry entry;
           uint32_t index;
+          uint32_t winner_order;
           bool recycled = false;
         };
         std::vector<PendingAllocation> allocations;
+        std::vector<uint32_t> winner_slots;
       };
       std::vector<ShardBatch> by_shard(key_shards.size());
+      std::vector<uint32_t> resolved_slots;
+      std::vector<uint8_t> resolved_sink;
+      thread_local ankerl::unordered_dense::map<uint64_t, uint32_t>
+          winner_by_key;
+      if (coalesce_duplicates) {
+        resolved_slots.assign(entries.size(), 0);
+        resolved_sink.assign(entries.size(), 0);
+      }
       for (ShardBatch &batch : by_shard) {
         batch.existing.reserve(entries.size() / by_shard.size() + 1);
         batch.candidates.reserve(entries.size() / by_shard.size() + 1);
+        batch.aliases.reserve(entries.size() / by_shard.size() + 1);
         batch.inserted.reserve(entries.size() / by_shard.size() + 1);
+        batch.published.reserve(entries.size() / by_shard.size() + 1);
+        batch.winner_candidates.reserve(entries.size() / by_shard.size() + 1);
         batch.sink_entries.reserve(entries.size() / by_shard.size() + 1);
         batch.inserted_keys.reserve(entries.size() / by_shard.size() + 1);
         batch.inserted_indices.reserve(entries.size() / by_shard.size() + 1);
@@ -2368,31 +2390,64 @@ public:
                 resolved = key_shard.rotate_locator_unlocked(entry.key,
                                                              resolved->slot_id);
               batch.existing.push_back({entry, resolved->slot_id});
+              if (coalesce_duplicates)
+                resolved_slots[entry.position] = resolved->slot_id;
               continue;
             }
             if (!retirement_admission.admitted()) {
               retirement_pressure->record_sink_hit();
               batch.sink_entries.push_back(entry);
+              if (coalesce_duplicates)
+                resolved_sink[entry.position] = 1;
               continue;
             }
             batch.inserted.push_back(entry);
+          }
+          batch.winner_candidates.clear();
+          batch.aliases.clear();
+          if (coalesce_duplicates) {
+            if (batch.inserted.size() > std::numeric_limits<uint32_t>::max())
+              throw std::overflow_error("miss batch exceeds index range");
+            winner_by_key.clear();
+            winner_by_key.reserve(batch.inserted.size());
+            for (uint32_t candidate_index = 0;
+                 candidate_index < batch.inserted.size(); ++candidate_index) {
+              const BatchEntry &entry = batch.inserted[candidate_index];
+              auto [winner, inserted] = winner_by_key.try_emplace(
+                  entry.key,
+                  static_cast<uint32_t>(batch.winner_candidates.size()));
+              if (inserted)
+                batch.winner_candidates.push_back(candidate_index);
+              else
+                batch.aliases.push_back({candidate_index, winner->second});
+            }
+          } else {
+            batch.winner_candidates.resize(batch.inserted.size());
+            std::ranges::iota(batch.winner_candidates, uint32_t{0});
           }
         }
 
         struct AllocationOrder {
           size_t shard_id;
           const BatchEntry *entry;
+          uint32_t winner_order;
         };
         std::vector<AllocationOrder> allocation_order;
         allocation_order.reserve(entries.size());
         for (size_t shard_id = 0; shard_id < by_shard.size(); ++shard_id) {
-          for (const BatchEntry &entry : by_shard[shard_id].inserted)
-            allocation_order.push_back({shard_id, &entry});
+          const ShardBatch &batch = by_shard[shard_id];
+          for (uint32_t winner_order = 0;
+               winner_order < batch.winner_candidates.size(); ++winner_order)
+            allocation_order.push_back(
+                {shard_id,
+                 &batch.inserted[batch.winner_candidates[winner_order]],
+                 winner_order});
         }
         std::ranges::sort(
             allocation_order, {},
             [](const AllocationOrder &item) { return item.entry->position; });
         for (const AllocationOrder &item : allocation_order) {
+          auto &batch = by_shard[item.shard_id];
           auto &key_shard = *key_shards[item.shard_id];
           uint32_t arena_index;
           if (auto recycled = key_shard.take_recycled_index()) {
@@ -2404,8 +2459,8 @@ public:
             key_shard.reserve_new_index();
             arena_index = allocate_entry(static_cast<uint32_t>(item.shard_id));
           }
-          by_shard[item.shard_id].allocations.push_back(
-              {*item.entry, arena_index});
+          batch.allocations.push_back(
+              {*item.entry, arena_index, item.winner_order});
         }
 
         for (size_t shard_id = 0; shard_id < by_shard.size(); ++shard_id) {
@@ -2414,7 +2469,10 @@ public:
             continue;
           auto &key_shard = *key_shards[shard_id];
           std::unique_lock writer_lock(key_shard.writer_mutex);
-          batch.inserted.clear();
+          batch.published.clear();
+          batch.inserted_keys.clear();
+          batch.inserted_indices.clear();
+          batch.winner_slots.assign(batch.winner_candidates.size(), 0);
           for (auto &allocation : batch.allocations) {
             auto located = key_shard.find_slot_hashed_unlocked(
                 allocation.entry.key, allocation.entry.hash);
@@ -2424,6 +2482,9 @@ public:
                 throw std::logic_error(
                     "key directory references an empty locator slot");
               batch.existing.push_back({allocation.entry, *located});
+              batch.winner_slots[allocation.winner_order] = *located;
+              if (coalesce_duplicates)
+                resolved_slots[allocation.entry.position] = *located;
               key_shard.recycle_unpublished_index(allocation.index);
               allocation.recycled = true;
               continue;
@@ -2431,16 +2492,36 @@ public:
             arena.publish_owner(allocation.index, allocation.entry.key,
                                 static_cast<uint32_t>(shard_id));
             initialize(allocation.entry, allocation.index);
-            batch.inserted.push_back(allocation.entry);
+            batch.published.push_back(allocation.entry);
             batch.inserted_keys.push_back(allocation.entry.key);
             batch.inserted_indices.push_back(allocation.index);
           }
-          if (batch.inserted_keys.empty())
-            continue;
-          key_shards[shard_id]->publish_indices_batch_unlocked(
-              batch.inserted_keys, batch.inserted_indices);
-          for (uint32_t index : batch.inserted_indices)
-            arena.mark_live(index, true);
+          if (!batch.inserted_keys.empty()) {
+            key_shards[shard_id]->publish_indices_batch_unlocked(
+                batch.inserted_keys, batch.inserted_indices);
+            for (uint32_t index : batch.inserted_indices)
+              arena.mark_live(index, true);
+            for (auto &allocation : batch.allocations) {
+              if (allocation.recycled)
+                continue;
+              auto slot_id = key_shard.find_slot_hashed_unlocked(
+                  allocation.entry.key, allocation.entry.hash);
+              if (!slot_id)
+                throw std::logic_error(
+                    "published key disappeared before alias resolution");
+              batch.winner_slots[allocation.winner_order] = *slot_id;
+              if (coalesce_duplicates)
+                resolved_slots[allocation.entry.position] = *slot_id;
+            }
+          }
+          for (const auto &alias : batch.aliases)
+            if (coalesce_duplicates)
+              resolved_slots[batch.inserted[alias.candidate_index].position] =
+                  batch.winner_slots[alias.winner_order];
+            else
+              batch.existing.push_back(
+                  {batch.inserted[alias.candidate_index],
+                   batch.winner_slots[alias.winner_order]});
         }
       } catch (...) {
         for (size_t shard_id = 0; shard_id < by_shard.size(); ++shard_id) {
@@ -2454,6 +2535,21 @@ public:
         }
         throw;
       }
+      if (coalesce_duplicates) {
+        for (const BatchEntry &entry : entries) {
+          auto &entry_shard = *key_shards[shard_id_for_hash(entry.hash)];
+          if (resolved_sink[entry.position]) {
+            visit(entry, 0, true);
+            continue;
+          }
+          const uint32_t slot_id = resolved_slots[entry.position];
+          if (slot_id == 0)
+            throw std::logic_error("resolved lookup slot is zero");
+          entry_shard.locators->read(
+              slot_id, [&](uint32_t index) { visit(entry, index, false); });
+        }
+        return;
+      }
       for (size_t shard_id = 0; shard_id < by_shard.size(); ++shard_id) {
         ShardBatch &batch = by_shard[shard_id];
         auto &key_shard = *key_shards[shard_id];
@@ -2461,19 +2557,18 @@ public:
           if (write_existing_payload) {
             key_shard.locators->write(
                 entry.slot_id, [&](uint32_t index, std::atomic<uint64_t> &) {
-                  visit(entry.entry, index, false, false);
+                  visit(entry.entry, index, false);
                 });
           } else {
             key_shard.locators->read(entry.slot_id, [&](uint32_t index) {
-              visit(entry.entry, index, false, false);
+              visit(entry.entry, index, false);
             });
           }
         }
-        for (size_t index = 0; index < batch.inserted.size(); ++index)
-          visit(batch.inserted[index], batch.inserted_indices[index], true,
-                false);
+        for (size_t index = 0; index < batch.published.size(); ++index)
+          visit(batch.published[index], batch.inserted_indices[index], false);
         for (const BatchEntry &entry : batch.sink_entries)
-          visit(entry, 0, false, true);
+          visit(entry, 0, true);
       }
     }
 
@@ -3900,7 +3995,7 @@ public:
                   std::copy_n(src, slot.dim, slot.arena.data(new_index));
               },
               [&](const typename SlotStore::BatchEntry &entry, uint32_t index,
-                  bool, bool sink) {
+                  bool sink) {
                 if (sink)
                   return;
                 const ParamT *src =
@@ -3921,14 +4016,12 @@ public:
   template <typename K>
   std::error_code lookup_or_insert(std::span<const K> keys,
                                    std::span<ParamT> out_flat_values,
-                                   std::span<const int64_t> row_lengths,
-                                   std::span<uint8_t> out_inserted_mask) {
+                                   std::span<const int64_t> row_lengths) {
     ActiveInvocationGuard invocation(invocation_gate_);
     StoreSnapshot *snapshot = snapshot_.load(std::memory_order_acquire);
     if (snapshot == nullptr)
       throw std::runtime_error("store snapshot is unavailable");
     size_t n = keys.size();
-    validate_unique_mutation_batch(keys, row_lengths);
     auto offsets = compute_offsets(row_lengths);
     struct DimensionBatch {
       SlotStore *slot;
@@ -3966,17 +4059,15 @@ public:
               }
             },
             [&](const typename SlotStore::BatchEntry &entry, uint32_t index,
-                bool inserted, bool sink) {
+                bool sink) {
               const size_t dim =
                   static_cast<size_t>(row_lengths[entry.position]);
               const ParamT *source =
                   sink ? slot.sink.data() : slot.arena.data(index);
               std::copy_n(source, dim,
                           out_flat_values.data() + offsets[entry.position]);
-              out_inserted_mask[entry.position] =
-                  inserted ? uint8_t{1} : uint8_t{0};
             },
-            false);
+            false, true);
       }
     });
     return {};

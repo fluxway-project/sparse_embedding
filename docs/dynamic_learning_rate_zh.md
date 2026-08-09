@@ -57,7 +57,7 @@ store = se.EmbeddingStore(
 # 在训练循环中，只要对特征进行了查询 (lookup/lookup_or_insert)，
 # 它们的 LFU 得分就会在后台自动更新。
 keys = np.array([1, 2, 3], dtype=np.int64)
-embeddings, valid_mask = store.lookup_or_insert(keys, dim=128)
+embeddings, lengths = store.lookup_or_insert(keys, dim=128)
 
 # 计算梯度...
 gradients = np.ones((3, 128), dtype=np.float32)

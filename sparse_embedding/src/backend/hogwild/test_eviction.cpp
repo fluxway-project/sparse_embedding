@@ -39,8 +39,7 @@ int main() {
   for (size_t i = 0; i < num_keys; ++i)
     keys[i] = i;
 
-  std::vector<uint8_t> inserted(num_keys, 0);
-  store.lookup_or_insert<uint64_t>(keys, values, lengths, inserted);
+  store.lookup_or_insert<uint64_t>(keys, values, lengths);
   require(store.size() == num_keys, "inserted key count mismatch");
   std::vector<uint64_t> scores(num_keys, 1);
   scores[0] = 1000;
@@ -72,9 +71,7 @@ int main() {
   std::vector<float> new_values(10000 * 128, 1.0f);
 
   auto start = std::chrono::steady_clock::now();
-  std::vector<uint8_t> new_inserted(10000, 0);
-  store.lookup_or_insert<uint64_t>(new_keys, new_values, new_lengths,
-                                   new_inserted);
+  store.lookup_or_insert<uint64_t>(new_keys, new_values, new_lengths);
   auto end = std::chrono::steady_clock::now();
 
   std::this_thread::sleep_for(std::chrono::seconds(5));

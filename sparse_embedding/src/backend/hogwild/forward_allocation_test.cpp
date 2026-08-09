@@ -79,11 +79,10 @@ int main() {
   std::array<uint64_t, kRows> keys{};
   std::array<int64_t, kRows> lengths{};
   std::array<float, kRows * 8> values{};
-  std::array<uint8_t, kRows> inserted{};
   for (size_t index = 0; index < kRows; ++index)
     keys[index] = index + 1;
   lengths.fill(8);
-  store.lookup_or_insert<uint64_t>(keys, values, lengths, inserted);
+  store.lookup_or_insert<uint64_t>(keys, values, lengths);
 
   store.forward_lookup<uint64_t>(keys, values, lengths);
   store.forward_lookup<uint64_t>(keys, values, lengths);
