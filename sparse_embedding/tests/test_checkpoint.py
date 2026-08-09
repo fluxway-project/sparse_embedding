@@ -100,8 +100,16 @@ def test_four_participants_restore_to_seven_partitions(tmp_path):
         )
     locator = storage.commit_checkpoint(identity, fragments)
 
+    partition_calls = 0
+
     def partition_fn(keys, partition_count):
-        return (np.asarray(keys, dtype=np.uint64) * 7 + 3) % partition_count
+        nonlocal partition_calls
+        partition_calls += 1
+        before = keys.copy()
+        assert keys.dtype == np.uint64
+        result = (keys * 7 + 3) % partition_count
+        np.testing.assert_array_equal(keys, before)
+        return result
 
     seen = set()
     all_keys = np.arange(100, dtype=np.uint64)
@@ -122,6 +130,7 @@ def test_four_participants_restore_to_seven_partitions(tmp_path):
                 np.repeat(expected[:, None].astype(np.float32), 4, axis=1),
             )
     assert seen == set(range(100))
+    assert partition_calls >= 14
 
 
 def test_duplicate_key_across_fragments_is_rejected(tmp_path):
