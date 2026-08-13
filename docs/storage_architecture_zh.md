@@ -80,7 +80,7 @@ store = se.EmbeddingStore(config, score_policy="lfu")
 
 唯一权威查询路径是 `ParlayHash key -> slot_id -> SegmentedLocatorTable -> arena_index`。shard 只由 key hash 决定；热/冷 tier 与物理 page 不参与路由。因此一次查询只需一次目录查找与一次 locator 读取，不会出现 HotMap 未命中后再查 ColdMap 的第二次 hash 查找。
 
-每个 shard 原子发布不可变 `MapBundle*`。map value 是非零 `slot_id`，不是 arena index。reader acquire-load 当前 bundle，不获取 shard shared mutex。结构性 writer 持有该 shard writer mutex，克隆已发布 bundle，应用 insert/erase/reserve 修改，再通过一次 atomic exchange 发布替换版本。旧 bundle 通过共享 epoch-retirement pressure 域回收。
+每个 shard 原子发布不可变 `MapBundle*`。map value 是非零 `slot_id`，不是 arena index。reader acquire-load 当前 bundle，不获取 shard shared mutex。结构性 writer（insert、erase、reserve、locator rotation、checkpoint import）才持有该 shard writer mutex，克隆已发布 bundle，应用目录修改，再通过一次 atomic exchange 发布替换版本。普通 lookup、optimizer 和 compaction relocation 不获取该 mutex；它们只使用 locator packed seqlock/CAS。旧 bundle 通过共享 epoch-retirement pressure 域回收。
 
 `SegmentedLocatorTable` 拥有固定 32 KiB segment，每个 segment 含 4,096 个 8-byte locator slot。slot 保存 `{sequence, arena_index}` 并按 8-byte 对齐。slot ID、locator slot、arena index、page 与 store snapshot 都只能在 epoch 安全回收后复用。locator sequence 接近 wraparound 时，目录会把该 key rotate 到新 slot，并永久退休旧 slot，避免 ABA。
 
@@ -98,13 +98,11 @@ telemetry partition；task 数提供足够的独立随机访存工作来隐藏�
 
 ### ParlayHash 并发
 
-每个 embedding 维度包含多个 key shard。查询不获取 shard mutex。insert、erase、reserve、locator rotation、checkpoint import 与 compaction publication 只在受影响 shard 的 writer mutex 下重建并原子发布不可变目录状态。不存在全局 Upsert mutex，因此一个 shard 扩容时，其他 shard 仍可并行。
+每个 embedding 维度包含多个 key shard。查询不获取 shard mutex。insert、erase、reserve、locator rotation 与 checkpoint import 只在受影响 shard 的 writer mutex 下重建并原子发布不可变目录状态；compaction publication 不重建 `MapBundle`，而是直接对 locator 执行 packed seqlock/CAS 发布。不存在全局 Upsert mutex，因此一个 shard 扩容时，其他 shard 仍可并行。
 
-初始容量策略集中定义在 store 内：
+扩表策略集中定义在 store 与 `FlatKeyDirectory` 内。每个 shard 只按自己的实际目标 key 数扩容；`reserve(keys_count, dim)` 将总预算精确分摊到 shard，`reserve_per_shard(counts, dim)` 则直接接受调用方已知的每 shard 预算，不再把所有 shard 向上取相同二次幂。目录 bucket 数按 2.5 倍探测预算并向 16 对齐；只有较小容量仍低于旧 4 倍二次幂上限时才使用二次幂，因此大表不会因 per-shard rounding 快速膨胀。扩容倍率为 `<64K` 时 2x、`64K–1M` 时 1.5x、`>=1M` 时 1.25x，并且每次都至少覆盖本次 required capacity。
 
-- `kParlayHashCapacityMultiplier = 4`
-- `kInitialKeysPerShard = 1`
-每个 shard 以 1 个预期 key 起步并独立增长，在不引入逻辑 key 配额的前提下控制启动 RSS 与 cache footprint。容量已知的生产 workload 应在计时前调用 `reserve(keys_count, dim)` 或 `reserve_per_shard(counts, dim)`。reserve 在热路径之外重建容量；结构性 index 溢出和 storage 分配失败会报告精确错误。
+扩容只发生在 writer/control plane：writer 在受影响 shard 的 mutex 下 clone 当前 `MapBundle`，把 key→locator slot 复制到新目录后 atomic exchange；旧 bundle 通过 epoch retirement 回收，locator slot 与 arena index 地址不因目录扩容改变。已知容量的生产 workload 应在计时前调用 `reserve(keys_count, dim)` 或 `reserve_per_shard(counts, dim)`，将目录复制和 arena/optimizer reserve 移出热路径。运行期若插入超出预算，系统按上述精确增长策略扩容；容量上溢、bucket/slot 上限或 storage 分配失败直接抛出明确异常，不使用 fallback。
 
 ## 淘汰机制与后台线程
 
@@ -142,7 +140,7 @@ storage facade 不接收 store 生命周期锁。启用 score 的 store 注销 p
 
 所有可能仍被旧 reader 看到的对象都通过同一个 epoch-backed `RetirementPressure` 域退休。该域统计已退休但未回收的 bundle、snapshot、page、arena index、locator slot 与 page image 字节。默认配置为 `backpressure_fraction = 0.15`、`circuit_fraction = 0.25`、`epoch_stall_timeout = 30s`；构造时拒绝非法比例，Auto storage 还要求 circuit 阈值低于 spill high watermark。
 
-低于 backpressure 时正常运行。处于 backpressure 与 circuit 之间时，每个 writer 或 compactor 调用最多 yield 一次。进入 circuit 后，凡是会产生新 retirement 的控制面 mutation，除非已在本次调用内获得 admission，否则直接抛异常。已有 key 继续正常读取和更新。缺失 key 的 lookup-or-insert 返回该 dimension 的 64-byte 对齐零值 `SinkImage`，`contains = false`，不增长容量，也不进入 checkpoint。对 sink key 的写操作是 no-op；压力降回 backpressure 阈值以下后，新插入恢复。
+低于 backpressure 时正常运行。处于 backpressure 与 circuit 之间时，每个 writer 或 compactor 调用最多执行一次 CPU pause。进入 circuit 后，凡是会产生新 retirement 的控制面 mutation，除非已在本次调用内获得 admission，否则直接抛异常。已有 key 继续正常读取和更新；缺失 key 的 lookup-or-insert 和 assign 明确失败，不会伪造成功或增长目录。压力降回 backpressure 阈值以下后，新插入恢复。
 
 ### 自适应局部性信号
 
@@ -165,11 +163,17 @@ approximate_exp，它是有界的 base-2 加多项式 exp 近似；测试将相�
 并验证权重有限且归一化为一。共访密度进入 utility，因此经常一起使用的 key 获得更低淘汰
 概率，也可以通过整页搬迁聚集；预期局部性收益通过目标 workload benchmark 验证。
 
-`compact_adaptive_pages()` 将选择出的物理 page 预算交给与显式 compaction 相同的整页搬迁事务：源 page 先进入 draining 状态，再逐 key 在所属 shard 的独占访问范围内重新校验并搬迁；只有 live bitmap 为空后，数据页与 score 页才会进入 epoch 延迟回收。draining 或 retired 源页的 slot 不能作为 destination 复用。目录始终是唯一查询权威，因此 page 移动不会引入 HotMap/ColdMap 的二次查询。
+`compact_adaptive_pages()` 将选择出的物理 page 预算交给与显式 compaction 相同的整页搬迁事务：源 page 先进入 `Available → Draining`，再逐 key 重新校验 locator、owner 和 sequence；目的地先完成 payload、score 和 Adam state 拷贝，再由 locator packed seqlock 发布新 index。普通 relocation 不获取全局 compaction mutex、shard writer mutex 或操作系统阻塞原语；冲突只产生有限重试或明确的 retry 失败。只有 live bitmap 为空后，数据页与 score 页才会进入 epoch 延迟回收，随后转为 `Retired → Available`。draining 或 retired 源页的 slot 不能作为 destination 复用。目录始终是唯一查询权威，因此 page 移动不会引入 HotMap/ColdMap 的二次查询。
 
 启用 score 的 store 还提供 `promote_hot_keys(dim, page_id, maximum_keys, minimum_score)`。该操作从一个源页确定性选择 top-K，只通过权威 shard 目录搬迁这些 Key，并发布不可变 Hot Page 快照。源页保持分配状态，未选中的冷 Key 继续从原页读取；源页会标记为 draining，因此其 slot 不会被复用为搬迁 destination。调用方可通过 `promoted_hot_page_size(dim)` 查看已发布快照中的 Key 数量。
 
 `seal_adaptive_pages()` 生成 64-byte 对齐的不可变 page 快照，用于 checkpoint 与布局控制；它不是查询索引，不改变路由。selector 与 planner 还接收可复用 scratch 对象，因此调度器能够跨控制周期复用 vector 容量，避免反复分配临时选择 buffer。
+
+compaction 目的地按 shard 批量执行 ticket-CAS 预留；普通 compaction 先按 shard 形成迁移顺序以保持 cache-local 连续布局，co-access compaction 则先按共访 cluster 稳定排序，再逐 key 预留，以保留热 key 共址语义。预留、payload 拷贝和发布均在控制面调用内完成，不把 destination 分配或 page migration 引入 lookup/optimizer 热路径。
+
+### 生命周期与无阻塞边界
+
+`MapBundle`、`StoreSnapshot`、locator slot、arena index、`StoragePage` 和 sealed page image 共用 epoch retirement。reader 在 invocation gate 与 epoch 中取得快照；clear、import 和析构先关闭 invocation gate，再等待活动调用退出，最后释放 payload。旧物理页只有在 source page 无 live entry 且最后一个 epoch reader 退出后才析构，`retired_bytes` 随回收归零。PageStorage 的 swap/spill mutex 和条件变量只存在于后台换页控制面，不进入 lookup、optimizer 或 relocation 热路径。
 
 ## 框架无关的 Lance checkpoint 协议
 
@@ -214,7 +218,6 @@ thermal tier、热度、coaccess 和 residency 等调度态不进入 checkpoint�
 | `retired_bytes` | 已进入 epoch retirement 但尚未回收的字节 |
 | `retirement_pressure_state` | 当前 pressure 状态：normal、backpressure 或 circuit |
 | `retirement_backpressure_count` | 因 retirement pressure 执行 yield 的 writer 调用数 |
-| `retirement_sink_hit_count` | 缺失 key 被导向 Sink 的次数 |
 | `oldest_unreclaimed_age_ns` | 最早未回收 retirement record 的年龄 |
 | `epoch_stall_count` | 发出 CRITICAL JSON log 的 epoch stall 次数 |
 | `spill_directory` | 自动选择或显式配置的 spill 目录 |

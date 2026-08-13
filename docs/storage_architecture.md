@@ -110,10 +110,12 @@ HotMap-to-ColdMap fallback lookup.
 
 Each shard publishes an immutable `MapBundle*`. A map value is a nonzero
 `slot_id`, never an arena index. Readers acquire-load the current bundle and
-do not take a shard shared mutex. Structural writers hold that shard's writer
-mutex, clone the published bundle, apply insert/erase/reserve changes, then
-publish the replacement with one atomic exchange. The retired bundle is returned
-through the shared epoch-retirement pressure domain.
+do not take a shard shared mutex. Structural writers (insert, erase, reserve,
+locator rotation, and checkpoint import) hold that shard's writer mutex, clone
+the published bundle, apply directory changes, then publish the replacement with
+one atomic exchange. Lookup, optimizer, and ordinary compaction relocation do
+not take that mutex; they use locator packed seqlock/CAS. The retired bundle is
+returned through the shared epoch-retirement pressure domain.
 
 `SegmentedLocatorTable` owns fixed 32 KiB segments of 4,096 eight-byte locator
 slots. A slot stores `{sequence, arena_index}` and is eight-byte aligned. Slot
@@ -154,20 +156,32 @@ for both task decomposition and execution.
 
 Each embedding dimension owns multiple key shards. Lookup never takes a shard
 mutex. Insert, erase, reserve, locator rotation, checkpoint import, and
-compaction publication take only the affected shard writer mutex while they
-rebuild and atomically publish immutable directory state. There is no global
+compaction publication takes no writer mutex: insert, erase, reserve, locator
+rotation, and checkpoint import rebuild and atomically publish immutable
+directory state under only the affected shard writer mutex, while compaction
+publishes a locator update through packed seqlock/CAS. There is no global
 Upsert mutex, so unrelated shards continue in parallel while one shard grows.
 
-The initial-capacity policy is centralized in the store:
+Expansion policy is centralized in the store and `FlatKeyDirectory`. Each shard
+grows only to its own required key budget. `reserve(keys_count, dim)` distributes
+the total budget exactly across shards, while `reserve_per_shard(counts, dim)`
+accepts caller-provided per-shard budgets and avoids equal power-of-two rounding.
+Directory bucket counts use a 2.5x probe budget rounded to 16 buckets; a
+power-of-two bucket count is used only when the smaller legacy 4x bound still
+fits. Large tables therefore do not pay a per-shard power-of-two memory spike.
+Growth steps are 2x below 64K keys, 1.5x from 64K to 1M, and 1.25x at or above
+1M, with every step covering the required capacity.
 
-- `kParlayHashCapacityMultiplier = 4`
-- `kInitialKeysPerShard = 1`
-Each shard starts with one expected key and grows independently. This keeps
-startup RSS and cache footprint bounded without imposing a logical key quota.
-Known production workloads should call `reserve(keys_count, dim)` or
-`reserve_per_shard(counts, dim)` before the timed phase. Reserve rebuilds
-capacity outside the hot path; structural index overflow and storage allocation
-failures are reported precisely.
+Expansion runs only in the writer/control plane. Affected-shard writers clone
+the current `MapBundle`, copy key-to-locator mappings into the new directory,
+and publish it with one atomic exchange. Epoch retirement reclaims the old
+bundle; locator-slot and arena-index addresses do not change during directory
+growth. Known production workloads should call `reserve(keys_count, dim)` or
+`reserve_per_shard(counts, dim)` before timing so directory cloning and
+arena/optimizer reservation stay off the hot path. If runtime inserts exceed the
+budget, the same precise growth policy is applied. Capacity overflow, bucket or
+slot limits, and storage allocation failures throw explicit errors; no fallback
+capacity path is used.
 
 ## Eviction Mechanism and Background Threads
 
@@ -229,13 +243,12 @@ rejects invalid fractions, and Auto storage requires the circuit threshold to
 be below the spill high watermark.
 
 Below backpressure the store runs normally. Between backpressure and circuit,
-each writer or compactor yields at most once per call. At circuit pressure,
-control-plane mutations that would create new retirement throw unless already
-admitted. Existing keys continue to read and update normally. Missing
-lookup-or-insert keys return the dimension-sized, 64-byte-aligned zero
-`SinkImage`, report `contains = false`, do not
-grow capacity, and do not enter checkpoints. Writes to sink keys are no-ops;
-after pressure falls below the backpressure threshold, new insertion resumes.
+each writer or compactor performs at most one CPU pause per call. At circuit
+pressure, control-plane mutations that would create new retirement throw
+unless already admitted. Existing keys continue to read and update normally.
+Missing lookup-or-insert and assign operations fail explicitly without growing
+the directory. New insertion resumes after pressure falls below the
+backpressure threshold.
 
 ### Adaptive Placement Signals
 
@@ -269,9 +282,13 @@ workload benchmarks.
 
 `compact_adaptive_pages()` applies the selected physical-page budget through
 the same full-page relocation transaction as explicit compaction. A source page
-first enters a draining state, then every live key is revalidated and moved
-under its own shard's exclusive access; only after its live bitmap is empty are
-its data and score pages epoch-retired. Draining and retired source slots are
+first transitions `Available -> Draining`; every live key revalidates its
+locator, owner, and sequence. The destination payload, score, and Adam state
+are copied before the locator packed seqlock publishes the new index. Ordinary
+relocation takes no global compaction mutex, shard writer mutex, or blocking OS
+primitive; conflicts result in bounded retry or an explicit retry failure. Only
+after the source live bitmap is empty are its data and score pages epoch-retired,
+then transitioned `Retired -> Available`. Draining and retired source slots are
 never reused as destinations. The directory remains the sole lookup authority,
 so page movement never introduces a second HotMap/ColdMap search.
 
@@ -288,6 +305,25 @@ checkpoint/layout control work. A sealed page is not a lookup index and does
 not change routing. Selector and planner APIs additionally accept reusable
 scratch objects, so a scheduler can retain vector capacities across control
 cycles rather than allocating temporary selection buffers each time.
+
+Compaction destinations are reserved with per-shard ticket-CAS batches. Ordinary
+compaction groups migration order by shard for contiguous cache-friendly
+publication; co-access compaction keeps its stable co-access-cluster ordering
+before reservation so hot keys remain colocated. Reservation, payload copy, and
+publication stay in the control-plane invocation and never enter lookup or
+optimizer hot paths.
+
+### Lifetime and non-blocking boundaries
+
+`MapBundle`, `StoreSnapshot`, locator slots, arena indices, `StoragePage`, and
+sealed page images share one epoch-retirement domain. Readers hold the
+invocation gate and an epoch while loading snapshots. Clear, import, and
+destruction close the gate, wait for active invocations to leave, and only then
+release payloads. A source page is destroyed only after it has no live entries
+and the last epoch reader has exited; `retired_bytes` consequently drains to
+zero. PageStorage swap/spill mutexes and its condition variable are background
+control-plane mechanisms and never enter lookup, optimizer, or relocation hot
+paths.
 
 ## Framework-neutral Lance Checkpoint Protocol
 
@@ -340,7 +376,6 @@ usage:
 | `retired_bytes` | Epoch-retired bytes not yet reclaimed |
 | `retirement_pressure_state` | Current pressure state: normal, backpressure, or circuit |
 | `retirement_backpressure_count` | Writer calls that yielded for retirement pressure |
-| `retirement_sink_hit_count` | Missing-key admissions redirected to Sink |
 | `oldest_unreclaimed_age_ns` | Age of the oldest unreclaimed retirement record |
 | `epoch_stall_count` | Count of epoch-stall events that emitted a CRITICAL JSON log |
 | `spill_directory` | Selected or configured spill directory |

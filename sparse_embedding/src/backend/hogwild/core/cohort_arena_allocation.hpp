@@ -8,6 +8,7 @@
 #include <memory>
 #include <mutex>
 #include <optional>
+#include <span>
 #include <stdexcept>
 #include <string>
 #include <vector>
@@ -85,6 +86,49 @@ public:
       return {static_cast<uint32_t>(index), static_cast<uint32_t>(page_id),
               static_cast<uint32_t>(ticket & slot_mask_)};
     }
+  }
+
+  template <typename Accept, typename Visit>
+  void acquire_fresh_batch(uint32_t shard_id, size_t count, Accept &&accept,
+                           Visit &&visit) {
+    if (shard_id >= shard_count_)
+      throw std::out_of_range("cohort allocation shard id is out of range");
+    if (count == 0)
+      throw std::invalid_argument("cohort allocation batch is empty");
+    const uint32_t cohort_id = static_cast<uint32_t>(shard_id / cohort_size_);
+    size_t produced = 0;
+    while (produced < count) {
+      uint64_t ticket = 0;
+      size_t reserved = 0;
+      reserve_ticket_range(cohort_id, count - produced, ticket, reserved);
+      for (size_t offset = 0; offset < reserved; ++offset) {
+        const uint64_t candidate_ticket = ticket + offset;
+        const uint32_t page_id = static_cast<uint32_t>(
+            (candidate_ticket >> entries_shift_) * cohort_count_ + cohort_id);
+        if (!claim_page(page_id, cohort_id))
+          continue;
+        const uint32_t slot =
+            static_cast<uint32_t>(candidate_ticket & slot_mask_);
+        const uint64_t index =
+            static_cast<uint64_t>(page_id) * entries_per_page_ + slot;
+        if (index > std::numeric_limits<uint32_t>::max())
+          throw std::overflow_error("cohort allocation index overflows uint32");
+        Allocation allocation{static_cast<uint32_t>(index), page_id, slot};
+        if (!accept(allocation))
+          continue;
+        visit(allocation);
+        ++produced;
+        if (produced == count)
+          break;
+      }
+    }
+  }
+
+  void acquire_fresh_batch(uint32_t shard_id, std::span<Allocation> output) {
+    size_t position = 0;
+    acquire_fresh_batch(
+        shard_id, output.size(), [](const Allocation &) { return true; },
+        [&](const Allocation &allocation) { output[position++] = allocation; });
   }
 
   void reserve_contiguous_range(uint32_t first, uint32_t end) {
@@ -241,6 +285,28 @@ private:
            !ticket.compare_exchange_weak(observed, required_ticket,
                                          std::memory_order_acq_rel,
                                          std::memory_order_acquire)) {
+    }
+  }
+
+  void reserve_ticket_range(uint32_t cohort_id, size_t requested,
+                            uint64_t &first, size_t &count) {
+    const uint64_t limit = static_cast<uint64_t>(pages_per_cohort_)
+                           << entries_shift_;
+    uint64_t observed =
+        tickets_[cohort_id].value.load(std::memory_order_acquire);
+    while (true) {
+      if (observed >= limit)
+        throw std::length_error("cohort allocation page capacity exceeded");
+      const uint64_t available = limit - observed;
+      const size_t batch = static_cast<size_t>(
+          std::min<uint64_t>(available, static_cast<uint64_t>(requested)));
+      if (tickets_[cohort_id].value.compare_exchange_weak(
+              observed, observed + batch, std::memory_order_acq_rel,
+              std::memory_order_acquire)) {
+        first = observed;
+        count = batch;
+        return;
+      }
     }
   }
 

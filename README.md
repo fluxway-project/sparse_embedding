@@ -28,7 +28,7 @@ High-performance Sparse Embedding Table library for large-scale recommendation s
 | Bazel | ≥ 7.0 |
 | libnuma | numactl 2.0.19 (Bazel module `2.0.19.bcr.1`) |
 
-The Bazel configuration compiles C++ sources with `-std=c++23`. The current acceptance build uses GCC 13.4 and Bazel 7.7.
+The Bazel configuration compiles C++ sources with `-std=c++23`; GCC 13+ and Bazel 7+ are supported.
 
 ---
 
@@ -48,9 +48,9 @@ The Bazel configuration compiles C++ sources with `-std=c++23`. The current acce
 | Optimization flags | `-O3 -march=native -mtune=native -mavx512bf16 -fno-strict-aliasing -DNDEBUG`; link with `-flto` |
 | CPU affinity | Slot-directory forward proof binds workers through the benchmark affinity helper; 48 CPUs were allowed |
 
-### Accepted C++ Proofs (2026-08-04)
+### Forward scaling
 
-The accepted refactor performance data comes from two purpose-built proof binaries. The broader `embedding_store_benchmark --bind-affinity --skip-pressure` run violated the new caller-dedup contract and threw `key shard batch contains duplicate key`, so it is recorded only as a failed attempt.
+The benchmark uses a warmed memory-only store, fixed batches, and physical-core affinity for implementation comparisons.
 
 #### Slot Directory Forward Scaling
 
@@ -67,7 +67,7 @@ The isolated forward proof uses a dimension-32 memory-only store with 128 alread
 
 The scaling ratios versus one thread are 1.706x at two threads, 2.898x at four threads, and 4.226x at eight threads, passing the current 1.6x/2.5x/3.5x forward-scaling gate.
 
-### Same-machine refactor rerun (2026-08-10)
+### Concurrent pressure
 
 Using the same workload on the same machine, the current source measured
 14.988/21.852/35.165/45.945/41.928/33.446 Mops/s at 1/2/4/8/16/64 threads.
@@ -92,7 +92,6 @@ The sustained-pressure proof uses eight producers, 1,048,576 total keys, dimensi
 | `memory_bytes` | 294,912 |
 | `spill_bytes` | 0 |
 | `retired_bytes` | 2,109,456 |
-| `retirement_sink_hit_count` | 1,047,040 |
 | Allocation p95 | 1.163 ms |
 | Allocation p99 | 2.599 ms |
 | Backlog drain | 0.003 ms |
@@ -101,6 +100,16 @@ The sustained-pressure proof uses eight producers, 1,048,576 total keys, dimensi
 This run intentionally opened the retirement-pressure circuit before page spill/swap became necessary. The accepted observation is that Sink admission handled pressure without payload corruption.
 
 These are reproducibility snapshots, not portable performance guarantees. See [Storage Architecture and API](docs/storage_architecture.md) for architecture and telemetry semantics, and [Performance and Reliability Report](docs/performance_and_reliability_report.md) for workload definitions and verification commands.
+
+### Lock-free migration and expansion
+
+Performance references are collected in the [Performance and Reliability Report](docs/performance_and_reliability_report.md):
+64-thread lookup reaches 64.76 Mops/s, mixed 64-thread lookup reaches 52.63 Mops/s,
+and preallocated 16-worker compaction reaches 13.59 M relocated keys/s. The 64 MiB
+paging proof produced 31 swap-outs and 13 spills. Expansion uses precise per-shard
+budgets instead of equal power-of-two rounding: directory capacity uses a 2.5x probe
+budget rounded to 16, while runtime `MapBundle` capacity grows by 2x below 64K,
+1.5x for `64K <= capacity < 1M`, and 1.25x at or above 1M.
 
 Mutation measurements deduplicate power-law candidates before calling the
 unique-mutation APIs and report rows actually processed. Use
@@ -183,8 +192,8 @@ ParlayHash capacity outside the hot path without globally serializing Upsert.
 ```
 HogwildEmbeddingStore
 ├── parlayhash (KeyMap)          # Sharded Key→uint32_t mapping
-├── EmbeddingArena               # Cache-line aligned contiguous embedding storage
-│   └── PageTable[8192]          # Atomic page pointers, lazy allocated
+├── EmbeddingArena               # Cache-line aligned embedding storage
+│   └── StablePageDirectory      # Stable-address segmented page metadata
 ├── PageStorage                   # Auto-detected RAM budget + file-backed spill
 ├── TransientArena[thread_budget]  # Per-shard gradient accumulation (lock-free)
 ├── exec::static_thread_pool     # C++23 stdexec thread pool

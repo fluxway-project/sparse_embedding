@@ -27,6 +27,7 @@
 #include <stdexcept>
 #include <vector>
 
+#include "sparse_embedding/src/optimizer/stable_page_directory.hpp"
 #include "sparse_embedding/src/storage/page_storage.hpp"
 
 namespace se {
@@ -62,7 +63,9 @@ public:
     }
     std::lock_guard<std::mutex> lock(alloc_mtx_);
     size_t required_pages = (capacity + kEntriesPerPage - 1) / kEntriesPerPage;
-    while (pages_.size() < required_pages) {
+    if (pages_.page_count() >= required_pages)
+      return;
+    while (pages_.page_count() < required_pages) {
       PageEvaluator evaluator;
       if (page_eviction_enabled_)
         evaluator = []() constexpr -> uint64_t {
@@ -71,19 +74,24 @@ public:
       const PageEvictionMode eviction_mode = page_eviction_enabled_
                                                  ? PageEvictionMode::kEnabled
                                                  : PageEvictionMode::kDisabled;
-      pages_.push_back(storage_->allocate(kEntriesPerPage * row_stride_,
-                                          kCacheLineSize, std::move(evaluator),
-                                          eviction_mode));
-      capacity_.store(pages_.size() * kEntriesPerPage,
-                      std::memory_order_release);
+      auto page = std::make_unique<StoragePage>(
+          storage_->allocate(kEntriesPerPage * row_stride_, kCacheLineSize,
+                             std::move(evaluator), eviction_mode));
+      StoragePage *page_ptr = page.get();
+      storage_pages_.push_back(std::move(page));
+      pages_.publish(pages_.page_count(), page_ptr);
+      pages_.advance_count();
     }
+    capacity_.store(pages_.page_count() * kEntriesPerPage,
+                    std::memory_order_release);
   }
 
   size_t capacity() const { return capacity_.load(std::memory_order_acquire); }
 
   void set_page_eviction_enabled(bool enabled) {
     std::lock_guard<std::mutex> lock(alloc_mtx_);
-    if (!pages_.empty() && enabled != page_eviction_enabled_)
+    if (capacity_.load(std::memory_order_acquire) != 0 &&
+        enabled != page_eviction_enabled_)
       throw std::logic_error(
           "optimizer page eviction policy cannot change after allocation");
     page_eviction_enabled_ = enabled;
@@ -94,6 +102,7 @@ public:
   void clear() {
     std::lock_guard<std::mutex> lock(alloc_mtx_);
     pages_.clear();
+    storage_pages_.clear();
     capacity_.store(0, std::memory_order_release);
   }
 
@@ -108,15 +117,18 @@ public:
 
 private:
   std::byte *raw(uint32_t index) const {
-    return pages_[index / kEntriesPerPage].data() +
-           (index % kEntriesPerPage) * row_stride_;
+    StoragePage *page = pages_.load(index / kEntriesPerPage);
+    if (page == nullptr)
+      throw std::logic_error("optimizer state page is not allocated");
+    return page->data() + (index % kEntriesPerPage) * row_stride_;
   }
 
   size_t dim_;
   size_t row_stride_;
   PageStorage storage_;
   bool page_eviction_enabled_;
-  std::vector<StoragePage> pages_;
+  StablePageDirectory<StoragePage> pages_;
+  std::vector<std::unique_ptr<StoragePage>> storage_pages_;
   std::atomic<size_t> capacity_{0};
   std::mutex alloc_mtx_;
 };

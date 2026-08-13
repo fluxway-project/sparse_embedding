@@ -11,18 +11,20 @@
 #include <stdexcept>
 #include <vector>
 
-#include "sparse_embedding/src/memory/x86_seqlock.hpp"
+#include "sparse_embedding/src/memory/seqlock.hpp"
 
 namespace se::hogwild_internal {
 
-using se::memory::read_x86_packed_seqlock;
-using se::memory::X86PackedWriteGuard;
+using se::memory::PackedReadGuard;
+using se::memory::PackedWriteGuard;
 
 struct alignas(8) LocatorSlot {
   std::atomic<uint64_t> packed{0};
+  uint64_t key{0};
+  std::atomic<uint32_t> readers{0};
 };
 
-static_assert(sizeof(LocatorSlot) == 8);
+static_assert(sizeof(LocatorSlot) == 24);
 static_assert(alignof(LocatorSlot) == 8);
 static_assert(std::atomic<uint64_t>::is_always_lock_free);
 
@@ -49,7 +51,7 @@ public:
   SegmentedLocatorTable(const SegmentedLocatorTable &) = delete;
   SegmentedLocatorTable &operator=(const SegmentedLocatorTable &) = delete;
 
-  uint32_t allocate(uint32_t arena_index) {
+  uint32_t allocate(uint64_t key, uint32_t arena_index) {
     const std::optional<uint32_t> recycled = take_recycled_slot();
     const uint32_t slot_id =
         recycled.has_value()
@@ -59,13 +61,15 @@ public:
       throw std::length_error("locator slot capacity exhausted");
     LocatorSlot &slot = locate_or_create(slot_id);
     if (recycled.has_value()) {
-      X86PackedWriteGuard guard(slot.packed);
+      PackedWriteGuard guard(slot.packed, slot.readers);
       const uint64_t current = slot.packed.load(std::memory_order_acquire);
       if (decode_index(current) != 0)
         throw std::logic_error("recycled locator slot is still live");
+      slot.key = key;
       slot.packed.store(pack(version_of(current), encode(arena_index)),
                         std::memory_order_release);
     } else {
+      slot.key = key;
       slot.packed.store(pack(0, encode(arena_index)),
                         std::memory_order_release);
     }
@@ -78,7 +82,7 @@ public:
         version_of(slot.packed.load(std::memory_order_acquire));
     if (version >= kRotationSequence)
       return false;
-    X86PackedWriteGuard guard(slot.packed);
+    PackedWriteGuard guard(slot.packed, slot.readers);
     const uint64_t current = slot.packed.load(std::memory_order_acquire);
     if (decode_index(current) == 0)
       throw std::logic_error("locator slot was already released");
@@ -99,6 +103,13 @@ public:
     if (index == 0)
       return std::nullopt;
     return decode(index);
+  }
+
+  uint64_t key(uint32_t slot_id) const noexcept {
+    const LocatorSlot *slot = locate(slot_id);
+    if (slot == nullptr)
+      std::terminate();
+    return slot->key;
   }
 
   bool requires_rotation(uint32_t slot_id) const {
@@ -147,13 +158,35 @@ public:
 
   template <typename Read> decltype(auto) read(uint32_t slot_id, Read &&read) {
     LocatorSlot &slot = locate_required(slot_id);
-    return read_x86_packed_seqlock(slot.packed, [&] {
-      const uint32_t encoded =
-          decode_index(slot.packed.load(std::memory_order_acquire));
-      if (encoded == 0)
-        throw std::logic_error("locator slot is not live");
-      return std::forward<Read>(read)(decode(encoded));
-    });
+    PackedReadGuard guard(slot.packed, slot.readers);
+    const uint32_t encoded =
+        decode_index(slot.packed.load(std::memory_order_acquire));
+    if (encoded == 0)
+      throw std::logic_error("locator slot is not live");
+    return std::forward<Read>(read)(decode(encoded));
+  }
+
+  template <typename Read> bool try_read(uint32_t slot_id, Read &&read) {
+    LocatorSlot &slot = locate_required(slot_id);
+    PackedReadGuard guard(slot.packed, slot.readers);
+    const uint32_t encoded =
+        decode_index(slot.packed.load(std::memory_order_acquire));
+    if (encoded == 0)
+      return false;
+    std::forward<Read>(read)(decode(encoded));
+    return true;
+  }
+
+  template <typename Read>
+  bool try_read_key(uint32_t slot_id, uint64_t expected_key, Read &&read) {
+    LocatorSlot &slot = locate_required(slot_id);
+    PackedReadGuard guard(slot.packed, slot.readers);
+    const uint32_t encoded =
+        decode_index(slot.packed.load(std::memory_order_acquire));
+    if (encoded == 0 || slot.key != expected_key)
+      return false;
+    std::forward<Read>(read)(decode(encoded));
+    return true;
   }
 
   template <typename Write>
@@ -162,12 +195,91 @@ public:
     if (version_of(slot.packed.load(std::memory_order_acquire)) >
         kRotationSequence)
       throw LocatorSequenceExhausted();
-    X86PackedWriteGuard guard(slot.packed);
+    PackedWriteGuard guard(slot.packed, slot.readers);
     const uint64_t current = slot.packed.load(std::memory_order_acquire);
     const uint32_t encoded = decode_index(current);
     if (encoded == 0)
       throw std::logic_error("locator slot is not live");
     return std::forward<Write>(write)(decode(encoded), slot.packed);
+  }
+
+  template <typename Write> bool try_write(uint32_t slot_id, Write &&write) {
+    LocatorSlot &slot = locate_required(slot_id);
+    if (version_of(slot.packed.load(std::memory_order_acquire)) >
+        kRotationSequence)
+      throw LocatorSequenceExhausted();
+    PackedWriteGuard guard(slot.packed, slot.readers);
+    const uint64_t current = slot.packed.load(std::memory_order_acquire);
+    const uint32_t encoded = decode_index(current);
+    if (encoded == 0)
+      return false;
+    std::forward<Write>(write)(decode(encoded), slot.packed);
+    return true;
+  }
+
+  template <typename Write>
+  bool try_write_key(uint32_t slot_id, uint64_t expected_key, Write &&write) {
+    LocatorSlot &slot = locate_required(slot_id);
+    if (version_of(slot.packed.load(std::memory_order_acquire)) >
+        kRotationSequence)
+      throw LocatorSequenceExhausted();
+    PackedWriteGuard guard(slot.packed, slot.readers);
+    const uint64_t current = slot.packed.load(std::memory_order_acquire);
+    const uint32_t encoded = decode_index(current);
+    if (encoded == 0 || slot.key != expected_key)
+      return false;
+    std::forward<Write>(write)(decode(encoded), slot.packed);
+    return true;
+  }
+
+  template <typename Retire>
+  bool retire(uint32_t slot_id, uint32_t expected_index, Retire &&retire) {
+    LocatorSlot &slot = locate_required(slot_id);
+    if (version_of(slot.packed.load(std::memory_order_acquire)) >
+        kRotationSequence)
+      throw LocatorSequenceExhausted();
+    PackedWriteGuard guard(slot.packed, slot.readers);
+    const uint64_t current = slot.packed.load(std::memory_order_acquire);
+    if (decode_index(current) != encode(expected_index))
+      return false;
+    std::forward<Retire>(retire)(expected_index);
+    slot.packed.store(pack(version_of(current), 0), std::memory_order_release);
+    return true;
+  }
+
+  template <typename Retire>
+  bool retire_current(uint32_t slot_id, Retire &&retire) noexcept {
+    static_assert(std::is_nothrow_invocable_v<Retire, uint32_t>);
+    LocatorSlot *located = const_cast<LocatorSlot *>(locate(slot_id));
+    if (located == nullptr)
+      std::terminate();
+    LocatorSlot &slot = *located;
+    PackedWriteGuard guard(slot.packed, slot.readers);
+    const uint64_t current = slot.packed.load(std::memory_order_acquire);
+    const uint32_t encoded = decode_index(current);
+    if (encoded == 0)
+      return false;
+    std::forward<Retire>(retire)(decode(encoded));
+    slot.packed.store(pack(version_of(current), 0), std::memory_order_release);
+    return true;
+  }
+
+  bool recycle_retired_after_epoch(uint32_t slot_id) noexcept {
+    LocatorSlot &slot = locate_required(slot_id);
+    const uint32_t version =
+        version_of(slot.packed.load(std::memory_order_acquire));
+    if (version >= kRotationSequence)
+      return false;
+    PackedWriteGuard guard(slot.packed, slot.readers);
+    if (decode_index(slot.packed.load(std::memory_order_acquire)) != 0)
+      std::terminate();
+    try {
+      std::lock_guard lock(recycle_mutex_);
+      recycled_slots_.push_back(slot_id);
+    } catch (...) {
+      std::terminate();
+    }
+    return true;
   }
 
   bool publish(uint32_t slot_id, uint32_t expected_index,
@@ -176,7 +288,7 @@ public:
     if (version_of(slot.packed.load(std::memory_order_acquire)) >
         kRotationSequence)
       throw LocatorSequenceExhausted();
-    X86PackedWriteGuard guard(slot.packed);
+    PackedWriteGuard guard(slot.packed, slot.readers);
     const uint64_t current = slot.packed.load(std::memory_order_acquire);
     if (decode_index(current) != encode(expected_index))
       return false;
@@ -192,7 +304,7 @@ public:
     if (version_of(slot.packed.load(std::memory_order_acquire)) >
         kRotationSequence)
       throw LocatorSequenceExhausted();
-    X86PackedWriteGuard guard(slot.packed);
+    PackedWriteGuard guard(slot.packed, slot.readers);
     const uint64_t current = slot.packed.load(std::memory_order_acquire);
     if (decode_index(current) != encode(expected_index))
       return false;
@@ -288,6 +400,6 @@ private:
 };
 
 static_assert(sizeof(LocatorSlot) * SegmentedLocatorTable::kEntriesPerSegment ==
-              32768);
+              98304);
 
 } // namespace se::hogwild_internal

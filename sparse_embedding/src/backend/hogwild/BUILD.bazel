@@ -31,6 +31,12 @@ cc_test(
     deps = [":hogwild_partition_topology"],
 )
 
+cc_test(
+    name = "flat_key_directory_test",
+    srcs = ["flat_key_directory_test.cpp"],
+    deps = [":hogwild_support_headers"],
+)
+
 cc_library(
     name = "hogwild_compaction_headers",
     hdrs = ["compaction/page_compaction_profile.hpp"],
@@ -116,6 +122,7 @@ cc_library(
         "compaction/page_compaction_profile.hpp",
         "core/cohort_arena_allocation.hpp",
         "core/cohort_page_allocator.hpp",
+        "core/flat_key_directory.hpp",
         "core/segmented_locator_table.hpp",
         "operation_dispatch_policy.hpp",
         "partition/shard_owner_scheduler.hpp",
@@ -303,22 +310,22 @@ cc_test(
     srcs = ["mutation_contract_test.cpp"],
     copts = ["-UNDEBUG"],
     defines = ["HOGWILD_EXPLICIT_INSTANTIATION"],
-    deps = [":hogwild_headers"],
+    linkopts = ["-pthread"],
+    deps = [
+        ":hogwild_headers",
+        "//sparse_embedding/src/storage",
+    ],
 )
 
 cc_test(
     name = "mutation_contract_opt_test",
     srcs = ["mutation_contract_test.cpp"],
     defines = ["HOGWILD_EXPLICIT_INSTANTIATION"],
-    deps = [":hogwild_headers"],
-)
-
-cc_binary(
-    name = "lookup_or_insert_maskless_benchmark",
-    srcs = ["lookup_or_insert_maskless_benchmark.cpp"],
-    defines = ["HOGWILD_EXPLICIT_INSTANTIATION"],
     linkopts = ["-pthread"],
-    deps = [":hogwild_headers"],
+    deps = [
+        ":hogwild_headers",
+        "//sparse_embedding/src/storage",
+    ],
 )
 
 cc_test(

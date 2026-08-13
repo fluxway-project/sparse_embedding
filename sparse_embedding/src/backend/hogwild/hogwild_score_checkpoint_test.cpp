@@ -288,7 +288,9 @@ static void test_evict_by_score() {
   auto store = make_store<ManualScorePolicy>(kDim, 2);
 
   std::vector<uint64_t> keys = {1, 2, 3, 4, 5};
-  std::vector<float> vals(5 * kDim, 1.0f);
+  std::vector<float> vals(5 * kDim);
+  for (size_t row = 0; row < keys.size(); ++row)
+    std::fill_n(vals.data() + row * kDim, kDim, static_cast<float>(keys[row]));
   std::vector<int64_t> lens(5, kDim);
   store.assign<uint64_t>(keys, vals, lens);
 
@@ -307,6 +309,13 @@ static void test_evict_by_score() {
   CHECK(!ec);
   CHECK(evicted_count == 3u);
   CHECK(store.size() == 2u);
+  for (size_t row = 0; row < evicted_count; ++row) {
+    CHECK(std::ranges::all_of(
+        std::span<const float>(evicted_vals.data() + row * kDim, kDim),
+        [&](float value) {
+          return value == static_cast<float>(evicted_keys[row]);
+        }));
+  }
 
   // key=1 must survive (score=100 > max_score=1)
   std::vector<uint8_t> mask(1);

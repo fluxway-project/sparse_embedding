@@ -203,6 +203,14 @@ public:
     }
   }
 
+  void mark_nonresident(uint32_t page_id) noexcept {
+    if (page_id >= page_count_)
+      std::terminate();
+    if (residency_started_at_[page_id].exchange(0, std::memory_order_acq_rel) ==
+        0)
+      std::terminate();
+  }
+
   void advance_residency_epoch() {
     uint64_t epoch = residency_epoch_.load(std::memory_order_acquire);
     while (true) {

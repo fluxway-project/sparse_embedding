@@ -5,12 +5,12 @@
 #include <cstddef>
 #include <cstdint>
 #include <format>
+#include <immintrin.h>
 #include <iostream>
 #include <limits>
 #include <map>
 #include <mutex>
 #include <stdexcept>
-#include <thread>
 
 namespace se {
 
@@ -30,7 +30,6 @@ struct RetirementPressureStats {
   size_t retired_bytes = 0;
   RetirementPressureState state = RetirementPressureState::kNormal;
   uint64_t backpressure_count = 0;
-  uint64_t sink_hit_count = 0;
   uint64_t oldest_unreclaimed_age_ns = 0;
   uint64_t epoch_stall_count = 0;
 };
@@ -53,6 +52,12 @@ public:
     ControlPlaneCall &operator=(ControlPlaneCall &&) = delete;
 
     bool admitted() const noexcept { return admitted_; }
+
+    void require_admitted() const {
+      if (!admitted_)
+        throw std::runtime_error(
+            "retirement pressure circuit is open for control-plane mutation");
+    }
 
   private:
     friend class RetirementPressure;
@@ -158,11 +163,6 @@ public:
     return state_ == RetirementPressureState::kCircuitOpen;
   }
 
-  void record_sink_hit() noexcept {
-    std::lock_guard lock(mutex_);
-    ++sink_hit_count_;
-  }
-
   void refresh_stall_state() noexcept {
     std::lock_guard lock(mutex_);
     refresh_stall_state_locked(std::chrono::steady_clock::now());
@@ -175,7 +175,6 @@ public:
     result.retired_bytes = retired_bytes_;
     result.state = state_;
     result.backpressure_count = backpressure_count_;
-    result.sink_hit_count = sink_hit_count_;
     result.epoch_stall_count = epoch_stall_count_;
     if (!records_.empty()) {
       result.oldest_unreclaimed_age_ns = static_cast<uint64_t>(
@@ -235,7 +234,7 @@ private:
       }
     }
     if (should_yield)
-      std::this_thread::yield();
+      _mm_pause();
     return should_yield;
   }
 
@@ -286,7 +285,6 @@ private:
   size_t retired_bytes_ = 0;
   uint64_t next_retirement_id_ = 1;
   uint64_t backpressure_count_ = 0;
-  uint64_t sink_hit_count_ = 0;
   uint64_t epoch_stall_count_ = 0;
   RetirementPressureState state_ = RetirementPressureState::kNormal;
   bool stall_active_ = false;

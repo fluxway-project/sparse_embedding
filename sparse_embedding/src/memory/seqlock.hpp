@@ -1,30 +1,48 @@
 #pragma once
 
-#if !defined(__linux__) || !defined(__x86_64__) ||                             \
-    !(defined(__GNUC__) || defined(__clang__))
-#error "X86 SeqLock requires Linux x86_64 with GCC or Clang"
+#if !(defined(__GNUC__) || defined(__clang__))
+#error "SeqLock requires GCC or Clang"
+#endif
+
+#if !(defined(__x86_64__) || defined(__i386__) || defined(__aarch64__) ||      \
+      defined(__arm64__))
+#error "SeqLock requires x86 or ARM architecture"
 #endif
 
 #include <atomic>
 #include <cstdint>
-#include <immintrin.h>
 #include <type_traits>
+
+#if defined(__x86_64__) || defined(__i386__)
+#include <immintrin.h>
+#endif
 
 namespace se::memory {
 
 inline void compiler_barrier() noexcept { asm volatile("" ::: "memory"); }
 
-class X86SeqLock {
+inline void cpu_relax() noexcept {
+#if defined(__x86_64__) || defined(__i386__)
+  _mm_pause();
+#elif defined(__aarch64__) || defined(__arm64__)
+  __builtin_arm_yield();
+#endif
+}
+
+static_assert(std::atomic<uint32_t>::is_always_lock_free);
+static_assert(std::atomic<uint64_t>::is_always_lock_free);
+
+class SeqLock {
 public:
-  explicit X86SeqLock(std::atomic<uint32_t> &sequence) noexcept
+  explicit SeqLock(std::atomic<uint32_t> &sequence) noexcept
       : sequence_(sequence) {}
-  X86SeqLock(const X86SeqLock &) = delete;
-  X86SeqLock &operator=(const X86SeqLock &) = delete;
+  SeqLock(const SeqLock &) = delete;
+  SeqLock &operator=(const SeqLock &) = delete;
   void lock() noexcept {
     uint32_t observed = sequence_.load(std::memory_order_relaxed);
     while (true) {
       while ((observed & 1U) != 0U) {
-        _mm_pause();
+        cpu_relax();
         observed = sequence_.load(std::memory_order_relaxed);
       }
       if (sequence_.compare_exchange_weak(observed, observed + 1U,
@@ -44,40 +62,44 @@ private:
   std::atomic<uint32_t> &sequence_;
 };
 
-class X86SeqWriteGuard {
+class SeqWriteGuard {
 public:
-  explicit X86SeqWriteGuard(std::atomic<uint32_t> &sequence) noexcept
+  explicit SeqWriteGuard(std::atomic<uint32_t> &sequence) noexcept
       : lock_(sequence) {
     lock_.lock();
   }
-  ~X86SeqWriteGuard() { lock_.unlock(); }
-  X86SeqWriteGuard(const X86SeqWriteGuard &) = delete;
-  X86SeqWriteGuard &operator=(const X86SeqWriteGuard &) = delete;
+  ~SeqWriteGuard() { lock_.unlock(); }
+  SeqWriteGuard(const SeqWriteGuard &) = delete;
+  SeqWriteGuard &operator=(const SeqWriteGuard &) = delete;
 
 private:
-  X86SeqLock lock_;
+  SeqLock lock_;
 };
 
-class X86PackedWriteLock {
+class PackedWriteLock {
 public:
-  explicit X86PackedWriteLock(std::atomic<uint64_t> &packed) noexcept
-      : packed_(packed) {}
-  X86PackedWriteLock(const X86PackedWriteLock &) = delete;
-  X86PackedWriteLock &operator=(const X86PackedWriteLock &) = delete;
+  PackedWriteLock(std::atomic<uint64_t> &packed,
+                  std::atomic<uint32_t> &readers) noexcept
+      : packed_(packed), readers_(readers) {}
+  PackedWriteLock(const PackedWriteLock &) = delete;
+  PackedWriteLock &operator=(const PackedWriteLock &) = delete;
   void lock() noexcept {
     uint64_t observed = packed_.load(std::memory_order_relaxed);
     while (true) {
       const uint32_t version = static_cast<uint32_t>(observed >> 32);
       if ((version & 1U) != 0U) {
-        _mm_pause();
+        cpu_relax();
         observed = packed_.load(std::memory_order_relaxed);
         continue;
       }
       const uint64_t held = observed | (uint64_t{1} << 32);
       if (packed_.compare_exchange_weak(observed, held,
                                         std::memory_order_acquire,
-                                        std::memory_order_relaxed))
+                                        std::memory_order_relaxed)) {
+        while (readers_.load(std::memory_order_acquire) != 0U)
+          cpu_relax();
         return;
+      }
     }
   }
   void unlock() noexcept {
@@ -90,29 +112,65 @@ public:
 
 private:
   std::atomic<uint64_t> &packed_;
+  std::atomic<uint32_t> &readers_;
 };
 
-class X86PackedWriteGuard {
+class PackedWriteGuard {
 public:
-  explicit X86PackedWriteGuard(std::atomic<uint64_t> &packed) noexcept
-      : lock_(packed) {
+  PackedWriteGuard(std::atomic<uint64_t> &packed,
+                   std::atomic<uint32_t> &readers) noexcept
+      : lock_(packed, readers) {
     lock_.lock();
   }
-  ~X86PackedWriteGuard() { lock_.unlock(); }
-  X86PackedWriteGuard(const X86PackedWriteGuard &) = delete;
-  X86PackedWriteGuard &operator=(const X86PackedWriteGuard &) = delete;
+  ~PackedWriteGuard() { lock_.unlock(); }
+  PackedWriteGuard(const PackedWriteGuard &) = delete;
+  PackedWriteGuard &operator=(const PackedWriteGuard &) = delete;
 
 private:
-  X86PackedWriteLock lock_;
+  PackedWriteLock lock_;
+};
+
+class PackedReadGuard {
+public:
+  PackedReadGuard(std::atomic<uint64_t> &packed,
+                  std::atomic<uint32_t> &readers) noexcept
+      : packed_(packed), readers_(readers), active_(false) {
+    for (;;) {
+      const uint64_t before = packed_.load(std::memory_order_acquire);
+      if ((static_cast<uint32_t>(before >> 32) & 1U) != 0U) {
+        cpu_relax();
+        continue;
+      }
+      readers_.fetch_add(1, std::memory_order_acquire);
+      if (packed_.load(std::memory_order_acquire) == before) {
+        active_ = true;
+        return;
+      }
+      readers_.fetch_sub(1, std::memory_order_release);
+    }
+  }
+
+  ~PackedReadGuard() {
+    if (active_)
+      readers_.fetch_sub(1, std::memory_order_release);
+  }
+
+  PackedReadGuard(const PackedReadGuard &) = delete;
+  PackedReadGuard &operator=(const PackedReadGuard &) = delete;
+
+private:
+  std::atomic<uint64_t> &packed_;
+  std::atomic<uint32_t> &readers_;
+  bool active_;
 };
 
 template <typename Read>
-decltype(auto) read_x86_seqlock(std::atomic<uint32_t> &sequence, Read &&read) {
+decltype(auto) read_seqlock(std::atomic<uint32_t> &sequence, Read &&read) {
   Read &reader = read;
   while (true) {
     const uint32_t before = sequence.load(std::memory_order_acquire);
     if ((before & 1U) != 0U) {
-      _mm_pause();
+      cpu_relax();
       continue;
     }
     compiler_barrier();
@@ -131,13 +189,12 @@ decltype(auto) read_x86_seqlock(std::atomic<uint32_t> &sequence, Read &&read) {
 }
 
 template <typename Read>
-decltype(auto) read_x86_packed_seqlock(std::atomic<uint64_t> &packed,
-                                       Read &&read) {
+decltype(auto) read_packed_seqlock(std::atomic<uint64_t> &packed, Read &&read) {
   Read &reader = read;
   while (true) {
     const uint64_t before = packed.load(std::memory_order_acquire);
     if ((static_cast<uint32_t>(before >> 32) & 1U) != 0U) {
-      _mm_pause();
+      cpu_relax();
       continue;
     }
     compiler_barrier();

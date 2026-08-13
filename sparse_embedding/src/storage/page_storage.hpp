@@ -55,7 +55,6 @@ struct StorageStats {
   size_t retired_bytes;
   RetirementPressureState retirement_pressure_state;
   uint64_t retirement_backpressure_count;
-  uint64_t retirement_sink_hit_count;
   uint64_t oldest_unreclaimed_age_ns;
   uint64_t epoch_stall_count;
   std::shared_ptr<RetirementPressure> retirement_pressure_domain;
@@ -95,6 +94,8 @@ PRO_DEF_MEM_DISPATCH(MemStorageStats, stats);
 PRO_DEF_MEM_DISPATCH(MemSpillDirectory, spill_directory);
 PRO_DEF_MEM_DISPATCH(MemConsumeSpillWarning, consume_spill_warning);
 PRO_DEF_MEM_DISPATCH(MemDrainPageEvictionBacklog, drain_page_eviction_backlog);
+PRO_DEF_MEM_DISPATCH(MemBeginRead, begin_read);
+PRO_DEF_MEM_DISPATCH(MemEndRead, end_read);
 PRO_DEF_MEM_DISPATCH(MemSupportsPageEviction,
                      supports_background_page_eviction);
 PRO_DEF_MEM_DISPATCH(MemSetPageEvictionProxy, set_page_eviction_proxy);
@@ -118,6 +119,8 @@ struct PageStorageFacade
                        bool() noexcept> //
       ::add_convention<MemDrainPageEvictionBacklog,
                        void(std::chrono::nanoseconds)>                 //
+      ::add_convention<MemBeginRead, void() const noexcept>            //
+      ::add_convention<MemEndRead, void() const noexcept>              //
       ::add_convention<MemSupportsPageEviction, bool() const noexcept> //
       ::add_convention<MemSetPageEvictionProxy,
                        PageEvictionRegistration(PageEvictionProxy)> //

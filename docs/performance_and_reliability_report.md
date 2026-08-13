@@ -24,7 +24,7 @@ Compaction, hot-key promotion, and page eviction update one authoritative
 directory. Source pages remain readable until epoch safety and are never reused
 as destinations while draining or retired.
 
-## Standard machine and build configuration
+## Testing Standard Machine and Build Configuration
 
 | Item | Configuration |
 |---|---|
@@ -116,6 +116,68 @@ The small-memory all-path pressure test covers `lookup_or_insert`,
 `forward_lookup`, `assign`, `contains`, `erase`, duplicate gradient accumulation,
 and `optimizer_step`, and verifies payload integrity after paging.
 
+## Runtime and performance reference
+
+The current path is `key -> shard MapBundle -> locator_slot -> arena_index ->
+payload`. The logical directory remains a COW snapshot and the physical page
+directory uses stable segments; lookup, optimizer, and ordinary compaction
+relocation take no mutex. Expansion runs in the writer/control plane. When a
+runtime insert exceeds the reserved budget, growth uses these exact factors:
+
+| Layer | Expansion rule |
+|---|---|
+| Directory bucket budget | `ceil(2.5 * key_capacity)`, rounded up to 16; use the smaller `ceil_pow2(4 * key_capacity)` when it fits |
+| `MapBundle` runtime capacity | 2x below 64K; 1.5x for `64K <= capacity < 1M`; 1.25x at or above 1M |
+| Shard budget | `reserve(keys_count, dim)` distributes exactly; `reserve_per_shard(counts, dim)` uses caller-provided per-shard budgets |
+
+Expansion clones the current `MapBundle` and publishes it with one atomic
+exchange. Epoch retirement reclaims the old bundle; locator-slot and arena-index
+addresses remain stable. Bucket/slot/arena limits and allocation failures throw
+explicit errors; no fallback capacity path is used.
+
+### Performance results
+
+High-concurrency lookup/insert: dimension 32, `1<<20` warm keys, 1,024-key
+batches, 64 lookup rounds, 8 insert rounds, memory-only 1 GiB, and five
+repetitions per configuration reporting median/p95/p99.
+
+| Threads | Lookup median/p95/p99 (Mops/s) | Insert median/p95/p99 (Mops/s) |
+|---:|---:|---:|
+| 1 | 6.31 / 6.80 / 6.80 | 0.0456 / 0.0519 / 0.0519 |
+| 16 | 50.38 / 51.65 / 51.65 | 0.282 / 0.313 / 0.313 |
+| 64 | **64.76 / 72.30 / 72.30** | **0.583 / 0.608 / 0.608** |
+
+Mixed lookup/insert uses the same dimension, warm keys, and batch for 64 rounds;
+16/64 total threads are split evenly, with Auto storage at 1 GiB memory and
+2 GiB spill limits.
+
+| Total | Lookup/insert threads | Lookup / insert (Mops/s) | Lookup/insert p99 (ns) |
+|---:|---:|---:|---:|
+| 16 | 8 / 8 | 26.67 / 0.298 | 376,041 / 56,071,999 |
+| 64 | 32 / 32 | **52.63 / 0.365** | 1,212,543 / 153,709,741 |
+
+Compaction strong scaling uses dimension 128, 64 shards, four pages per source
+worker, 4,096 entries per page, 64 store threads, fixed work, 1/2/4/8/16
+compaction workers, five repetitions, and preallocated destinations.
+
+| Workers | Relocated keys/s |
+|---:|---:|
+| 1 | 1.19 M |
+| 2 | 2.10 M |
+| 4 | 3.83 M |
+| 8 | 10.17 M |
+| 16 | **13.59 M** |
+
+Without destination preallocation the values are 1.16/2.04/3.79/7.54/9.56 M
+keys/s. The executable targets are `high_concurrency_lookup_insert_benchmark`,
+`mixed_lookup_insert_concurrency_benchmark`, and `page_compaction_benchmark`.
+
+Paging tests should verify `swap_out_count > 0` and `spill_count > 0`. Safety
+regression must cover dimension 1, Adam, concurrent `optimizer_step()` and
+`compact_page()`, and inspect native subprocess termination codes. Full native,
+TSAN, and ASAN/UBSAN suites are release validation requirements; exception
+handling must not replace signal detection.
+
 ## Public validation
 
 ```bash
@@ -130,6 +192,15 @@ Pressure validation:
 ```bash
 bazel test -c opt //sparse_embedding/src/backend/hogwild:small_memory_all_paths_pressure_test \
   --test_output=errors
+```
+
+Latest benchmark commands:
+
+```bash
+bazel run -c opt //benchmarks:high_concurrency_lookup_insert_benchmark
+bazel run -c opt //benchmarks:mixed_lookup_insert_concurrency_benchmark
+bazel run -c opt //benchmarks:page_compaction_benchmark -- \
+  --strong-scaling --preallocate-destinations
 ```
 
 ## Design boundaries
