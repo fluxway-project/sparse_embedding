@@ -31,3 +31,6 @@ sparse_embedding/_core.pyi
 
 tmp/
 maintenance/
+
+# Scripts
+deploy_wheel.sh
