@@ -27,6 +27,28 @@ cc_binary(
 )
 
 cc_binary(
+    name = "high_concurrency_lookup_insert_benchmark",
+    srcs = ["high_concurrency_lookup_insert_benchmark.cpp"],
+    defines = ["HOGWILD_EXPLICIT_INSTANTIATION"],
+    linkopts = ["-pthread"],
+    deps = [
+        "//sparse_embedding/src/backend/hogwild:hogwild_headers",
+        "//sparse_embedding/src/storage",
+    ],
+)
+
+cc_binary(
+    name = "mixed_lookup_insert_concurrency_benchmark",
+    srcs = ["mixed_lookup_insert_concurrency_benchmark.cpp"],
+    defines = ["HOGWILD_EXPLICIT_INSTANTIATION"],
+    linkopts = ["-pthread"],
+    deps = [
+        "//sparse_embedding/src/backend/hogwild:hogwild_headers",
+        "//sparse_embedding/src/storage",
+    ],
+)
+
+cc_binary(
     name = "training_path_profile",
     srcs = ["training_path_profile.cpp"],
     defines = ["HOGWILD_EXPLICIT_INSTANTIATION"],

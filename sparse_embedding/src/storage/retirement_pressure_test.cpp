@@ -67,7 +67,6 @@ int main() {
     circuit_rejected = true;
   }
   require(circuit_rejected, "circuit admitted a control-plane retirement");
-  pressure.record_sink_hit();
   pressure.complete_retirement(fourth);
   pressure.complete_retirement(third);
   require(pressure.stats().state == se::RetirementPressureState::kCircuitOpen,
@@ -84,6 +83,5 @@ int main() {
   pressure.complete_retirement(first);
   const auto stats = pressure.stats();
   require(stats.retired_bytes == 0, "retired byte accounting did not drain");
-  require(stats.sink_hit_count == 1, "sink hit accounting mismatch");
   return 0;
 }

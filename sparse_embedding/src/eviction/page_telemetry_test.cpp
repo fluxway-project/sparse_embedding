@@ -36,6 +36,11 @@ int main() {
   require(telemetry.residency_age(0) == 3.0F &&
               telemetry.residency_age(1) == 1.0F,
           "page telemetry residency epoch did not advance");
+  telemetry.mark_nonresident(0);
+  require_throws([&] { telemetry.residency_age(0); });
+  telemetry.register_resident(0);
+  require(telemetry.residency_age(0) == 0.0F,
+          "page telemetry did not restart residency after page reuse");
   se::PageAccessTelemetry access(4, 64);
   constexpr std::array<uint64_t, 4> keys{10, 20, 30, 40};
   constexpr std::array<uint32_t, 4> pages{0, 1, 0, 0};

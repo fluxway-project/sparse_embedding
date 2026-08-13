@@ -39,9 +39,108 @@ template <typename Function> void require_throws(Function &&function) {
   throw std::runtime_error("expected operation to throw");
 }
 
+void run_optimizer_step_dim1_regression(std::string_view mode) {
+  const bool run_compaction = mode == "all" || mode == "compact";
+  const bool run_lookup = mode == "all" || mode == "lookup";
+  if (mode != "step" && mode != "lookup" && mode != "compact" && mode != "all")
+    throw std::invalid_argument("invalid optimizer_step_dim1 mode");
+
+  se::StorageOptions options;
+  options.memory_limit_bytes = 32 << 20;
+  options.spill_directory = std::filesystem::temp_directory_path();
+  options.max_spill_bytes = 256 << 20;
+  auto storage = se::create_page_storage(std::move(options));
+  se::AdamConfig config;
+  auto factory = pro::make_proxy<se::FunctionFacade<
+      pro::proxy<se::OptimizerFacade<float, float>>(size_t)>>(
+      [storage, config](size_t dim) mutable {
+        using Adam = se::AdamOptimizer<float, float, se::StaticLearningRate>;
+        return pro::make_proxy<se::OptimizerFacade<float, float>, Adam>(
+            dim, config, storage, se::StaticLearningRate{1.0e-3F});
+      });
+  using Store =
+      se::HogwildEmbeddingStore<uint64_t, float, float, se::NoScorePolicy>;
+  Store store({1}, {}, std::move(factory), se::NoScorePolicy{},
+              se::HogwildStoreOptions{.thread_budget = 4, .storage = storage});
+  constexpr size_t key_count = 1024;
+  constexpr size_t rounds = 64;
+  std::vector<uint64_t> keys(key_count);
+  std::iota(keys.begin(), keys.end(), uint64_t{1});
+  std::vector<int64_t> lengths(key_count, 1);
+  std::vector<float> values(key_count, 0.0F);
+  store.lookup_or_insert<uint64_t>(keys, values, lengths);
+
+  const size_t participants = 1 + run_compaction + run_lookup;
+  std::barrier start(static_cast<std::ptrdiff_t>(participants));
+  std::vector<std::exception_ptr> errors(participants);
+  std::vector<std::thread> workers;
+  workers.emplace_back([&] {
+    try {
+      start.arrive_and_wait();
+      std::vector<float> gradients(key_count, 1.0F);
+      for (size_t round = 0; round < rounds; ++round) {
+        store.accumulate_gradients<uint64_t>(keys, gradients, lengths);
+        store.optimizer_step();
+      }
+    } catch (...) {
+      errors[0] = std::current_exception();
+    }
+  });
+  if (run_compaction) {
+    const size_t error_index = workers.size();
+    workers.emplace_back([&, error_index] {
+      try {
+        start.arrive_and_wait();
+        require(store.compact_page(1, 0) == key_count,
+                "dim=1 Adam compaction lost a key");
+      } catch (...) {
+        errors[error_index] = std::current_exception();
+      }
+    });
+  }
+  if (run_lookup) {
+    const size_t error_index = workers.size();
+    workers.emplace_back([&, error_index] {
+      try {
+        start.arrive_and_wait();
+        std::vector<float> output(key_count);
+        for (size_t round = 0; round < rounds; ++round)
+          store.lookup<uint64_t>(keys, output, lengths);
+      } catch (...) {
+        errors[error_index] = std::current_exception();
+      }
+    });
+  }
+  for (auto &worker : workers)
+    worker.join();
+  for (const auto &error : errors)
+    if (error != nullptr)
+      std::rethrow_exception(error);
+
+  std::vector<float> output(key_count);
+  store.lookup<uint64_t>(keys, output, lengths);
+  require(store.size() == key_count, "dim=1 Adam regression lost a key");
+  require(std::ranges::all_of(output,
+                              [](float value) { return std::isfinite(value); }),
+          "dim=1 Adam regression produced a non-finite value");
+}
+
 } // namespace
 
-int main() {
+int main(int argc, char **argv) {
+  if (argc > 1) {
+    const std::string_view regression = argv[1];
+    if (regression == "optimizer_step_dim1") {
+      if (argc != 3)
+        throw std::invalid_argument(
+            "optimizer_step_dim1 requires an explicit mode");
+      run_optimizer_step_dim1_regression(argv[2]);
+      return 0;
+    }
+    throw std::invalid_argument("unknown hogwild storage regression");
+  }
+  run_optimizer_step_dim1_regression("all");
+
   se::StorageOptions options;
   options.memory_limit_bytes = 0;
   options.spill_directory = std::filesystem::temp_directory_path();
@@ -1127,8 +1226,9 @@ int main() {
   std::atomic<bool> reader_ok{true};
   std::thread reader([&] {
     try {
+      std::array<float, 32 * 8> reader_values{};
       for (size_t i = 0; i < 200; ++i) {
-        snapshot_store.lookup<uint64_t>(snapshot_keys, snapshot_values,
+        snapshot_store.lookup<uint64_t>(snapshot_keys, reader_values,
                                         snapshot_lengths);
       }
     } catch (...) {
@@ -1277,37 +1377,45 @@ int main() {
   require(scored_stress_store.size() == stress_batch_size,
           "admitted scored insertion batch lost keys");
 
-  se::StorageOptions sink_options;
-  sink_options.mode = se::StorageMode::kMemoryOnly;
-  sink_options.memory_limit_bytes = 1 << 20;
-  auto sink_storage = se::create_page_storage(std::move(sink_options));
-  Store sink_store(
+  se::StorageOptions circuit_options;
+  circuit_options.mode = se::StorageMode::kMemoryOnly;
+  circuit_options.memory_limit_bytes = 1 << 20;
+  auto circuit_storage = se::create_page_storage(std::move(circuit_options));
+  Store circuit_store(
       {8}, {}, nullptr, se::NoScorePolicy{},
-      se::HogwildStoreOptions{.thread_budget = 1, .storage = sink_storage});
-  auto pressure = sink_storage->stats().retirement_pressure_domain;
+      se::HogwildStoreOptions{.thread_budget = 1, .storage = circuit_storage});
+  auto pressure = circuit_storage->stats().retirement_pressure_domain;
   const uint64_t circuit_retirement = pressure->begin_retirement(1 << 18);
-  constexpr std::array<uint64_t, 1> sink_key{900001};
-  constexpr std::array<int64_t, 1> sink_length{8};
-  std::array<float, 8> sink_values;
-  sink_values.fill(7.0F);
-  sink_store.lookup_or_insert<uint64_t>(sink_key, sink_values, sink_length);
-  require(std::ranges::all_of(sink_values,
-                              [](float value) { return value == 0.0F; }),
-          "circuit lookup-or-insert did not return the zero sink image");
-  require(sink_store.size() == 0,
-          "circuit lookup-or-insert grew the key directory");
-  std::array<uint8_t, 1> sink_exists{1};
-  sink_store.contains<uint64_t>(sink_key, sink_exists);
-  require(sink_exists[0] == 0, "circuit sink key appeared in contains results");
-  std::array<float, 8> sink_assignment;
-  sink_assignment.fill(3.0F);
-  sink_store.assign<uint64_t>(sink_key, sink_assignment, sink_length);
-  require(sink_store.size() == 0,
-          "assign inserted a sink key while circuit was open");
-  require(sink_storage->stats().retirement_sink_hit_count >= 2,
-          "circuit sink hits were not recorded");
+  constexpr std::array<uint64_t, 1> circuit_key{900001};
+  constexpr std::array<int64_t, 1> circuit_length{8};
+  std::array<float, 8> circuit_values;
+  circuit_values.fill(7.0F);
+  bool insertion_rejected = false;
+  try {
+    circuit_store.lookup_or_insert<uint64_t>(circuit_key, circuit_values,
+                                             circuit_length);
+  } catch (const std::runtime_error &error) {
+    insertion_rejected =
+        std::string_view(error.what()) ==
+        "retirement pressure circuit is open for control-plane mutation";
+  }
+  require(insertion_rejected,
+          "circuit lookup-or-insert did not reject the missing key");
+  require(circuit_store.size() == 0,
+          "rejected lookup-or-insert grew the key directory");
+  bool assignment_rejected = false;
+  try {
+    circuit_store.assign<uint64_t>(circuit_key, circuit_values, circuit_length);
+  } catch (const std::runtime_error &error) {
+    assignment_rejected =
+        std::string_view(error.what()) ==
+        "retirement pressure circuit is open for control-plane mutation";
+  }
+  require(assignment_rejected, "circuit assign did not reject the missing key");
+  require(circuit_store.size() == 0, "rejected assign grew the key directory");
   pressure->complete_retirement(circuit_retirement);
-  sink_store.lookup_or_insert<uint64_t>(sink_key, sink_values, sink_length);
-  require(sink_store.size() == 1,
+  circuit_store.lookup_or_insert<uint64_t>(circuit_key, circuit_values,
+                                           circuit_length);
+  require(circuit_store.size() == 1,
           "key insertion did not resume after circuit recovery");
 }

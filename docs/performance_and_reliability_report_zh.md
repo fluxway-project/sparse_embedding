@@ -19,7 +19,7 @@ Lance checkpoint 包含 `entries`、物理 `page_images` 和固定版本的 mani
 Compaction、热 Key 提升和 page eviction 都通过唯一权威目录更新 locator。源 page 在
 epoch 安全前保持可读，不会被重新用作 destination。
 
-## 标准机器与编译配置
+## 测试标准机器与编译配置
 
 | 项目 | 配置 |
 |---|---|
@@ -109,6 +109,60 @@ spill limit、0.75/0.50 watermarks 的 pressure profile：
 `contains`、`erase`、重复 gradient accumulation 和 `optimizer_step`，并校验换页后
 payload 未改变。
 
+## 运行机制与性能参考
+
+当前路径为 `key → shard MapBundle → locator_slot → arena_index → payload`。逻辑目录
+仍使用 COW 快照，物理页目录使用稳定 segment；lookup、optimizer 和普通 compaction
+relocation 不获取 mutex。扩表只发生在 writer/control plane：`reserve` 在计时前完成，
+运行期超出预算时按以下精确系数增长：
+
+| 层次 | 扩容规则 |
+|---|---|
+| 目录 bucket 预算 | `ceil(2.5 × key_capacity)`，再向上对齐到 16；若较小的 `ceil_pow2(4 × key_capacity)` 更省则采用它 |
+| `MapBundle` 运行期容量 | `<64K`：2×；`64K≤capacity<1M`：1.5×；`≥1M`：1.25× |
+| shard 预算 | `reserve(keys_count, dim)` 精确按 shard 分摊；`reserve_per_shard(counts, dim)` 使用调用方给出的独立预算 |
+
+扩容 clone 当前 `MapBundle` 后 atomic exchange，旧 bundle 由 epoch retirement 回收；locator
+slot 与 arena index 地址保持稳定。bucket/slot/arena 上限或分配失败直接抛异常，不使用
+fallback。
+
+### 最新性能结果
+
+高并发 lookup/insert：`dim=32`、warm keys=`1<<20`、batch=1024、lookup 64 轮、insert 8
+轮、memory-only 1 GiB、每配置 5 次 median/p95/p99。
+
+| threads | lookup median/p95/p99 (Mops/s) | insert median/p95/p99 (Mops/s) |
+|---:|---:|---:|
+| 1 | 6.31 / 6.80 / 6.80 | 0.0456 / 0.0519 / 0.0519 |
+| 16 | 50.38 / 51.65 / 51.65 | 0.282 / 0.313 / 0.313 |
+| 64 | **64.76 / 72.30 / 72.30** | **0.583 / 0.608 / 0.608** |
+
+混合 lookup/insert：同一 dim、warm keys、batch，64 轮；16/64 总线程各半，Auto storage
+memory=1 GiB、spill=2 GiB。
+
+| 总线程 | lookup/insert 线程 | lookup / insert (Mops/s) | lookup/insert p99 (ns) |
+|---:|---:|---:|---:|
+| 16 | 8 / 8 | 26.67 / 0.298 | 376,041 / 56,071,999 |
+| 64 | 32 / 32 | **52.63 / 0.365** | 1,212,543 / 153,709,741 |
+
+compaction 强扩展：`dim=128`、64 shards、每 source worker 4 pages、每页 4096 entries、
+store_threads=64，固定工作量，1/2/4/8/16 workers，每配置 5 次 median，destination
+预分配。
+
+| workers | relocated keys/s |
+---:|---:|
+| 1 | 1.19 M |
+| 2 | 2.10 M |
+| 4 | 3.83 M |
+| 8 | 10.17 M |
+| 16 | **13.59 M** |
+
+未预分配结果为 1.16/2.04/3.79/7.54/9.56 M keys/s。对应可执行目标为三个 benchmark 目标。
+
+换页测试应验证 `swap_out_count > 0` 与 `spill_count > 0`。安全回归应覆盖 dim=1、Adam、
+`optimizer_step()` 与并发 `compact_page()`，并在独立子进程中检查非零终止码。完整 native
+测试、TSAN、ASAN/UBSAN 均应作为发布前验证，不依赖异常捕获替代信号检测。
+
 ## 公开验证
 
 ```bash
@@ -123,6 +177,15 @@ PYTHONPATH="$PWD" pytest -q
 ```bash
 bazel test -c opt //sparse_embedding/src/backend/hogwild:small_memory_all_paths_pressure_test \
   --test_output=errors
+```
+
+性能测试命令：
+
+```bash
+bazel run -c opt //benchmarks:high_concurrency_lookup_insert_benchmark
+bazel run -c opt //benchmarks:mixed_lookup_insert_concurrency_benchmark
+bazel run -c opt //benchmarks:page_compaction_benchmark -- \
+  --strong-scaling --preallocate-destinations
 ```
 
 ## 设计边界

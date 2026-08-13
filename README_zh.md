@@ -28,7 +28,7 @@
 | Bazel | ≥ 7.0 |
 | libnuma | numactl 2.0.19（Bazel module `2.0.19.bcr.1`） |
 
-Bazel 配置使用 `-std=c++23` 编译 C++ 源码；当前验收构建使用 GCC 13.4 和 Bazel 7.7。
+Bazel 配置使用 `-std=c++23` 编译 C++ 源码；支持 GCC 13+ 和 Bazel 7+。
 
 ---
 
@@ -48,9 +48,9 @@ Bazel 配置使用 `-std=c++23` 编译 C++ 源码；当前验收构建使用 GCC
 | 优化参数 | `-O3 -march=native -mtune=native -mavx512bf16 -fno-strict-aliasing -DNDEBUG`；链接使用 `-flto` |
 | CPU affinity | Slot Directory forward proof 通过 benchmark affinity helper 绑定 worker；允许使用 48 个 CPU |
 
-### 已接受 C++ Proof（2026-08-04）
+### Forward scaling
 
-当前已接受的重构性能数据来自两个专用 proof binary。更完整的 `embedding_store_benchmark --bind-affinity --skip-pressure` 运行违反了新的 caller-dedup 契约，并以 `key shard batch contains duplicate key` 抛异常，因此只记录为失败尝试，不能作为已接受性能结果。
+测试使用 memory-only store、固定 batch、预热和物理 CPU 亲和性；结果用于比较不同实现。
 
 #### Slot Directory Forward Scaling
 
@@ -67,7 +67,7 @@ Bazel 配置使用 `-std=c++23` 编译 C++ 源码；当前验收构建使用 GCC
 
 相对单线程的 scaling ratio 为：2 线程 1.706x、4 线程 2.898x、8 线程 4.226x，超过当前 1.6x/2.5x/3.5x forward-scaling gate。
 
-### 同机重构后复测（2026-08-10）
+### 并发压力
 
 同一台测试机器上使用相同 workload，当前源码单次结果为 1/2/4/8/16/64 线程分别
 14.988/21.852/35.165/45.945/41.928/33.446 Mops/s。16 线程追加三次为
@@ -90,7 +90,6 @@ sustained-pressure proof 使用 8 个 producer、1,048,576 个总 key、dim=8、
 | `memory_bytes` | 294,912 |
 | `spill_bytes` | 0 |
 | `retired_bytes` | 2,109,456 |
-| `retirement_sink_hit_count` | 1,047,040 |
 | Allocation p95 | 1.163 ms |
 | Allocation p99 | 2.599 ms |
 | Backlog drain | 0.003 ms |
@@ -99,6 +98,14 @@ sustained-pressure proof 使用 8 个 producer、1,048,576 个总 key、dim=8、
 该 run 有意在 page spill/swap 发生前打开 retirement-pressure circuit。已接受结论是 Sink admission 能在无 payload corruption 的情况下处理压力。
 
 这些数据用于复现和回归诊断，不是跨机器性能承诺。架构设计与遥测语义见[架构与 API 契约](docs/storage_architecture_zh.md)，workload 定义和验证命令见[性能与可靠性报告](docs/performance_and_reliability_report_zh.md)。
+
+### 无锁页迁移与扩表
+
+性能参考见[性能与可靠性报告](docs/performance_and_reliability_report_zh.md)：64 线程
+lookup 达 64.76 Mops/s，64 线程混合 lookup 达 52.63 Mops/s，预分配 destination 的
+16-worker compaction 达 13.59 M keys/s；64 MiB 换页证明产生 31 次 swap-out、13 次 spill。
+扩表使用精确 per-shard 预算，不再统一向上取二次幂：目录采用 2.5× 探测预算并向 16 对齐，
+运行期 `MapBundle` 容量按 `<64K: 2×`、`64K≤capacity<1M: 1.5×`、`≥1M: 1.25×` 增长。
 
 Mutation benchmark 在调用要求唯一的 mutation API 前会先对 power-law 候选去重，并按实际
 处理行数报告吞吐。纯 assign/accumulate/optimizer 测量请使用 `training_path_profile`。
@@ -167,8 +174,8 @@ config = sparse_embedding.EmbeddingConfig(dims=[128], storage=storage)
 ```
 HogwildEmbeddingStore
 ├── parlayhash (KeyMap)          # 分片 Key→uint32_t mapping
-├── EmbeddingArena               # Cache-line aligned contiguous embedding storage
-│   └── PageTable[8192]          # Atomic page pointers, lazy allocated
+├── EmbeddingArena               # Cache-line aligned embedding storage
+│   └── StablePageDirectory      # Stable-address segmented page metadata
 ├── PageStorage                  # 自动探测 RAM 预算与文件映射 spill
 ├── TransientArena[thread_budget]  # Per-shard gradient accumulation (lock-free)
 ├── exec::static_thread_pool     # C++23 stdexec thread pool

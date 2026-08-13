@@ -203,7 +203,7 @@ int main() {
   const uint64_t p95_ns = percentile(all_latencies, 95);
   const uint64_t p99_ns = percentile(all_latencies, 99);
   const uint64_t pressure_pages = stats.spill_count + stats.swap_out_count;
-  if (pressure_pages == 0 && stats.retirement_sink_hit_count == 0)
+  if (pressure_pages == 0)
     throw std::runtime_error(
         "sustained pressure did not reach a pressure path");
   const uint64_t backlog_drain_ns = static_cast<uint64_t>(
@@ -223,8 +223,6 @@ int main() {
             << "memory_bytes=" << stats.memory_bytes << '\n'
             << "spill_bytes=" << stats.spill_bytes << '\n'
             << "retired_bytes=" << stats.retired_bytes << '\n'
-            << "retirement_sink_hit_count=" << stats.retirement_sink_hit_count
-            << '\n'
             << "allocation_p95_ns=" << p95_ns << '\n'
             << "allocation_p99_ns=" << p99_ns << '\n'
             << "full_lookup_verified=1\n"

@@ -389,7 +389,6 @@ public:
     }
     result["retirement_backpressure_count"] =
         stats.retirement_backpressure_count;
-    result["retirement_sink_hit_count"] = stats.retirement_sink_hit_count;
     result["oldest_unreclaimed_age_ns"] = stats.oldest_unreclaimed_age_ns;
     result["epoch_stall_count"] = stats.epoch_stall_count;
     return result;

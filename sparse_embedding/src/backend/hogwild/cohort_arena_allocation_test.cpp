@@ -85,6 +85,22 @@ void prove_concurrent_uniqueness() {
   }
 }
 
+void prove_batch_uniqueness() {
+  se::CohortArenaAllocation allocation(64, 16, 64, 128);
+  std::array<se::CohortArenaAllocation::Allocation, 96> batch{};
+  allocation.acquire_fresh_batch(17, batch);
+  std::unordered_set<uint32_t> unique;
+  unique.reserve(batch.size());
+  for (const auto &entry : batch) {
+    require(entry.index == entry.page_id * 64 + entry.slot,
+            "batch allocation index arithmetic changed");
+    require(entry.page_id % 4 == 1,
+            "batch allocation crossed the shard cohort boundary");
+    require(unique.insert(entry.index).second,
+            "batch allocation produced a duplicate index");
+  }
+}
+
 void prove_recycled_page_remains_contiguous() {
   se::CohortArenaAllocation allocation(16, 4, 64, 128);
   const auto original = allocation.acquire_fresh(0);
@@ -105,5 +121,6 @@ int main() {
   prove_exact_binding();
   prove_contiguous_range_exclusion();
   prove_concurrent_uniqueness();
+  prove_batch_uniqueness();
   prove_recycled_page_remains_contiguous();
 }

@@ -1,6 +1,7 @@
 #include "sparse_embedding/src/storage/page_storage.hpp"
 
 #include <fcntl.h>
+#include <immintrin.h>
 #include <linux/fs.h>
 #include <sys/ioctl.h>
 #include <sys/mman.h>
@@ -202,6 +203,8 @@ public:
   std::string spill_directory() const;
   bool consume_spill_warning() noexcept;
   void drain_page_eviction_backlog(std::chrono::nanoseconds timeout);
+  void begin_read() const noexcept;
+  void end_read() const noexcept;
   bool supports_background_page_eviction() const noexcept;
   PageEvictionRegistration set_page_eviction_proxy(PageEvictionProxy proxy);
   void clear_page_eviction_proxy(PageEvictionRegistration registration);
@@ -238,9 +241,15 @@ private:
 
   ClaimedSwap claim_swap_out_page(PageRecord &record,
                                   uint64_t proxy_generation);
-  void write_claimed_page(const ClaimedSwap &claim);
+  std::shared_ptr<std::vector<std::byte>>
+  snapshot_claimed_page(const ClaimedSwap &claim);
+  void
+  write_claimed_page(const ClaimedSwap &claim,
+                     const std::shared_ptr<std::vector<std::byte>> &snapshot);
   bool commit_claimed_page(const ClaimedSwap &claim);
   void rollback_claimed_page(const ClaimedSwap &claim) noexcept;
+  bool try_begin_swap() noexcept;
+  void end_swap() noexcept;
 
   // Builds one ordered eviction batch from a mutex-protected page snapshot.
   using EvictionPageSnapshot = storage_detail::EvictionPageSnapshot;
@@ -269,6 +278,8 @@ private:
   std::atomic<uint64_t> eviction_evaluated_pages_{0};
   std::atomic<uint64_t> eviction_selection_ns_{0};
   std::atomic<uint64_t> eviction_candidate_invalidated_count_{0};
+  static constexpr uint64_t kSwapExclusiveBit = uint64_t{1} << 63;
+  mutable std::atomic<uint64_t> page_access_state_{0};
   storage_detail::PageRegistry page_registry_;
 
   PageEvictionProxy proxy_;
@@ -565,6 +576,10 @@ StoragePage TieredPageStorage::allocate_memory(size_t bytes,
                                                size_t alignment,
                                                PageBacking backing,
                                                PageEvaluator evaluator) {
+  if (allocated_size > static_cast<size_t>(PTRDIFF_MAX)) {
+    memory_bytes_.fetch_sub(allocated_size, std::memory_order_relaxed);
+    throw std::bad_alloc();
+  }
   const bool register_evaluator =
       evaluator && backing == PageBacking::kAnonymousMapping;
   void *ptr = nullptr;
@@ -738,9 +753,21 @@ TieredPageStorage::claim_swap_out_page(PageRecord &record,
           proxy_generation};
 }
 
-void TieredPageStorage::write_claimed_page(const ClaimedSwap &claim) {
+std::shared_ptr<std::vector<std::byte>>
+TieredPageStorage::snapshot_claimed_page(const ClaimedSwap &claim) {
+  auto snapshot =
+      std::make_shared<std::vector<std::byte>>(claim.allocated_size);
+  std::memcpy(snapshot->data(), claim.addr, claim.allocated_size);
+  return snapshot;
+}
+
+void TieredPageStorage::write_claimed_page(
+    const ClaimedSwap &claim,
+    const std::shared_ptr<std::vector<std::byte>> &snapshot) {
+  if (!snapshot || snapshot->size() != claim.allocated_size)
+    throw std::logic_error("claimed swap snapshot size mismatch");
   const ssize_t written =
-      pwrite(spill_allocator_.file_descriptor(), claim.addr,
+      pwrite(spill_allocator_.file_descriptor(), snapshot->data(),
              claim.allocated_size, static_cast<off_t>(claim.offset));
   if (written < 0 || static_cast<size_t>(written) != claim.allocated_size) {
     throw std::runtime_error("failed to write page during swap: " +
@@ -894,19 +921,35 @@ TieredPageStorage::drain_eviction_backlog_until(
         const ClaimedSwap claim =
             claim_swap_out_page(*record, proxy_generation);
         lock.unlock();
+        while (!try_begin_swap())
+          _mm_pause();
+        std::shared_ptr<std::vector<std::byte>> snapshot;
+        bool exclusive_held = true;
         try {
-          write_claimed_page(claim);
+          snapshot = snapshot_claimed_page(claim);
+          end_swap();
+          exclusive_held = false;
+          write_claimed_page(claim, snapshot);
+          while (!try_begin_swap())
+            _mm_pause();
+          exclusive_held = true;
           lock.lock();
           if (!commit_claimed_page(claim)) {
             rollback_claimed_page(claim);
+            end_swap();
+            exclusive_held = false;
             proxy_changed = true;
             lock.unlock();
             break;
           }
           swapped = true;
           no_progress_attempts = 0;
+          end_swap();
+          exclusive_held = false;
           lock.unlock();
         } catch (...) {
+          if (exclusive_held)
+            end_swap();
           if (!lock.owns_lock())
             lock.lock();
           rollback_claimed_page(claim);
@@ -937,6 +980,36 @@ void TieredPageStorage::run_swap_cycle(void *context) {
   if (context == nullptr)
     throw std::invalid_argument("swap cycle context must not be null");
   static_cast<TieredPageStorage *>(context)->swap_cycle();
+}
+
+void TieredPageStorage::begin_read() const noexcept {
+  uint64_t observed = page_access_state_.load(std::memory_order_acquire);
+  while (true) {
+    if ((observed & kSwapExclusiveBit) != 0) {
+      _mm_pause();
+      observed = page_access_state_.load(std::memory_order_acquire);
+      continue;
+    }
+    if (page_access_state_.compare_exchange_weak(observed, observed + 1,
+                                                 std::memory_order_acquire,
+                                                 std::memory_order_relaxed))
+      return;
+  }
+}
+
+void TieredPageStorage::end_read() const noexcept {
+  page_access_state_.fetch_sub(1, std::memory_order_release);
+}
+
+bool TieredPageStorage::try_begin_swap() noexcept {
+  uint64_t expected = 0;
+  return page_access_state_.compare_exchange_strong(expected, kSwapExclusiveBit,
+                                                    std::memory_order_acquire,
+                                                    std::memory_order_relaxed);
+}
+
+void TieredPageStorage::end_swap() noexcept {
+  page_access_state_.store(0, std::memory_order_release);
 }
 
 void TieredPageStorage::swap_cycle() {
@@ -992,7 +1065,6 @@ StorageStats TieredPageStorage::stats() const noexcept {
           pressure.retired_bytes,
           pressure.state,
           pressure.backpressure_count,
-          pressure.sink_hit_count,
           pressure.oldest_unreclaimed_age_ns,
           pressure.epoch_stall_count,
           retirement_pressure_};
