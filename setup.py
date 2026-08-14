@@ -52,6 +52,8 @@ def _invoke_bazel(with_lance: bool) -> Path:
         so_glob = "_core.so"
 
     cmd = ["bazel", "build", bazel_target]
+    if with_lance:
+        cmd.append("//:copy_liblance_c")
     env = os.environ.copy()
     if "BAZEL_COPTS" in env:
         import shlex
@@ -97,6 +99,20 @@ class BazelAwareBuildPy(build_py):
             shutil.copy2(so_src, so_dst)
             print(f"[setup.py] Copied {so_src.name} -> {so_dst}", file=sys.stderr)
 
+            if with_lance:
+                lance_so = _PKG_DIR / "liblance_c.so"
+                lance_src = _bazel_bin_dir() / "sparse_embedding" / "liblance_c.so"
+                if not lance_src.is_file():
+                    raise FileNotFoundError(
+                        f"Lance target produced no shared library at {lance_src}"
+                    )
+                if lance_so.exists() or lance_so.is_symlink():
+                    lance_so.unlink()
+                shutil.copy2(lance_src, lance_so)
+                print(
+                    f"[setup.py] Copied {lance_src.name} -> {lance_so}", file=sys.stderr
+                )
+
             # Generate the _core.pyi type stubs using nanobind.stubgen
             print("[setup.py] Generating type stubs (_core.pyi)...", file=sys.stderr)
             try:
@@ -125,20 +141,6 @@ class BazelAwareBuildPy(build_py):
                 print(f"[setup.py] stderr: {e.stderr}", file=sys.stderr)
                 raise
             print("[setup.py] Successfully generated _core.pyi", file=sys.stderr)
-
-            if with_lance:
-                lance_so = _PKG_DIR / "liblance_c.so"
-                bazel_lance = (
-                    _PROJECT_DIR / "bazel-bin" / "sparse_embedding" / "liblance_c.so"
-                )
-                if bazel_lance.exists():
-                    if lance_so.exists():
-                        lance_so.unlink()
-                    shutil.copy2(bazel_lance, lance_so)
-                    print(
-                        f"[setup.py] Copied liblance_c.so -> {lance_so}",
-                        file=sys.stderr,
-                    )
 
         super().run()
 
