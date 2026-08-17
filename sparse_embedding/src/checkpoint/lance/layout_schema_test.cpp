@@ -11,8 +11,9 @@ int main() {
       throw std::runtime_error("duplicate Lance entry layout column");
   }
   for (std::string_view required :
-       {"snapshot_id", "worker_id", "shard_id", "shard_sequence", "operation",
-        "page_ordinal", "slot_ordinal"}) {
+       {"dim", "key", "embedding_values", "embedding_dtype",
+        "optimizer_state_values", "optimizer_state_dtype", "step",
+        "row_state"}) {
     if (!entry_names.contains(required))
       throw std::runtime_error("missing Lance entry layout column");
   }
@@ -22,15 +23,40 @@ int main() {
     if (!page_names.insert(column.name).second)
       throw std::runtime_error("duplicate Lance page-image column");
   }
-  if (!page_names.contains("page_payload") || !page_names.contains("checksum"))
-    throw std::runtime_error("Lance page-image schema is incomplete");
+  for (std::string_view required :
+       {"embedding_dim", "page_slot_stride_bytes", "slot_ordinals", "keys",
+        "sequences", "embedding_values", "optimizer_state_values", "checksum",
+        "row_state"}) {
+    if (!page_names.contains(required))
+      throw std::runtime_error("Lance page-image schema is incomplete");
+  }
 
   std::set<std::string_view> manifest_names;
-  for (const auto &column : se::lance_layout::kManifestColumns)
-    manifest_names.insert(column.name);
+  constexpr std::array<std::string_view, 20> manifest_columns = {
+      "protocol_version",
+      "checkpoint_name",
+      "checkpoint_version",
+      "parent_checkpoint_version",
+      "entries_lance_version",
+      "page_images_lance_version",
+      "participant_count",
+      "checkpoint_mode",
+      "schema_digest",
+      "fragment_digest",
+      "save_attempt",
+      "authority_scope",
+      "authority_generation",
+      "commit_authority",
+      "created_at",
+      "dimensions",
+      "embedding_dtype",
+      "optimizer_dtype",
+      "score_policy",
+      "reference_id"};
+  manifest_names.insert(manifest_columns.begin(), manifest_columns.end());
   for (std::string_view required :
-       {"entries_lance_version", "page_images_lance_version",
-        "shard_high_watermarks"}) {
+       {"protocol_version", "entries_lance_version",
+        "page_images_lance_version", "schema_digest", "dimensions"}) {
     if (!manifest_names.contains(required))
       throw std::runtime_error("Lance snapshot manifest schema is incomplete");
   }

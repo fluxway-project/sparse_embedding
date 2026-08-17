@@ -32,10 +32,14 @@
 #include "sparse_embedding/src/bindings/async_bridge.hpp"
 #include "sparse_embedding/src/bindings/dlpack_utils.hpp"
 #include "sparse_embedding/src/bindings/module_wrapper.hpp"
+#include "sparse_embedding/src/bindings/module_wrapper_methods.inl"
 #include "sparse_embedding/src/ops/partitioner.hpp"
 #include "sparse_embedding/src/ops/tensor_ops.hpp"
 #ifdef SE_ENABLE_LANCE_CHECKPOINTER
+#include "sparse_embedding/src/bindings/module_checkpoint_methods.inl"
 #include "sparse_embedding/src/checkpoint/checkpoint_registry.hpp"
+#include "sparse_embedding/src/checkpoint/lance/layout_schema.hpp"
+#include "sparse_embedding/src/checkpoint/lance/native_fragment_writer.hpp"
 #endif
 
 namespace nb = nanobind;
@@ -43,11 +47,19 @@ namespace nb = nanobind;
 using namespace se::py::detail;
 
 // =============================================================================
-// EmbeddingStoreWrapper constructor (out-of-line to avoid cross-TU
-// instantiation of ConstructOpsImpl in every .inl translation unit)
+// EmbeddingStoreWrapper constructor.
 // =============================================================================
 
 namespace se::py::detail {
+
+void construct_store(EmbeddingStoreWrapper &self, const PyInitializer &init_cfg,
+                     const PyOptimizer &opt_cfg, size_t thread_budget,
+                     se::StoreConstructionKind kind) {
+  se::StoreConstructionTarget target{&self.store_, self.dims_, self.storage_};
+  se::StoreConstructionRequest request{init_cfg.builder, opt_cfg.config};
+  se::create_hogwild_store(kind, std::move(target), std::move(request),
+                           thread_budget);
+}
 
 EmbeddingStoreWrapper::EmbeddingStoreWrapper(
     const se::EmbeddingConfig &emb_cfg,
@@ -62,6 +74,7 @@ EmbeddingStoreWrapper::EmbeddingStoreWrapper(
                                                   : emb_cfg.optimizer_dtype,
                                               "opt_dtype")),
       key_type_enum_(parse_key_dtype(emb_cfg.key_dtype)),
+      score_policy_name_(score_policy_name),
       storage_(se::create_page_storage(emb_cfg.storage)) {
   PyInitializer init_cfg = init_cfg_opt.value_or(
       PyInitializer{std::make_shared<pro::proxy<se::InitializerBuilderFacade>>(
@@ -78,10 +91,34 @@ EmbeddingStoreWrapper::EmbeddingStoreWrapper(
                              ? std::max(1u, std::thread::hardware_concurrency())
                              : emb_cfg.thread_budget;
 
-  dispatch_types([&]<typename P, typename O>() {
-    ConstructOpsImpl<P, O>::construct(*this, init_cfg, opt_cfg,
-                                      score_policy_name, thread_budget);
-  });
+  const auto score_policy = se::parse_store_score_policy(score_policy_name);
+  const bool requires_score = std::visit(
+      [](const auto &config) {
+        return config.dynamic_lr_policy.has_value() &&
+               std::visit(
+                   [](const auto &policy) { return policy.requires_score(); },
+                   *config.dynamic_lr_policy);
+      },
+      opt_cfg.config);
+  if (requires_score && score_policy == se::StoreScorePolicy::kNone)
+    throw std::invalid_argument(
+        "dynamic learning-rate policy requires a score policy");
+
+  const auto to_store_dtype = [](ValueDType dtype) {
+    switch (dtype) {
+    case ValueDType::kFloat32:
+      return se::StoreParamDType::kFloat32;
+    case ValueDType::kFloat16:
+      return se::StoreParamDType::kFloat16;
+    case ValueDType::kBFloat16:
+      return se::StoreParamDType::kBFloat16;
+    }
+    throw std::invalid_argument("unsupported value dtype");
+  };
+  construct_store(*this, init_cfg, opt_cfg, thread_budget,
+                  se::StoreConstructionKind{
+                      to_store_dtype(value_dtype_code_),
+                      to_store_dtype(optimizer_dtype_code_), score_policy});
 }
 
 } // namespace se::py::detail
@@ -490,36 +527,173 @@ NB_MODULE(_core, m) {
            nb::arg("pages"))
       .def("value_dtype", &EmbeddingStoreWrapper::value_dtype)
       .def("optimizer_dtype", &EmbeddingStoreWrapper::optimizer_dtype)
+      .def("score_policy", &EmbeddingStoreWrapper::score_policy)
 
-      .def("export_batches_dlpack",
-           &EmbeddingStoreWrapper::export_batches_dlpack, nb::arg("visitor"),
-           nb::arg("batch_size") = 65536,
-           nb::arg("include_optimizer_state") = false)
-      .def("export_batches_arrow", &EmbeddingStoreWrapper::export_batches_arrow,
-           nb::arg("visitor"), nb::arg("batch_size") = 65536,
-           nb::arg("include_optimizer_state") = false)
-      .def("assign_opt_state", &EmbeddingStoreWrapper::assign_opt_state,
-           nb::arg("keys"), nb::arg("opt_states"), nb::arg("dimension"),
-           nb::arg("steps") = nb::none())
+      ;
 
 #ifdef SE_ENABLE_LANCE_CHECKPOINTER
-      .def("save_checkpoint", &EmbeddingStoreWrapper::save_checkpoint,
-           nb::arg("uri"), nb::arg("mode") = "full", nb::arg("min_score") = 0,
-           nb::arg("include_optimizer_state") = false,
-           nb::arg("use_compression") = false)
-      .def("load_checkpoint", &EmbeddingStoreWrapper::load_checkpoint,
-           nb::arg("uri"), nb::arg("version") = 0, nb::arg("clear") = true,
-           nb::arg("load_optimizer_state") = false,
-           nb::arg("filter_fn") = nb::none(), nb::arg("target_shard_id") = 0,
-           nb::arg("batch_size") = 65536)
-      .def("set_checkpoint_factories",
-           [](EmbeddingStoreWrapper &self, const std::string &backend) {
-             auto factories = se::make_checkpoint_factories(backend);
-             self.set_checkpoint_factories(std::move(factories.writer),
-                                           std::move(factories.reader));
-           })
-#endif // SE_ENABLE_LANCE_CHECKPOINTER
-      ;
+  auto checkpoint = m.def_submodule("checkpoint");
+  checkpoint.def(
+      "save_checkpoint",
+      [](EmbeddingStoreWrapper &self, const std::string &uri,
+         const std::string &mode, uint64_t min_score,
+         bool include_optimizer_state, bool use_compression) {
+        self.save_checkpoint(uri, mode, min_score, include_optimizer_state,
+                             use_compression);
+      },
+      nb::arg("store"), nb::arg("uri"), nb::arg("mode") = "full",
+      nb::arg("min_score") = 0, nb::arg("include_optimizer_state") = false,
+      nb::arg("use_compression") = false);
+  checkpoint.def(
+      "load_checkpoint",
+      [](EmbeddingStoreWrapper &self, const std::string &uri, uint64_t version,
+         bool clear, bool load_optimizer_state, nb::object filter_fn,
+         uint32_t target_shard_id, size_t batch_size) {
+        self.load_checkpoint(uri, version, clear, load_optimizer_state,
+                             filter_fn, target_shard_id, batch_size);
+      },
+      nb::arg("store"), nb::arg("uri"), nb::arg("version") = 0,
+      nb::arg("clear") = true, nb::arg("load_optimizer_state") = false,
+      nb::arg("filter_fn") = nb::none(), nb::arg("target_shard_id") = 0,
+      nb::arg("batch_size") = 65536);
+  checkpoint.def(
+      "write_native_fragment",
+      [](EmbeddingStoreWrapper &self, const std::string &uri,
+         uint32_t participant_index, const std::vector<uint32_t> &dimensions,
+         const std::string &embedding_dtype, const std::string &optimizer_dtype,
+         const std::string &score_policy, uint32_t protocol_version,
+         const std::string &schema_digest) {
+        return self.write_native_fragment(
+            uri, participant_index, dimensions, embedding_dtype,
+            optimizer_dtype, score_policy, protocol_version, schema_digest);
+      },
+      nb::arg("store"), nb::arg("uri"), nb::arg("participant_index"),
+      nb::arg("dimensions"), nb::arg("embedding_dtype"),
+      nb::arg("optimizer_dtype"), nb::arg("score_policy"),
+      nb::arg("protocol_version"), nb::arg("schema_digest"));
+  checkpoint.def(
+      "set_checkpoint_factories",
+      [](EmbeddingStoreWrapper &self, const std::string &backend) {
+        auto factories = se::make_checkpoint_factories(backend);
+        self.set_checkpoint_factories(std::move(factories.writer),
+                                      std::move(factories.reader));
+      },
+      nb::arg("store"), nb::arg("backend"));
+  checkpoint.def(
+      "export_batches_dlpack",
+      [](EmbeddingStoreWrapper &self, nb::callable visitor, size_t batch_size,
+         bool include_optimizer_state) {
+        self.export_batches_dlpack(visitor, batch_size,
+                                   include_optimizer_state);
+      },
+      nb::arg("store"), nb::arg("visitor"), nb::arg("batch_size") = 65536,
+      nb::arg("include_optimizer_state") = false);
+  checkpoint.def(
+      "export_batches_arrow",
+      [](EmbeddingStoreWrapper &self, nb::callable visitor, size_t batch_size,
+         bool include_optimizer_state) {
+        self.export_batches_arrow(visitor, batch_size, include_optimizer_state);
+      },
+      nb::arg("store"), nb::arg("visitor"), nb::arg("batch_size") = 65536,
+      nb::arg("include_optimizer_state") = false);
+  checkpoint.def(
+      "assign_opt_state",
+      [](EmbeddingStoreWrapper &self, nb::object keys, nb::object opt_states,
+         size_t dimension, nb::object steps) {
+        self.assign_opt_state(keys, opt_states, dimension, steps);
+      },
+      nb::arg("store"), nb::arg("keys"), nb::arg("opt_states"),
+      nb::arg("dimension"), nb::arg("steps") = nb::none());
+  checkpoint.def(
+      "restore_native_entries",
+      [](EmbeddingStoreWrapper &self, const std::string &uri, uint64_t version,
+         nb::object selected_keys) {
+        self.restore_native_entries(uri, version, selected_keys);
+      },
+      nb::arg("store"), nb::arg("uri"), nb::arg("version"),
+      nb::arg("selected_keys"));
+  checkpoint.def(
+      "restore_native_page_images",
+      [](EmbeddingStoreWrapper &self, const std::string &uri, uint64_t version,
+         uint32_t participant_index) {
+        self.restore_native_page_images(uri, version, participant_index);
+      },
+      nb::arg("store"), nb::arg("uri"), nb::arg("version"),
+      nb::arg("participant_index"));
+  checkpoint.def(
+      "active_entry_keys",
+      [](const std::string &uri, uint64_t version) {
+        std::vector<uint64_t> keys;
+        se::scan_native_active_entry_keys(
+            uri, version, [&](std::span<const uint64_t> batch) {
+              keys.insert(keys.end(), batch.begin(), batch.end());
+              return true;
+            });
+        auto output = se::py::create_output_tensor<uint64_t>(
+            std::array<int64_t, 1>{static_cast<int64_t>(keys.size())});
+        std::copy(keys.begin(), keys.end(),
+                  static_cast<uint64_t *>(output->dl_tensor.data));
+        return se::py::wrap_output_tensor(output);
+      },
+      nb::arg("uri"), nb::arg("version"));
+  checkpoint.def(
+      "merge_native_lance_sources",
+      [](const std::string &target_uri,
+         const std::vector<std::string> &source_uris,
+         const std::vector<std::string> &keys, uint64_t checkpoint_version) {
+        std::vector<std::string_view> key_views;
+        key_views.reserve(keys.size());
+        for (const auto &key : keys)
+          key_views.emplace_back(key);
+        const auto artifact = se::merge_native_lance_sources(
+            target_uri, source_uris, key_views, checkpoint_version);
+        nb::dict result;
+        result["locator"] = artifact.locator;
+        result["target_version"] = artifact.target_version;
+        result["inserted_rows"] = artifact.inserted_rows;
+        result["updated_rows"] = artifact.updated_rows;
+        result["deleted_rows"] = artifact.deleted_rows;
+        return result;
+      },
+      nb::arg("target_uri"), nb::arg("source_uris"), nb::arg("keys"),
+      nb::arg("checkpoint_version") = 0);
+
+  checkpoint.def("lance_entries_schema_capsule", []() {
+    auto *s = new ArrowSchema(se::lance_layout::make_entries_schema());
+    return nb::capsule(s, "arrow_schema", [](void *p) noexcept {
+      auto *schema = static_cast<ArrowSchema *>(p);
+      if (schema) {
+        if (schema->release)
+          schema->release(schema);
+        delete schema;
+      }
+    });
+  });
+
+  checkpoint.def("lance_page_images_schema_capsule", []() {
+    auto *s = new ArrowSchema(se::lance_layout::make_page_images_schema());
+    return nb::capsule(s, "arrow_schema", [](void *p) noexcept {
+      auto *schema = static_cast<ArrowSchema *>(p);
+      if (schema) {
+        if (schema->release)
+          schema->release(schema);
+        delete schema;
+      }
+    });
+  });
+
+  checkpoint.def("lance_manifest_schema_capsule", []() {
+    auto *s = new ArrowSchema(se::lance_layout::make_manifest_schema());
+    return nb::capsule(s, "arrow_schema", [](void *p) noexcept {
+      auto *schema = static_cast<ArrowSchema *>(p);
+      if (schema) {
+        if (schema->release)
+          schema->release(schema);
+        delete schema;
+      }
+    });
+  });
+#endif
 
   m.def(
       "async_unique",

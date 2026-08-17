@@ -34,6 +34,12 @@ from ._core import (
     set_leak_warnings,
     wake_fd,
 )
+from ._version import (
+    __lance_c_commit__,
+    __lance_c_version__,
+    __python_requires__,
+    __version__,
+)
 
 
 class AutoStorage:
@@ -122,6 +128,10 @@ atexit.register(_clear_wake_queue)
 atexit.register(_disable_leak_warnings)
 
 __all__ = [
+    "__version__",
+    "__python_requires__",
+    "__lance_c_version__",
+    "__lance_c_commit__",
     "Adam",
     "AutoStorage",
     "Sgd",

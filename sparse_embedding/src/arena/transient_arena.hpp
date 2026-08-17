@@ -20,14 +20,18 @@
 
 #include <ankerl/unordered_dense.h>
 
+#include <array>
+#include <atomic>
 #include <cstdint>
 #include <cstdlib>
 #include <cstring>
 #include <limits>
+#include <mutex>
 #include <stdexcept>
 #include <type_traits>
 #include <vector>
 
+#include "sparse_embedding/src/memory/seqlock.hpp"
 #include "sparse_embedding/src/simd/simd_ops.hpp"
 #include "sparse_embedding/src/storage/page_storage.hpp"
 
@@ -54,14 +58,81 @@ public:
   TransientArena &operator=(const TransientArena &) = delete;
 
   uint32_t get_or_allocate(uint64_t feature_id) {
+    {
+      se::memory::PackedReadGuard metadata_lock(metadata_state_,
+                                                metadata_readers_);
+      const auto existing = id_map_.find(feature_id);
+      if (existing != id_map_.end())
+        return existing->second;
+    }
+    se::memory::PackedWriteGuard metadata_lock(metadata_state_,
+                                               metadata_readers_);
     return get_or_allocate_impl(feature_id, 0, false);
   }
 
   uint32_t get_or_allocate_hashed(uint64_t feature_id, uint64_t feature_hash) {
+    {
+      se::memory::PackedReadGuard metadata_lock(metadata_state_,
+                                                metadata_readers_);
+      const auto existing = id_map_.find(feature_id);
+      if (existing != id_map_.end())
+        return existing->second;
+    }
+    se::memory::PackedWriteGuard metadata_lock(metadata_state_,
+                                               metadata_readers_);
     return get_or_allocate_impl(feature_id, feature_hash, true);
   }
 
+  void accumulate_hashed(uint64_t feature_id, uint64_t feature_hash,
+                         const ValT *grad) {
+    uint32_t slot_index;
+    bool needs_allocate = false;
+    {
+      se::memory::PackedReadGuard metadata_lock(metadata_state_,
+                                                metadata_readers_);
+      const auto existing = id_map_.find(feature_id);
+      if (existing != id_map_.end()) {
+        slot_index = existing->second;
+      } else {
+        needs_allocate = true;
+      }
+      if (!needs_allocate) {
+        std::lock_guard stripe_lock(stripe_mutexes_[slot_index % kStripeCount]);
+        accumulate_impl(slot_index, grad);
+        return;
+      }
+    }
+    {
+      se::memory::PackedWriteGuard write_lock(metadata_state_,
+                                              metadata_readers_);
+      slot_index = get_or_allocate_impl(feature_id, feature_hash, true);
+      std::lock_guard stripe_lock(stripe_mutexes_[slot_index % kStripeCount]);
+      accumulate_impl(slot_index, grad);
+    }
+  }
+
+  void accumulate_hashed_exclusive(uint64_t feature_id, uint64_t feature_hash,
+                                   const ValT *grad) {
+    uint32_t slot_index;
+    {
+      se::memory::PackedReadGuard metadata_lock(metadata_state_,
+                                                metadata_readers_);
+      const auto existing = id_map_.find(feature_id);
+      if (existing != id_map_.end()) {
+        slot_index = existing->second;
+        accumulate_impl(slot_index, grad);
+        return;
+      }
+    }
+    se::memory::PackedWriteGuard metadata_lock(metadata_state_,
+                                               metadata_readers_);
+    slot_index = get_or_allocate_impl(feature_id, feature_hash, true);
+    accumulate_impl(slot_index, grad);
+  }
+
   template <typename Fn> void for_each_accumulated(Fn &&fn) {
+    se::memory::PackedWriteGuard metadata_lock(metadata_state_,
+                                               metadata_readers_);
     if (feature_ids_.size() != next_slot_ ||
         feature_hashes_.size() != next_slot_)
       throw std::logic_error(
@@ -71,6 +142,8 @@ public:
   }
 
   void clear() {
+    se::memory::PackedWriteGuard metadata_lock(metadata_state_,
+                                               metadata_readers_);
     id_map_.clear();
     feature_ids_.clear();
     feature_hashes_.clear();
@@ -80,14 +153,25 @@ public:
   void reserve(size_t expected_unique_keys) {
     if (expected_unique_keys == 0)
       return;
+    se::memory::PackedWriteGuard metadata_lock(metadata_state_,
+                                               metadata_readers_);
+    if (expected_unique_keys > std::numeric_limits<size_t>::max() - next_slot_)
+      throw std::overflow_error("transient arena reserve size overflows");
+    const size_t required = next_slot_ + expected_unique_keys;
     id_map_.reserve(expected_unique_keys);
     feature_ids_.reserve(expected_unique_keys);
     feature_hashes_.reserve(expected_unique_keys);
+    while (capacity_ < required)
+      allocate_chunk();
   }
 
   size_t dim() const { return dim_; }
 
-  size_t active_slots() const { return next_slot_; }
+  size_t active_slots() const {
+    se::memory::PackedReadGuard metadata_lock(metadata_state_,
+                                              metadata_readers_);
+    return next_slot_;
+  }
 
 private:
   uint32_t get_or_allocate_impl(uint64_t feature_id, uint64_t feature_hash,
@@ -115,8 +199,7 @@ private:
     return it_new->second;
   }
 
-public:
-  void accumulate(uint32_t slot_index, const ValT *grad) {
+  void accumulate_impl(uint32_t slot_index, const ValT *grad) {
     if constexpr (simd::is_simd_supported_v<ValT>) {
       simd::simd_accumulate(
           grad, reinterpret_cast<ValT *>(grad_data(slot_index)), dim_);
@@ -126,6 +209,14 @@ public:
         target[d] += grad[d];
       }
     }
+  }
+
+public:
+  void accumulate(uint32_t slot_index, const ValT *grad) {
+    se::memory::PackedReadGuard metadata_lock(metadata_state_,
+                                              metadata_readers_);
+    std::lock_guard stripe_lock(stripe_mutexes_[slot_index % kStripeCount]);
+    accumulate_impl(slot_index, grad);
   }
 
 private:
@@ -175,11 +266,19 @@ private:
   bool page_eviction_enabled_;
   std::vector<StoragePage> grad_chunks_;
   size_t capacity_{0};
+  static constexpr size_t kStripeCount = 64;
+  mutable std::atomic<uint64_t> metadata_state_{0};
+  mutable std::atomic<uint32_t> metadata_readers_{0};
+  mutable std::array<std::mutex, kStripeCount> stripe_mutexes_;
   ankerl::unordered_dense::map<uint64_t, uint32_t> id_map_;
   std::vector<uint64_t> feature_ids_;
   std::vector<uint64_t> feature_hashes_;
   size_t next_slot_{0};
 };
+
+extern template class TransientArena<float>;
+extern template class TransientArena<float16_t>;
+extern template class TransientArena<bfloat16_t>;
 
 } // namespace se
 

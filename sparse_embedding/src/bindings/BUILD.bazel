@@ -4,11 +4,101 @@ BUILD file for bindings
 
 filegroup(
     name = "srcs",
-    srcs = glob([
-        "*.hpp",
-        "*.cpp",
-        "typed/*.cpp",
-        "typed/*.inl",
-    ]),
+    srcs = glob(
+        [
+            "*.hpp",
+            "*.cpp",
+            "*.inl",
+            "typed/*.cpp",
+            "typed/*.inl",
+        ],
+        exclude = [
+            "typed/*_construct.cpp",
+            "typed/*_checkpoint.cpp",
+            "typed/construct_dispatch_*.cpp",
+            "typed/construct_store_*.cpp",
+            "typed/module_checkpoint.cpp",
+            "typed/optimizer_factory_*.cpp",
+        ],
+    ),
     visibility = ["//visibility:public"],
+)
+
+filegroup(
+    name = "srcs_without_module",
+    srcs = glob(
+        [
+            "*.hpp",
+            "*.cpp",
+            "*.inl",
+            "typed/*.cpp",
+            "typed/*.inl",
+        ],
+        exclude = [
+            "module.cpp",
+            "typed/*_construct.cpp",
+            "typed/*_checkpoint.cpp",
+            "typed/construct_dispatch_*.cpp",
+            "typed/construct_store_*.cpp",
+            "typed/module_checkpoint.cpp",
+            "typed/optimizer_factory_*.cpp",
+        ],
+    ),
+    visibility = ["//visibility:public"],
+)
+
+cc_library(
+    name = "module_with_lance",
+    srcs = ["module.cpp"],
+    hdrs = glob([
+        "*.hpp",
+        "*.inl",
+        "typed/*.inl",
+    ]) + ["//sparse_embedding/src/ops:headers"],
+    copts = ["-DSE_ENABLE_LANCE_CHECKPOINTER"],
+    tags = ["manual"],
+    visibility = ["//visibility:public"],
+    deps = [
+        "//sparse_embedding/src/backend/hogwild:hogwild_embedding_store",
+        "//sparse_embedding/src/checkpoint",
+        "//sparse_embedding/src/checkpoint:checkpoint_lance",
+        "//sparse_embedding/src/common",
+        "//sparse_embedding/src/eviction",
+        "//sparse_embedding/src/initializer",
+        "//sparse_embedding/src/interface",
+        "//sparse_embedding/src/optimizer",
+        "@dlpack",
+        "@nanobind",
+        "@proxy",
+    ],
+)
+
+cc_library(
+    name = "checkpoint_instantiations_with_lance",
+    srcs = glob(["typed/module_*_checkpoint.cpp"]),
+    hdrs = glob([
+        "*.hpp",
+        "*.inl",
+        "typed/*.inl",
+    ]) + ["//sparse_embedding/src/ops:headers"],
+    copts = [
+        "-DSE_ENABLE_LANCE_CHECKPOINTER",
+        "-O0",
+    ],
+    tags = ["manual"],
+    visibility = ["//visibility:public"],
+    deps = [
+        "//sparse_embedding/src/backend/hogwild:hogwild_embedding_store",
+        "//sparse_embedding/src/checkpoint",
+        "//sparse_embedding/src/checkpoint:checkpoint_lance",
+        "//sparse_embedding/src/common",
+        "//sparse_embedding/src/eviction",
+        "//sparse_embedding/src/initializer",
+        "//sparse_embedding/src/interface",
+        "//sparse_embedding/src/optimizer",
+        "@dlpack",
+        "@nanobind",
+        "@proxy",
+    ],
+    alwayslink = True,
 )

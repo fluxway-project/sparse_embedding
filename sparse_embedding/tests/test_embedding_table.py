@@ -17,14 +17,10 @@ def test_embedding_table_basic():
     assert store.num_slots() == 1
 
     keys = np.array([1, 2, 3], dtype=np.int64)
-    vals, lens, mask = store.lookup_or_insert(keys, dim=128)
+    vals, lens = store.lookup_or_insert(keys, dim=128)
 
     assert vals is not None
     assert lens is not None
-    assert mask is not None
-
-    mask_np = np.from_dlpack(mask)
-    assert mask_np.shape[0] == 3
 
     vals_lookup, lens_lookup = store.lookup(keys, dim=128)
     assert vals_lookup is not None
@@ -121,20 +117,14 @@ def test_embedding_table_32bit_keys():
     keys_uint32 = np.array([4, 5, 6], dtype=np.uint32)
 
     # Test int32
-    vals, lens, mask = store.lookup_or_insert(keys_int32, dim=128)
+    vals, lens = store.lookup_or_insert(keys_int32, dim=128)
     assert vals is not None
     assert lens is not None
-    assert mask is not None
-    mask_np = np.from_dlpack(mask)
-    assert mask_np.shape[0] == 3
 
     # Test uint32
-    vals, lens, mask = store.lookup_or_insert(keys_uint32, dim=128)
+    vals, lens = store.lookup_or_insert(keys_uint32, dim=128)
     assert vals is not None
     assert lens is not None
-    assert mask is not None
-    mask_np = np.from_dlpack(mask)
-    assert mask_np.shape[0] == 3
 
 
 def test_embedding_table_reserve_api():
@@ -152,9 +142,8 @@ def test_embedding_table_reserve_api():
     store.reserve_per_shard([32] * shard_count, dim=8)
 
     keys = np.arange(64, dtype=np.int64)
-    vals, _, mask = store.lookup_or_insert(keys, dim=8)
+    vals, _ = store.lookup_or_insert(keys, dim=8)
     assert np.from_dlpack(vals).shape[0] == 64 * 8
-    assert int(np.from_dlpack(mask).sum()) == 64
     assert store.total_size() == 64
 
     vals_lookup, _ = store.lookup(keys, dim=8)
@@ -235,9 +224,7 @@ async def test_embedding_table_async():
     vals_np = np.from_dlpack(vals)
     assert vals_np.shape[0] == 3 * 128
 
-    vals2, lens2, mask2 = await store.async_lookup_or_insert(keys, dim=128)
-    mask_np = np.from_dlpack(mask2)
-    assert mask_np.shape[0] == 3
+    vals2, lens2 = await store.async_lookup_or_insert(keys, dim=128)
 
     # test async_accumulate_gradients
     grads = np.random.rand(3, 128).astype(np.float32)

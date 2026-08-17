@@ -779,10 +779,9 @@ private:
 // 64-byte aligned contiguous memory for SIMD-friendly dense vectors.
 // =============================================================================
 
-template <typename KeyT, typename ParamT, typename OptT,
-          typename ScorePolicyT = NoScorePolicy>
-class HogwildEmbeddingStore {
+template <typename ParamT, typename OptT> class HogwildEmbeddingStoreCore {
 public:
+  using KeyT = uint64_t;
   using ValueType = ParamT;
   using Initializer = pro::proxy<InitializerFacade<ParamT>>;
   using OptimizerFactory =
@@ -1014,7 +1013,7 @@ public:
           : directory(other.directory), locators(other.locators) {}
 
       std::optional<uint32_t> find(uint64_t key) const noexcept {
-        return find_hashed(key, SplitMixHash<KeyT>{}(static_cast<KeyT>(key)));
+        return find_hashed(key, SplitMixHash<uint64_t>{}(key));
       }
 
       std::optional<uint32_t> find_hashed(uint64_t key,
@@ -1025,16 +1024,15 @@ public:
       }
 
       void insert(uint64_t key, uint32_t slot_id) {
-        directory.insert_hashed(
-            key, SplitMixHash<KeyT>{}(static_cast<KeyT>(key)), slot_id,
-            [&](uint32_t existing_slot_id) noexcept {
-              return locators->key(existing_slot_id);
-            });
+        directory.insert_hashed(key, SplitMixHash<uint64_t>{}(key), slot_id,
+                                [&](uint32_t existing_slot_id) noexcept {
+                                  return locators->key(existing_slot_id);
+                                });
       }
 
       std::optional<uint32_t> remove(uint64_t key) {
         return directory.remove_hashed(
-            key, SplitMixHash<KeyT>{}(static_cast<KeyT>(key)),
+            key, SplitMixHash<uint64_t>{}(key),
             [&](uint32_t slot_id) noexcept { return locators->key(slot_id); });
       }
 
@@ -1525,6 +1523,7 @@ public:
     };
 
     size_t dim;
+    ScorePolicyRuntime &score_policy;
     std::atomic<uint64_t> lookup_generation{1};
     std::shared_ptr<PageReuseState> page_reuse =
         std::make_shared<PageReuseState>();
@@ -1555,19 +1554,21 @@ public:
 
     size_t index_retirement_bytes() const {
       size_t bytes = arena.data_stride();
-      if constexpr (ScorePolicyT::kHasScore)
+      if (score_policy.enabled())
         bytes += sizeof(uint64_t);
       if (optimizer.has_value())
         bytes += optimizer->allocation_bytes_per_entry();
       return bytes;
     }
 
-    SlotStore(size_t d, OptimizerFactory opt_factory_in, size_t partition_count,
+    SlotStore(size_t d, ScorePolicyRuntime &score_policy_in,
+              OptimizerFactory opt_factory_in, size_t partition_count,
               size_t transient_shard_count, bool enable_score,
               PageStorage storage,
               std::shared_ptr<RetirementPressure> retirement_pressure,
               bool numa_aware_pages)
-        : dim(d), retirement_pressure(std::move(retirement_pressure)),
+        : dim(d), score_policy(score_policy_in),
+          retirement_pressure(std::move(retirement_pressure)),
           shard_mask(partition_count - 1),
           access_telemetry(EmbeddingArena<ParamT>::kMaxPages, 4096,
                            transient_shard_count),
@@ -1605,7 +1606,7 @@ public:
     }
 
     size_t shard_id_for_key(uint64_t key) const {
-      return SplitMixHash<KeyT>{}(static_cast<KeyT>(key)) & shard_mask;
+      return SplitMixHash<uint64_t>{}(key)&shard_mask;
     }
 
     size_t shard_id_for_hash(size_t hash) const { return hash & shard_mask; }
@@ -1742,7 +1743,7 @@ public:
           image.keys.reserve(EmbeddingArena<ParamT>::kEntriesPerPage);
           image.seq_counts.reserve(EmbeddingArena<ParamT>::kEntriesPerPage);
           image.values.reserve(EmbeddingArena<ParamT>::kEntriesPerPage * dim);
-          if constexpr (ScorePolicyT::kHasScore)
+          if (score_policy.enabled())
             image.scores.reserve(EmbeddingArena<ParamT>::kEntriesPerPage);
           if (optimizer_state_dim != 0) {
             image.optimizer_states.reserve(
@@ -1776,7 +1777,7 @@ public:
             captured.values.resize(dim);
             const ParamT *source = arena.data(index);
             simd::simd_copy(source, captured.values.data(), dim);
-            if constexpr (ScorePolicyT::kHasScore) {
+            if (score_policy.enabled()) {
               captured.score = std::atomic_ref<uint64_t>(arena.score_raw(index))
                                    .load(std::memory_order_relaxed);
             }
@@ -1798,7 +1799,7 @@ public:
           image.seq_counts.push_back(captured.seq_count);
           image.values.insert(image.values.end(), captured.values.begin(),
                               captured.values.end());
-          if constexpr (ScorePolicyT::kHasScore)
+          if (score_policy.enabled())
             image.scores.push_back(captured.score);
           if (optimizer_state_dim != 0) {
             image.optimizer_states.insert(image.optimizer_states.end(),
@@ -1858,13 +1859,13 @@ public:
       size_t entry_count = 0;
       for (const auto &import : images) {
         const auto &image = import.image;
-        if (import.dim != dim || image.vector_dim != dim ||
-            image.vector_stride != arena.data_stride())
+        if (import.embedding_dim != dim || image.embedding_dim != dim ||
+            image.page_slot_stride_bytes != arena.data_stride())
           throw std::invalid_argument("page-image layout does not match slot");
         const size_t optimizer_state_dim =
             optimizer.has_value() ? optimizer->state_dim() : 0;
         const size_t count = hogwild::io::validate_page_image(
-            import, dim, arena.data_stride(), ScorePolicyT::kHasScore,
+            import, dim, arena.data_stride(), score_policy.enabled(),
             optimizer_state_dim, EmbeddingArena<ParamT>::kEntriesPerPage);
         page_ids.push_back(image.physical_page_id);
         maximum_page_id = std::max(maximum_page_id, image.physical_page_id);
@@ -1934,7 +1935,7 @@ public:
               image.seq_counts[offset]);
           simd::simd_copy(image.values.data() + offset * dim, arena.data(index),
                           dim);
-          if constexpr (ScorePolicyT::kHasScore) {
+          if (score_policy.enabled()) {
             const uint64_t score =
                 image.scores.empty() ? 0 : image.scores[offset];
             std::atomic_ref<uint64_t>(arena.score_raw(index))
@@ -2032,7 +2033,7 @@ public:
 
     template <typename Visit>
     bool with_shared_entry(uint64_t key, Visit &&visit) {
-      const size_t hash = SplitMixHash<KeyT>{}(static_cast<KeyT>(key));
+      const size_t hash = SplitMixHash<uint64_t>{}(key);
       return with_shared_entry_hashed(key, hash, std::forward<Visit>(visit));
     }
 
@@ -2105,7 +2106,7 @@ public:
 
     template <typename Visit>
     bool with_shared_write_entry(uint64_t key, Visit &&visit) {
-      const size_t hash = SplitMixHash<KeyT>{}(static_cast<KeyT>(key));
+      const size_t hash = SplitMixHash<uint64_t>{}(key);
       return with_shared_write_entry_hashed(key, hash,
                                             std::forward<Visit>(visit));
     }
@@ -2655,7 +2656,7 @@ public:
                                   static_cast<uint32_t>(shard_id_for_key(key)));
               simd::simd_copy(arena.data(locked_index), arena.data(destination),
                               dim);
-              if constexpr (ScorePolicyT::kHasScore) {
+              if (score_policy.enabled()) {
                 const uint64_t score =
                     std::atomic_ref<uint64_t>(arena.score_raw(locked_index))
                         .load(std::memory_order_relaxed);
@@ -2711,7 +2712,7 @@ public:
           1, std::memory_order_relaxed);
 #endif
       simd::simd_copy(arena.data(source_index), arena.data(destination), dim);
-      if constexpr (ScorePolicyT::kHasScore) {
+      if (score_policy.enabled()) {
         const uint64_t score =
             std::atomic_ref<uint64_t>(arena.score_raw(source_index))
                 .load(std::memory_order_relaxed);
@@ -2825,7 +2826,7 @@ public:
     // relocation transaction used by full compaction.
     size_t promote_hot_keys(uint64_t page_id, size_t maximum_keys,
                             uint64_t minimum_score) {
-      if constexpr (!ScorePolicyT::kHasScore) {
+      if (!score_policy.enabled()) {
         throw std::runtime_error(
             "hot-key promotion requires a score-enabled policy");
       } else {
@@ -3381,11 +3382,11 @@ public:
     return storage;
   }
 
-  explicit HogwildEmbeddingStore(const std::vector<size_t> &table_dims,
-                                 Initializer initializer,
-                                 OptimizerFactory opt_factory,
-                                 ScorePolicyT score_policy,
-                                 HogwildStoreOptions options = {})
+  explicit HogwildEmbeddingStoreCore(const std::vector<size_t> &table_dims,
+                                     Initializer initializer,
+                                     OptimizerFactory opt_factory,
+                                     ScorePolicyKind score_policy_kind,
+                                     HogwildStoreOptions options = {})
       : partition_topology_(HogwildPartitionTopology::derive(
             options.thread_budget, options.locality)),
         num_threads_(partition_topology_.execution_workers()),
@@ -3393,12 +3394,11 @@ public:
             num_threads_, options.dispatch_config())),
         pool_(static_cast<uint32_t>(
             operation_dispatch_topology_.physical_threads)),
-        initializer_(std::move(initializer)),
-        score_policy_(std::move(score_policy)),
+        initializer_(std::move(initializer)), score_policy_(score_policy_kind),
         storage_(require_storage(std::move(options.storage))),
         retirement_pressure_(storage_->stats().retirement_pressure_domain),
         background_page_eviction_enabled_(
-            ScorePolicyT::kHasScore &&
+            score_policy_.enabled() &&
             storage_->supports_background_page_eviction()),
         bind_worker_affinity_(partition_topology_.numa_execution()),
         numa_memory_locality_(partition_topology_.numa_memory()),
@@ -3407,7 +3407,7 @@ public:
                             ? std::optional<int>(
                                   ThreadAffinity::cpu_for_worker(num_threads_))
                             : std::nullopt) {
-    bool enable_score = ScorePolicyT::kHasScore;
+    bool enable_score = score_policy_.enabled();
 
     if (table_dims.empty()) {
       throw std::invalid_argument("table_dims must not be empty");
@@ -3439,9 +3439,9 @@ public:
       }
       if (dim_to_slot_[dim] == nullptr) {
         slot_storage_.push_back(std::make_unique<SlotStore>(
-            dim, opt_factory, partition_topology_.partition_count(),
-            num_threads_, enable_score, storage_, retirement_pressure_,
-            partition_topology_.numa_memory()));
+            dim, score_policy_, opt_factory,
+            partition_topology_.partition_count(), num_threads_, enable_score,
+            storage_, retirement_pressure_, partition_topology_.numa_memory()));
         dim_to_slot_[dim] = slot_storage_.back().get();
       }
     }
@@ -3457,7 +3457,40 @@ public:
     }
   }
 
-  ~HogwildEmbeddingStore() {
+  HogwildEmbeddingStoreCore(const std::vector<size_t> &table_dims,
+                            Initializer initializer,
+                            OptimizerFactory opt_factory, NoScorePolicy,
+                            HogwildStoreOptions options = {})
+      : HogwildEmbeddingStoreCore(table_dims, std::move(initializer),
+                                  std::move(opt_factory),
+                                  ScorePolicyKind::kNone, std::move(options)) {}
+
+  HogwildEmbeddingStoreCore(const std::vector<size_t> &table_dims,
+                            Initializer initializer,
+                            OptimizerFactory opt_factory, LfuScorePolicy,
+                            HogwildStoreOptions options = {})
+      : HogwildEmbeddingStoreCore(table_dims, std::move(initializer),
+                                  std::move(opt_factory), ScorePolicyKind::kLfu,
+                                  std::move(options)) {}
+
+  HogwildEmbeddingStoreCore(const std::vector<size_t> &table_dims,
+                            Initializer initializer,
+                            OptimizerFactory opt_factory,
+                            const LruScorePolicy &,
+                            HogwildStoreOptions options = {})
+      : HogwildEmbeddingStoreCore(table_dims, std::move(initializer),
+                                  std::move(opt_factory), ScorePolicyKind::kLru,
+                                  std::move(options)) {}
+
+  HogwildEmbeddingStoreCore(const std::vector<size_t> &table_dims,
+                            Initializer initializer,
+                            OptimizerFactory opt_factory, ManualScorePolicy,
+                            HogwildStoreOptions options = {})
+      : HogwildEmbeddingStoreCore(
+            table_dims, std::move(initializer), std::move(opt_factory),
+            ScorePolicyKind::kManual, std::move(options)) {}
+
+  ~HogwildEmbeddingStoreCore() {
     telemetry_ring_.stop();
     invocation_gate_.close_and_wait();
     if (page_eviction_registration_.value != 0)
@@ -3573,7 +3606,7 @@ public:
             } else {
               std::copy_n(src, dim, out);
             }
-            if constexpr (ScorePolicyT::kHasScore) {
+            if (score_policy_.enabled()) {
               score_policy_.on_access(&slot.arena.score_raw(index));
             }
             if (collects_telemetry && sampled_count < sampled_keys.size()) {
@@ -3584,18 +3617,18 @@ public:
             }
           };
           const bool found = [&] {
-            if (!routed_hashes.empty() && !ScorePolicyT::kHasScore) {
+            if (!routed_hashes.empty() && !score_policy_.enabled()) {
               return slot.with_read_view_entry_hashed(key, routed_hashes[i],
                                                       visit);
             }
             if (!routed_hashes.empty()) {
-              if constexpr (ScorePolicyT::kHasScore)
+              if (score_policy_.enabled())
                 return slot.with_shared_write_entry_hashed(
                     key, routed_hashes[i], visit);
               return slot.with_shared_entry_hashed(key, routed_hashes[i],
                                                    visit);
             }
-            if constexpr (ScorePolicyT::kHasScore)
+            if (score_policy_.enabled())
               return slot.with_shared_write_entry(key, visit);
             return slot.with_shared_entry(key, visit);
           }();
@@ -3831,10 +3864,8 @@ public:
           }
           auto &slot = *snapshot->dim_to_slot[dim];
           const ParamT *grad_src = flat_grads.data() + offsets[i];
-          uint32_t t_idx =
-              slot.transient_shards[shard_id]->get_or_allocate_hashed(
-                  key, gradient_hashes[i]);
-          slot.transient_shards[shard_id]->accumulate(t_idx, grad_src);
+          slot.transient_shards[shard_id]->accumulate_hashed_exclusive(
+              key, gradient_hashes[i], grad_src);
         }
       }
     };
@@ -3887,7 +3918,7 @@ public:
                     ParamT *param = slot->arena.data(arena_idx);
                     if (!slot->optimizer.has_value())
                       return;
-                    if constexpr (ScorePolicyT::kHasScore) {
+                    if (score_policy_.enabled()) {
                       const uint64_t score =
                           std::atomic_ref<uint64_t>(
                               slot->arena.score_raw(arena_idx))
@@ -3953,7 +3984,7 @@ public:
         std::vector<MissingBatch> missing_batches;
         for (size_t i = begin; i < end; ++i) {
           uint64_t key = static_cast<uint64_t>(keys[i]);
-          const size_t hash = SplitMixHash<KeyT>{}(static_cast<KeyT>(key));
+          const size_t hash = SplitMixHash<uint64_t>{}(key);
           size_t dim = static_cast<size_t>(row_lengths[i]);
           if (dim >= snapshot->dim_to_slot.size() ||
               snapshot->dim_to_slot[dim] == nullptr) [[unlikely]] {
@@ -4032,8 +4063,7 @@ public:
         batch = std::prev(batches.end());
       }
       const uint64_t key = static_cast<uint64_t>(keys[i]);
-      batch->entries.push_back(
-          {key, SplitMixHash<KeyT>{}(static_cast<KeyT>(key)), i});
+      batch->entries.push_back({key, SplitMixHash<uint64_t>{}(key), i});
     }
     for (DimensionBatch &batch : batches) {
       SlotStore &slot = *batch.slot;
@@ -4151,12 +4181,12 @@ public:
                             ? (*slot->opt_factory)(slot->dim)
                             : nullptr;
       if (slot->optimizer.has_value() && slot->optimizer->requires_score() &&
-          !ScorePolicyT::kHasScore) {
+          !score_policy_.enabled()) {
         throw std::invalid_argument(
             "dynamic learning-rate policy requires score storage");
       }
       if (slot->optimizer.has_value())
-        slot->optimizer->set_page_eviction_enabled(ScorePolicyT::kHasScore);
+        slot->optimizer->set_page_eviction_enabled(score_policy_.enabled());
     }
     publish_store_snapshot();
     return {};
@@ -4215,7 +4245,7 @@ public:
     StoreSnapshot *snapshot = snapshot_.load(std::memory_order_acquire);
     if (snapshot == nullptr)
       throw std::runtime_error("store snapshot is unavailable");
-    if constexpr (!ScorePolicyT::kHasScore) {
+    if (!score_policy_.enabled()) {
       throw std::runtime_error("assign_scores requires a score-enabled policy");
     }
     size_t n = keys.size();
@@ -4503,7 +4533,7 @@ private:
           slot->optimizer.has_value() ? slot->optimizer->state_dim() : 0;
       int num_workers = static_cast<int>(parlay::num_workers());
 
-      constexpr bool has_score = ScorePolicyT::kHasScore;
+      const bool has_score = score_policy_.enabled();
 
       struct Buffer {
         std::vector<K> keys;
@@ -4517,7 +4547,7 @@ private:
       for (int i = 0; i < num_workers; ++i) {
         local_bufs[i].keys.reserve(256);
         local_bufs[i].vals.reserve(256 * emb_dim);
-        if constexpr (has_score)
+        if (has_score)
           local_bufs[i].scores.reserve(256);
         if (opt_dim > 0) {
           local_bufs[i].opts.reserve(256 * opt_dim);
@@ -4528,7 +4558,7 @@ private:
       Buffer global_buf;
       global_buf.keys.reserve(batch_size);
       global_buf.vals.reserve(batch_size * emb_dim);
-      if constexpr (has_score)
+      if (has_score)
         global_buf.scores.reserve(batch_size);
       if (opt_dim > 0) {
         global_buf.opts.reserve(batch_size * opt_dim);
@@ -4559,7 +4589,7 @@ private:
           buf.steps.clear();
           buf.keys.reserve(batch_size);
           buf.vals.reserve(batch_size * emb_dim);
-          if constexpr (has_score)
+          if (has_score)
             buf.scores.reserve(batch_size);
           if (opt_dim > 0) {
             buf.opts.reserve(batch_size * opt_dim);
@@ -4579,7 +4609,7 @@ private:
         lb.keys.push_back(static_cast<K>(key));
         const ParamT *src = slot->arena.data(idx);
         lb.vals.insert(lb.vals.end(), src, src + emb_dim);
-        if constexpr (has_score) {
+        if (has_score) {
           lb.scores.push_back(
               std::atomic_ref<uint64_t>(slot->arena.score_raw(idx))
                   .load(std::memory_order_relaxed));
@@ -4607,7 +4637,7 @@ private:
                                    lb.keys.end());
             global_buf.vals.insert(global_buf.vals.end(), lb.vals.begin(),
                                    lb.vals.end());
-            if constexpr (has_score) {
+            if (has_score) {
               global_buf.scores.insert(global_buf.scores.end(),
                                        lb.scores.begin(), lb.scores.end());
             }
@@ -4627,7 +4657,7 @@ private:
               local_flush_buf = std::move(global_buf);
               global_buf.keys.reserve(batch_size);
               global_buf.vals.reserve(batch_size * emb_dim);
-              if constexpr (has_score)
+              if (has_score)
                 global_buf.scores.reserve(batch_size);
               if (opt_dim > 0) {
                 global_buf.opts.reserve(batch_size * opt_dim);
@@ -4656,7 +4686,7 @@ private:
                                  lb.keys.end());
           global_buf.vals.insert(global_buf.vals.end(), lb.vals.begin(),
                                  lb.vals.end());
-          if constexpr (has_score) {
+          if (has_score) {
             global_buf.scores.insert(global_buf.scores.end(), lb.scores.begin(),
                                      lb.scores.end());
           }
@@ -4685,7 +4715,7 @@ private:
   DispatchTopology operation_dispatch_topology_;
   exec::static_thread_pool pool_;
   Initializer initializer_;
-  [[no_unique_address]] ScorePolicyT score_policy_;
+  ScorePolicyRuntime score_policy_;
   PageStorage storage_;
   std::shared_ptr<RetirementPressure> retirement_pressure_;
   bool background_page_eviction_enabled_;
@@ -4701,7 +4731,7 @@ private:
   static constexpr size_t kParallelThreshold = 64;
 
 public:
-  bool has_score_policy() const { return ScorePolicyT::kHasScore; }
+  bool has_score_policy() const { return score_policy_.enabled(); }
 
   std::vector<size_t> table_dims() const {
     ActiveInvocationGuard invocation(invocation_gate_, &storage_);
@@ -4736,7 +4766,7 @@ public:
     StoreSnapshot *snapshot = snapshot_.load(std::memory_order_acquire);
     if (snapshot == nullptr)
       throw std::runtime_error("store snapshot is unavailable");
-    bool has_score = ScorePolicyT::kHasScore;
+    bool has_score = score_policy_.enabled();
 
     for (SlotStore *slot : snapshot->slots) {
       size_t dim = slot->dim;
@@ -4891,9 +4921,37 @@ public:
         std::forward<VisitorFn>(visitor), batch_size);
   }
 
-  void assign_opt_states(size_t dim, std::span<const KeyT> keys,
+  template <typename K>
+  void assign_opt_states(size_t dim, std::span<const K> keys,
                          std::span<const OptT> opt_states,
                          std::span<const uint32_t> steps) {
+    assign_opt_states_span(dim, keys, opt_states, steps);
+  }
+
+  template <std::ranges::contiguous_range Keys,
+            std::ranges::contiguous_range States,
+            std::ranges::contiguous_range Steps>
+  void assign_opt_states(size_t dim, const Keys &keys, const States &states,
+                         const Steps &steps) {
+    using KeyT = std::ranges::range_value_t<Keys>;
+    using StateT = std::ranges::range_value_t<States>;
+    using StepT = std::ranges::range_value_t<Steps>;
+    static_assert(std::is_same_v<StateT, OptT>);
+    static_assert(std::is_same_v<StepT, uint32_t>);
+    assign_opt_states_span(
+        dim,
+        std::span<const KeyT>(std::ranges::data(keys), std::ranges::size(keys)),
+        std::span<const OptT>(std::ranges::data(states),
+                              std::ranges::size(states)),
+        std::span<const uint32_t>(std::ranges::data(steps),
+                                  std::ranges::size(steps)));
+  }
+
+private:
+  template <typename K>
+  void assign_opt_states_span(size_t dim, std::span<const K> keys,
+                              std::span<const OptT> opt_states,
+                              std::span<const uint32_t> steps) {
     ActiveInvocationGuard invocation(invocation_gate_, &storage_);
     StoreSnapshot *snapshot = snapshot_.load(std::memory_order_acquire);
     if (snapshot == nullptr)
@@ -4936,19 +4994,20 @@ public:
     });
   }
 
+public:
   // export_opt_state_batch — type-erased facade-compatible wrapper.
   // Visitor receives (dim, keys, vals, scores, opt_states, steps) with native
   // ParamT/OptT precision.
+  template <typename K>
   void export_opt_state_batch(
-      se::Function<bool(size_t, std::span<const KeyT>, std::span<const ParamT>,
+      se::Function<bool(size_t, std::span<const K>, std::span<const ParamT>,
                         std::span<const uint64_t>, std::span<const OptT>,
                         std::span<const uint32_t>)>
           visitor,
       size_t batch_size) {
-    export_batch_with_opt<KeyT>(
-        [&](size_t dim, std::span<const KeyT> keys,
-            std::span<const ParamT> vals, std::span<const uint64_t> scores,
-            std::span<const OptT> opt_states,
+    export_batch_with_opt<K>(
+        [&](size_t dim, std::span<const K> keys, std::span<const ParamT> vals,
+            std::span<const uint64_t> scores, std::span<const OptT> opt_states,
             std::span<const uint32_t> steps) -> bool {
           return (*visitor)(dim, keys, vals, scores, opt_states, steps);
         },
@@ -4958,14 +5017,15 @@ public:
   // export_opt_state_batch_owned — ownership-transferring facade wrapper.
   // Visitor receives std::vector&& of native ParamT/OptT precision for
   // zero-copy Arrow C Data Interface construction.
+  template <typename K>
   void export_opt_state_batch_owned(
-      se::Function<bool(size_t, std::vector<KeyT> &&, std::vector<ParamT> &&,
+      se::Function<bool(size_t, std::vector<K> &&, std::vector<ParamT> &&,
                         std::vector<uint64_t> &&, std::vector<OptT> &&,
                         std::vector<uint32_t> &&)>
           visitor,
       size_t batch_size) {
-    export_batch_with_opt_owned<KeyT>(
-        [&](size_t dim, std::vector<KeyT> &&keys, std::vector<ParamT> &&vals,
+    export_batch_with_opt_owned<K>(
+        [&](size_t dim, std::vector<K> &&keys, std::vector<ParamT> &&vals,
             std::vector<uint64_t> &&scores, std::vector<OptT> &&opt_states,
             std::vector<uint32_t> &&steps) -> bool {
           return (*visitor)(dim, std::move(keys), std::move(vals),
@@ -4975,7 +5035,7 @@ public:
         batch_size);
   }
 
-  bool compact_one(size_t dim, KeyT key) {
+  template <typename K> bool compact_one(size_t dim, K key) {
     ActiveInvocationGuard invocation(invocation_gate_, &storage_);
     StoreSnapshot *snapshot = snapshot_.load(std::memory_order_acquire);
     if (snapshot == nullptr)
@@ -5079,11 +5139,11 @@ public:
       std::vector<std::vector<PageImageImport<ParamT, OptT>>> by_dimension(
           dim_to_slot_.size());
       for (const auto &import : images) {
-        if (import.dim >= dim_to_slot_.size() ||
-            dim_to_slot_[import.dim] == nullptr)
+        if (import.embedding_dim >= dim_to_slot_.size() ||
+            dim_to_slot_[import.embedding_dim] == nullptr)
           throw std::invalid_argument(
               "page-image import dimension has no physical table");
-        by_dimension[import.dim].push_back(import);
+        by_dimension[import.embedding_dim].push_back(import);
       }
       for (size_t dim = 0; dim < by_dimension.size(); ++dim) {
         if (!by_dimension[dim].empty())
@@ -5121,7 +5181,7 @@ public:
                                  std::span<K> out_evicted_keys,
                                  std::span<ParamT> out_evicted_values,
                                  size_t &out_evicted_count) {
-    if constexpr (!ScorePolicyT::kHasScore)
+    if (!score_policy_.enabled())
       throw std::runtime_error(
           "evict_by_score requires a score-enabled policy");
     if (out_evicted_keys.size() < max_evict_count) {
@@ -5263,43 +5323,21 @@ public:
   }
 };
 
-// =============================================================================
-// Extern template declarations — suppress implicit instantiation in TUs that
-// include this header. The explicit instantiation lives in
-// hogwild_embedding_store.cpp.
-// =============================================================================
+template <typename KeyT, typename ParamT, typename OptT,
+          typename ScorePolicyT = NoScorePolicy>
+using HogwildEmbeddingStore = HogwildEmbeddingStoreCore<ParamT, OptT>;
+
 #ifndef HOGWILD_EXPLICIT_INSTANTIATION
-
-#define SE_EXTERN_STORE(KEY_T, PARAM_T, OPT_T)                                 \
-  extern template class HogwildEmbeddingStore<KEY_T, PARAM_T, OPT_T,           \
-                                              NoScorePolicy>;                  \
-  extern template class HogwildEmbeddingStore<KEY_T, PARAM_T, OPT_T,           \
-                                              LfuScorePolicy>;                 \
-  extern template class HogwildEmbeddingStore<KEY_T, PARAM_T, OPT_T,           \
-                                              LruScorePolicy>;                 \
-  extern template class HogwildEmbeddingStore<KEY_T, PARAM_T, OPT_T,           \
-                                              ManualScorePolicy>;
-
-#define SE_EXTERN_OPT_PAIR(PARAM_T, OPT_T)                                     \
-  SE_EXTERN_STORE(uint64_t, PARAM_T, OPT_T)                                    \
-  SE_EXTERN_STORE(int64_t, PARAM_T, OPT_T)                                     \
-  SE_EXTERN_STORE(uint32_t, PARAM_T, OPT_T)                                    \
-  SE_EXTERN_STORE(int32_t, PARAM_T, OPT_T)
-
-#define SE_EXTERN_ALL(PARAM_T)                                                 \
-  SE_EXTERN_OPT_PAIR(PARAM_T, float)                                           \
-  SE_EXTERN_OPT_PAIR(PARAM_T, float16_t)                                       \
-  SE_EXTERN_OPT_PAIR(PARAM_T, bfloat16_t)
-
-SE_EXTERN_ALL(float)
-SE_EXTERN_ALL(float16_t)
-SE_EXTERN_ALL(bfloat16_t)
-
-#undef SE_EXTERN_STORE
-#undef SE_EXTERN_OPT_PAIR
-#undef SE_EXTERN_ALL
-
-#endif // HOGWILD_EXPLICIT_INSTANTIATION
+extern template class HogwildEmbeddingStoreCore<float, float>;
+extern template class HogwildEmbeddingStoreCore<float, float16_t>;
+extern template class HogwildEmbeddingStoreCore<float, bfloat16_t>;
+extern template class HogwildEmbeddingStoreCore<float16_t, float>;
+extern template class HogwildEmbeddingStoreCore<float16_t, float16_t>;
+extern template class HogwildEmbeddingStoreCore<float16_t, bfloat16_t>;
+extern template class HogwildEmbeddingStoreCore<bfloat16_t, float>;
+extern template class HogwildEmbeddingStoreCore<bfloat16_t, float16_t>;
+extern template class HogwildEmbeddingStoreCore<bfloat16_t, bfloat16_t>;
+#endif
 
 } // namespace se
 

@@ -75,11 +75,13 @@ cc_library(
     srcs = [
         "lance/lance_checkpoint.cpp",
         "lance/lance_checkpoint_registry.cpp",
+        "lance/native_fragment_writer.cpp",
     ],
     hdrs = [
         "lance/arrow/c/abi.h",
         "lance/lance_checkpoint.hpp",
         "lance/layout_schema.hpp",
+        "lance/native_fragment_writer.hpp",
     ],
     tags = ["manual"],
     visibility = ["//visibility:public"],

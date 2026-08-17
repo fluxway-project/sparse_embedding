@@ -236,8 +236,8 @@ int main(int argc, char **argv) {
   store.export_page_images(pro::make_proxy<se::FunctionFacade<bool(
                                size_t, se::PageImageExport<float, float> &&)>>(
       [&](size_t dim, se::PageImageExport<float, float> &&image) {
-        if (dim == 8 && image.physical_page_id == 0 && image.vector_dim == 8 &&
-            image.vector_stride == 64) {
+        if (dim == 8 && image.physical_page_id == 0 &&
+            image.embedding_dim == 8 && image.page_slot_stride_bytes == 64) {
           page_image_seen =
               std::ranges::equal(image.keys, keys) &&
               std::ranges::equal(image.slot_ordinals,
@@ -687,7 +687,7 @@ int main(int argc, char **argv) {
             pro::make_proxy<se::FunctionFacade<bool(
                 size_t, se::PageImageExport<float, float> &&)>>(
                 [&](size_t dim, se::PageImageExport<float, float> &&image) {
-                  require(dim == 8 && image.vector_dim == 8 &&
+                  require(dim == 8 && image.embedding_dim == 8 &&
                               image.values.size() == image.keys.size() * 8 &&
                               image.slot_ordinals.size() == image.keys.size() &&
                               image.seq_counts.size() == image.keys.size(),

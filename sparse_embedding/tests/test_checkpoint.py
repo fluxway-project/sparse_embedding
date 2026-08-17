@@ -184,7 +184,9 @@ def test_repeated_updates_keep_logical_rows_bounded(tmp_path):
     assert entries.num_rows == 64
     assert pages.num_rows == 1
     names = {path.name for path in root.rglob("*")}
-    assert not names.intersection({"payload.pkl", "metadata.json", "fragment.json"})
+    assert not names.intersection(
+        {"payload.pkl", "metadata.json", "fragment.json", "artifact.json"}
+    )
 
 
 def test_reclaim_bounds_physical_versions_after_repeated_updates(tmp_path):

@@ -30,8 +30,8 @@ namespace se {
 
 template <typename ParamT, typename OptT> struct PageImageExport {
   uint64_t physical_page_id;
-  uint32_t vector_dim;
-  uint32_t vector_stride;
+  uint32_t embedding_dim;
+  uint32_t page_slot_stride_bytes;
   std::vector<uint32_t> slot_ordinals;
   std::vector<uint64_t> keys;
   std::vector<uint64_t> seq_counts;
@@ -42,7 +42,7 @@ template <typename ParamT, typename OptT> struct PageImageExport {
 };
 
 template <typename ParamT, typename OptT> struct PageImageImport {
-  size_t dim;
+  size_t embedding_dim;
   PageImageExport<ParamT, OptT> image;
 };
 

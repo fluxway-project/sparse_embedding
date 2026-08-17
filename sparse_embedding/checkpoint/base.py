@@ -64,12 +64,8 @@ class TableSpecification:
             )
         if not self.score_policy.strip():
             raise ValueError("score_policy must be non-empty")
-        if (
-            isinstance(self.protocol_version, bool)
-            or not isinstance(self.protocol_version, int)
-            or self.protocol_version <= 0
-        ):
-            raise ValueError("protocol_version must be positive")
+        if self.protocol_version != 1:
+            raise ValueError("unsupported checkpoint protocol version")
 
 
 @dataclass(frozen=True, slots=True)

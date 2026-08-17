@@ -15,6 +15,8 @@ from typing import Any, cast
 import numpy as np
 import pyarrow as pa
 
+from sparse_embedding import _core as _native
+
 from ._lance_workspace import LanceWorkspace, LocalLanceWorkspace
 from .base import (
     CheckpointConflictError,
@@ -32,8 +34,10 @@ from .base import (
     StorageBudgetExceeded,
     TableSpecification,
 )
+from .schema import ENTRY_SCHEMA, MANIFEST_SCHEMA, PAGE_IMAGE_SCHEMA
 
-_FORMAT_VERSION = 9
+_checkpoint_native = _native.checkpoint
+_PROTOCOL_VERSION = 1
 _ACTIVE = "active"
 _DELETED = "deleted"
 
@@ -47,72 +51,6 @@ class _CommitOutcome:
     manifest_before: int
 
 
-ENTRY_SCHEMA = pa.schema(
-    [
-        pa.field("dim", pa.uint32()),
-        pa.field("key", pa.uint64()),
-        pa.field("embedding_values", pa.list_(pa.float32())),
-        pa.field("embedding_dtype", pa.string()),
-        pa.field("optimizer_state_values", pa.list_(pa.float32())),
-        pa.field("optimizer_state_dtype", pa.string()),
-        pa.field("optimizer_state_stride", pa.uint32()),
-        pa.field("step", pa.uint32()),
-        pa.field("score", pa.uint64()),
-        pa.field("sequence", pa.uint64()),
-        pa.field("physical_page_id", pa.uint64()),
-        pa.field("page_slot", pa.uint32()),
-        pa.field("row_state", pa.string()),
-        pa.field("last_updated_checkpoint_version", pa.uint64()),
-        pa.field("source_participant_index", pa.uint32()),
-    ]
-)
-
-PAGE_IMAGE_SCHEMA = pa.schema(
-    [
-        pa.field("source_participant_index", pa.uint32()),
-        pa.field("dim", pa.uint32()),
-        pa.field("physical_page_id", pa.uint64()),
-        pa.field("embedding_stride", pa.uint32()),
-        pa.field("embedding_dtype", pa.string()),
-        pa.field("slot_ordinals", pa.list_(pa.uint32())),
-        pa.field("keys", pa.list_(pa.uint64())),
-        pa.field("sequences", pa.list_(pa.uint64())),
-        pa.field("embedding_values", pa.list_(pa.float32())),
-        pa.field("scores", pa.list_(pa.uint64())),
-        pa.field("optimizer_state_values", pa.list_(pa.float32())),
-        pa.field("optimizer_state_dtype", pa.string()),
-        pa.field("optimizer_state_stride", pa.uint32()),
-        pa.field("steps", pa.list_(pa.uint32())),
-        pa.field("checksum", pa.string()),
-        pa.field("row_state", pa.string()),
-        pa.field("last_updated_checkpoint_version", pa.uint64()),
-    ]
-)
-
-MANIFEST_SCHEMA = pa.schema(
-    [
-        pa.field("protocol_version", pa.uint32()),
-        pa.field("checkpoint_name", pa.string()),
-        pa.field("checkpoint_version", pa.uint64()),
-        pa.field("parent_checkpoint_version", pa.uint64()),
-        pa.field("entries_lance_version", pa.uint64()),
-        pa.field("page_images_lance_version", pa.uint64()),
-        pa.field("participant_count", pa.uint32()),
-        pa.field("checkpoint_mode", pa.string()),
-        pa.field("schema_digest", pa.string()),
-        pa.field("fragment_digest", pa.string()),
-        pa.field("save_attempt", pa.string()),
-        pa.field("authority_scope", pa.string()),
-        pa.field("authority_generation", pa.uint64()),
-        pa.field("commit_authority", pa.string()),
-        pa.field("created_at", pa.timestamp("us", tz="UTC")),
-        pa.field("dimensions", pa.list_(pa.uint32())),
-        pa.field("embedding_dtype", pa.string()),
-        pa.field("optimizer_dtype", pa.string()),
-    ]
-)
-
-
 def _empty_table(schema: pa.Schema) -> pa.Table:
     return pa.Table.from_arrays(
         [pa.array([], type=field.type) for field in schema], schema=schema
@@ -120,9 +58,9 @@ def _empty_table(schema: pa.Schema) -> pa.Table:
 
 
 def _schema_digest(specification: TableSpecification | None = None) -> str:
-    payload = (
-        ENTRY_SCHEMA.serialize().to_pybytes()
-        + PAGE_IMAGE_SCHEMA.serialize().to_pybytes()
+    payload = b"".join(
+        schema.serialize().to_pybytes()
+        for schema in (ENTRY_SCHEMA, PAGE_IMAGE_SCHEMA, MANIFEST_SCHEMA)
     )
     if specification is not None:
         payload += _canonical_digest(
@@ -140,17 +78,50 @@ def _schema_digest(specification: TableSpecification | None = None) -> str:
 
 
 def _canonical_digest(rows: Sequence[dict[str, Any]]) -> str:
-    payload = json.dumps(rows, sort_keys=True, separators=(",", ":"))
+    def normalize(value: Any) -> Any:
+        if isinstance(value, (bytes, bytearray, memoryview)):
+            return {"__bytes__": bytes(value).hex()}
+        if isinstance(value, np.ndarray):
+            return {"__ndarray__": np.ascontiguousarray(value).tobytes().hex()}
+        if isinstance(value, dict):
+            return {str(key): normalize(item) for key, item in value.items()}
+        if isinstance(value, (list, tuple)):
+            return [normalize(item) for item in value]
+        return value
+
+    payload = json.dumps(normalize(rows), sort_keys=True, separators=(",", ":"))
     return hashlib.sha256(payload.encode()).hexdigest()
 
 
-def _page_checksum(row: dict[str, Any]) -> str:
-    payload = {
-        key: value
-        for key, value in row.items()
-        if key not in {"checksum", "row_state", "last_updated_checkpoint_version"}
-    }
-    return _canonical_digest([payload])
+def _native_page_checksum(row: dict[str, Any]) -> str:
+    hash_value = 1469598103934665603
+    for key in (
+        "slot_ordinals",
+        "keys",
+        "sequences",
+        "embedding_values",
+        "scores",
+        "optimizer_state_values",
+        "steps",
+    ):
+        value = row[key]
+        if not isinstance(value, (bytes, bytearray, memoryview)):
+            value = np.ascontiguousarray(value).tobytes()
+        for byte in bytes(value):
+            hash_value ^= byte
+            hash_value = (hash_value * 1099511628211) & ((1 << 64) - 1)
+    return f"{hash_value:x}"
+
+
+def _decode_value_bytes(payload: bytes, dtype: str) -> np.ndarray:
+    if dtype == "float32":
+        return np.frombuffer(payload, dtype=np.float32)
+    if dtype == "float16":
+        return np.frombuffer(payload, dtype=np.float16).astype(np.float32)
+    if dtype == "bfloat16":
+        bits = np.frombuffer(payload, dtype=np.uint16).astype(np.uint32) << 16
+        return bits.view(np.float32)
+    raise ValueError(f"unsupported payload dtype: {dtype}")
 
 
 class _LanceCheckpointStorage:
@@ -193,33 +164,41 @@ class _LanceCheckpointStorage:
         if self._workspace.exists(fragment_root):
             raise CheckpointConflictError("checkpoint fragment already exists")
         specification = self._store_specification(store)
-        entries, pages = self._encode_store(store, participant, specification)
-        metadata = self._specification_metadata(specification)
         self._workspace.create_prefix(fragment_root)
-        self._workspace.write_dataset(
-            entries.replace_schema_metadata(metadata),
-            f"{fragment_root}/entries",
-            mode="create",
+        artifact = _checkpoint_native.write_native_fragment(
+            store,
+            self._workspace.uri(fragment_root),
+            participant.participant_index,
+            list(specification.dimensions),
+            specification.embedding_dtype,
+            specification.optimizer_dtype or "",
+            specification.score_policy,
+            specification.protocol_version,
+            _schema_digest(specification),
         )
-        self._workspace.write_dataset(
-            pages.replace_schema_metadata(metadata),
-            f"{fragment_root}/page_images",
-            mode="create",
-        )
-        stored_entries = self._workspace.dataset(f"{fragment_root}/entries").to_table()
-        stored_pages = self._workspace.dataset(
-            f"{fragment_root}/page_images"
-        ).to_table()
-        rows = stored_entries.to_pylist() + stored_pages.to_pylist()
+        if not isinstance(artifact, dict):
+            raise TypeError("native fragment writer returned a non-mapping artifact")
+        required = {
+            "locator",
+            "entries_version",
+            "page_images_version",
+            "entry_count",
+            "page_count",
+            "physical_bytes",
+            "schema_digest",
+            "content_digest",
+        }
+        if set(artifact) != required:
+            raise ValueError("native fragment artifact fields are invalid")
         fragment = CheckpointFragment(
             fragment_id=fragment_id,
             checkpoint_name=identity.checkpoint_name,
             save_attempt=identity.save_attempt,
             participant=participant,
-            entry_count=stored_entries.num_rows,
-            page_count=stored_pages.num_rows,
-            schema_digest=_schema_digest(specification),
-            content_digest=_canonical_digest(rows),
+            entry_count=int(artifact["entry_count"]),
+            page_count=int(artifact["page_count"]),
+            schema_digest=str(artifact["schema_digest"]),
+            content_digest=str(artifact["content_digest"]),
         )
         self._require_authority(identity)
         return fragment
@@ -261,54 +240,41 @@ class _LanceCheckpointStorage:
         self._workspace.assert_commit_lock()
         self._reconcile_staging()
         validated, specification = self._validate_fragments(identity, fragments)
+        self._ensure_payload_tables(validated, identity)
         manifest_rows = self._manifest_rows()
         previous = max(
             (int(row["checkpoint_version"]) for row in manifest_rows), default=0
         )
         checkpoint_version = previous + 1
-        entry_rows: list[dict[str, Any]] = []
-        page_rows: list[dict[str, Any]] = []
-        for fragment in validated:
-            root = f"{self._attempt_prefix(identity)}/{fragment.fragment_id}"
-            entries = self._workspace.dataset(f"{root}/entries").to_table().to_pylist()
-            pages = (
-                self._workspace.dataset(f"{root}/page_images").to_table().to_pylist()
-            )
-            digest = _canonical_digest(entries + pages)
-            if digest != fragment.content_digest:
-                raise InvalidCheckpointFragment("checkpoint fragment digest mismatch")
-            if (
-                len(entries) != fragment.entry_count
-                or len(pages) != fragment.page_count
-            ):
-                raise InvalidCheckpointFragment(
-                    "checkpoint fragment row count mismatch"
-                )
-            entry_rows.extend(entries)
-            page_rows.extend(pages)
-        entry_keys = [(row["dim"], row["key"]) for row in entry_rows]
-        if len(entry_keys) != len(set(entry_keys)):
-            raise InvalidCheckpointFragment("duplicate (dim, key) across fragments")
-        self._apply_checkpoint_version(entry_rows, checkpoint_version)
-        self._apply_checkpoint_version(page_rows, checkpoint_version)
-        entry_source = self._with_entry_tombstones(entry_rows, checkpoint_version)
-        page_source = self._with_page_tombstones(page_rows, checkpoint_version)
+        fragment_roots = [
+            f"{self._attempt_prefix(identity)}/{fragment.fragment_id}"
+            for fragment in validated
+        ]
         self._workspace.assert_commit_lock()
         entries_before = self._workspace.dataset("entries").version
         pages_before = self._workspace.dataset("page_images").version
         try:
-            entries_version = self._merge(
-                "entries", ENTRY_SCHEMA, ("dim", "key"), entry_source
+            entry_artifact = _checkpoint_native.merge_native_lance_sources(
+                self._workspace.uri("entries"),
+                [self._workspace.uri(f"{root}/entries") for root in fragment_roots],
+                ["dim", "key"],
+                checkpoint_version,
             )
-            pages_version = self._merge(
-                "page_images",
-                PAGE_IMAGE_SCHEMA,
-                ("source_participant_index", "dim", "physical_page_id"),
-                page_source,
+            page_artifact = _checkpoint_native.merge_native_lance_sources(
+                self._workspace.uri("page_images"),
+                [self._workspace.uri(f"{root}/page_images") for root in fragment_roots],
+                [
+                    "source_participant_index",
+                    "embedding_dim",
+                    "physical_page_id",
+                ],
+                checkpoint_version,
             )
+            entries_version = int(entry_artifact["target_version"])
+            pages_version = int(page_artifact["target_version"])
             self._check_storage_budget()
             self._workspace.assert_commit_lock()
-        except Exception:
+        except Exception as error:
             try:
                 for name, version in (
                     ("entries", entries_before),
@@ -319,6 +285,10 @@ class _LanceCheckpointStorage:
                 raise RuntimeError(
                     "checkpoint merge rollback failed after commit preparation error"
                 ) from rollback_error
+            if "duplicate checkpoint key" in str(error):
+                raise InvalidCheckpointFragment(
+                    "checkpoint fragments contain a duplicate key"
+                ) from error
             raise
         fragment_digest = _canonical_digest(
             [
@@ -330,7 +300,7 @@ class _LanceCheckpointStorage:
             ]
         )
         manifest = {
-            "protocol_version": _FORMAT_VERSION,
+            "protocol_version": _PROTOCOL_VERSION,
             "checkpoint_name": identity.checkpoint_name,
             "checkpoint_version": checkpoint_version,
             "parent_checkpoint_version": previous,
@@ -348,6 +318,8 @@ class _LanceCheckpointStorage:
             "dimensions": list(specification.dimensions),
             "embedding_dtype": specification.embedding_dtype,
             "optimizer_dtype": specification.optimizer_dtype or "",
+            "score_policy": specification.score_policy,
+            "reference_id": reference_id or "",
         }
         manifest_before = self._workspace.dataset("snapshot_manifest").version
         locator = SparseCheckpointLocator(identity.checkpoint_name, checkpoint_version)
@@ -368,7 +340,6 @@ class _LanceCheckpointStorage:
             self._record_pending_outcome(
                 identity,
                 locator,
-                reference_id or "",
                 entries_before,
                 pages_before,
                 manifest_before,
@@ -409,9 +380,7 @@ class _LanceCheckpointStorage:
                 ):
                     self._restore_dataset_version(name, version)
                 self._reclaim_unlocked(timedelta(0))
-                self._workspace.delete_record(
-                    self._outcome_key(identity.checkpoint_name)
-                )
+                self._delete_pending_outcome(identity.checkpoint_name)
             attempt = self._attempt_prefix(identity)
             if self._workspace.exists(attempt):
                 self._workspace.delete_prefix(attempt)
@@ -420,9 +389,7 @@ class _LanceCheckpointStorage:
     def acknowledge_checkpoint(self, identity: CheckpointSaveIdentity) -> None:
         with self._commit_lock():
             if self._pending_outcome(identity, require_identity=False) is not None:
-                self._workspace.delete_record(
-                    self._outcome_key(identity.checkpoint_name)
-                )
+                self._delete_pending_outcome(identity.checkpoint_name)
 
     def acquire_checkpoint_lease(
         self, locator: SparseCheckpointLocator, request: CheckpointLeaseRequest
@@ -664,7 +631,7 @@ class _LanceCheckpointStorage:
             self._delete_reference_tags(locator, reference_id)
             self._reclaim_unlocked(timedelta(0))
             self._record_reclaim_completion(reservation, locator)
-            self._workspace.delete_record(self._outcome_key(locator.checkpoint_name))
+            self._delete_pending_outcome(locator.checkpoint_name)
             if pending in tags.list():
                 tags.delete(pending)
 
@@ -699,13 +666,49 @@ class _LanceCheckpointStorage:
 
     def _ensure_tables(self) -> None:
         self._workspace.ensure_root()
+        for name, schema in (("snapshot_manifest", MANIFEST_SCHEMA),):
+            if not self._workspace.exists(name):
+                self._workspace.write_dataset(_empty_table(schema), name, mode="create")
+            elif self._workspace.dataset(name).schema != schema:
+                raise RuntimeError(
+                    f"checkpoint dataset {name!r} does not match protocol schema"
+                )
         for name, schema in (
             ("entries", ENTRY_SCHEMA),
             ("page_images", PAGE_IMAGE_SCHEMA),
-            ("snapshot_manifest", MANIFEST_SCHEMA),
         ):
-            if not self._workspace.exists(name):
-                self._workspace.write_dataset(_empty_table(schema), name, mode="create")
+            if self._workspace.exists(name):
+                actual = self._workspace.dataset(name).schema
+                if actual.remove_metadata() != schema.remove_metadata():
+                    raise RuntimeError(
+                        f"checkpoint dataset {name!r} does not match protocol schema"
+                    )
+
+    def _ensure_payload_tables(
+        self,
+        fragments: Sequence[CheckpointFragment],
+        identity: CheckpointSaveIdentity,
+    ) -> None:
+        first_root = f"{self._attempt_prefix(identity)}/{fragments[0].fragment_id}"
+        for name, canonical in (
+            ("entries", ENTRY_SCHEMA),
+            ("page_images", PAGE_IMAGE_SCHEMA),
+        ):
+            source_schema = self._workspace.dataset(f"{first_root}/{name}").schema
+            if source_schema.remove_metadata() != canonical.remove_metadata():
+                raise InvalidCheckpointFragment(
+                    f"checkpoint fragment {name!r} schema fields are invalid"
+                )
+            if self._workspace.exists(name):
+                target_schema = self._workspace.dataset(name).schema
+                if target_schema != source_schema:
+                    raise InvalidCheckpointFragment(
+                        f"checkpoint target {name!r} schema metadata is inconsistent"
+                    )
+                continue
+            self._workspace.write_dataset(
+                _empty_table(source_schema), name, mode="create"
+            )
 
     def _publish_authority(self, identity: CheckpointSaveIdentity) -> None:
         dataset = self._workspace.dataset("snapshot_manifest")
@@ -933,10 +936,30 @@ class _LanceCheckpointStorage:
             )
         )
 
+    def _outcome_tag(
+        self,
+        checkpoint_name: str,
+        checkpoint_generation: int,
+        checkpoint_version: int,
+        entries_before: int,
+        page_images_before: int,
+        manifest_before: int,
+    ) -> str:
+        return ".".join(
+            (
+                "setransaction",
+                self._short_token(checkpoint_name),
+                str(checkpoint_generation),
+                str(checkpoint_version),
+                str(entries_before),
+                str(page_images_before),
+                str(manifest_before),
+            )
+        )
+
     @staticmethod
-    def _outcome_key(checkpoint_name: str) -> str:
-        digest = hashlib.sha256(checkpoint_name.encode()).hexdigest()
-        return f".transactions/{digest}.json"
+    def _short_token(value: str) -> str:
+        return hashlib.sha256(value.encode()).hexdigest()[:32]
 
     def _pending_outcome(
         self,
@@ -944,51 +967,85 @@ class _LanceCheckpointStorage:
         *,
         require_identity: bool = True,
     ) -> _CommitOutcome | None:
-        stored = self._workspace.read_record(
-            self._outcome_key(identity.checkpoint_name)
+        prefix = f"setransaction.{self._short_token(identity.checkpoint_name)}."
+        tags = tuple(
+            tag
+            for tag in self._workspace.dataset("snapshot_manifest").tags.list()
+            if tag.startswith(prefix)
         )
-        if stored is None:
+        if not tags:
             return None
-        payload = json.loads(stored)
-        expected_identity = {
-            "checkpoint_name": identity.checkpoint_name,
-            "save_attempt": identity.save_attempt,
-            "authority_scope": identity.commit_authority.scope,
-            "authority_generation": identity.commit_authority.generation,
-            "commit_authority": identity.commit_authority.authority_id,
-        }
-        if not isinstance(payload, dict):
+        if len(tags) != 1:
+            raise ValueError("durable checkpoint commit outcome is ambiguous")
+        parts = tags[0].split(".")
+        if len(parts) != 7:
             raise ValueError("durable checkpoint commit outcome is corrupt")
-        if any(payload.get(name) != value for name, value in expected_identity.items()):
+        (
+            _,
+            checkpoint_token,
+            authority_generation,
+            version,
+            entries_before,
+            page_images_before,
+            manifest_before,
+        ) = parts
+        if checkpoint_token != self._short_token(identity.checkpoint_name):
+            raise CheckpointConflictError(
+                "durable checkpoint outcome belongs to another checkpoint"
+            )
+        try:
+            decoded = {
+                "authority_generation": int(authority_generation),
+                "checkpoint_version": int(version),
+                "entries_before": int(entries_before),
+                "page_images_before": int(page_images_before),
+                "manifest_before": int(manifest_before),
+            }
+        except (ValueError, UnicodeDecodeError) as error:
+            raise ValueError("durable checkpoint commit outcome is corrupt") from error
+        if decoded["authority_generation"] != identity.commit_authority.generation:
+            if not require_identity:
+                return None
+            raise CheckpointConflictError(
+                "durable checkpoint outcome belongs to another authority generation"
+            )
+        manifests = [
+            row
+            for row in self._manifest_rows()
+            if row["checkpoint_name"] == identity.checkpoint_name
+            and int(row["checkpoint_version"]) == decoded["checkpoint_version"]
+        ]
+        if len(manifests) != 1:
+            raise CheckpointConflictError(
+                "durable checkpoint outcome has no unique manifest"
+            )
+        manifest = manifests[0]
+        expected_identity = (
+            manifest["save_attempt"] == identity.save_attempt
+            and manifest["authority_scope"] == identity.commit_authority.scope
+            and int(manifest["authority_generation"])
+            == identity.commit_authority.generation
+            and manifest["commit_authority"] == identity.commit_authority.authority_id
+        )
+        if not expected_identity:
             if not require_identity:
                 return None
             raise CheckpointConflictError(
                 "checkpoint name belongs to another durable commit outcome"
             )
-        reference_id = payload.get("reference_id")
-        version = payload.get("checkpoint_version")
         version_fields = {
-            name: payload.get(name)
-            for name in (
-                "entries_before",
-                "page_images_before",
-                "manifest_before",
-            )
+            name: decoded[name]
+            for name in ("entries_before", "page_images_before", "manifest_before")
         }
-        if (
-            not isinstance(reference_id, str)
-            or isinstance(version, bool)
-            or not isinstance(version, int)
-            or version <= 0
-            or any(
-                isinstance(value, bool) or not isinstance(value, int) or value <= 0
-                for value in version_fields.values()
-            )
+        if decoded["checkpoint_version"] <= 0 or any(
+            value <= 0 for value in version_fields.values()
         ):
             raise ValueError("durable checkpoint commit outcome is corrupt")
         return _CommitOutcome(
-            locator=SparseCheckpointLocator(identity.checkpoint_name, version),
-            reference_id=reference_id,
+            locator=SparseCheckpointLocator(
+                identity.checkpoint_name, decoded["checkpoint_version"]
+            ),
+            reference_id=manifest["reference_id"],
             entries_before=cast(int, version_fields["entries_before"]),
             page_images_before=cast(int, version_fields["page_images_before"]),
             manifest_before=cast(int, version_fields["manifest_before"]),
@@ -998,61 +1055,50 @@ class _LanceCheckpointStorage:
         self,
         identity: CheckpointSaveIdentity,
         locator: SparseCheckpointLocator,
-        reference_id: str,
         entries_before: int,
         page_images_before: int,
         manifest_before: int,
     ) -> None:
-        payload = {
-            "checkpoint_name": identity.checkpoint_name,
-            "checkpoint_version": locator.checkpoint_version,
-            "save_attempt": identity.save_attempt,
-            "authority_scope": identity.commit_authority.scope,
-            "authority_generation": identity.commit_authority.generation,
-            "commit_authority": identity.commit_authority.authority_id,
-            "reference_id": reference_id,
-            "entries_before": entries_before,
-            "page_images_before": page_images_before,
-            "manifest_before": manifest_before,
-        }
-        self._workspace.write_record_once(
-            self._outcome_key(identity.checkpoint_name),
-            json.dumps(payload, sort_keys=True, separators=(",", ":")).encode(),
+        tag = self._outcome_tag(
+            identity.checkpoint_name,
+            identity.commit_authority.generation,
+            locator.checkpoint_version,
+            entries_before,
+            page_images_before,
+            manifest_before,
         )
+        tags = self._workspace.dataset("snapshot_manifest").tags
+        if tag not in tags.list():
+            tags.create(tag, self._workspace.dataset("snapshot_manifest").version)
 
-    def _reclaim_completion_key(
+    def _delete_pending_outcome(self, checkpoint_name: str) -> None:
+        tags = self._workspace.dataset("snapshot_manifest").tags
+        prefix = f"setransaction.{self._short_token(checkpoint_name)}."
+        for tag in tuple(tags.list()):
+            if tag.startswith(prefix):
+                tags.delete(tag)
+
+    def _reclaim_completion_tag(
         self,
         reservation: CleanupReservation,
         locator: SparseCheckpointLocator,
     ) -> str:
-        identity = "\x00".join(
+        return ".".join(
             (
-                reservation.reservation_id,
-                locator.checkpoint_name,
+                "sereclaim",
+                self._token(reservation.reservation_id),
                 str(locator.checkpoint_version),
+                self._encode(locator.checkpoint_name),
             )
         )
-        digest = hashlib.sha256(identity.encode("utf-8")).hexdigest()
-        return f".retention/completed/{digest}.json"
 
     def _reclaim_completed(
         self,
         reservation: CleanupReservation,
         locator: SparseCheckpointLocator,
     ) -> bool:
-        key = self._reclaim_completion_key(reservation, locator)
-        stored = self._workspace.read_record(key)
-        if stored is None:
-            return False
-        payload = json.loads(stored)
-        expected = {
-            "reservation_id": reservation.reservation_id,
-            "checkpoint_name": locator.checkpoint_name,
-            "checkpoint_version": locator.checkpoint_version,
-        }
-        if payload != expected:
-            raise ValueError(f"reclaim completion record is corrupt: {key}")
-        return True
+        tag = self._reclaim_completion_tag(reservation, locator)
+        return tag in self._workspace.dataset("snapshot_manifest").tags.list()
 
     def _record_reclaim_completion(
         self,
@@ -1061,14 +1107,9 @@ class _LanceCheckpointStorage:
     ) -> None:
         if self._reclaim_completed(reservation, locator):
             return
-        payload = {
-            "reservation_id": reservation.reservation_id,
-            "checkpoint_name": locator.checkpoint_name,
-            "checkpoint_version": locator.checkpoint_version,
-        }
-        encoded = json.dumps(payload, sort_keys=True, separators=(",", ":")).encode()
-        self._workspace.write_record_once(
-            self._reclaim_completion_key(reservation, locator), encoded
+        self._workspace.dataset("snapshot_manifest").tags.create(
+            self._reclaim_completion_tag(reservation, locator),
+            self._workspace.dataset("snapshot_manifest").version,
         )
 
     @staticmethod
@@ -1083,87 +1124,6 @@ class _LanceCheckpointStorage:
         suffix = self._reservation_locator_suffix(locator)
         return any(
             self._is_reservation_tag(tag) and tag.endswith(suffix) for tag in tags
-        )
-
-    def _encode_store(
-        self,
-        store: Any,
-        participant: CheckpointParticipant,
-        specification: TableSpecification,
-    ) -> tuple[pa.Table, pa.Table]:
-        entry_rows: list[dict[str, Any]] = []
-        page_rows: list[dict[str, Any]] = []
-        images = store.export_page_images()
-        if not isinstance(images, list):
-            raise TypeError("export_page_images must return a list")
-        for image in images:
-            dim = int(image["dim"])
-            page_id = int(image["physical_page_id"])
-            slots = np.asarray(image["slot_ordinals"], dtype=np.uint32)
-            keys = np.asarray(image["keys"], dtype=np.uint64)
-            sequences = np.asarray(image["seq_counts"], dtype=np.uint64)
-            values = np.asarray(image["values"], dtype=np.float32).reshape(
-                len(keys), dim
-            )
-            scores = np.asarray(image.get("scores", []), dtype=np.uint64)
-            optimizer = np.asarray(image.get("optimizer_states", []), dtype=np.float32)
-            stride = optimizer.size // len(keys) if len(keys) else 0
-            optimizer = optimizer.reshape(len(keys), stride) if stride else None
-            steps = np.asarray(image.get("steps", []), dtype=np.uint32)
-            for index, key in enumerate(keys):
-                entry_rows.append(
-                    {
-                        "dim": dim,
-                        "key": int(key),
-                        "embedding_values": values[index].tolist(),
-                        "embedding_dtype": specification.embedding_dtype,
-                        "optimizer_state_values": optimizer[index].tolist()
-                        if optimizer is not None
-                        else [],
-                        "optimizer_state_dtype": specification.optimizer_dtype or "",
-                        "optimizer_state_stride": stride,
-                        "step": int(steps[index]) if steps.size else 0,
-                        "score": int(scores[index]) if scores.size else 0,
-                        "sequence": int(sequences[index]),
-                        "physical_page_id": page_id,
-                        "page_slot": int(slots[index]),
-                        "row_state": _ACTIVE,
-                        "last_updated_checkpoint_version": 0,
-                        "source_participant_index": participant.participant_index,
-                    }
-                )
-            page_row = {
-                "source_participant_index": participant.participant_index,
-                "dim": dim,
-                "physical_page_id": page_id,
-                "embedding_stride": int(image["vector_stride"]),
-                "embedding_dtype": specification.embedding_dtype,
-                "slot_ordinals": slots.tolist(),
-                "keys": keys.tolist(),
-                "sequences": sequences.tolist(),
-                "embedding_values": np.asarray(
-                    image["values"], dtype=np.float32
-                ).tolist(),
-                "scores": scores.tolist(),
-                "optimizer_state_values": np.asarray(
-                    image.get("optimizer_states", []), dtype=np.float32
-                ).tolist(),
-                "optimizer_state_dtype": specification.optimizer_dtype or "",
-                "optimizer_state_stride": stride,
-                "steps": steps.tolist(),
-                "checksum": "",
-                "row_state": _ACTIVE,
-                "last_updated_checkpoint_version": 0,
-            }
-            page_row["checksum"] = _page_checksum(page_row)
-            page_rows.append(page_row)
-        return (
-            pa.Table.from_pylist(entry_rows, schema=ENTRY_SCHEMA)
-            if entry_rows
-            else _empty_table(ENTRY_SCHEMA),
-            pa.Table.from_pylist(page_rows, schema=PAGE_IMAGE_SCHEMA)
-            if page_rows
-            else _empty_table(PAGE_IMAGE_SCHEMA),
         )
 
     def _validate_fragments(
@@ -1199,58 +1159,6 @@ class _LanceCheckpointStorage:
             specification,
         )
 
-    @staticmethod
-    def _apply_checkpoint_version(rows: list[dict[str, Any]], version: int) -> None:
-        for row in rows:
-            row["last_updated_checkpoint_version"] = version
-
-    def _with_entry_tombstones(
-        self, rows: list[dict[str, Any]], version: int
-    ) -> list[dict[str, Any]]:
-        current = self._workspace.dataset("entries").to_table().to_pylist()
-        incoming = {(row["dim"], row["key"]) for row in rows}
-        tombstones = []
-        for row in current:
-            if row["row_state"] == _ACTIVE and (row["dim"], row["key"]) not in incoming:
-                deleted = dict(row)
-                deleted["row_state"] = _DELETED
-                deleted["last_updated_checkpoint_version"] = version
-                tombstones.append(deleted)
-        return rows + tombstones
-
-    def _with_page_tombstones(
-        self, rows: list[dict[str, Any]], version: int
-    ) -> list[dict[str, Any]]:
-        current = self._workspace.dataset("page_images").to_table().to_pylist()
-        incoming = {
-            (row["source_participant_index"], row["dim"], row["physical_page_id"])
-            for row in rows
-        }
-        tombstones = []
-        for row in current:
-            key = (row["source_participant_index"], row["dim"], row["physical_page_id"])
-            if row["row_state"] == _ACTIVE and key not in incoming:
-                deleted = dict(row)
-                deleted["row_state"] = _DELETED
-                deleted["last_updated_checkpoint_version"] = version
-                tombstones.append(deleted)
-        return rows + tombstones
-
-    def _merge(
-        self,
-        name: str,
-        schema: pa.Schema,
-        keys: tuple[str, ...],
-        rows: list[dict[str, Any]],
-    ) -> int:
-        dataset = self._workspace.dataset(name)
-        if rows:
-            source = pa.Table.from_pylist(rows, schema=schema)
-            dataset.merge_insert(
-                list(keys)
-            ).when_matched_update_all().when_not_matched_insert_all().execute(source)
-        return self._workspace.dataset(name).version
-
     def _restore_dataset_version(self, name: str, version: int) -> None:
         self._workspace.dataset(name).checkout_version(version).restore()
 
@@ -1271,18 +1179,15 @@ class _LanceCheckpointStorage:
     def _restore_elastic(
         self, store: Any, manifest: dict[str, Any], mode: ElasticRestore
     ) -> None:
-        dataset = self._workspace.dataset(
-            "entries",
-            version=int(manifest["entries_lance_version"]),
+        if not hasattr(_checkpoint_native, "active_entry_keys"):
+            raise RuntimeError(
+                "native checkpoint restore requires a Lance-enabled _core extension"
+            )
+        keys_capsule = _checkpoint_native.active_entry_keys(
+            self._workspace.uri("entries"),
+            int(manifest["entries_lance_version"]),
         )
-        routing = dataset.to_table(columns=["key", "row_state"])
-        active_positions = np.flatnonzero(routing["row_state"].to_numpy() == _ACTIVE)
-        keys = (
-            routing["key"]
-            .take(pa.array(active_positions))
-            .to_numpy()
-            .astype(np.uint64, copy=False)
-        )
+        keys = np.from_dlpack(keys_capsule).astype(np.uint64, copy=False)
         first = np.asarray(mode.partition_fn(keys, mode.partition_count))
         second = np.asarray(mode.partition_fn(keys, mode.partition_count))
         if first.shape != keys.shape:
@@ -1293,39 +1198,17 @@ class _LanceCheckpointStorage:
             raise ValueError("partition_fn is not stable")
         if np.any(first < 0) or np.any(first >= mode.partition_count):
             raise ValueError("partition_fn returned an out-of-range partition ID")
-        selected_positions = active_positions[first == mode.target_partition_id]
-        if selected_positions.size == 0:
+        selected_keys = np.ascontiguousarray(
+            keys[first == mode.target_partition_id], dtype=np.uint64
+        )
+        if selected_keys.size == 0:
             return
-        selected = dataset.take(
-            selected_positions,
-            columns=[
-                "dim",
-                "key",
-                "embedding_values",
-                "optimizer_state_values",
-                "optimizer_state_stride",
-                "step",
-            ],
-        ).to_pylist()
-        for dim in sorted({int(row["dim"]) for row in selected}):
-            dim_rows = [row for row in selected if int(row["dim"]) == dim]
-            dim_keys = np.ascontiguousarray(
-                [row["key"] for row in dim_rows], dtype=np.uint64
-            )
-            values = np.ascontiguousarray(
-                [row["embedding_values"] for row in dim_rows], dtype=np.float32
-            )
-            store.assign(dim_keys, values)
-            stride = int(dim_rows[0]["optimizer_state_stride"])
-            if stride:
-                optimizer = np.ascontiguousarray(
-                    [row["optimizer_state_values"] for row in dim_rows],
-                    dtype=np.float32,
-                ).reshape(-1)
-                steps = np.ascontiguousarray(
-                    [row["step"] for row in dim_rows], dtype=np.uint32
-                )
-                store.assign_opt_state(dim_keys, optimizer, dim, steps)
+        _checkpoint_native.restore_native_entries(
+            store,
+            self._workspace.uri("entries"),
+            int(manifest["entries_lance_version"]),
+            selected_keys,
+        )
 
     def _restore_physical(
         self, store: Any, manifest: dict[str, Any], mode: PhysicalRestore
@@ -1334,36 +1217,16 @@ class _LanceCheckpointStorage:
             raise ValueError("physical restore requires the saved participant topology")
         if store.total_size() != 0:
             raise RuntimeError("physical restore requires an empty store")
-        rows = (
-            self._workspace.dataset(
-                "page_images",
-                version=int(manifest["page_images_lance_version"]),
+        if not hasattr(_checkpoint_native, "restore_native_page_images"):
+            raise RuntimeError(
+                "native checkpoint restore requires a Lance-enabled _core extension"
             )
-            .to_table(
-                filter=f"row_state = 'active' AND source_participant_index = {mode.participant.participant_index}"
-            )
-            .to_pylist()
+        _checkpoint_native.restore_native_page_images(
+            store,
+            self._workspace.uri("page_images"),
+            int(manifest["page_images_lance_version"]),
+            mode.participant.participant_index,
         )
-        pages = []
-        for row in rows:
-            if _page_checksum({**row, "checksum": ""}) != row["checksum"]:
-                raise RuntimeError("page image checksum mismatch")
-            pages.append(
-                {
-                    "dim": row["dim"],
-                    "physical_page_id": row["physical_page_id"],
-                    "vector_dim": row["dim"],
-                    "vector_stride": row["embedding_stride"],
-                    "slot_ordinals": row["slot_ordinals"],
-                    "keys": row["keys"],
-                    "seq_counts": row["sequences"],
-                    "values": row["embedding_values"],
-                    "scores": row["scores"],
-                    "optimizer_states": row["optimizer_state_values"],
-                    "steps": row["steps"],
-                }
-            )
-        store.import_page_images(pages)
 
     @staticmethod
     def _store_specification(store: Any) -> TableSpecification:
@@ -1372,49 +1235,45 @@ class _LanceCheckpointStorage:
             dimensions=dimensions,
             embedding_dtype=store.value_dtype(),
             optimizer_dtype=store.optimizer_dtype(),
-            score_policy="uint64",
-            protocol_version=_FORMAT_VERSION,
+            score_policy=store.score_policy(),
+            protocol_version=_PROTOCOL_VERSION,
         )
-
-    @staticmethod
-    def _specification_metadata(
-        specification: TableSpecification,
-    ) -> dict[bytes, bytes]:
-        return {
-            b"sparse_embedding.specification": "\0".join(
-                (
-                    ",".join(str(dim) for dim in specification.dimensions),
-                    specification.embedding_dtype,
-                    specification.optimizer_dtype or "",
-                    specification.score_policy,
-                    str(specification.protocol_version),
-                )
-            ).encode()
-        }
 
     @staticmethod
     def _decode_specification(
         metadata: dict[bytes, bytes] | None,
     ) -> TableSpecification:
-        if metadata is None or b"sparse_embedding.specification" not in metadata:
+        required = {
+            b"sparse_embedding.protocol_version",
+            b"sparse_embedding.dimensions",
+            b"sparse_embedding.embedding_dtype",
+            b"sparse_embedding.optimizer_dtype",
+            b"sparse_embedding.score_policy",
+        }
+        if metadata is None or not required.issubset(metadata):
             raise InvalidCheckpointFragment(
                 "checkpoint fragment specification is missing"
             )
-        payload = metadata[b"sparse_embedding.specification"].decode().split("\0")
-        if len(payload) != 5:
-            raise InvalidCheckpointFragment(
-                "checkpoint fragment specification is invalid"
-            )
-        dimensions, embedding_dtype, optimizer_dtype, score_policy, protocol_version = (
-            payload
-        )
         try:
+            parsed_protocol_version = int(
+                metadata[b"sparse_embedding.protocol_version"]
+            )
+            if parsed_protocol_version != _PROTOCOL_VERSION:
+                raise InvalidCheckpointFragment(
+                    "unsupported checkpoint protocol version"
+                )
+            dimensions = tuple(
+                int(item)
+                for item in metadata[b"sparse_embedding.dimensions"].decode().split(",")
+                if item
+            )
             return TableSpecification(
-                dimensions=tuple(int(item) for item in dimensions.split(",") if item),
-                embedding_dtype=embedding_dtype,
-                optimizer_dtype=optimizer_dtype or None,
-                score_policy=score_policy,
-                protocol_version=int(protocol_version),
+                dimensions=dimensions,
+                embedding_dtype=metadata[b"sparse_embedding.embedding_dtype"].decode(),
+                optimizer_dtype=metadata[b"sparse_embedding.optimizer_dtype"].decode()
+                or None,
+                score_policy=metadata[b"sparse_embedding.score_policy"].decode(),
+                protocol_version=parsed_protocol_version,
             )
         except (TypeError, ValueError) as error:
             raise InvalidCheckpointFragment(
@@ -1432,11 +1291,13 @@ class _LanceCheckpointStorage:
     @staticmethod
     def _manifest_specification(manifest: dict[str, Any]) -> TableSpecification:
         try:
+            if int(manifest["protocol_version"]) != _PROTOCOL_VERSION:
+                raise RuntimeError("unsupported checkpoint protocol version")
             return TableSpecification(
                 dimensions=tuple(int(dim) for dim in manifest["dimensions"]),
                 embedding_dtype=manifest["embedding_dtype"],
                 optimizer_dtype=manifest["optimizer_dtype"] or None,
-                score_policy="uint64",
+                score_policy=manifest["score_policy"],
                 protocol_version=int(manifest["protocol_version"]),
             )
         except (KeyError, TypeError, ValueError) as error:
