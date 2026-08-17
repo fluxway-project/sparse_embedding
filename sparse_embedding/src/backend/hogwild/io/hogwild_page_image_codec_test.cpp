@@ -13,8 +13,8 @@ void require(bool condition, const char *message) {
 
 int main() {
   se::PageImageExport<float, float> image;
-  image.vector_dim = 2;
-  image.vector_stride = 64;
+  image.embedding_dim = 2;
+  image.page_slot_stride_bytes = 64;
   image.slot_ordinals = {0, 3};
   image.keys = {7, 9};
   image.seq_counts = {2, 4};

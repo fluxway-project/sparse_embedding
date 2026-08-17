@@ -6,9 +6,11 @@ load("@rules_cc//cc:defs.bzl", "cc_library")
 
 cc_library(
     name = "arena",
+    srcs = ["transient_arena.cpp"],
     hdrs = glob(["*.hpp"]),
     visibility = ["//visibility:public"],
     deps = [
+        "//sparse_embedding/src/memory",
         "//sparse_embedding/src/simd",
         "//sparse_embedding/src/storage",
         "@robin_map",

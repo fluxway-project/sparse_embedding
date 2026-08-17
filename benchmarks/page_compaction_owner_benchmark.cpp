@@ -112,7 +112,8 @@ int main(int argc, char **argv) {
   options.mode = se::StorageMode::kMemoryOnly;
   options.memory_limit_bytes = size_t{1} << 30;
   auto storage = se::create_page_storage(std::move(options));
-  se::EmbeddingArena<float> arena(1, false, storage);
+  auto retirement_pressure = storage->stats().retirement_pressure_domain;
+  se::EmbeddingArena<float> arena(1, false, storage, retirement_pressure);
   arena.reserve_entries(kOwnerCount);
   for (uint32_t index = 0; index < kOwnerCount; ++index) {
     arena.publish_owner(index, static_cast<uint64_t>(index) + 1, index & 63U);

@@ -25,7 +25,7 @@ def test_heavy_collision_adam_update():
     # We create only 2 keys, but simulate 4 batches of updates
     # This will trigger exactly 1 optimizer step at the last batch
     keys = np.array([101, 102], dtype=np.int64)
-    vals, _, _ = store.lookup_or_insert(keys, dim=16)
+    vals, _ = store.lookup_or_insert(keys, dim=16)
     v_start = np.from_dlpack(vals).copy()
     assert np.all(v_start == 0.0)
 

@@ -9,6 +9,14 @@
 #include "sparse_embedding/src/checkpoint/checkpoint_batch_filter.hpp"
 #include "sparse_embedding/src/ops/partitioner.hpp"
 
+#include <array>
+#include <charconv>
+#include <unordered_map>
+
+#ifdef SE_ENABLE_LANCE_CHECKPOINTER
+#include "sparse_embedding/src/checkpoint/lance/native_fragment_writer.hpp"
+#endif
+
 namespace se::py::detail {
 
 #ifdef SE_ENABLE_LANCE_CHECKPOINTER
@@ -307,6 +315,204 @@ void CheckpointOpsImpl<ParamT, OptT>::load_checkpoint(
       }
     }
   });
+}
+
+template <typename ParamT, typename OptT>
+nb::dict CheckpointOpsImpl<ParamT, OptT>::write_native_fragment(
+    EmbeddingStoreWrapper &self, const std::string &uri,
+    uint32_t participant_index, const std::vector<uint32_t> &dimensions,
+    const std::string &embedding_dtype, const std::string &optimizer_dtype,
+    const std::string &score_policy, uint32_t protocol_version,
+    const std::string &schema_digest) {
+  se::NativeFragmentWriter writer;
+  writer.begin_fragment(
+      uri, participant_index, dimensions, embedding_dtype, optimizer_dtype,
+      score_policy, protocol_version, schema_digest,
+      self.get_store<ParamT, OptT>()->has_score_policy());
+  {
+    nb::gil_scoped_release release;
+    self.get_store<ParamT, OptT>()->export_page_images(
+        pro::make_proxy<se::FunctionFacade<bool(
+            size_t, se::PageImageExport<ParamT, OptT> &&)>>(
+            [&](size_t dim, se::PageImageExport<ParamT, OptT> &&image) {
+              const auto values = std::as_bytes(std::span<const ParamT>(
+                  image.values.data(), image.values.size()));
+              const auto optimizer = std::as_bytes(std::span<const OptT>(
+                  image.optimizer_states.data(), image.optimizer_states.size()));
+              writer.write_page_image(
+                  dim, image.physical_page_id, image.page_slot_stride_bytes,
+                  sizeof(ParamT) * dim,
+                  image.slot_ordinals, image.keys, image.seq_counts, values,
+                  image.scores, optimizer,
+                  image.keys.empty()
+                      ? 0
+                      : image.optimizer_states.size() / image.keys.size(),
+                  sizeof(OptT),
+                  image.steps);
+              return true;
+            }));
+  }
+  const auto artifact = writer.finalize();
+  nb::dict result;
+  result["locator"] = artifact.locator;
+  result["entries_version"] = artifact.entries_version;
+  result["page_images_version"] = artifact.page_images_version;
+  result["entry_count"] = artifact.entry_count;
+  result["page_count"] = artifact.page_count;
+  result["physical_bytes"] = artifact.physical_bytes;
+  result["schema_digest"] = artifact.schema_digest;
+  result["content_digest"] = artifact.content_digest;
+  return result;
+}
+
+template <typename ParamT, typename OptT>
+void CheckpointOpsImpl<ParamT, OptT>::restore_native_entries(
+    EmbeddingStoreWrapper &self, const std::string &uri, uint64_t version,
+    nb::object selected_keys) {
+  auto [dlm, cap] = se::py::extract_dlpack_tensor(selected_keys);
+  if (dlm->dl_tensor.dtype.code != kDLUInt || dlm->dl_tensor.dtype.bits != 64)
+    throw std::invalid_argument("native restore selected_keys must be uint64");
+  const auto keys = se::py::dlpack_to_span<const uint64_t>(dlm);
+  se::scan_native_entries(
+      uri, version, keys,
+      [&](const se::NativeEntryBatch &batch) {
+        std::unordered_map<uint32_t, std::vector<size_t>> by_dimension;
+        for (size_t index = 0; index < batch.keys.size(); ++index)
+          by_dimension[batch.dimensions[index]].push_back(index);
+        for (const auto &[dim, indices] : by_dimension) {
+          std::vector<uint64_t> raw_keys;
+          std::vector<ParamT> values;
+          raw_keys.reserve(indices.size());
+          values.reserve(indices.size() * dim);
+          std::vector<int64_t> lengths(indices.size(), dim);
+          for (size_t index : indices) {
+            raw_keys.push_back(batch.keys[index]);
+            const auto begin = batch.embedding_offsets[index];
+            const auto end = batch.embedding_offsets[index + 1];
+            const auto *source = reinterpret_cast<const ParamT *>(
+                batch.embedding_values.data() + begin);
+            values.insert(values.end(), source, source + dim);
+          }
+          auto assign_dimension = [&]<typename KeyT>() {
+            std::vector<KeyT> dim_keys;
+            dim_keys.reserve(raw_keys.size());
+            for (const uint64_t key : raw_keys)
+              dim_keys.push_back(static_cast<KeyT>(key));
+            self.get_store<ParamT, OptT>()->assign(
+                std::span<const KeyT>(dim_keys), std::span<const ParamT>(values),
+                std::span<const int64_t>(lengths));
+            if (!batch.scores.empty() &&
+                self.get_store<ParamT, OptT>()->has_score_policy()) {
+              std::vector<uint64_t> dim_scores;
+              dim_scores.reserve(indices.size());
+              for (size_t index : indices)
+                dim_scores.push_back(batch.scores[index]);
+              self.get_store<ParamT, OptT>()->assign_scores(
+                  std::span<const KeyT>(dim_keys),
+                  std::span<const uint64_t>(dim_scores));
+            }
+            const uint32_t optimizer_stride =
+                batch.optimizer_strides[indices.front()];
+            if (optimizer_stride != 0) {
+              std::vector<OptT> optimizer;
+              optimizer.reserve(indices.size() * optimizer_stride);
+              for (size_t index : indices) {
+                const auto begin = batch.optimizer_offsets[index];
+                const auto end = batch.optimizer_offsets[index + 1];
+                const auto *source = reinterpret_cast<const OptT *>(
+                    batch.optimizer_values.data() + begin);
+                optimizer.insert(optimizer.end(), source,
+                                 source + optimizer_stride);
+              }
+              std::vector<uint32_t> steps;
+              steps.reserve(indices.size());
+              for (size_t index : indices)
+                steps.push_back(batch.steps[index]);
+              self.get_store<ParamT, OptT>()->assign_opt_states(
+                  dim, std::span<const KeyT>(dim_keys),
+                  std::span<const OptT>(optimizer),
+                  std::span<const uint32_t>(steps));
+            }
+          };
+          switch (self.key_type_enum_) {
+          case KeyDType::kInt32:
+            assign_dimension.template operator()<int32_t>();
+            break;
+          case KeyDType::kUInt32:
+            assign_dimension.template operator()<uint32_t>();
+            break;
+          case KeyDType::kInt64:
+            assign_dimension.template operator()<int64_t>();
+            break;
+          case KeyDType::kUInt64:
+            assign_dimension.template operator()<uint64_t>();
+            break;
+          }
+        }
+        return true;
+      });
+}
+
+template <typename ParamT, typename OptT>
+void CheckpointOpsImpl<ParamT, OptT>::restore_native_page_images(
+    EmbeddingStoreWrapper &self, const std::string &uri, uint64_t version,
+    uint32_t participant_index) {
+  se::scan_native_page_images(
+      uri, version, participant_index,
+      [&](se::NativePageImage &&page) {
+        if (page.embedding_dtype != self.value_dtype() ||
+            page.optimizer_dtype != self.optimizer_dtype())
+          throw std::runtime_error("native page image dtype does not match store");
+        const auto checksum = [](const se::NativePageImage &value) {
+          uint64_t hash = 1469598103934665603ULL;
+          auto update = [&](std::span<const std::byte> bytes) {
+            for (const auto byte : bytes) {
+              hash ^= std::to_integer<unsigned char>(byte);
+              hash *= 1099511628211ULL;
+            }
+          };
+          update(std::as_bytes(std::span<const uint32_t>(value.slot_ordinals)));
+          update(std::as_bytes(std::span<const uint64_t>(value.keys)));
+          update(std::as_bytes(std::span<const uint64_t>(value.sequences)));
+          update(value.values);
+          update(std::as_bytes(std::span<const uint64_t>(value.scores)));
+          update(value.optimizer_values);
+          update(std::as_bytes(std::span<const uint32_t>(value.steps)));
+          std::array<char, 17> output{};
+          auto [end, error] = std::to_chars(output.data(), output.data() + 16,
+                                            hash, 16);
+          if (error != std::errc{})
+            throw std::runtime_error("failed to format page checksum");
+          return std::string(output.data(), end);
+        };
+        if (checksum(page) != page.checksum)
+          throw std::runtime_error("page image checksum mismatch");
+        se::PageImageExport<ParamT, OptT> image{
+            page.physical_page_id,
+            page.embedding_dim,
+            page.page_slot_stride_bytes,
+            std::move(page.slot_ordinals),
+            std::move(page.keys),
+            std::move(page.sequences),
+            {},
+            std::move(page.scores),
+            {},
+            std::move(page.steps)};
+        if (page.values.size() % sizeof(ParamT) != 0 ||
+            page.optimizer_values.size() % sizeof(OptT) != 0)
+          throw std::runtime_error("native page image payload has invalid byte size");
+        const auto *values = reinterpret_cast<const ParamT *>(page.values.data());
+        image.values.assign(values, values + page.values.size() / sizeof(ParamT));
+        const auto *optimizer =
+            reinterpret_cast<const OptT *>(page.optimizer_values.data());
+        image.optimizer_states.assign(
+            optimizer, optimizer + page.optimizer_values.size() / sizeof(OptT));
+        se::PageImageImport<ParamT, OptT> imported{page.embedding_dim,
+                                                   std::move(image)};
+        self.get_store<ParamT, OptT>()->import_page_images(
+            std::span<const se::PageImageImport<ParamT, OptT>>(&imported, 1));
+        return true;
+      });
 }
 #endif  // SE_ENABLE_LANCE_CHECKPOINTER
 

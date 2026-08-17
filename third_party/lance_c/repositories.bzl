@@ -2,6 +2,7 @@
 
 load("@bazel_tools//tools/build_defs/repo:git.bzl", "git_repository")
 load("@bazel_tools//tools/build_defs/repo:http.bzl", "http_archive")
+load("//:versions.bzl", "LANCE_C_COMMIT", "LANCE_C_VERSION")
 
 def lance_c_repo(ctx):
     build_from_source = ctx.os.environ.get("SE_BUILD_LANCE_C_FROM_SOURCE", "0") == "1"
@@ -10,7 +11,7 @@ def lance_c_repo(ctx):
         git_repository(
             name = "lance_c",
             remote = "https://github.com/lance-format/lance-c.git",
-            commit = "c801dfe5cb4498ce9a1c04834b77d374afb680d9",
+            commit = LANCE_C_COMMIT,
             build_file = "//third_party/lance_c:BUILD.lance_c.bazel",
             patch_cmds = [
                 "find . -path ./BUILD.bazel -prune -o -name BUILD -exec rm {} + -o -name BUILD.bazel -exec rm {} +",
@@ -28,7 +29,11 @@ def lance_c_repo(ctx):
         if arch in ["aarch64", "arm64"]:
             target_arch = "aarch64"
 
-        url = "https://github.com/lance-format/lance-c/releases/download/v0.1.2/lance-c-v0.1.2-{}-{}.tar.xz".format(target_arch, target_os)
+        url = "https://github.com/lance-format/lance-c/releases/download/v{version}/lance-c-v{version}-{arch}-{os}.tar.xz".format(
+            version = LANCE_C_VERSION,
+            arch = target_arch,
+            os = target_os,
+        )
 
         build_file_content = """
 filegroup(

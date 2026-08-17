@@ -65,6 +65,9 @@ struct ArrowArray {
   void *private_data;
 };
 
+#ifndef ARROW_C_STREAM_INTERFACE
+#define ARROW_C_STREAM_INTERFACE
+
 struct ArrowArrayStream {
   int (*get_schema)(struct ArrowArrayStream *, struct ArrowSchema *out);
   int (*get_next)(struct ArrowArrayStream *, struct ArrowArray *out);
@@ -72,6 +75,8 @@ struct ArrowArrayStream {
   void (*release)(struct ArrowArrayStream *);
   void *private_data;
 };
+
+#endif // ARROW_C_STREAM_INTERFACE
 
 #endif // ARROW_C_DATA_INTERFACE
 

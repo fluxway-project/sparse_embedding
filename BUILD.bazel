@@ -10,6 +10,7 @@ load("@rules_cc//cc:defs.bzl", "cc_binary")
 load("@rules_python//python:defs.bzl", "py_library")
 load("@rules_python//python:packaging.bzl", "py_wheel")
 load("@rules_shell//shell:sh_binary.bzl", "sh_binary")
+load("//:versions.bzl", "PACKAGE_VERSION", "PYTHON_REQUIRES")
 
 sh_binary(
     name = "format",
@@ -73,18 +74,17 @@ genrule(
 cc_binary(
     name = "core_so_with_lance",
     srcs = [
-        "//sparse_embedding/src/bindings:srcs",
+        "//sparse_embedding/src/bindings:srcs_without_module",
         "//sparse_embedding/src/ops:srcs",
     ],
-    copts = [
-        "-DSE_ENABLE_LANCE_CHECKPOINTER",
-        "-fvisibility=hidden",
-    ],
+    copts = ["-fvisibility=hidden"],
     linkopts = ["-Wl,-rpath,$$ORIGIN"],
     linkshared = True,
     tags = ["manual"],
     deps = [
         "//sparse_embedding/src/backend/hogwild:hogwild_embedding_store",
+        "//sparse_embedding/src/bindings:checkpoint_instantiations_with_lance",
+        "//sparse_embedding/src/bindings:module_with_lance",
         "//sparse_embedding/src/checkpoint",
         "//sparse_embedding/src/checkpoint:checkpoint_lance",
         "//sparse_embedding/src/common",
@@ -122,12 +122,10 @@ py_library(
 
 py_wheel(
     name = "sparse_embedding_wheel",
-    abi = "cp312",
     distribution = "sparse_embedding",
     platform = "manylinux2014_x86_64",
-    python_requires = ">=3.11",
-    python_tag = "cp312",
-    version = "0.1.0",
+    python_requires = PYTHON_REQUIRES,
+    version = PACKAGE_VERSION,
     deps = [
         ":copy_core_so",
         ":sparse_embedding_lib",
@@ -136,13 +134,11 @@ py_wheel(
 
 py_wheel(
     name = "sparse_embedding_wheel_with_lance",
-    abi = "cp312",
     distribution = "sparse_embedding",
     platform = "manylinux2014_x86_64",
-    python_requires = ">=3.11",
-    python_tag = "cp312",
+    python_requires = PYTHON_REQUIRES,
     tags = ["manual"],
-    version = "0.1.0",
+    version = PACKAGE_VERSION,
     deps = [
         ":copy_core_so",
         ":copy_liblance_c",

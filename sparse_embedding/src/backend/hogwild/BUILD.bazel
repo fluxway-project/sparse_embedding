@@ -3,7 +3,6 @@ BUILD file for hogwild
 """
 
 load("@rules_cc//cc:cc_library.bzl", "cc_library")
-load(":instantiation/hogwild_instantiation.bzl", "hogwild_instantiation_library")
 
 cc_library(
     name = "operation_dispatch_policy",
@@ -90,7 +89,11 @@ cc_library(
     name = "hogwild_headers",
     hdrs = [
         "hogwild_embedding_store.hpp",
+        "optimizer_construction_impl.inl",
         "public/hogwild_store_options.hpp",
+        "public/optimizer_construction.hpp",
+        "public/store_construction.hpp",
+        "store_factory_impl.inl",
     ],
     visibility = ["//visibility:public"],
     deps = [
@@ -143,53 +146,28 @@ cc_library(
 
 cc_library(
     name = "hogwild_embedding_store_arenas",
-    srcs = ["hogwild_embedding_store.cpp"],
+    srcs = [
+        "hogwild_embedding_store.cpp",
+        "store_construction.cpp",
+    ],
     deps = [":hogwild_headers"],
 )
 
-hogwild_instantiation_library(
-    name = "hogwild_store_bfloat16_bfloat16",
-    src = "instantiation/hogwild_embedding_store_instantiation_bfloat16_bfloat16.cpp",
+cc_library(
+    name = "optimizer_construction",
+    srcs = glob(["instantiation/optimizer_construction_*.cpp"]),
+    deps = [":hogwild_headers"],
+    alwayslink = True,
 )
 
-hogwild_instantiation_library(
-    name = "hogwild_store_bfloat16_float",
-    src = "instantiation/hogwild_embedding_store_instantiation_bfloat16_float.cpp",
-)
-
-hogwild_instantiation_library(
-    name = "hogwild_store_bfloat16_float16",
-    src = "instantiation/hogwild_embedding_store_instantiation_bfloat16_float16.cpp",
-)
-
-hogwild_instantiation_library(
-    name = "hogwild_store_float_bfloat16",
-    src = "instantiation/hogwild_embedding_store_instantiation_float_bfloat16.cpp",
-)
-
-hogwild_instantiation_library(
-    name = "hogwild_store_float_float",
-    src = "instantiation/hogwild_embedding_store_instantiation_float_float.cpp",
-)
-
-hogwild_instantiation_library(
-    name = "hogwild_store_float_float16",
-    src = "instantiation/hogwild_embedding_store_instantiation_float_float16.cpp",
-)
-
-hogwild_instantiation_library(
-    name = "hogwild_store_float16_bfloat16",
-    src = "instantiation/hogwild_embedding_store_instantiation_float16_bfloat16.cpp",
-)
-
-hogwild_instantiation_library(
-    name = "hogwild_store_float16_float",
-    src = "instantiation/hogwild_embedding_store_instantiation_float16_float.cpp",
-)
-
-hogwild_instantiation_library(
-    name = "hogwild_store_float16_float16",
-    src = "instantiation/hogwild_embedding_store_instantiation_float16_float16.cpp",
+cc_library(
+    name = "store_specializations",
+    srcs = glob(["instantiation/core_specialization_*.cpp"]),
+    deps = [
+        ":hogwild_headers",
+        ":optimizer_construction",
+    ],
+    alwayslink = True,
 )
 
 cc_library(
@@ -197,15 +175,8 @@ cc_library(
     visibility = ["//visibility:public"],
     deps = [
         ":hogwild_embedding_store_arenas",
-        ":hogwild_store_bfloat16_bfloat16",
-        ":hogwild_store_bfloat16_float",
-        ":hogwild_store_bfloat16_float16",
-        ":hogwild_store_float16_bfloat16",
-        ":hogwild_store_float16_float",
-        ":hogwild_store_float16_float16",
-        ":hogwild_store_float_bfloat16",
-        ":hogwild_store_float_float",
-        ":hogwild_store_float_float16",
+        ":optimizer_construction",
+        ":store_specializations",
     ],
 )
 

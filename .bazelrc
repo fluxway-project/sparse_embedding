@@ -1,3 +1,11 @@
+# Bound Bazel JVM daemon heap to prevent greedy memory consumption across low and high RAM hosts
+startup --host_jvm_args=-Xmx1024m
+startup --host_jvm_args=-XX:+UseG1GC
+
+# Dynamic RAM-aware resource scheduling to adapt across heterogeneous hosts without hardcoding jobs
+build --local_resources=memory=HOST_RAM*0.75
+build --local_resources=cpu=HOST_CPUS
+
 build --cxxopt=-std=c++23
 build --enable_runfiles=false
 
@@ -21,6 +29,16 @@ build:opt --linkopt=-flto
 build:opt --copt=-march=native
 build:opt --copt=-mtune=native
 
+# GCC compiler heap garbage collection tuning: reclaim unused AST/template nodes aggressively (zero runtime impact)
+build:opt --copt=--param=ggc-min-expand=20
+build:opt --copt=--param=ggc-min-heapsize=32768
+
+# Omit variable location tracking on assignments in optimized release builds to reduce SSA hash table memory
+build:opt --copt=-fno-var-tracking-assignments
+
+# Use high-performance LLD linker to reduce linking memory footprint by ~75% and accelerate link time
+build:opt --linkopt=-fuse-ld=lld
+
 # ==============================================================================
 # LTO Variants — optional overrides
 # ==============================================================================
@@ -29,7 +47,9 @@ build:opt_clang --config=opt
 build:opt_clang --repo_env=CC=clang
 build:opt_clang --repo_env=CXX=clang++
 build:opt_clang --features=thin_lto
+build:opt_clang --linkopt=-fuse-ld=lld
 build:opt_clang --linkopt=-Wl,-mllvm,-import-instr-limit=100
+build:opt_clang --copt=-Wno-unused-command-line-argument
 
 # ==============================================================================
 # Debug Configuration (Dbg)
@@ -44,3 +64,4 @@ build:dbg --copt=-O0
 build:dbg --copt=-g
 build:dbg --copt=-DDEBUG
 build:dbg --strip=never
+build:dbg --linkopt=-fuse-ld=lld

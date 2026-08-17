@@ -54,7 +54,7 @@ struct CheckpointPageImage {
   uint32_t worker_id;
   uint32_t shard_id;
   uint32_t entry_count;
-  uint32_t vector_stride;
+  uint32_t page_slot_stride_bytes;
   CheckpointPageTier tier;
   std::vector<std::byte> payload;
 };
@@ -197,7 +197,7 @@ inline void validate_worker_checkpoint_artifact(
       throw std::invalid_argument(
           "checkpoint page does not belong to its worker artifact");
     if (page.payload.empty() || page.entry_count == 0 ||
-        page.vector_stride == 0)
+        page.page_slot_stride_bytes == 0)
       throw std::invalid_argument("checkpoint page image is empty");
   }
 }

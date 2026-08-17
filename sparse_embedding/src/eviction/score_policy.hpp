@@ -20,9 +20,46 @@
 
 #include <atomic>
 #include <cstdint>
+#include <exception>
 #include <memory>
 
 namespace se {
+
+enum class ScorePolicyKind : uint8_t { kNone, kLfu, kLru, kManual };
+
+class ScorePolicyRuntime {
+public:
+  explicit ScorePolicyRuntime(ScorePolicyKind kind)
+      : kind_(kind), clock_(kind == ScorePolicyKind::kLru
+                                ? std::make_unique<std::atomic<uint64_t>>(1)
+                                : nullptr) {}
+
+  bool enabled() const noexcept { return kind_ != ScorePolicyKind::kNone; }
+
+  void on_access(uint64_t *score_ptr) noexcept {
+    switch (kind_) {
+    case ScorePolicyKind::kNone:
+    case ScorePolicyKind::kManual:
+      return;
+    case ScorePolicyKind::kLfu: {
+      std::atomic_ref<uint64_t> score(*score_ptr);
+      score.store(score.load(std::memory_order_relaxed) + 1,
+                  std::memory_order_relaxed);
+      return;
+    }
+    case ScorePolicyKind::kLru:
+      std::atomic_ref<uint64_t>(*score_ptr)
+          .store(clock_->fetch_add(1, std::memory_order_relaxed),
+                 std::memory_order_relaxed);
+      return;
+    }
+    std::terminate();
+  }
+
+private:
+  ScorePolicyKind kind_;
+  std::unique_ptr<std::atomic<uint64_t>> clock_;
+};
 
 // ---------------------------------------------------------------------------
 // Built-in policies (plain structs — zero virtual overhead, designed for
@@ -67,6 +104,28 @@ struct ManualScorePolicy {
   static constexpr bool kHasScore = true;
   inline void on_access(uint64_t *) {}
 };
+
+inline constexpr ScorePolicyKind score_policy_kind(NoScorePolicy) noexcept {
+  return ScorePolicyKind::kNone;
+}
+
+inline constexpr ScorePolicyKind score_policy_kind(LfuScorePolicy) noexcept {
+  return ScorePolicyKind::kLfu;
+}
+
+inline constexpr ScorePolicyKind
+score_policy_kind(const LruScorePolicy &) noexcept {
+  return ScorePolicyKind::kLru;
+}
+
+inline constexpr ScorePolicyKind score_policy_kind(ManualScorePolicy) noexcept {
+  return ScorePolicyKind::kManual;
+}
+
+inline constexpr ScorePolicyKind
+score_policy_kind(ScorePolicyKind kind) noexcept {
+  return kind;
+}
 
 } // namespace se
 

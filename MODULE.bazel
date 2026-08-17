@@ -51,11 +51,6 @@ crate.from_cargo(
     cargo_lockfile = "//third_party/lance_c:Cargo.lock",
     manifests = ["//third_party/lance_c:Cargo.toml"],
 )
-crate.annotation(
-    crate = "aws-lc-sys",
-    patch_args = ["-p0"],
-    patches = ["//third_party/lance_c:aws-lc-sys.patch"],
-)
 use_repo(crate, "crate_index")
 
 # Hedron's Compile Commands Extractor for Bazel

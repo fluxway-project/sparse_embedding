@@ -38,12 +38,6 @@ class LanceWorkspace(Protocol):
 
     def child_prefixes(self, relative: str) -> tuple[str, ...]: ...
 
-    def read_record(self, relative: str) -> bytes | None: ...
-
-    def write_record_once(self, relative: str, payload: bytes) -> None: ...
-
-    def delete_record(self, relative: str) -> None: ...
-
     def storage_bytes(self) -> int: ...
 
     def assert_commit_lock(self) -> None: ...
@@ -86,33 +80,6 @@ class LocalLanceWorkspace:
         if not path.exists():
             return ()
         return tuple(item.name for item in path.iterdir() if item.is_dir())
-
-    def read_record(self, relative: str) -> bytes | None:
-        path = self._root / relative
-        return None if not path.exists() else path.read_bytes()
-
-    def write_record_once(self, relative: str, payload: bytes) -> None:
-        path = self._root / relative
-        path.parent.mkdir(parents=True, exist_ok=True)
-        if path.exists():
-            if path.read_bytes() != payload:
-                raise ValueError(
-                    f"persistent record conflicts with existing data: {path}"
-                )
-            return
-        temporary = path.with_suffix(f".{uuid.uuid4().hex}.tmp")
-        try:
-            with temporary.open("xb") as stream:
-                stream.write(payload)
-                stream.flush()
-                os.fsync(stream.fileno())
-            temporary.replace(path)
-        except BaseException:
-            temporary.unlink(missing_ok=True)
-            raise
-
-    def delete_record(self, relative: str) -> None:
-        (self._root / relative).unlink(missing_ok=True)
 
     def storage_bytes(self) -> int:
         if not self._root.exists():
@@ -249,48 +216,6 @@ class S3LanceWorkspace:
             if child:
                 result.append(child)
         return tuple(result)
-
-    def read_record(self, relative: str) -> bytes | None:
-        from botocore.exceptions import ClientError
-
-        try:
-            response = self._client.get_object(
-                Bucket=self._bucket,
-                Key=self._key(relative),
-            )
-        except ClientError as error:
-            status = error.response.get("ResponseMetadata", {}).get("HTTPStatusCode")
-            if status == 404:
-                return None
-            raise
-        return response["Body"].read()
-
-    def write_record_once(self, relative: str, payload: bytes) -> None:
-        from botocore.exceptions import ClientError
-
-        key = self._key(relative)
-        try:
-            self._client.put_object(
-                Bucket=self._bucket,
-                Key=key,
-                Body=payload,
-                IfNoneMatch="*",
-            )
-        except ClientError as error:
-            status = error.response.get("ResponseMetadata", {}).get("HTTPStatusCode")
-            if status not in {409, 412}:
-                raise
-            existing = self.read_record(relative)
-            if existing != payload:
-                raise ValueError(
-                    f"persistent record conflicts with existing data: {relative}"
-                ) from error
-
-    def delete_record(self, relative: str) -> None:
-        self._client.delete_object(
-            Bucket=self._bucket,
-            Key=self._key(relative),
-        )
 
     def storage_bytes(self) -> int:
         total = 0

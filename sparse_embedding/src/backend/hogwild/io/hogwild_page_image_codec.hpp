@@ -14,8 +14,8 @@ size_t validate_page_image_columns(const PageImageExport<ParamT, OptT> &image,
                                    bool score_enabled,
                                    size_t optimizer_state_dim,
                                    size_t entries_per_page) {
-  if (image.vector_dim != expected_dim ||
-      image.vector_stride != expected_stride)
+  if (image.embedding_dim != expected_dim ||
+      image.page_slot_stride_bytes != expected_stride)
     throw std::invalid_argument("page-image layout does not match slot");
   const size_t count = image.keys.size();
   if (count == 0 || image.slot_ordinals.size() != count ||
@@ -58,7 +58,7 @@ size_t validate_page_image(const PageImageImport<ParamT, OptT> &import,
                            size_t expected_dim, size_t expected_stride,
                            bool score_enabled, size_t optimizer_state_dim,
                            size_t entries_per_page) {
-  if (import.dim != expected_dim)
+  if (import.embedding_dim != expected_dim)
     throw std::invalid_argument(
         "page-image import dimension does not match slot");
   return validate_page_image_columns(import.image, expected_dim,

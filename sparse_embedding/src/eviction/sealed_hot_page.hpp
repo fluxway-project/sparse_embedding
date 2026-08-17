@@ -26,8 +26,8 @@ struct SealedPageLayout {
   uint64_t layout_generation;
   uint32_t entry_count;
   uint32_t entry_capacity;
-  uint32_t vector_dim;
-  uint32_t vector_stride;
+  uint32_t embedding_dim;
+  uint32_t page_slot_stride_bytes;
 };
 
 struct SealedPageByteDeleter {
@@ -47,13 +47,15 @@ public:
     if (slot >= layout_.entry_count)
       throw std::out_of_range("sealed page slot is out of range");
     const auto *data = reinterpret_cast<const Value *>(
-        payload_.get() + static_cast<size_t>(slot) * layout_.vector_stride);
-    return {data, layout_.vector_dim};
+        payload_.get() +
+        static_cast<size_t>(slot) * layout_.page_slot_stride_bytes);
+    return {data, layout_.embedding_dim};
   }
 
   const std::byte *payload_data() const noexcept { return payload_.get(); }
   size_t payload_size() const noexcept {
-    return static_cast<size_t>(layout_.entry_count) * layout_.vector_stride;
+    return static_cast<size_t>(layout_.entry_count) *
+           layout_.page_slot_stride_bytes;
   }
 
 private:
@@ -71,13 +73,15 @@ public:
 
   SealedHotPageBuilder(PageThermalTier tier, uint32_t cluster_id,
                        uint64_t page_layout_generation, uint32_t entry_capacity,
-                       uint32_t vector_dim)
-      : layout_{tier,           cluster_id, page_layout_generation,    0,
-                entry_capacity, vector_dim, aligned_stride(vector_dim)},
-        payload_(static_cast<std::byte *>(::operator new(
-            static_cast<size_t>(entry_capacity) * layout_.vector_stride,
-            std::align_val_t{kCacheLineSize}))) {
-    if (page_layout_generation == 0 || entry_capacity == 0 || vector_dim == 0)
+                       uint32_t embedding_dim)
+      : layout_{tier,           cluster_id,    page_layout_generation,       0,
+                entry_capacity, embedding_dim, aligned_stride(embedding_dim)},
+        payload_(static_cast<std::byte *>(
+            ::operator new(static_cast<size_t>(entry_capacity) *
+                               layout_.page_slot_stride_bytes,
+                           std::align_val_t{kCacheLineSize}))) {
+    if (page_layout_generation == 0 || entry_capacity == 0 ||
+        embedding_dim == 0)
       throw std::invalid_argument("sealed page layout is incomplete");
     keys_.reserve(entry_capacity);
     seq_counts_.reserve(entry_capacity);
@@ -87,15 +91,16 @@ public:
                   std::span<const Value> value) {
     if (sealed_)
       throw std::logic_error("sealed page cannot accept another entry");
-    if (seq_count == 0 || value.size() != layout_.vector_dim)
+    if (seq_count == 0 || value.size() != layout_.embedding_dim)
       throw std::invalid_argument("sealed page entry is invalid");
     if (layout_.entry_count == layout_.entry_capacity)
       throw std::length_error("sealed page capacity is exhausted");
     const uint32_t slot = layout_.entry_count;
     std::byte *destination =
-        payload_.get() + static_cast<size_t>(slot) * layout_.vector_stride;
+        payload_.get() +
+        static_cast<size_t>(slot) * layout_.page_slot_stride_bytes;
     std::memcpy(destination, value.data(),
-                static_cast<size_t>(layout_.vector_dim) * sizeof(Value));
+                static_cast<size_t>(layout_.embedding_dim) * sizeof(Value));
     keys_.push_back(key);
     seq_counts_.push_back(seq_count);
     ++layout_.entry_count;
@@ -117,10 +122,10 @@ public:
   }
 
 private:
-  static uint32_t aligned_stride(uint32_t vector_dim) {
-    const size_t bytes = static_cast<size_t>(vector_dim) * sizeof(Value);
+  static uint32_t aligned_stride(uint32_t embedding_dim) {
+    const size_t bytes = static_cast<size_t>(embedding_dim) * sizeof(Value);
     if (bytes > UINT32_MAX - (kCacheLineSize - 1))
-      throw std::overflow_error("sealed page vector stride overflows uint32");
+      throw std::overflow_error("sealed page slot stride overflows uint32");
     return static_cast<uint32_t>((bytes + kCacheLineSize - 1) &
                                  ~(size_t{kCacheLineSize} - 1));
   }
@@ -195,10 +200,10 @@ public:
   };
 
   SealedHotPagePool(size_t maximum_pages, uint32_t entry_capacity,
-                    uint32_t vector_dim)
+                    uint32_t embedding_dim)
       : state_(make_state(maximum_pages)), entry_capacity_(entry_capacity),
-        vector_dim_(vector_dim) {
-    if (maximum_pages == 0 || entry_capacity == 0 || vector_dim == 0)
+        embedding_dim_(embedding_dim) {
+    if (maximum_pages == 0 || entry_capacity == 0 || embedding_dim == 0)
       throw std::invalid_argument("sealed page pool dimensions are invalid");
     if (maximum_pages > std::numeric_limits<uint32_t>::max())
       throw std::overflow_error("sealed page pool id space is exhausted");
@@ -206,8 +211,9 @@ public:
 
   Reservation reserve(PageThermalTier tier, uint32_t cluster_id,
                       uint64_t page_layout_generation) {
-    SealedHotPageBuilder<Value> builder(
-        tier, cluster_id, page_layout_generation, entry_capacity_, vector_dim_);
+    SealedHotPageBuilder<Value> builder(tier, cluster_id,
+                                        page_layout_generation, entry_capacity_,
+                                        embedding_dim_);
     std::lock_guard lock(state_->mutex);
     uint32_t page_id = 0;
     if (!state_->free_page_ids.empty()) {
@@ -236,7 +242,7 @@ public:
         std::make_shared<SealedHotPage<Value>>(reservation.builder.seal());
     if (page->layout().entry_count == 0 ||
         page->layout().entry_count > entry_capacity_ ||
-        page->layout().vector_dim != vector_dim_)
+        page->layout().embedding_dim != embedding_dim_)
       throw std::logic_error("sealed page publication has invalid layout");
     std::lock_guard lock(state_->mutex);
     if (reservation.state != state_ ||
@@ -286,7 +292,7 @@ private:
 
   std::shared_ptr<PoolState> state_;
   uint32_t entry_capacity_;
-  uint32_t vector_dim_;
+  uint32_t embedding_dim_;
 };
 
 } // namespace se

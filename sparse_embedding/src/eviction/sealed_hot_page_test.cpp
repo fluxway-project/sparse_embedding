@@ -38,7 +38,7 @@ int main() {
   require(page.layout().cluster_id == 41 &&
               page.layout().layout_generation == 9,
           "sealed page layout metadata mismatch");
-  require(page.layout().vector_stride == 64,
+  require(page.layout().page_slot_stride_bytes == 64,
           "sealed page payload is not cache-line aligned");
   require(reinterpret_cast<uintptr_t>(page.payload_data()) % 64 == 0,
           "sealed page payload base is not cache-line aligned");
