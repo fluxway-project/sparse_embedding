@@ -32,7 +32,8 @@
 #include <vector>
 
 #include "sparse_embedding/src/memory/seqlock.hpp"
-#include "sparse_embedding/src/simd/simd_ops.hpp"
+#include "sparse_embedding/src/simd/memory_ops.hpp"
+#include "sparse_embedding/src/simd/prefetch.hpp"
 #include "sparse_embedding/src/storage/page_storage.hpp"
 
 namespace se {
@@ -113,21 +114,25 @@ public:
 
   void accumulate_hashed_exclusive(uint64_t feature_id, uint64_t feature_hash,
                                    const ValT *grad) {
-    uint32_t slot_index;
-    {
-      se::memory::PackedReadGuard metadata_lock(metadata_state_,
-                                                metadata_readers_);
-      const auto existing = id_map_.find(feature_id);
-      if (existing != id_map_.end()) {
-        slot_index = existing->second;
-        accumulate_impl(slot_index, grad);
-        return;
-      }
+    auto [it, inserted] =
+        id_map_.try_emplace(feature_id, static_cast<uint32_t>(next_slot_));
+    if (!inserted) {
+      accumulate_impl(it->second, grad);
+      return;
     }
-    se::memory::PackedWriteGuard metadata_lock(metadata_state_,
-                                               metadata_readers_);
-    slot_index = get_or_allocate_impl(feature_id, feature_hash, true);
-    accumulate_impl(slot_index, grad);
+    if (next_slot_ == capacity_) [[unlikely]] {
+      allocate_chunk();
+    }
+    const uint32_t slot_index = static_cast<uint32_t>(next_slot_);
+    if constexpr (simd::is_simd_supported_v<ValT>) {
+      simd::simd_copy(grad, reinterpret_cast<ValT *>(grad_data(slot_index)),
+                      dim_);
+    } else {
+      std::copy_n(grad, dim_, reinterpret_cast<ValT *>(grad_data(slot_index)));
+    }
+    feature_ids_.push_back(feature_id);
+    feature_hashes_.push_back(feature_hash);
+    ++next_slot_;
   }
 
   template <typename Fn> void for_each_accumulated(Fn &&fn) {
@@ -137,8 +142,14 @@ public:
         feature_hashes_.size() != next_slot_)
       throw std::logic_error(
           "transient arena feature-id layout is inconsistent");
-    for (size_t slot_index = 0; slot_index < next_slot_; ++slot_index)
+    constexpr size_t kPrefetchDist = 8;
+    for (size_t slot_index = 0; slot_index < next_slot_; ++slot_index) {
+      if (slot_index + kPrefetchDist < next_slot_) {
+        __builtin_prefetch(&feature_ids_[slot_index + kPrefetchDist], 0, 1);
+        __builtin_prefetch(&feature_hashes_[slot_index + kPrefetchDist], 0, 1);
+      }
       invoke_accumulated(fn, slot_index);
+    }
   }
 
   void clear() {

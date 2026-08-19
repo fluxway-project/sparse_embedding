@@ -34,6 +34,11 @@ public:
   FlatKeyDirectory(FlatKeyDirectory &&) noexcept = default;
   FlatKeyDirectory &operator=(FlatKeyDirectory &&) noexcept = default;
 
+  void prefetch_bucket_hashed(uint64_t hash) const noexcept {
+    const size_t position = bucket_position(hash);
+    __builtin_prefetch(&slots_[position], 0, 3);
+  }
+
   template <typename KeyForSlot>
   std::optional<uint32_t>
   find_hashed(uint64_t key, uint64_t hash,

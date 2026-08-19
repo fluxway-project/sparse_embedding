@@ -22,7 +22,7 @@
 #include <ranges>
 #include <span>
 
-#include "sparse_embedding/src/simd/simd_ops.hpp"
+#include "sparse_embedding/src/simd/uniform_init_ops.hpp"
 
 namespace se {
 

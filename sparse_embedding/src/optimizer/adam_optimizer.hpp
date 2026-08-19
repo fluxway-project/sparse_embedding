@@ -25,7 +25,7 @@
 #include "sparse_embedding/src/optimizer/learning_rate.hpp"
 #include "sparse_embedding/src/optimizer/optimizer_config.hpp"
 #include "sparse_embedding/src/optimizer/optimizer_state.hpp"
-#include "sparse_embedding/src/simd/simd_ops.hpp"
+#include "sparse_embedding/src/simd/adam_ops.hpp"
 
 namespace se {
 
@@ -40,13 +40,24 @@ class AdamOptimizer {
                   // required for correct Adam bias correction.
   AdamConfig config;
   LearningRateT learning_rate;
+  static constexpr size_t kMaxCachedSteps = 4096;
+  std::array<float, kMaxCachedSteps> bc1_table_{};
+  std::array<float, kMaxCachedSteps> bc2_table_{};
 
 public:
   explicit AdamOptimizer(size_t dim, const AdamConfig &cfg, PageStorage storage,
                          LearningRateT lr)
       : m_state(dim, storage), v_state(dim, storage),
         step_state(1, std::move(storage)), config(cfg),
-        learning_rate(std::move(lr)) {}
+        learning_rate(std::move(lr)) {
+    bc1_table_[0] = 1.0f;
+    bc2_table_[0] = 1.0f;
+    for (size_t t = 1; t < kMaxCachedSteps; ++t) {
+      const float step_f = static_cast<float>(t);
+      bc1_table_[t] = 1.0f / (1.0f - std::pow(config.beta1, step_f));
+      bc2_table_[t] = 1.0f / (1.0f - std::pow(config.beta2, step_f));
+    }
+  }
 
   void allocate(uint32_t idx) {
     m_state.allocate(idx);
@@ -112,6 +123,12 @@ public:
 
   void set_step(uint32_t idx, uint32_t s) { *step_state.data(idx) = s; }
 
+  void prefetch(uint32_t idx) const noexcept {
+    m_state.prefetch(idx);
+    v_state.prefetch(idx);
+    step_state.prefetch(idx);
+  }
+
   constexpr bool requires_score() const {
     return learning_rate.requires_score();
   }
@@ -121,9 +138,15 @@ public:
             [[maybe_unused]] uint64_t global_step, uint64_t score) {
     uint32_t &id_step = *step_state.data(idx);
     id_step++;
-    const float step_f = static_cast<float>(id_step);
-    const float bc1 = 1.0f / (1.0f - std::pow(config.beta1, step_f));
-    const float bc2 = 1.0f / (1.0f - std::pow(config.beta2, step_f));
+    float bc1, bc2;
+    if (id_step < kMaxCachedSteps) [[likely]] {
+      bc1 = bc1_table_[id_step];
+      bc2 = bc2_table_[id_step];
+    } else [[unlikely]] {
+      const float step_f = static_cast<float>(id_step);
+      bc1 = 1.0f / (1.0f - std::pow(config.beta1, step_f));
+      bc2 = 1.0f / (1.0f - std::pow(config.beta2, step_f));
+    }
 
     size_t dim = param_span.size();
     ParamT *param = param_span.data();

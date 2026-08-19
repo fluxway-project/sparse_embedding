@@ -70,7 +70,8 @@
 #include "sparse_embedding/src/interface/optimizer_interface.hpp"
 #include "sparse_embedding/src/observability/telemetry_ring.hpp"
 #include "sparse_embedding/src/optimizer/stable_page_directory.hpp"
-#include "sparse_embedding/src/simd/simd_ops.hpp"
+#include "sparse_embedding/src/simd/memory_ops.hpp"
+#include "sparse_embedding/src/simd/prefetch.hpp"
 #include "sparse_embedding/src/storage/page_storage.hpp"
 
 namespace se {
@@ -1016,6 +1017,10 @@ public:
         return find_hashed(key, SplitMixHash<uint64_t>{}(key));
       }
 
+      void prefetch_bucket_hashed(size_t hash) const noexcept {
+        directory.prefetch_bucket_hashed(hash);
+      }
+
       std::optional<uint32_t> find_hashed(uint64_t key,
                                           size_t hash) const noexcept {
         return directory.find_hashed(key, hash, [&](uint32_t slot_id) noexcept {
@@ -1159,6 +1164,13 @@ public:
                     hogwild_internal::SegmentedLocatorTable *locator_table,
                     uint64_t identity)
           : bundle(initial), locators(locator_table), table_identity(identity) {
+      }
+
+      void prefetch_bucket_hashed(size_t hash) const noexcept {
+        const MapBundle *b = bundle.load(std::memory_order_relaxed);
+        if (b != nullptr) {
+          b->prefetch_bucket_hashed(hash);
+        }
       }
     };
 
@@ -2104,6 +2116,15 @@ public:
                                                  std::forward<Visit>(visit));
     }
 
+    void prefetch_entry_hashed([[maybe_unused]] uint64_t key,
+                               size_t hash) const noexcept {
+      const auto &shard = *key_shards[hash & shard_mask];
+      const auto *rv = shard.read_view.get();
+      if (rv != nullptr) {
+        rv->prefetch_bucket_hashed(hash);
+      }
+    }
+
     template <typename Visit>
     bool with_shared_write_entry(uint64_t key, Visit &&visit) {
       const size_t hash = SplitMixHash<uint64_t>{}(key);
@@ -2115,28 +2136,10 @@ public:
     bool with_shared_write_entry_hashed(uint64_t key, size_t hash,
                                         Visit &&visit) {
       auto &shard = *key_shards[hash & shard_mask];
-      while (true) {
-        auto slot_id = shard.find_slot_hashed_unlocked(key, hash);
-        if (!slot_id.has_value())
-          return false;
-        if (shard.locators->requires_rotation(*slot_id)) {
-          std::unique_lock lock(shard.writer_mutex);
-          const auto current = shard.find_locator_unlocked(key);
-          if (!current.has_value())
-            return false;
-          if (current->slot_id != *slot_id ||
-              !shard.locators->requires_rotation(current->slot_id))
-            continue;
-          shard.rotate_locator_unlocked(key, current->slot_id);
-          continue;
-        }
-        try {
-          return shard.locators->try_write(
-              *slot_id,
-              [&](uint32_t index, std::atomic<uint64_t> &) { visit(index); });
-        } catch (const hogwild_internal::LocatorSequenceExhausted &) {
-        }
-      }
+      const auto slot_id = shard.find_slot_hashed_unlocked(key, hash);
+      if (!slot_id.has_value())
+        return false;
+      return shard.locators->try_read(*slot_id, std::forward<Visit>(visit));
     }
 
     template <typename Visit>
@@ -2146,11 +2149,7 @@ public:
       const auto slot_id = shard.find_slot_hashed_unlocked(key, hash);
       if (!slot_id.has_value())
         return false;
-      if (shard.locators->requires_rotation(*slot_id))
-        throw hogwild_internal::LocatorSequenceExhausted();
-      return shard.locators->try_write(
-          *slot_id,
-          [&](uint32_t index, std::atomic<uint64_t> &) { visit(index); });
+      return shard.locators->try_read(*slot_id, std::forward<Visit>(visit));
     }
 
     template <typename Visit>
@@ -2533,19 +2532,10 @@ public:
           ShardBatch &batch = by_shard[shard_id];
           auto &key_shard = *key_shards[shard_id];
           for (const ExistingEntry &entry : batch.existing) {
-            if (write_existing_payload) {
-              if (!key_shard.locators->try_write_key(
-                      entry.slot_id, entry.entry.key,
-                      [&](uint32_t index, std::atomic<uint64_t> &) {
-                        visit(entry.entry, index);
-                      }))
-                retry_entries.push_back(entry.entry);
-            } else {
-              if (!key_shard.locators->try_read_key(
-                      entry.slot_id, entry.entry.key,
-                      [&](uint32_t index) { visit(entry.entry, index); }))
-                retry_entries.push_back(entry.entry);
-            }
+            if (!key_shard.locators->try_read_key(
+                    entry.slot_id, entry.entry.key,
+                    [&](uint32_t index) { visit(entry.entry, index); }))
+              retry_entries.push_back(entry.entry);
           }
         }
       }
@@ -3572,8 +3562,10 @@ public:
               collect_telemetry && i >= telemetry_partition_offset(worker) &&
               i < telemetry_partition_offset(worker + 1);
           const size_t prefetch_distance =
-              operation_dispatch_topology_.forward_prefetch_distance;
-          if (prefetch_distance != 0 && position + prefetch_distance < count) {
+              operation_dispatch_topology_.forward_prefetch_distance != 0
+                  ? operation_dispatch_topology_.forward_prefetch_distance
+                  : 8;
+          if (position + prefetch_distance < count) {
             const size_t prefetch_index =
                 index_at(position + prefetch_distance);
             __builtin_prefetch(&keys[prefetch_index], 0, 1);
@@ -3585,6 +3577,19 @@ public:
               __builtin_prefetch(&offsets[prefetch_index], 0, 1);
               __builtin_prefetch(
                   out_flat_values.data() + offsets[prefetch_index], 1, 1);
+            }
+            const uint64_t prefetch_key =
+                static_cast<uint64_t>(keys[prefetch_index]);
+            const size_t prefetch_dim = fixed_dim.value_or(
+                static_cast<size_t>(row_lengths[prefetch_index]));
+            if (prefetch_dim < snapshot->dim_to_slot.size() &&
+                snapshot->dim_to_slot[prefetch_dim] != nullptr) [[likely]] {
+              auto &prefetch_slot = *snapshot->dim_to_slot[prefetch_dim];
+              const size_t prefetch_hash =
+                  !routed_hashes.empty()
+                      ? routed_hashes[prefetch_index]
+                      : SplitMixHash<uint64_t>{}(prefetch_key);
+              prefetch_slot.prefetch_entry_hashed(prefetch_key, prefetch_hash);
             }
           }
           uint64_t key = static_cast<uint64_t>(keys[i]);
@@ -3617,20 +3622,13 @@ public:
             }
           };
           const bool found = [&] {
-            if (!routed_hashes.empty() && !score_policy_.enabled()) {
-              return slot.with_read_view_entry_hashed(key, routed_hashes[i],
-                                                      visit);
+            const size_t hash = !routed_hashes.empty()
+                                    ? routed_hashes[i]
+                                    : SplitMixHash<uint64_t>{}(key);
+            if (!score_policy_.enabled()) {
+              return slot.with_read_view_entry_hashed(key, hash, visit);
             }
-            if (!routed_hashes.empty()) {
-              if (score_policy_.enabled())
-                return slot.with_shared_write_entry_hashed(
-                    key, routed_hashes[i], visit);
-              return slot.with_shared_entry_hashed(key, routed_hashes[i],
-                                                   visit);
-            }
-            if (score_policy_.enabled())
-              return slot.with_shared_write_entry(key, visit);
-            return slot.with_shared_entry(key, visit);
+            return slot.with_shared_write_entry_hashed(key, hash, visit);
           }();
           if (!found) {
             std::fill_n(out, dim, ParamT{0});
@@ -3918,6 +3916,7 @@ public:
                     ParamT *param = slot->arena.data(arena_idx);
                     if (!slot->optimizer.has_value())
                       return;
+                    slot->optimizer->prefetch(arena_idx);
                     if (score_policy_.enabled()) {
                       const uint64_t score =
                           std::atomic_ref<uint64_t>(

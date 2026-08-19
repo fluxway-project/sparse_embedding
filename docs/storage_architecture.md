@@ -124,13 +124,14 @@ after an epoch-safe retirement. If a locator sequence approaches wraparound, the
 directory rotates that key to a fresh slot and permanently retires the old slot
 rather than risking ABA.
 
-Payload reads and writes use the Linux x86_64 GCC/Clang SeqLock contract.
-Writers CAS an even sequence to odd, update the value, score, optimizer state,
-or compaction relocation payload, then release-publish an even sequence. Readers
-load the sequence with acquire semantics, pass a compiler barrier, run the SIMD
-copy, pass a second compiler barrier, and validate the sequence again. Readers
-are lock-free and may retry under writer pressure; they do not mutate reader
-counters or telemetry synchronously.
+Payload access follows the Linux x86_64 GCC/Clang pure optimistic SeqLock contract.
+Operations that mutate `arena_index` mappings (such as compaction relocation) CAS an even sequence
+to odd, migrate the physical page payload, then release-publish an even new sequence and destination address.
+Readers and in-place weight updaters (`optimizer_step`, `assign_existing`) use pure optimistic `try_read`
+to load the sequence and arena index with acquire semantics, pass a compiler barrier, directly read or modify
+the destination memory in-place, pass a second compiler barrier, and validate sequence consistency.
+Readers and updaters are entirely lock-free with zero atomic writes on the read path, automatically detecting
+version mutations and retrying if a compaction relocation occurs concurrently.
 
 Store lifetime is protected by an atomic `StoreSnapshot*` and an invocation
 gate. Forward, lookup, mutation, export, and metadata calls register once at
@@ -151,6 +152,29 @@ execution worker for an invocation that enters when 128 invocations are active.
 The share is fixed when each invocation enters; earlier invocations are not
 retroactively resized. Explicit `memory_parallelism` remains the upper bound
 for both task decomposition and execution.
+
+### Software Pipelined Prefetching
+
+Sparse embedding operations suffer primarily from memory latency bottlenecks due to irregular and non-contiguous memory access patterns (random key hashing, segmented locator lookup, physical page payload indexing, and optimizer moment state retrieval). Hardware stream prefetchers cannot predict these access patterns. The engine implements a multi-stage software pipelined prefetching architecture across both retrieval (Forward/Lookup) and training (Accumulate/Optimizer Step) hot paths:
+
+1. **SIMD & Prefetch Primitives (`simd/prefetch.hpp`)**:
+   Provides portable intrinsic wrappers for cache line prefetching (`prefetch_l1`, `prefetch_l2`, `__builtin_prefetch`) with configurable locality hints and read/write intent flags.
+
+2. **Hierarchical Forward/Lookup Pipeline (`HogwildEmbeddingStore::forward`)**:
+   Under a configurable pipeline distance (`forward_prefetch_distance`, default 8–16), the forward loop prefetches future items ahead of current compute:
+   - **Stage 1 (Feature Inputs)**: Prefetches future batch keys (`keys[i + distance]`), row lengths, and offsets into L1/L2 cache.
+   - **Stage 2 (Output Destination Buffer)**: Issues write-intent prefetching for destination memory (`out_flat_values + offset`).
+   - **Stage 3 (Directory Hash Buckets)**: Computes future key hashes and executes `prefetch_entry_hashed(prefetch_key, prefetch_hash)` -> `FlatKeyDirectory::prefetch_bucket_hashed(hash)`, bringing directory slot hash buckets into CPU cache prior to probing.
+   - **Stage 4 (Locator Slots)**: `SegmentedLocatorTable::prefetch_slot(slot_id)` pre-stages the 8-byte aligned `LocatorSlot` `{sequence, arena_index}`.
+
+3. **Optimizer State Page Prefetching (`OptimizerFacade` & `AdamOptimizer`)**:
+   - `OptimizerFacade` / `OptimizerKernel` interface declares a `pro::weak_dispatch<OptMemPrefetch>` (`prefetch(uint32_t idx)`) convention.
+   - During gradient accumulation and parameter updates (`optimizer_step`), the store issues `slot->optimizer->prefetch(arena_idx)` before running the kernel update.
+   - In `OptimizerState::prefetch(index)`, the storage page pointer is loaded and `__builtin_prefetch(ptr, 1, 3)` is executed with write-intent (`rw=1`, `locality=3`).
+   - `AdamOptimizer` concurrently prefetches the first moment ($m$), second moment ($v$), and per-slot `step_state` cache lines, eliminating LLC stalls during SIMD vector math.
+
+4. **Transient Arena Accumulation Pipeline**:
+   - In `TransientArena::for_each_accumulated`, iterating accumulated gradients prefetches future `feature_ids_` and `feature_hashes_` 8 steps ahead.
 
 ### ParlayHash Concurrency
 

@@ -24,6 +24,7 @@
 
 #include "sparse_embedding/src/optimizer/learning_rate.hpp"
 #include "sparse_embedding/src/optimizer/optimizer_config.hpp"
+#include "sparse_embedding/src/simd/sgd_ops.hpp"
 #include "sparse_embedding/src/storage/page_storage.hpp"
 
 namespace se {
@@ -58,6 +59,8 @@ public:
   constexpr uint32_t step_data(uint32_t /*idx*/) const { return 0; }
 
   void set_step(uint32_t /*idx*/, uint32_t /*s*/) {}
+
+  void prefetch(uint32_t /*idx*/) const noexcept {}
 
   constexpr bool requires_score() const {
     return learning_rate.requires_score();

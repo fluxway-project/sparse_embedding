@@ -91,13 +91,14 @@ barrier cost from cancelling the benefit of more threads.
 
 ### Training paths
 
-Dimension 128, 65,536 existing unique rows, eight workers, and affinity enabled:
+Dimension 128, 65,536 existing unique rows, eight workers, and affinity
+enabled. Throughput is the five-run median:
 
 | Operation | Throughput |
 |---|---:|
-| `assign` | **21.82 Mops/s** |
-| `accumulate_gradients` (including required step) | **7.33 Mops/s** |
-| `optimizer_step` | **15.67 Mops/s** |
+| `assign` | **16.50 Mops/s** |
+| `accumulate_gradients` (including required step) | **8.69 Mops/s** |
+| `optimizer_step` | **16.85 Mops/s** |
 
 ### High-concurrency pressure and reliability
 
@@ -143,9 +144,9 @@ repetitions per configuration reporting median/p95/p99.
 
 | Threads | Lookup median/p95/p99 (Mops/s) | Insert median/p95/p99 (Mops/s) |
 |---:|---:|---:|
-| 1 | 6.31 / 6.80 / 6.80 | 0.0456 / 0.0519 / 0.0519 |
-| 16 | 50.38 / 51.65 / 51.65 | 0.282 / 0.313 / 0.313 |
-| 64 | **64.76 / 72.30 / 72.30** | **0.583 / 0.608 / 0.608** |
+| 1 | 12.32 / 12.48 / 12.48 | 0.0455 / 0.0526 / 0.0526 |
+| 16 | 70.46 / 73.43 / 73.43 | 0.345 / 0.387 / 0.387 |
+| 64 | **79.29 / 91.47 / 91.47** | **0.592 / 0.611 / 0.611** |
 
 Mixed lookup/insert uses the same dimension, warm keys, and batch for 64 rounds;
 16/64 total threads are split evenly, with Auto storage at 1 GiB memory and
