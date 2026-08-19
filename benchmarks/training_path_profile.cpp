@@ -32,6 +32,7 @@ struct ProfileSgd {
   void set_state(uint32_t, std::span<const float>) {}
   uint32_t step_data(uint32_t) const { return 0; }
   void set_step(uint32_t, uint32_t) {}
+  void prefetch(uint32_t) {}
   bool requires_score() const { return false; }
   void step(uint32_t, std::span<float> parameter,
             std::span<const float> gradient, uint64_t, uint64_t) {

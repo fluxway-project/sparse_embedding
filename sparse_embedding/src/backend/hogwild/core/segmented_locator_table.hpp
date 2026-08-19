@@ -15,7 +15,6 @@
 
 namespace se::hogwild_internal {
 
-using se::memory::PackedReadGuard;
 using se::memory::PackedWriteGuard;
 
 struct alignas(8) LocatorSlot {
@@ -145,6 +144,13 @@ public:
     return slot;
   }
 
+  void prefetch_slot(uint32_t slot_id) const noexcept {
+    const LocatorSlot *slot = locate(slot_id);
+    if (slot != nullptr) {
+      __builtin_prefetch(slot, 0, 3);
+    }
+  }
+
   static uint64_t load_packed_at(const LocatorSlot *slot) noexcept {
     return slot->packed.load(std::memory_order_acquire);
   }
@@ -158,35 +164,71 @@ public:
 
   template <typename Read> decltype(auto) read(uint32_t slot_id, Read &&read) {
     LocatorSlot &slot = locate_required(slot_id);
-    PackedReadGuard guard(slot.packed, slot.readers);
-    const uint32_t encoded =
-        decode_index(slot.packed.load(std::memory_order_acquire));
-    if (encoded == 0)
-      throw std::logic_error("locator slot is not live");
-    return std::forward<Read>(read)(decode(encoded));
+    while (true) {
+      const uint64_t before = slot.packed.load(std::memory_order_acquire);
+      if ((static_cast<uint32_t>(before >> 32) & 1U) != 0U) {
+        se::memory::cpu_relax();
+        continue;
+      }
+      const uint32_t encoded = decode_index(before);
+      if (encoded == 0)
+        throw std::logic_error("locator slot is not live");
+      se::memory::compiler_barrier();
+      if constexpr (std::is_void_v<std::invoke_result_t<Read, uint32_t>>) {
+        std::forward<Read>(read)(decode(encoded));
+        se::memory::compiler_barrier();
+        if (before == slot.packed.load(std::memory_order_acquire))
+          return;
+      } else {
+        auto result = std::forward<Read>(read)(decode(encoded));
+        se::memory::compiler_barrier();
+        if (before == slot.packed.load(std::memory_order_acquire))
+          return result;
+      }
+    }
   }
 
   template <typename Read> bool try_read(uint32_t slot_id, Read &&read) {
-    LocatorSlot &slot = locate_required(slot_id);
-    PackedReadGuard guard(slot.packed, slot.readers);
-    const uint32_t encoded =
-        decode_index(slot.packed.load(std::memory_order_acquire));
-    if (encoded == 0)
+    const LocatorSlot *slot = locate(slot_id);
+    if (slot == nullptr)
       return false;
-    std::forward<Read>(read)(decode(encoded));
-    return true;
+    while (true) {
+      const uint64_t before = slot->packed.load(std::memory_order_acquire);
+      if ((static_cast<uint32_t>(before >> 32) & 1U) != 0U) {
+        se::memory::cpu_relax();
+        continue;
+      }
+      const uint32_t encoded = decode_index(before);
+      if (encoded == 0)
+        return false;
+      se::memory::compiler_barrier();
+      std::forward<Read>(read)(decode(encoded));
+      se::memory::compiler_barrier();
+      if (before == slot->packed.load(std::memory_order_acquire))
+        return true;
+    }
   }
 
   template <typename Read>
   bool try_read_key(uint32_t slot_id, uint64_t expected_key, Read &&read) {
-    LocatorSlot &slot = locate_required(slot_id);
-    PackedReadGuard guard(slot.packed, slot.readers);
-    const uint32_t encoded =
-        decode_index(slot.packed.load(std::memory_order_acquire));
-    if (encoded == 0 || slot.key != expected_key)
+    const LocatorSlot *slot = locate(slot_id);
+    if (slot == nullptr)
       return false;
-    std::forward<Read>(read)(decode(encoded));
-    return true;
+    while (true) {
+      const uint64_t before = slot->packed.load(std::memory_order_acquire);
+      if ((static_cast<uint32_t>(before >> 32) & 1U) != 0U) {
+        se::memory::cpu_relax();
+        continue;
+      }
+      const uint32_t encoded = decode_index(before);
+      if (encoded == 0 || slot->key != expected_key)
+        return false;
+      se::memory::compiler_barrier();
+      std::forward<Read>(read)(decode(encoded));
+      se::memory::compiler_barrier();
+      if (before == slot->packed.load(std::memory_order_acquire))
+        return true;
+    }
   }
 
   template <typename Write>

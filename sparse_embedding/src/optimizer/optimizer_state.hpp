@@ -112,6 +112,15 @@ public:
     return reinterpret_cast<const T *>(raw(index));
   }
 
+  void prefetch(uint32_t index) const noexcept {
+    const StoragePage *page = pages_.load(index / kEntriesPerPage);
+    if (page != nullptr) {
+      const std::byte *ptr =
+          page->data() + (index % kEntriesPerPage) * row_stride_;
+      __builtin_prefetch(ptr, 1, 3);
+    }
+  }
+
   constexpr size_t dim() const { return dim_; }
   constexpr size_t row_stride() const { return row_stride_; }
 

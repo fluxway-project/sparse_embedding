@@ -84,13 +84,13 @@ slot-directory read path 和连续分片调度。
 
 ### 训练路径
 
-dim=128、65,536 个已存在且唯一的 row、8 workers、affinity enabled：
+dim=128、65,536 个已存在且唯一的 row、8 workers、affinity enabled。吞吐为 5 次运行中位数：
 
 | 操作 | 吞吐 |
 |---|---:|
-| `assign` | **21.82 Mops/s** |
-| `accumulate_gradients`（含必需 step） | **7.33 Mops/s** |
-| `optimizer_step` | **15.67 Mops/s** |
+| `assign` | **16.50 Mops/s** |
+| `accumulate_gradients`（含必需 step） | **8.69 Mops/s** |
+| `optimizer_step` | **16.85 Mops/s** |
 
 ### 高并发压力与可靠性
 
@@ -133,9 +133,9 @@ fallback。
 
 | threads | lookup median/p95/p99 (Mops/s) | insert median/p95/p99 (Mops/s) |
 |---:|---:|---:|
-| 1 | 6.31 / 6.80 / 6.80 | 0.0456 / 0.0519 / 0.0519 |
-| 16 | 50.38 / 51.65 / 51.65 | 0.282 / 0.313 / 0.313 |
-| 64 | **64.76 / 72.30 / 72.30** | **0.583 / 0.608 / 0.608** |
+| 1 | 12.32 / 12.48 / 12.48 | 0.0455 / 0.0526 / 0.0526 |
+| 16 | 70.46 / 73.43 / 73.43 | 0.345 / 0.387 / 0.387 |
+| 64 | **79.29 / 91.47 / 91.47** | **0.592 / 0.611 / 0.611** |
 
 混合 lookup/insert：同一 dim、warm keys、batch，64 轮；16/64 总线程各半，Auto storage
 memory=1 GiB、spill=2 GiB。

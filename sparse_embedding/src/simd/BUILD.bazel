@@ -5,10 +5,91 @@ BUILD file for simd
 load("@rules_cc//cc:defs.bzl", "cc_library", "cc_test")
 
 cc_library(
-    name = "simd",
-    hdrs = ["simd_ops.hpp"],
+    name = "traits",
+    hdrs = ["traits.hpp"],
     visibility = ["//visibility:public"],
     deps = ["//sparse_embedding/src/common"],
+)
+
+cc_library(
+    name = "intrinsics",
+    hdrs = ["intrinsics.hpp"],
+    visibility = ["//visibility:public"],
+    deps = [
+        ":traits",
+        "//sparse_embedding/src/common",
+    ],
+)
+
+cc_library(
+    name = "prefetch",
+    hdrs = ["prefetch.hpp"],
+    visibility = ["//visibility:public"],
+)
+
+cc_library(
+    name = "memory_ops",
+    hdrs = ["memory_ops.hpp"],
+    visibility = ["//visibility:public"],
+    deps = [
+        ":intrinsics",
+        ":traits",
+    ],
+)
+
+cc_library(
+    name = "sgd_ops",
+    hdrs = ["sgd_ops.hpp"],
+    visibility = ["//visibility:public"],
+    deps = [
+        ":intrinsics",
+        ":traits",
+    ],
+)
+
+cc_library(
+    name = "adam_ops",
+    hdrs = ["adam_ops.hpp"],
+    visibility = ["//visibility:public"],
+    deps = [
+        ":intrinsics",
+        ":traits",
+    ],
+)
+
+cc_library(
+    name = "uniform_init_ops",
+    hdrs = ["uniform_init_ops.hpp"],
+    visibility = ["//visibility:public"],
+    deps = [
+        ":intrinsics",
+        ":traits",
+    ],
+)
+
+cc_library(
+    name = "simd",
+    hdrs = [
+        "adam_ops.hpp",
+        "intrinsics.hpp",
+        "memory_ops.hpp",
+        "prefetch.hpp",
+        "sgd_ops.hpp",
+        "simd_ops.hpp",
+        "traits.hpp",
+        "uniform_init_ops.hpp",
+    ],
+    visibility = ["//visibility:public"],
+    deps = [
+        ":adam_ops",
+        ":intrinsics",
+        ":memory_ops",
+        ":prefetch",
+        ":sgd_ops",
+        ":traits",
+        ":uniform_init_ops",
+        "//sparse_embedding/src/common",
+    ],
 )
 
 cc_test(

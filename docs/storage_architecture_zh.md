@@ -84,7 +84,7 @@ store = se.EmbeddingStore(config, score_policy="lfu")
 
 `SegmentedLocatorTable` 拥有固定 32 KiB segment，每个 segment 含 4,096 个 8-byte locator slot。slot 保存 `{sequence, arena_index}` 并按 8-byte 对齐。slot ID、locator slot、arena index、page 与 store snapshot 都只能在 epoch 安全回收后复用。locator sequence 接近 wraparound 时，目录会把该 key rotate 到新 slot，并永久退休旧 slot，避免 ABA。
 
-payload 读写使用 Linux x86_64 GCC/Clang SeqLock 契约。writer 通过 CAS 把偶数 sequence 改为奇数，更新 value、score、optimizer state 或 compaction relocation payload，再 release-publish 偶数 sequence。reader acquire-load sequence，经过 compiler barrier 后执行 SIMD copy，再经过第二个 barrier 并复读 sequence 校验。reader lock-free，在 writer 压力下允许重试；reader 不写 counter，也不做同步 telemetry mutation。
+payload 访问使用 Linux x86_64 GCC/Clang 纯乐观 SeqLock 契约。Compaction 物理搬迁等修改 `arena_index` 映射的操作通过 CAS 把偶数 sequence 改为奇数，迁移物理页 payload，再 release-publish 偶数新 sequence 与新地址。reader 与就地权重更新者（`optimizer_step`、`assign_existing`）通过纯乐观 `try_read` acquire-load sequence 与 arena 索引，经过 compiler barrier 后直接在目标内存就地读取或修改，再经过第二个 barrier 并复读 sequence 校验一致性。reader 完全 lock-free 且读路径零原子计数写入，在 writer 搬迁时自动感知版本变动并重试。
 
 store 生命周期由原子 `StoreSnapshot*` 与 invocation gate 保护。forward、lookup、mutation、export 与 metadata 调用在入口登记一次，acquire-load snapshot，退出时离开 gate。`clear`、reserve、page-image import 等重配置在私有 control-plane mutex 下等待已进入调用退出，再发布新 snapshot。析构先停止 telemetry、关闭 invocation gate、注销 page-eviction callback、退休 snapshot，最后销毁 slot state。
 
@@ -95,6 +95,29 @@ telemetry partition；task 数提供足够的独立随机访存工作来隐藏�
 活跃时，新进入调用的执行宽度为一个 worker。执行份额在每次调用进入时确定，不会追溯
 调整更早进入的调用。显式 `memory_parallelism` 仍是 task decomposition 与实际执行宽度
 的共同上限。
+
+### 流水线软件预取机制
+
+稀疏 Embedding 表检索与训练更新中，访存模式高度离散（随机键哈希、分段 locator 槽位定位、物理数据页索引以及优化器动量状态寻址）。硬件 Stream Prefetcher 无法有效预测此类跳跃式访存，导致大量执行周期消耗在 LLC Cache Miss 与内存停顿上。系统在前向检索（Forward / Lookup）与反向训练（Accumulate / Optimizer Step）热路径中构建了多级软件流水线预取体系：
+
+1. **SIMD 与预取原语层 (`simd/prefetch.hpp`)**：
+   封装跨平台的 L1/L2 预取原语（`prefetch_l1`、`prefetch_l2` 及 GNU `__builtin_prefetch`），支持指定读写意图（Read/Write Intent）与缓存局部性提示（Locality Hints）。
+
+2. **前向查询多级流水线 (`HogwildEmbeddingStore::forward`)**：
+   基于可配置的流水线步长 `forward_prefetch_distance`（默认 8～16 步），在处理当前样本时对未来的流水线阶段提前发出内存预取：
+   - **第 1 级（输入特征预取）**：预取未来位置的 `keys[i + dist]`、`row_lengths` 与 `offsets`。
+   - **第 2 级（输出缓冲区预取）**：对目标输出内存 `out_flat_values + offset` 发出写意图预取。
+   - **第 3 级（哈希目录桶预取）**：计算未来 key 的哈希并调用 `prefetch_entry_hashed` -> `FlatKeyDirectory::prefetch_bucket_hashed(hash)`，提前将目录哈希桶缓存行装入 L1/L2 缓存。
+   - **第 4 级（定位槽位预取）**：调用 `SegmentedLocatorTable::prefetch_slot(slot_id)` 预拉取 8 字节对齐的 `LocatorSlot`（含 `sequence` 与 `arena_index`）。
+
+3. **优化器状态页流水线 (`OptimizerFacade` & `AdamOptimizer`)**：
+   - `OptimizerFacade` / `OptimizerKernel` 契约引入弱分发接口 `pro::weak_dispatch<OptMemPrefetch>` (`prefetch(uint32_t idx)`)。
+   - 训练更新（`optimizer_step` 与梯度累加）在进入 SIMD 内核计算前，提前调用 `slot->optimizer->prefetch(arena_idx)`。
+   - `OptimizerState::prefetch(index)` 定位物理页地址并发出写意图预取 `__builtin_prefetch(ptr, 1, 3)`。
+   - `AdamOptimizer` 同步并发预取一阶动量（$m$）、二阶动量（$v$）和每槽 `step_state` 所在的物理页缓存行，完全消除 SIMD 算子执行时的动量加载停顿。
+
+4. **暂态内存池累加流水线 (`TransientArena`)**：
+   - 在 `TransientArena::for_each_accumulated` 反向遍历梯度时，提前 8 步预取后续槽位的 `feature_ids_` 与 `feature_hashes_`。
 
 ### ParlayHash 并发
 
