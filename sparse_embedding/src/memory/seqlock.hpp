@@ -10,7 +10,10 @@
 #endif
 
 #include <atomic>
+#include <cstddef>
 #include <cstdint>
+#include <span>
+#include <stdexcept>
 #include <type_traits>
 
 #if defined(__x86_64__) || defined(__i386__)
@@ -128,6 +131,38 @@ public:
 
 private:
   PackedWriteLock lock_;
+};
+
+struct PackedWriteTarget {
+  std::atomic<uint64_t> *packed;
+  std::atomic<uint32_t> *readers;
+};
+
+class PackedWriteGuardBatch {
+public:
+  explicit PackedWriteGuardBatch(std::span<const PackedWriteTarget> targets)
+      : targets_(targets), locked_(0) {
+    if (targets_.empty())
+      throw std::invalid_argument("packed write guard batch is empty");
+    for (; locked_ < targets_.size(); ++locked_)
+      PackedWriteLock(*targets_[locked_].packed, *targets_[locked_].readers)
+          .lock();
+  }
+
+  ~PackedWriteGuardBatch() {
+    while (locked_ != 0) {
+      --locked_;
+      PackedWriteLock(*targets_[locked_].packed, *targets_[locked_].readers)
+          .unlock();
+    }
+  }
+
+  PackedWriteGuardBatch(const PackedWriteGuardBatch &) = delete;
+  PackedWriteGuardBatch &operator=(const PackedWriteGuardBatch &) = delete;
+
+private:
+  std::span<const PackedWriteTarget> targets_;
+  size_t locked_;
 };
 
 class PackedReadGuard {

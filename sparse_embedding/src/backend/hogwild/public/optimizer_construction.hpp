@@ -9,7 +9,7 @@ namespace se {
 
 template <typename ParamT, typename OptT>
 using OptimizerConstructionFactory =
-    Function<pro::proxy<OptimizerFacade<ParamT, OptT>>(size_t)>;
+    Function<OptimizerExtension<ParamT, OptT>(size_t)>;
 
 #define SE_DECLARE_OPTIMIZER_FACTORY(NAME, P, O)                               \
   OptimizerConstructionFactory<P, O> create_optimizer_factory_##NAME(          \

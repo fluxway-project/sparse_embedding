@@ -56,21 +56,46 @@ The embedding and optimizer templates use the following canonical shapes:
 
 ```cpp
 using Store = se::HogwildEmbeddingStore<KeyT, ParamT, OptT, ScorePolicy>;
-using Optimizer = pro::proxy<se::OptimizerFacade<ParamT, OptT>>;
+using Optimizer = se::OptimizerExtension<ParamT, OptT>;
 using OptimizerFactory = se::Function<Optimizer(size_t)>;
 
 auto optimizer =
-    pro::make_proxy<se::OptimizerFacade<ParamT, OptT>, OptimizerImpl>();
+    pro::make_proxy<se::OptimizerExtensionFacade<ParamT, OptT>,
+                    OptimizerImpl>();
 auto optimizer_factory = pro::make_proxy<
     se::FunctionFacade<Optimizer(size_t)>>(
     [](size_t) -> Optimizer {
       return pro::make_proxy<
-          se::OptimizerFacade<ParamT, OptT>, OptimizerImpl>();
+          se::OptimizerExtensionFacade<ParamT, OptT>, OptimizerImpl>();
     });
 ```
 
-Facade definitions live in their interface headers. Callers use these exact
-template parameters rather than redeclaring a legacy facade or store alias.
+`OptimizerExtensionFacade<ParamT, OptT>` is the only optimizer extension seam.
+Its required operation is `update(const OptimizerBatchView<ParamT>&,
+uint64_t)`. Optional state, checkpoint, and lifecycle operations remain on the
+same facade. The store resolves keys and arena indices first, then invokes one
+batch update per key shard. Every parameter span is consumed while the
+corresponding locator `PackedWriteGuardBatch` is held; no raw `ParamT*` is
+retained for deferred work.
+
+`std::variant` is reserved for cold optimizer and learning-rate configuration;
+it is not a long-lived per-row runtime representation.
+
+### Optimizer Execution Invariants
+
+The training path accumulates gradients in `TransientArena` and then executes
+one batch update per execution shard. It obeys the following invariants:
+
+| Invariant | Contract |
+|---|---|
+| Locator lifetime | Key resolution, parameter-span construction, and optimizer mutation occur inside one `PackedWriteGuardBatch`. |
+| Proxy frequency | The optimizer extension proxy is entered once per resolved shard batch, never once per row. |
+| Deferred pointers | No raw `ParamT*` or parameter span escapes the locator write callback. |
+| Failure policy | Invalid dimensions, payload widths, duplicate locator slots, and missing optimizer state throw immediately. |
+
+Batch dispatch is the production seam. Static dispatch and type-erased dispatch
+implement the same batch contract; neither changes locator lifetime or permits
+parameter spans to escape the write guard.
 
 ## Python Configuration
 
@@ -158,20 +183,20 @@ for both task decomposition and execution.
 Sparse embedding operations suffer primarily from memory latency bottlenecks due to irregular and non-contiguous memory access patterns (random key hashing, segmented locator lookup, physical page payload indexing, and optimizer moment state retrieval). Hardware stream prefetchers cannot predict these access patterns. The engine implements a multi-stage software pipelined prefetching architecture across both retrieval (Forward/Lookup) and training (Accumulate/Optimizer Step) hot paths:
 
 1. **SIMD & Prefetch Primitives (`simd/prefetch.hpp`)**:
-   Provides portable intrinsic wrappers for cache line prefetching (`prefetch_l1`, `prefetch_l2`, `__builtin_prefetch`) with configurable locality hints and read/write intent flags.
+   Provides portable intrinsic wrappers for CPU cache line prefetching (`prefetch_l1`, `prefetch_l2`, `__builtin_prefetch`) with configurable locality hints and read/write intent flags.
 
 2. **Hierarchical Forward/Lookup Pipeline (`HogwildEmbeddingStore::forward`)**:
    Under a configurable pipeline distance (`forward_prefetch_distance`, default 8–16), the forward loop prefetches future items ahead of current compute:
    - **Stage 1 (Feature Inputs)**: Prefetches future batch keys (`keys[i + distance]`), row lengths, and offsets into L1/L2 cache.
    - **Stage 2 (Output Destination Buffer)**: Issues write-intent prefetching for destination memory (`out_flat_values + offset`).
-   - **Stage 3 (Directory Hash Buckets)**: Computes future key hashes and executes `prefetch_entry_hashed(prefetch_key, prefetch_hash)` -> `FlatKeyDirectory::prefetch_bucket_hashed(hash)`, bringing directory slot hash buckets into CPU cache prior to probing.
-   - **Stage 4 (Locator Slots)**: `SegmentedLocatorTable::prefetch_slot(slot_id)` pre-stages the 8-byte aligned `LocatorSlot` `{sequence, arena_index}`.
+   - **Stage 3 (Directory Hash Buckets)**: Computes future key hashes and executes `prefetch_entry_cacheline(prefetch_key, prefetch_hash)` -> `FlatKeyDirectory::prefetch_bucket_cacheline(hash)`, bringing directory slot hash buckets into CPU cache prior to probing.
+   - **Stage 4 (Locator Slots)**: `SegmentedLocatorTable::prefetch_slot_cacheline(slot_id)` pre-stages the 8-byte aligned `LocatorSlot` `{sequence, arena_index}`.
 
-3. **Optimizer State Page Prefetching (`OptimizerFacade` & `AdamOptimizer`)**:
-   - `OptimizerFacade` / `OptimizerKernel` interface declares a `pro::weak_dispatch<OptMemPrefetch>` (`prefetch(uint32_t idx)`) convention.
-   - During gradient accumulation and parameter updates (`optimizer_step`), the store issues `slot->optimizer->prefetch(arena_idx)` before running the kernel update.
-   - In `OptimizerState::prefetch(index)`, the storage page pointer is loaded and `__builtin_prefetch(ptr, 1, 3)` is executed with write-intent (`rw=1`, `locality=3`).
-   - `AdamOptimizer` concurrently prefetches the first moment ($m$), second moment ($v$), and per-slot `step_state` cache lines, eliminating LLC stalls during SIMD vector math.
+3. **Optimizer State Page Prefetching (`OptimizerExtensionFacade` & `AdamOptimizer`)**:
+   - `OptimizerExtensionFacade` keeps `prefetch_state(uint32_t idx)` as an optional operation on the optimizer extension seam.
+   - Optimizer kernels prefetch each row's state immediately before its SIMD update; proxy dispatch still occurs once per resolved batch rather than once per row.
+   - In `OptimizerState::prefetch_state_cacheline(index)`, the storage page pointer is loaded and `__builtin_prefetch(ptr, 1, 3)` is executed with write-intent (`rw=1`, `locality=3`), explicitly targeting CPU cacheline prefetching without confusing with storage I/O page faults.
+   - `AdamOptimizer` prefetches the first moment ($m$), second moment ($v$), and per-slot `step_state` cache lines before its SIMD update to reduce avoidable state-load latency.
 
 4. **Transient Arena Accumulation Pipeline**:
    - In `TransientArena::for_each_accumulated`, iterating accumulated gradients prefetches future `feature_ids_` and `feature_hashes_` 8 steps ahead.
@@ -291,6 +316,13 @@ invocation and weights its observations by the logical partition count.
 Telemetry partitioning is therefore independent of task decomposition and
 concurrency limiting. Store destruction stops and joins the consumer before
 destroying any slot referenced by queued events.
+
+Release-only optimizer locator revalidation failures use the same ring. The
+producer increments a relaxed counter and publishes a fixed-size diagnostic
+event; it never formats a string or performs iostream I/O. The consumer invokes
+the configured `noexcept` diagnostic sink, whose default implementation writes
+one line to `std::clog`. Diagnostic events are bounded and may be dropped when
+the ring is full; `dropped_diagnostic_events` exposes that loss separately.
 
 The adaptive policy uses the Boltzmann distribution
 `weight_i = exp(-(utility_i - min_utility) / temperature) / sum_j exp(...)`.

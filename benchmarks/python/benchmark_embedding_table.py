@@ -46,15 +46,17 @@ class EmbeddingTableBenchmark:
             embedding_config=config, initializer_config=initializer
         )
 
+    @staticmethod
+    def _unique_keys(batch_size: int) -> np.ndarray:
+        return np.arange(batch_size, dtype=np.int64)
+
     def benchmark_insertion(self, batch_sizes: list[int], iters: int = 10):
         print(
             f"\n=== Insertion Benchmark (lookup_or_insert) [Threads: {self.thread_budget}] ==="
         )
         for batch_size in batch_sizes:
             runner = BenchmarkRunner("Insert", iters=iters)
-            keys = np.random.randint(
-                0, batch_size * 10, size=batch_size, dtype=np.int64
-            )
+            keys = self._unique_keys(batch_size)
             # Warmup to ensure JIT/OS pages are ready
             for _ in range(3):
                 self.store.lookup_or_insert(keys, dim=self.dim)
@@ -85,9 +87,7 @@ class EmbeddingTableBenchmark:
         )
         for batch_size in batch_sizes:
             runner = BenchmarkRunner("Assign", iters=iters)
-            keys = np.random.randint(
-                0, batch_size * 10, size=batch_size, dtype=np.int64
-            )
+            keys = self._unique_keys(batch_size)
             values = np.random.rand(batch_size, self.dim).astype(np.float32)
             # Warmup
             for _ in range(3):
@@ -98,9 +98,7 @@ class EmbeddingTableBenchmark:
         print(f"\n=== End-to-End Step Benchmark [Threads: {self.thread_budget}] ===")
         for batch_size in batch_sizes:
             runner = BenchmarkRunner("E2E Step", iters=iters)
-            keys = np.random.randint(
-                0, batch_size * 10, size=batch_size, dtype=np.int64
-            )
+            keys = self._unique_keys(batch_size)
             values = np.random.rand(batch_size, self.dim).astype(np.float32)
             # Warmup
             self.store.lookup_or_insert(keys, dim=self.dim)

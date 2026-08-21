@@ -24,18 +24,22 @@ The following metrics show the Queries Per Second (QPS) for bulk `lookup_or_inse
 | **Insert QPS**       | 682,642.36      | 336,386.05    | **49.28%**     |
 | **Lookup QPS**       | 21,348,252.61   | 17,415,414.31 | **81.58%**     |
 
-## Analysis and Conclusion
+## Interpretation
 
 ### 1. Lookup Performance (ReadOnly)
 Under extreme concurrency (128 threads), the pure memory lookup reaches ~21.3M keys/s. Remarkably, the pure disk lookup retains ~17.4M keys/s, which is **81.58% of the pure memory performance**.
-This indicates that the C++ backend and OS-level memory mapping / page caching handles concurrent read-only access exceptionally well. Even when the backing store is on disk, the read throughput does not suffer a catastrophic drop, demonstrating the robustness of the zero-copy and multi-core dispatch architecture (`py::gil_scoped_release`).
+The result is specific to this workload and warm-up state. Disk-backed pages may be
+served by the operating-system cache; it must not be interpreted as a storage
+device latency or durability guarantee.
 
 ### 2. Insert Performance (Write + Allocate)
 The `lookup_or_insert` operation on disk drops to **49.28%** of the memory baseline.
-Unlike lookups, new insertions onto disk require dirtying pages and triggering physical disk IO operations (e.g., ext4/xfs block allocation, fsync constraints, and OS writeback). With 128 threads competing for disk-backed memory blocks, the IO contention and dirty page write-out become the primary bottleneck, resulting in approximately half the performance of pure memory allocations.
+Insertions modify disk-backed pages and can contend on allocation and writeback.
+The measured ratio is therefore workload- and device-dependent.
 
 ### 3. Effectiveness of Pre-reserving Capacity
-By using `store.reserve(10000000, 128)`, the benchmark cleanly separates data-path performance from control-path (resizing/warmup) overhead. The `SparseEmbeddingSpillWarning` during the initialization phase confirms that the disk space was successfully pre-reserved before any timing started.
+`store.reserve(10000000, 128)` moves capacity preparation out of the timed phase,
+so the table compares data-path behavior rather than resizing overhead.
 
 ---
 

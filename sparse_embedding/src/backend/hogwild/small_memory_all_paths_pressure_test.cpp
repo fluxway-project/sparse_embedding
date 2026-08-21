@@ -61,11 +61,11 @@ int main() {
 
   se::SgdConfig sgd_config;
   sgd_config.lr = 0.01F;
-  auto optimizer_factory = pro::make_proxy<se::FunctionFacade<
-      pro::proxy<se::OptimizerFacade<float, float>>(size_t)>>(
+  auto optimizer_factory = pro::make_proxy<
+      se::FunctionFacade<se::OptimizerExtension<float, float>(size_t)>>(
       [storage, sgd_config](size_t dim) mutable {
         return pro::make_proxy<
-            se::OptimizerFacade<float, float>,
+            se::OptimizerExtensionFacade<float, float>,
             se::SgdOptimizer<float, float, se::StaticLearningRate>>(
             dim, sgd_config, storage, se::StaticLearningRate{sgd_config.lr});
       });

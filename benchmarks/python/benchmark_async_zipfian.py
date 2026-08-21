@@ -18,6 +18,9 @@ async def worker(store, keys, values, batch_size):
         end = min(start + batch_size, num_keys)
         batch_keys = keys[start:end]
         batch_vals = values[start:end]
+        unique_keys, first_positions = np.unique(batch_keys, return_index=True)
+        batch_keys = unique_keys
+        batch_vals = batch_vals[first_positions]
 
         # The C++ extension returns an asyncio.Future directly
         future = store.async_assign(batch_keys, batch_vals)

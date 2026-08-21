@@ -51,12 +51,13 @@ void run_optimizer_step_dim1_regression(std::string_view mode) {
   options.max_spill_bytes = 256 << 20;
   auto storage = se::create_page_storage(std::move(options));
   se::AdamConfig config;
-  auto factory = pro::make_proxy<se::FunctionFacade<
-      pro::proxy<se::OptimizerFacade<float, float>>(size_t)>>(
+  auto factory = pro::make_proxy<
+      se::FunctionFacade<se::OptimizerExtension<float, float>(size_t)>>(
       [storage, config](size_t dim) mutable {
         using Adam = se::AdamOptimizer<float, float, se::StaticLearningRate>;
-        return pro::make_proxy<se::OptimizerFacade<float, float>, Adam>(
-            dim, config, storage, se::StaticLearningRate{1.0e-3F});
+        return pro::make_proxy<se::OptimizerExtensionFacade<float, float>,
+                               Adam>(dim, config, storage,
+                                     se::StaticLearningRate{1.0e-3F});
       });
   using Store =
       se::HogwildEmbeddingStore<uint64_t, float, float, se::NoScorePolicy>;
@@ -381,11 +382,11 @@ int main(int argc, char **argv) {
 
   using HotPromotionStore =
       se::HogwildEmbeddingStore<uint64_t, float, float, se::ManualScorePolicy>;
-  auto hot_training_factory = pro::make_proxy<se::FunctionFacade<
-      pro::proxy<se::OptimizerFacade<float, float>>(size_t)>>(
+  auto hot_training_factory = pro::make_proxy<
+      se::FunctionFacade<se::OptimizerExtension<float, float>(size_t)>>(
       [storage, training_config](size_t dim) mutable {
         using Sgd = se::SgdOptimizer<float, float, se::StaticLearningRate>;
-        return pro::make_proxy<se::OptimizerFacade<float, float>, Sgd>(
+        return pro::make_proxy<se::OptimizerExtensionFacade<float, float>, Sgd>(
             dim, training_config, storage,
             se::StaticLearningRate{training_config.lr});
       });
@@ -779,12 +780,13 @@ int main(int argc, char **argv) {
           "compaction reported success for an absent key");
 
   se::AdamConfig adam_config;
-  auto adam_factory = pro::make_proxy<se::FunctionFacade<
-      pro::proxy<se::OptimizerFacade<float, float>>(size_t)>>(
+  auto adam_factory = pro::make_proxy<
+      se::FunctionFacade<se::OptimizerExtension<float, float>(size_t)>>(
       [storage, adam_config](size_t dim) mutable {
         using Adam = se::AdamOptimizer<float, float, se::StaticLearningRate>;
-        return pro::make_proxy<se::OptimizerFacade<float, float>, Adam>(
-            dim, adam_config, storage, se::StaticLearningRate{0.01F});
+        return pro::make_proxy<se::OptimizerExtensionFacade<float, float>,
+                               Adam>(dim, adam_config, storage,
+                                     se::StaticLearningRate{0.01F});
       });
   AdamStore adam_store(
       {8}, {}, std::move(adam_factory), se::NoScorePolicy{},
@@ -909,12 +911,13 @@ int main(int argc, char **argv) {
   require(final_adam_seen,
           "concurrent compaction lost final optimizer state or step");
 
-  auto full_page_adam_factory = pro::make_proxy<se::FunctionFacade<
-      pro::proxy<se::OptimizerFacade<float, float>>(size_t)>>(
+  auto full_page_adam_factory = pro::make_proxy<
+      se::FunctionFacade<se::OptimizerExtension<float, float>(size_t)>>(
       [storage, adam_config](size_t dim) mutable {
         using Adam = se::AdamOptimizer<float, float, se::StaticLearningRate>;
-        return pro::make_proxy<se::OptimizerFacade<float, float>, Adam>(
-            dim, adam_config, storage, se::StaticLearningRate{0.01F});
+        return pro::make_proxy<se::OptimizerExtensionFacade<float, float>,
+                               Adam>(dim, adam_config, storage,
+                                     se::StaticLearningRate{0.01F});
       });
   AdamStore full_page_adam_store(
       {8}, {}, std::move(full_page_adam_factory), se::NoScorePolicy{},
@@ -1250,11 +1253,11 @@ int main(int argc, char **argv) {
   watermark_options.max_spill_bytes = 1 << 20;
   auto watermark_storage =
       se::create_page_storage(std::move(watermark_options));
-  auto watermark_training_factory = pro::make_proxy<se::FunctionFacade<
-      pro::proxy<se::OptimizerFacade<float, float>>(size_t)>>(
+  auto watermark_training_factory = pro::make_proxy<
+      se::FunctionFacade<se::OptimizerExtension<float, float>(size_t)>>(
       [watermark_storage, training_config](size_t dim) mutable {
         using Sgd = se::SgdOptimizer<float, float, se::StaticLearningRate>;
-        return pro::make_proxy<se::OptimizerFacade<float, float>, Sgd>(
+        return pro::make_proxy<se::OptimizerExtensionFacade<float, float>, Sgd>(
             dim, training_config, watermark_storage,
             se::StaticLearningRate{training_config.lr});
       });

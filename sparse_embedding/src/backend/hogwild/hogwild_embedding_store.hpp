@@ -68,6 +68,7 @@
 #include "sparse_embedding/src/interface/embedding_table_interface.hpp"
 #include "sparse_embedding/src/interface/initializer_interface.hpp"
 #include "sparse_embedding/src/interface/optimizer_interface.hpp"
+#include "sparse_embedding/src/observability/diagnostic_sink.hpp"
 #include "sparse_embedding/src/observability/telemetry_ring.hpp"
 #include "sparse_embedding/src/optimizer/stable_page_directory.hpp"
 #include "sparse_embedding/src/simd/memory_ops.hpp"
@@ -786,7 +787,7 @@ public:
   using ValueType = ParamT;
   using Initializer = pro::proxy<InitializerFacade<ParamT>>;
   using OptimizerFactory =
-      se::Function<pro::proxy<OptimizerFacade<ParamT, OptT>>(size_t)>;
+      se::Function<OptimizerExtension<ParamT, OptT>(size_t)>;
 
 private:
   struct InvocationGate {
@@ -1017,8 +1018,8 @@ public:
         return find_hashed(key, SplitMixHash<uint64_t>{}(key));
       }
 
-      void prefetch_bucket_hashed(size_t hash) const noexcept {
-        directory.prefetch_bucket_hashed(hash);
+      void prefetch_bucket_cacheline(size_t hash) const noexcept {
+        directory.prefetch_bucket_cacheline(hash);
       }
 
       std::optional<uint32_t> find_hashed(uint64_t key,
@@ -1166,10 +1167,10 @@ public:
           : bundle(initial), locators(locator_table), table_identity(identity) {
       }
 
-      void prefetch_bucket_hashed(size_t hash) const noexcept {
+      void prefetch_bucket_cacheline(size_t hash) const noexcept {
         const MapBundle *b = bundle.load(std::memory_order_relaxed);
         if (b != nullptr) {
-          b->prefetch_bucket_hashed(hash);
+          b->prefetch_bucket_cacheline(hash);
         }
       }
     };
@@ -1542,13 +1543,15 @@ public:
     std::shared_ptr<RetirementPressure> retirement_pressure;
     std::vector<std::unique_ptr<KeyShard>> key_shards;
     size_t shard_mask;
+    TelemetryRing &telemetry_ring;
     std::shared_ptr<PageResidencyTelemetry> page_telemetry =
         std::make_shared<PageResidencyTelemetry>(
             EmbeddingArena<ParamT>::kMaxPages);
     StripedPageAccessTelemetry access_telemetry;
     EmbeddingArena<ParamT> arena;
     SealedHotPagePool<ParamT> sealed_pages;
-    pro::proxy<OptimizerFacade<ParamT, OptT>> optimizer;
+    OptimizerExtension<ParamT, OptT> optimizer;
+    std::atomic<uint64_t> optimizer_locator_revalidation_failures{0};
     std::vector<std::unique_ptr<TransientArena<ParamT>>> transient_shards;
     OptimizerFactory opt_factory;
     std::atomic<uint64_t> global_step{0};
@@ -1556,6 +1559,31 @@ public:
     std::shared_ptr<const SealedHotPage<ParamT>> last_promoted_hot_page;
     mutable std::mutex promoted_hot_page_mutex;
     execution::ReusableWorkspacePool<CompactionWorkspace> compaction_workspaces;
+
+    struct OptimizerBatchScratch {
+      std::vector<hogwild_internal::SegmentedLocatorTable::KeyedWriteSlot>
+          locator_entries;
+      std::vector<OptimizerBatchRow<ParamT>> rows;
+      std::vector<size_t> order;
+      std::vector<size_t> positions;
+    };
+
+    static OptimizerBatchScratch &optimizer_batch_scratch() {
+      static thread_local OptimizerBatchScratch scratch;
+      return scratch;
+    }
+
+    void handle_optimizer_locator_revalidation_failure(uint64_t key) {
+#ifndef NDEBUG
+      throw std::runtime_error("optimizer locator batch became invalid key=" +
+                               std::to_string(key));
+#else
+      optimizer_locator_revalidation_failures.fetch_add(
+          1, std::memory_order_relaxed);
+      telemetry_ring.try_publish_diagnostic(
+          {DiagnosticKind::kOptimizerLocatorRevalidation, key});
+#endif
+    }
 
     static void register_arena_page(void *context, uint64_t page_id) {
       if (page_id > std::numeric_limits<uint32_t>::max())
@@ -1578,10 +1606,10 @@ public:
               size_t transient_shard_count, bool enable_score,
               PageStorage storage,
               std::shared_ptr<RetirementPressure> retirement_pressure,
-              bool numa_aware_pages)
+              bool numa_aware_pages, TelemetryRing &telemetry_ring_in)
         : dim(d), score_policy(score_policy_in),
           retirement_pressure(std::move(retirement_pressure)),
-          shard_mask(partition_count - 1),
+          shard_mask(partition_count - 1), telemetry_ring(telemetry_ring_in),
           access_telemetry(EmbeddingArena<ParamT>::kMaxPages, 4096,
                            transient_shard_count),
           arena(d, enable_score, storage, this->retirement_pressure,
@@ -2116,12 +2144,12 @@ public:
                                                  std::forward<Visit>(visit));
     }
 
-    void prefetch_entry_hashed([[maybe_unused]] uint64_t key,
-                               size_t hash) const noexcept {
+    void prefetch_entry_cacheline([[maybe_unused]] uint64_t key,
+                                  size_t hash) const noexcept {
       const auto &shard = *key_shards[hash & shard_mask];
       const auto *rv = shard.read_view.get();
       if (rv != nullptr) {
-        rv->prefetch_bucket_hashed(hash);
+        rv->prefetch_bucket_cacheline(hash);
       }
     }
 
@@ -2142,14 +2170,154 @@ public:
       return shard.locators->try_read(*slot_id, std::forward<Visit>(visit));
     }
 
-    template <typename Visit>
-    bool with_shared_optimizer_entry_hashed(uint64_t key, size_t hash,
-                                            Visit &&visit) {
-      auto &shard = *key_shards[hash & shard_mask];
-      const auto slot_id = shard.find_slot_hashed_unlocked(key, hash);
-      if (!slot_id.has_value())
-        return false;
-      return shard.locators->try_read(*slot_id, std::forward<Visit>(visit));
+    template <typename Batch, typename Visit>
+    bool with_shared_optimizer_batch(const Batch &batch,
+                                     std::span<const size_t> positions,
+                                     Visit &&visit) {
+      if (positions.empty())
+        throw std::invalid_argument("optimizer locator batch is empty");
+      OptimizerBatchScratch &scratch = optimizer_batch_scratch();
+      auto &locator_entries = scratch.locator_entries;
+      locator_entries.clear();
+      locator_entries.reserve(positions.size());
+      for (const size_t position : positions) {
+        const auto slot_id = key_shards[batch.hash(position) & shard_mask]
+                                 ->find_slot_hashed_unlocked(
+                                     batch.key(position), batch.hash(position));
+        if (!slot_id.has_value())
+          return false;
+        locator_entries.push_back({*slot_id, batch.key(position)});
+      }
+      const size_t key_shard_id = batch.hash(positions.front()) & shard_mask;
+      for (const size_t position : positions) {
+        if ((batch.hash(position) & shard_mask) != key_shard_id)
+          throw std::logic_error("optimizer batch crosses key shard boundary");
+      }
+      return key_shards[key_shard_id]->locators->try_write_key_batch(
+          locator_entries, [&](std::span<const uint32_t> indices) {
+            std::forward<Visit>(visit)(batch, positions, indices);
+          });
+    }
+
+    template <typename Batch, typename Visit>
+    bool with_shared_optimizer_batch_contiguous(const Batch &batch,
+                                                size_t begin, size_t end,
+                                                Visit &&visit) {
+      if (begin >= end || end > batch.size())
+        throw std::invalid_argument("optimizer contiguous batch is invalid");
+      OptimizerBatchScratch &scratch = optimizer_batch_scratch();
+      auto &locator_entries = scratch.locator_entries;
+      locator_entries.clear();
+      locator_entries.reserve(end - begin);
+      const size_t key_shard_id = batch.hash(begin) & shard_mask;
+      for (size_t position = begin; position < end; ++position) {
+        if ((batch.hash(position) & shard_mask) != key_shard_id)
+          throw std::logic_error("optimizer contiguous batch crosses shard");
+        const auto slot_id =
+            key_shards[key_shard_id]->find_slot_hashed_unlocked(
+                batch.key(position), batch.hash(position));
+        if (!slot_id.has_value())
+          return false;
+        locator_entries.push_back({*slot_id, batch.key(position)});
+      }
+      return key_shards[key_shard_id]->locators->try_write_key_batch(
+          locator_entries, [&](std::span<const uint32_t> indices) {
+            std::forward<Visit>(visit)(batch, begin, indices);
+          });
+    }
+
+    template <typename Batch>
+    void update_batch(const Batch &batch, uint64_t global_step) {
+      if (batch.size() == 0)
+        return;
+      if (!optimizer.has_value())
+        return;
+      const size_t first_key_shard = batch.hash(0) & shard_mask;
+      const bool single_key_shard = std::ranges::all_of(
+          std::views::iota(size_t{0}, batch.size()),
+          [this, first_key_shard, &batch](size_t position) {
+            return (batch.hash(position) & shard_mask) == first_key_shard;
+          });
+      OptimizerBatchScratch &scratch = optimizer_batch_scratch();
+      auto &rows = scratch.rows;
+      rows.clear();
+      rows.reserve(batch.size());
+      const auto execute_group = [&](std::span<const size_t> positions) {
+        const bool updated = with_shared_optimizer_batch(
+            batch, positions,
+            [&](const auto &batch_view, std::span<const size_t> batch_positions,
+                std::span<const uint32_t> indices) {
+              rows.clear();
+              for (size_t row = 0; row < indices.size(); ++row) {
+                ParamT *parameter = arena.data(indices[row]);
+                const uint64_t score =
+                    score_policy.enabled()
+                        ? std::atomic_ref<uint64_t>(
+                              arena.score_raw(indices[row]))
+                              .load(std::memory_order_relaxed)
+                        : 0;
+                rows.push_back(
+                    {indices[row], std::span<ParamT>(parameter, dim),
+                     std::span<const ParamT>(
+                         batch_view.gradient(batch_positions[row]), dim),
+                     score});
+              }
+              optimizer->update(
+                  {std::span<const OptimizerBatchRow<ParamT>>(rows), dim},
+                  global_step);
+            });
+        if (!updated)
+          handle_optimizer_locator_revalidation_failure(
+              batch.key(positions.front()));
+      };
+      if (single_key_shard) {
+        const bool updated = with_shared_optimizer_batch_contiguous(
+            batch, 0, batch.size(),
+            [&](const auto &batch_view, size_t begin,
+                std::span<const uint32_t> indices) {
+              rows.clear();
+              for (size_t row = 0; row < indices.size(); ++row) {
+                ParamT *parameter = arena.data(indices[row]);
+                const uint64_t score =
+                    score_policy.enabled()
+                        ? std::atomic_ref<uint64_t>(
+                              arena.score_raw(indices[row]))
+                              .load(std::memory_order_relaxed)
+                        : 0;
+                rows.push_back({indices[row], std::span<ParamT>(parameter, dim),
+                                std::span<const ParamT>(
+                                    batch_view.gradient(begin + row), dim),
+                                score});
+              }
+              optimizer->update(
+                  {std::span<const OptimizerBatchRow<ParamT>>(rows), dim},
+                  global_step);
+            });
+        if (!updated)
+          handle_optimizer_locator_revalidation_failure(batch.key(0));
+        return;
+      }
+      auto &order = scratch.order;
+      order.resize(batch.size());
+      std::ranges::iota(order, size_t{0});
+      std::ranges::sort(order, {}, [&](size_t position) {
+        return batch.hash(position) & shard_mask;
+      });
+      size_t begin = 0;
+      while (begin < order.size()) {
+        const size_t key_shard_id = batch.hash(order[begin]) & shard_mask;
+        size_t end = begin + 1;
+        while (end < order.size() &&
+               (batch.hash(order[end]) & shard_mask) == key_shard_id)
+          ++end;
+        auto &positions = scratch.positions;
+        positions.clear();
+        positions.reserve(end - begin);
+        for (size_t position = begin; position < end; ++position)
+          positions.push_back(order[position]);
+        execute_group(positions);
+        begin = end;
+      }
     }
 
     template <typename Visit>
@@ -3396,7 +3564,8 @@ public:
                         bind_worker_affinity_
                             ? std::optional<int>(
                                   ThreadAffinity::cpu_for_worker(num_threads_))
-                            : std::nullopt) {
+                            : std::nullopt,
+                        &write_diagnostic_to_clog) {
     bool enable_score = score_policy_.enabled();
 
     if (table_dims.empty()) {
@@ -3431,7 +3600,8 @@ public:
         slot_storage_.push_back(std::make_unique<SlotStore>(
             dim, score_policy_, opt_factory,
             partition_topology_.partition_count(), num_threads_, enable_score,
-            storage_, retirement_pressure_, partition_topology_.numa_memory()));
+            storage_, retirement_pressure_, partition_topology_.numa_memory(),
+            telemetry_ring_));
         dim_to_slot_[dim] = slot_storage_.back().get();
       }
     }
@@ -3481,8 +3651,8 @@ public:
             ScorePolicyKind::kManual, std::move(options)) {}
 
   ~HogwildEmbeddingStoreCore() {
-    telemetry_ring_.stop();
     invocation_gate_.close_and_wait();
+    telemetry_ring_.stop();
     if (page_eviction_registration_.value != 0)
       storage_->clear_page_eviction_proxy(page_eviction_registration_);
     delete snapshot_.exchange(nullptr, std::memory_order_acq_rel);
@@ -3589,7 +3759,8 @@ public:
                   !routed_hashes.empty()
                       ? routed_hashes[prefetch_index]
                       : SplitMixHash<uint64_t>{}(prefetch_key);
-              prefetch_slot.prefetch_entry_hashed(prefetch_key, prefetch_hash);
+              prefetch_slot.prefetch_entry_cacheline(prefetch_key,
+                                                     prefetch_hash);
             }
           }
           uint64_t key = static_cast<uint64_t>(keys[i]);
@@ -3862,7 +4033,7 @@ public:
           }
           auto &slot = *snapshot->dim_to_slot[dim];
           const ParamT *grad_src = flat_grads.data() + offsets[i];
-          slot.transient_shards[shard_id]->accumulate_hashed_exclusive(
+          slot.transient_shards[shard_id]->accumulate_hashed(
               key, gradient_hashes[i], grad_src);
         }
       }
@@ -3876,14 +4047,7 @@ public:
   }
 
   // =========================================================================
-  // Optimizer Step — Hogwild! lock-free parameter update
-  //
-  // Per Hogwild! theorem (Niu et al., NeurIPS 2011):
-  // For sparse SGD-family optimizers, concurrent lock-free read/write to
-  // shared parameters is provably convergent when feature access patterns
-  // are sufficiently sparse. Therefore, NO LOCKS are acquired on the global
-  // parameter KV table during this update. Forward reads may observe
-  // partially-updated parameters, which does not affect convergence.
+  // Optimizer Step — shard-batched proxy update under locator write guards
   // =========================================================================
 
   std::error_code optimizer_step() {
@@ -3908,32 +4072,10 @@ public:
         for (size_t shard_id = shard_begin; shard_id < shard_end; ++shard_id) {
           for (SlotStore *slot : snapshot->slots) {
             auto &shard = slot->transient_shards[shard_id];
-            shard->for_each_accumulated([&](uint64_t feature_id,
-                                            uint64_t feature_hash,
-                                            const ParamT *accumulated_grad) {
-              slot->with_shared_optimizer_entry_hashed(
-                  feature_id, feature_hash, [&](uint32_t arena_idx) {
-                    ParamT *param = slot->arena.data(arena_idx);
-                    if (!slot->optimizer.has_value())
-                      return;
-                    slot->optimizer->prefetch(arena_idx);
-                    if (score_policy_.enabled()) {
-                      const uint64_t score =
-                          std::atomic_ref<uint64_t>(
-                              slot->arena.score_raw(arena_idx))
-                              .load(std::memory_order_relaxed);
-                      slot->optimizer->step(
-                          arena_idx, std::span<ParamT>(param, slot->dim),
-                          std::span<const ParamT>(accumulated_grad, slot->dim),
-                          slot->global_step.load(std::memory_order_relaxed),
-                          score);
-                    } else {
-                      slot->optimizer->step(
-                          arena_idx, std::span<ParamT>(param, slot->dim),
-                          std::span<const ParamT>(accumulated_grad, slot->dim),
-                          slot->global_step.load(std::memory_order_relaxed), 0);
-                    }
-                  });
+            shard->with_accumulated_batch([&](const auto &batch) {
+              if (batch.size() != 0)
+                slot->update_batch(
+                    batch, slot->global_step.load(std::memory_order_relaxed));
             });
             shard->clear();
           }
@@ -4614,7 +4756,7 @@ private:
                   .load(std::memory_order_relaxed));
         }
         if (opt_dim > 0 && slot->optimizer.has_value()) {
-          // OptimizerFacade::state_data fills a caller-provided span (so the
+          // Optimizer state_data fills a caller-provided span (so the
           // optimizer is free to materialise its state from non-contiguous
           // internal buffers). Reserve room at the back of `lb.opts` and let
           // the optimizer write directly there to avoid a temporary copy.

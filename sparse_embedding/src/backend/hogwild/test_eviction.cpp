@@ -34,13 +34,14 @@ void run_optimizer_step_eviction_regression() {
   options.max_spill_bytes = 256 << 20;
   auto storage = create_page_storage(std::move(options));
   AdamConfig config;
-  auto factory = pro::make_proxy<
-      FunctionFacade<pro::proxy<OptimizerFacade<float, float>>(size_t)>>(
-      [storage, config](size_t dim) mutable {
-        using Adam = AdamOptimizer<float, float, StaticLearningRate>;
-        return pro::make_proxy<OptimizerFacade<float, float>, Adam>(
-            dim, config, storage, StaticLearningRate{1.0e-3F});
-      });
+  auto factory =
+      pro::make_proxy<FunctionFacade<OptimizerExtension<float, float>(size_t)>>(
+          [storage, config](size_t dim) mutable {
+            using Adam = AdamOptimizer<float, float, StaticLearningRate>;
+            return pro::make_proxy<OptimizerExtensionFacade<float, float>,
+                                   Adam>(dim, config, storage,
+                                         StaticLearningRate{1.0e-3F});
+          });
   using Store =
       HogwildEmbeddingStore<uint64_t, float, float, ManualScorePolicy>;
   Store store({1}, {}, std::move(factory), ManualScorePolicy{},

@@ -9,6 +9,7 @@ High-performance Sparse Embedding Table library for large-scale recommendation s
 - **Slot Directory Read Path**: Uses `parlayhash` for stable Key→slot lookup and a segmented locator table for Slot→arena publication, keeping warmed lookup/forward readers off shard shared locks and lifecycle locks.
 - **SIMD Acceleration**: AVX-512 vectorized hash computation and gradient Scatter operations.
 - **Hogwild! Gradient Accumulation**: Sharded TransientArena for lock-free gradient aggregation, avoiding cross-thread synchronization.
+- **Batch Optimizer Extension**: `OptimizerExtensionFacade<ParamT, OptT>` is the single optimizer type-erasure seam. The store resolves locator rows under shard-local SeqLock write guards and dispatches one `update(OptimizerBatchView, global_step)` per key shard instead of calling a proxy for every row.
 - **C++23 Standard Concurrency**: Sender/Receiver task scheduling based on NVIDIA `stdexec` + `exec::static_thread_pool`.
 - **Epoch Memory Safety**: Batch protection for concurrent hash map read/write using `epoch::with_epoch`, avoiding ABA problems.
 - **Distributed Lance Checkpointing**: A framework-neutral prepare/write/commit protocol writes manifest-pinned `entries` and physical `page_images`, including slot layout, sequence values, payload/state, and SHA-256 validation. Exact-version restore supports physical participants or caller-owned elastic partition functions. Monotonic commit authority rejects stale coordinators without depending on a specific distributed framework.
@@ -50,63 +51,38 @@ The Bazel configuration compiles C++ sources with `-std=c++23`; GCC 13+ and Baze
 
 ### Forward scaling
 
-The benchmark uses a warmed memory-only store, fixed batches, and physical-core affinity for implementation comparisons.
+The benchmark uses a warmed memory-only store, fixed batches, and physical-core affinity for implementation comparisons. Detailed workload definitions and reference tables are maintained in the performance report.
 
-#### Slot Directory Forward Scaling
+#### Slot-directory forward scaling
 
-The isolated forward proof uses a dimension-32 memory-only store with 128 already-published keys, a 4,096-key fixed power-law batch, seed `0x5EED5CA1E`, 400 timed `forward_lookup` repetitions, 48 allowed CPUs, and thread counts 1/2/4/8/16/64.
+The reference workload uses a dimension-32 memory-only table, 4,096-key fixed
+power-law batches, 400 timed `forward_lookup` repetitions, and physical-core
+affinity on 48 allowed CPUs.
 
 | Threads | Forward throughput |
 |---:|---:|
-| 1 | 9.632 Mops/s |
-| 2 | 16.436 Mops/s |
-| 4 | 27.914 Mops/s |
-| 8 | 40.707 Mops/s |
+| 1 | 14.988 Mops/s |
+| 2 | 21.852 Mops/s |
+| 4 | 35.165 Mops/s |
+| 8 | **45.945 Mops/s** |
 | 16 | 42.049 Mops/s |
-| 64 | 12.591 Mops/s |
+| 64 | 33.446 Mops/s |
 
-The scaling ratios versus one thread are 1.706x at two threads, 2.898x at four threads, and 4.226x at eight threads, passing the current 1.6x/2.5x/3.5x forward-scaling gate.
+The performance report contains the complete workload definition, concurrency
+tables, compaction scaling, and reliability validation commands.
 
-### Concurrent pressure
+### NUMA-aware execution and pressure validation
 
-Using the same workload on the same machine, the current source measured
-14.988/21.852/35.165/45.945/41.928/33.446 Mops/s at 1/2/4/8/16/64 threads.
-Three additional 16-thread runs measured 36.557/39.012/39.973 Mops/s, showing
-substantial scheduler and NUMA variance. Optimization conclusions require fixed
-physical-core affinity and NUMA placement. The eight-producer pressure proof
-passed without pressure pages, spill, or swap-out.
-
-`--numa-aware-sharding` enables both execution and memory NUMA locality: workers
-bind to physical CPUs and arena pages are placed by shard on the corresponding
-node. Reproduce with `bazel run -c opt //benchmarks:embedding_store_benchmark -- --threads=16 --numa-aware-sharding --skip-pressure`.
-
-#### Sustained Retirement Pressure and Sink
-
-The sustained-pressure proof uses eight producers, 1,048,576 total keys, dimension 8, Auto storage, an 8 MiB resident-memory limit, a 512 MiB spill limit, and 0.75/0.50 watermarks. It validates retained payloads after the pressure phase and reports the current retirement/Sink contract, not disk spill/swap throughput.
-
-| Metric | Result |
-|---|---:|
-| Pressure pages (`spill_count + swap_out_count`) | 0 |
-| `spill_count` | 0 |
-| `swap_out_count` | 0 |
-| `memory_bytes` | 294,912 |
-| `spill_bytes` | 0 |
-| `retired_bytes` | 2,109,456 |
-| Allocation p95 | 1.163 ms |
-| Allocation p99 | 2.599 ms |
-| Backlog drain | 0.003 ms |
-| Producer elapsed | 129.397 ms |
-
-This run intentionally opened the retirement-pressure circuit before page spill/swap became necessary. The accepted observation is that Sink admission handled pressure without payload corruption.
-
-These are reproducibility snapshots, not portable performance guarantees. See [Storage Architecture and API](docs/storage_architecture.md) for architecture and telemetry semantics, and [Performance and Reliability Report](docs/performance_and_reliability_report.md) for workload definitions and verification commands.
+`--numa-aware-sharding` enables execution and memory NUMA locality: workers bind
+to physical CPUs and arena pages are placed by shard on the corresponding node.
+The public pressure contract and validation command are documented in the
+[Performance and Reliability Report](docs/performance_and_reliability_report.md).
 
 ### Lock-free migration and expansion
 
 Performance references are collected in the [Performance and Reliability Report](docs/performance_and_reliability_report.md):
-64-thread lookup reaches 64.76 Mops/s, mixed 64-thread lookup reaches 52.63 Mops/s,
-and preallocated 16-worker compaction reaches 13.59 M relocated keys/s. The 64 MiB
-paging proof produced 31 swap-outs and 13 spills. Expansion uses precise per-shard
+64-thread lookup reaches 80.19 Mops/s, mixed 64-thread lookup reaches 63.17 Mops/s,
+and preallocated 16-worker compaction reaches 11.92 M relocated keys/s. Expansion uses precise per-shard
 budgets instead of equal power-of-two rounding: directory capacity uses a 2.5x probe
 budget rounded to 16, while runtime `MapBundle` capacity grows by 2x below 64K,
 1.5x for `64K <= capacity < 1M`, and 1.25x at or above 1M.
@@ -115,7 +91,7 @@ Mutation measurements deduplicate power-law candidates before calling the
 unique-mutation APIs and report rows actually processed. Use
 `training_path_profile` for pure assign/accumulate/optimizer measurements. The
 profile reuses one hash across gradient routing, transient accumulation, and
-optimizer lookup; current affinity-enabled measurements are documented in the
+optimizer lookup; the workload definition and statistics are documented in the
 performance report.
 NUMA-aware sharding is opt-in with `--numa-aware-sharding`; it places arena pages
 and workers by node, rebinds pooled threads to their assigned CPU, and caps the
@@ -197,7 +173,7 @@ HogwildEmbeddingStore
 ├── PageStorage                   # Auto-detected RAM budget + file-backed spill
 ├── TransientArena[thread_budget]  # Per-shard gradient accumulation (lock-free)
 ├── exec::static_thread_pool     # C++23 stdexec thread pool
-└── pro::proxy<OptimizerFacade<ParamT, OptT>> # Type-erased optimizer
+└── pro::proxy<OptimizerExtensionFacade<ParamT, OptT>> # Batch optimizer seam
 ```
 
 ### Key Design Decisions
@@ -210,7 +186,29 @@ HogwildEmbeddingStore
 
 4. **Conflict-Free Gradient Accumulation**: During the backward pass, each thread is assigned an independent shard of a `TransientArena`. Threads accumulate gradients locally within their shards, which are then aggregated and applied using SIMD-accelerated optimizer steps. This prevents false sharing and atomic contention when multiple threads update the same embedding vector.
 
-5. **Storage as a Deep Module**: Embedding, optimizer-state, score, and transient-gradient arenas share one page-storage interface. Allocation policy, resource detection, disk selection, warning emission, and extent reuse stay off the lookup and optimizer hot paths.
+5. **Batch-Scoped Optimizer Dispatch**: Locator resolution and parameter mutation stay inside the same packed SeqLock guard callback. The optimizer proxy is entered once per resolved shard batch; parameter spans are never retained for deferred updates.
+6. **Storage as a Deep Module**: Embedding, optimizer-state, score, and transient-gradient arenas share one page-storage interface. Allocation policy, resource detection, disk selection, warning emission, and extent reuse stay off the lookup and optimizer hot paths.
+
+### Training Update Path
+
+The training path (`accumulate_gradients()` followed by `optimizer_step()`)
+keeps gradient accumulation in the per-shard `TransientArena`.
+`optimizer_step()` resolves a shard batch, enters `OptimizerExtensionFacade`
+once, and consumes all parameter spans before the locator
+`PackedWriteGuardBatch` is released.
+
+Optimizer extension dispatch is deliberately batch-scoped. Static dispatch is
+an implementation option for the same contract, and `std::variant` remains a
+cold configuration mechanism rather than a per-row runtime path.
+
+Mutation APIs require unique `(key, dimension)` rows. `lookup_or_insert` may
+coalesce duplicate misses, but `assign`, `accumulate_gradients`, and
+`optimizer_step` consume batches produced from published keys. A concurrent
+erase/recycle race is sampled in release builds: the producer increments a
+relaxed counter and publishes a fixed-size diagnostic event to the bounded
+telemetry ring. Its single consumer may write the event to `std::clog`; the
+producer performs no I/O, and a full ring drops the event without blocking.
+Debug builds throw immediately.
 
 ---
 

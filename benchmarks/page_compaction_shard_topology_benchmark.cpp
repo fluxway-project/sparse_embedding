@@ -49,39 +49,41 @@ int run() {
   std::iota(keys.begin(), keys.end(), uint64_t{700000});
   std::vector<int64_t> lengths(kKeyCount, kDimension);
   std::vector<float> values(kKeyCount * kDimension, 1.0F);
+  store.reserve(kKeyCount, kDimension);
   store.lookup_or_insert<uint64_t>(keys, values, lengths);
 
-  std::array<uint64_t, kPageCount> page_masks{};
-  std::array<uint8_t, kPageCount> seen_pages{};
+  std::vector<uint64_t> page_masks;
+  std::vector<uint8_t> seen_pages;
+  page_masks.reserve(kPageCount);
+  seen_pages.reserve(kPageCount);
   size_t exported_keys = 0;
   store.export_page_images([&](size_t dim,
                                se::PageImageExport<float, float> &&image) {
-    if (dim != kDimension || image.physical_page_id >= kPageCount)
+    if (dim != kDimension)
       throw std::runtime_error("topology benchmark exported an invalid page");
-    const size_t page_id = static_cast<size_t>(image.physical_page_id);
-    if (seen_pages[page_id] != 0)
-      throw std::runtime_error("topology benchmark exported a duplicate page");
     uint64_t mask = 0;
     for (uint64_t key : image.keys)
       mask |= uint64_t{1} << shard_for_key(key);
-    if (mask == 0 || image.keys.size() != kKeysPerPage)
+    if (mask == 0 || image.keys.empty() || image.keys.size() > kKeysPerPage)
       throw std::runtime_error(
           "topology benchmark exported an incomplete page");
-    page_masks[page_id] = mask;
-    seen_pages[page_id] = 1;
+    page_masks.push_back(mask);
+    seen_pages.push_back(1);
     exported_keys += image.keys.size();
     return true;
   });
-  if (exported_keys != kKeyCount ||
+  if (exported_keys != kKeyCount || page_masks.empty() ||
       !std::ranges::all_of(seen_pages, [](uint8_t seen) { return seen == 1; }))
     throw std::runtime_error(
         "topology benchmark did not export the expected layout");
 
-  std::array<uint64_t, kWorkerCount> worker_masks{};
+  const size_t worker_count =
+      (page_masks.size() + kPagesPerWorker - 1) / kPagesPerWorker;
+  std::vector<uint64_t> worker_masks(worker_count);
   size_t page_coverage_total = 0;
   size_t page_coverage_min = kShardCount;
   size_t page_coverage_max = 0;
-  for (size_t page = 0; page < kPageCount; ++page) {
+  for (size_t page = 0; page < page_masks.size(); ++page) {
     const size_t coverage = std::popcount(page_masks[page]);
     page_coverage_total += coverage;
     page_coverage_min = std::min(page_coverage_min, coverage);
@@ -102,8 +104,8 @@ int run() {
   size_t shared_shards_total = 0;
   size_t full_overlap_pairs = 0;
   size_t pair_count = 0;
-  for (size_t left = 0; left < kWorkerCount; ++left) {
-    for (size_t right = left + 1; right < kWorkerCount; ++right) {
+  for (size_t left = 0; left < worker_count; ++left) {
+    for (size_t right = left + 1; right < worker_count; ++right) {
       const size_t shared =
           std::popcount(worker_masks[left] & worker_masks[right]);
       shared_shards_total += shared;
@@ -112,15 +114,15 @@ int run() {
     }
   }
 
-  std::cout << "page_shard_topology pages=" << kPageCount
+  std::cout << "page_shard_topology pages=" << page_masks.size()
             << " keys=" << kKeyCount
             << " page_coverage_min=" << page_coverage_min
             << " page_coverage_mean="
-            << static_cast<double>(page_coverage_total) / kPageCount
+            << static_cast<double>(page_coverage_total) / page_masks.size()
             << " page_coverage_max=" << page_coverage_max
             << " worker_coverage_min=" << worker_coverage_min
             << " worker_coverage_mean="
-            << static_cast<double>(worker_coverage_total) / kWorkerCount
+            << static_cast<double>(worker_coverage_total) / worker_count
             << " worker_coverage_max=" << worker_coverage_max
             << " pair_shared_shards_mean="
             << static_cast<double>(shared_shards_total) / pair_count

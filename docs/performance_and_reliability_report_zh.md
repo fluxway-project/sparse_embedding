@@ -12,6 +12,12 @@ Sparse Embedding 提供 shard-local 并发存储、无锁目录查询、miss-onl
 `lookup_or_insert` 对已存在 key 只执行目录查询；未命中 key 进入轻量 insertion
 slow path。同一批次的重复 miss 共享一个 arena slot，输出位置复用同一 embedding。
 
+`assign`、`accumulate_gradients` 与 optimizer update 的 mutation batch 要求
+`(key, dimension)` 行唯一且 key 已发布。并发 erase/recycle 竞态只会使受影响梯度批次
+失效：debug 构建立即抛异常用于诊断；release 构建使用 relaxed counter 计数，并向有界
+telemetry ring 发布固定大小诊断事件。单一后台 consumer 可以把事件写入 `std::clog`；
+producer 不执行 I/O，ring 满载时丢弃诊断且不阻塞训练路径。
+
 Lance checkpoint 包含 `entries`、物理 `page_images` 和固定版本的 manifest。page image
 保存 slot 布局、`seq_count`、参数、score、optimizer state/step 和 SHA-256 checksum。
 增量 checkpoint 只追加变化 entry 与 tombstone，并由外部 coordinator 完成全局提交。
@@ -55,6 +61,10 @@ bazel run -c opt //benchmarks:embedding_store_benchmark -- \
 
 ## 代表性性能结果
 
+以下数据来自上面的标准机器。高并发与 compaction 使用一次 benchmark
+调用内五次采样的中位数；混合 lookup/insert 使用五次独立进程运行的中位数。
+吞吐单位为 Mops/s 或 M keys/s，仅用于 workload 参考，不构成跨机器容量保证。
+
 ### 并发内存查询
 
 配置为 dim=128、预留容量的 memory-only table、10,000,000 个 `int64` key、8,192-key
@@ -65,10 +75,10 @@ batch、128 个并发调用方和最多 128 个内部 worker。
 | 查询吞吐 | **21.54 M keys/s** |
 | telemetry relaxed atomic update 降幅 | **93.75%** |
 
-### Forward scaling
+### Slot-directory forward scaling
 
-配置为 dim=32、4,096-key 固定 batch、128 个已发布 key、48 个 allowed CPU，使用
-slot-directory read path 和连续分片调度。
+配置为 dim=32、4,096-key memory-only table、4,096-key 固定 power-law batch、400 次
+计时 `forward_lookup` 重复，并在 48 个 allowed CPU 上使用物理核 affinity。
 
 | 线程数 | Forward 吞吐 |
 |---:|---:|
@@ -79,8 +89,8 @@ slot-directory read path 和连续分片调度。
 | 16 | 42.049 Mops/s |
 | 64 | 33.446 Mops/s |
 
-默认 256 KiB memory-work 粒度和 64 KiB 最小 row 粒度共同限制有效 task 数，避免
-线程数增加后被 enqueue、steal、completion 和 barrier 成本抵消。
+默认 memory-work 与 row-grain 限制有效 task 数，避免计时路径被 enqueue、steal、
+completion 和 barrier 成本主导。
 
 ### 训练路径
 
@@ -91,6 +101,9 @@ dim=128、65,536 个已存在且唯一的 row、8 workers、affinity enabled。�
 | `assign` | **16.50 Mops/s** |
 | `accumulate_gradients`（含必需 step） | **8.69 Mops/s** |
 | `optimizer_step` | **16.85 Mops/s** |
+
+批级 optimizer profile 与下表使用不同 workload。比较 assign、梯度累积和 optimizer step
+时请使用 `training_path_profile`；比较存储和 compaction 时请使用本文末尾的 benchmark 命令。
 
 ### 高并发压力与可靠性
 
@@ -133,17 +146,17 @@ fallback。
 
 | threads | lookup median/p95/p99 (Mops/s) | insert median/p95/p99 (Mops/s) |
 |---:|---:|---:|
-| 1 | 12.32 / 12.48 / 12.48 | 0.0455 / 0.0526 / 0.0526 |
-| 16 | 70.46 / 73.43 / 73.43 | 0.345 / 0.387 / 0.387 |
-| 64 | **79.29 / 91.47 / 91.47** | **0.592 / 0.611 / 0.611** |
+| 1 | 12.41 / 12.48 / 12.48 | 0.0456 / 0.0523 / 0.0523 |
+| 16 | 71.42 / 73.59 / 73.59 | 0.343 / 0.401 / 0.401 |
+| 64 | **80.19 / 94.25 / 94.25** | **0.577 / 0.626 / 0.626** |
 
 混合 lookup/insert：同一 dim、warm keys、batch，64 轮；16/64 总线程各半，Auto storage
 memory=1 GiB、spill=2 GiB。
 
 | 总线程 | lookup/insert 线程 | lookup / insert (Mops/s) | lookup/insert p99 (ns) |
 |---:|---:|---:|---:|
-| 16 | 8 / 8 | 26.67 / 0.298 | 376,041 / 56,071,999 |
-| 64 | 32 / 32 | **52.63 / 0.365** | 1,212,543 / 153,709,741 |
+| 16 | 8 / 8 | 48.41 / 0.360 | 195,991 / 53,862,829 |
+| 64 | 32 / 32 | **63.17 / 0.448** | 686,921 / 132,946,237 |
 
 compaction 强扩展：`dim=128`、64 shards、每 source worker 4 pages、每页 4096 entries、
 store_threads=64，固定工作量，1/2/4/8/16 workers，每配置 5 次 median，destination
@@ -151,13 +164,15 @@ store_threads=64，固定工作量，1/2/4/8/16 workers，每配置 5 次 median
 
 | workers | relocated keys/s |
 ---:|---:|
-| 1 | 1.19 M |
-| 2 | 2.10 M |
-| 4 | 3.83 M |
-| 8 | 10.17 M |
-| 16 | **13.59 M** |
+| 1 | 1.18 M |
+| 2 | 4.00 M |
+| 4 | 5.59 M |
+| 8 | 10.70 M |
+| 16 | **11.92 M** |
 
-未预分配结果为 1.16/2.04/3.79/7.54/9.56 M keys/s。对应可执行目标为三个 benchmark 目标。
+未预分配 destination 时，计时阶段还包含目标页分配，因此结果通常更低。对应可执行目标
+为 `high_concurrency_lookup_insert_benchmark`、`mixed_lookup_insert_concurrency_benchmark`
+和 `page_compaction_benchmark`。
 
 换页测试应验证 `swap_out_count > 0` 与 `spill_count > 0`。安全回归应覆盖 dim=1、Adam、
 `optimizer_step()` 与并发 `compact_page()`，并在独立子进程中检查非零终止码。完整 native

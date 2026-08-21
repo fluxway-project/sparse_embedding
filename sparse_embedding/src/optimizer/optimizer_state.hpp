@@ -112,7 +112,7 @@ public:
     return reinterpret_cast<const T *>(raw(index));
   }
 
-  void prefetch(uint32_t index) const noexcept {
+  void prefetch_state_cacheline(uint32_t index) const noexcept {
     const StoragePage *page = pages_.load(index / kEntriesPerPage);
     if (page != nullptr) {
       const std::byte *ptr =

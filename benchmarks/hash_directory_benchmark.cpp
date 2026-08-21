@@ -482,8 +482,8 @@ int main(int argc, char **argv) {
       throw std::invalid_argument("unknown benchmark argument: " + argument);
   }
   if (!bind_affinity)
-    throw std::invalid_argument(
-        "hash directory benchmark requires code affinity");
+    throw std::invalid_argument("hash directory benchmark requires code "
+                                "affinity; pass --bind-affinity");
 
   prove_correctness<CurrentParlayDirectory>("current");
   prove_correctness<SharedPtrCowDirectory>("shared_ptr_cow");

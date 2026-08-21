@@ -1,5 +1,10 @@
 # 动态学习率 (Score-Based LR)
 
+## 使用前提
+
+该 API 随仓库 Python package 提供，并使用项目 Bazel toolchain 构建。选择会读取特征得分的
+学习率策略时必须同时配置 score policy；不读取得分的策略可以独立使用。
+
 在大规模稀疏嵌入 (Sparse Embeddings) 中，根据特征（Feature）的访问频率或重要性动态调整学习率是非常有益的。对于高频特征，由于它们会被频繁更新，使用较小的学习率可以避免过度震荡或覆盖信息；而对于长尾（低频）特征，使用相对较大的学习率可以确保它们在有限的样本下充分学习。
 
 Sparse Embedding 提供了一组 **基于特征得分的动态学习率策略 (Score-Based Dynamic Learning Rate Policies)**。这些策略会根据特征当前的得分 (通常由 LFU 或 LRU 评分策略实时维护)，在更新时动态调节每个特征的学习率。
@@ -72,3 +77,11 @@ store.optimizer_step()
 
 * **依赖得分策略 (Score Policy is Required)：**如果你在优化器中指定了需要依赖得分的策略（例如 `SqrtDecayLrPolicy`），你就**必须**在创建 `EmbeddingStore` 时同时启用得分策略（例如 `score_policy="lfu"`）。如果未启用，系统在初始化时会抛出 `ValueError`。
 * **极致性能 (Performance)：**动态学习率引入的额外开销微乎其微。底层的 C++ 实现使用了 `constexpr` 来在编译期决议静态和动态学习率代码路径，确保对于普通的静态学习率没有任何额外开销；而对于动态学习率，其计算逻辑已完全融合到了底层深度优化的 SIMD (如 AVX2/AVX-512) 向量化更新流程中，做到了高效并行计算。
+
+## 验证
+
+公开行为由动态学习率测试模块覆盖：
+
+```bash
+PYTHONPATH="$PWD" pytest -q sparse_embedding/tests/test_dynamic_lr.py
+```

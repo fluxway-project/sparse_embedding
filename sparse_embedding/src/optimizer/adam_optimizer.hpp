@@ -20,10 +20,12 @@
 
 #include <algorithm>
 #include <cstdint>
+#include <ranges>
 #include <span>
 
 #include "sparse_embedding/src/optimizer/learning_rate.hpp"
 #include "sparse_embedding/src/optimizer/optimizer_config.hpp"
+#include "sparse_embedding/src/optimizer/optimizer_contract.hpp"
 #include "sparse_embedding/src/optimizer/optimizer_state.hpp"
 #include "sparse_embedding/src/simd/adam_ops.hpp"
 
@@ -123,10 +125,10 @@ public:
 
   void set_step(uint32_t idx, uint32_t s) { *step_state.data(idx) = s; }
 
-  void prefetch(uint32_t idx) const noexcept {
-    m_state.prefetch(idx);
-    v_state.prefetch(idx);
-    step_state.prefetch(idx);
+  void prefetch_state(uint32_t idx) const noexcept {
+    m_state.prefetch_state_cacheline(idx);
+    v_state.prefetch_state_cacheline(idx);
+    step_state.prefetch_state_cacheline(idx);
   }
 
   constexpr bool requires_score() const {
@@ -160,6 +162,16 @@ public:
     simd::simd_adam_update(param, accumulated_grad, m, v, lr, config.beta1,
                            config.beta2, config.eps, bc1, bc2,
                            config.weight_decay, dim);
+  }
+
+  void update(const OptimizerBatchView<ParamT> &batch, uint64_t global_step) {
+    if (!batch.valid())
+      throw std::invalid_argument("invalid optimizer batch view");
+    for (const size_t row : std::views::iota(size_t{0}, batch.size())) {
+      prefetch_state(batch.rows[row].index);
+      step(batch.rows[row].index, batch.rows[row].parameters,
+           batch.rows[row].gradients, global_step, batch.rows[row].score);
+    }
   }
 };
 

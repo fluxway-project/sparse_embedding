@@ -2,6 +2,19 @@
 
 This document details the boundary conditions and specifications for the Sparse Embedding checkpoint system when integrating with Lance, Gravitino, and Lance REST. All endpoints, metalakes, catalogs, and credentials depend on the deployment configuration and are omitted from this documentation.
 
+## Requirements and validation
+
+Local checkpoint use requires the Python package and a writable checkpoint
+directory. Gravitino-backed storage additionally requires a reachable control
+plane, Lance REST operation API, object storage with conditional writes, and
+credentials supplied by the deployment secret provider. Validate the local
+contract with:
+
+```bash
+PYTHONPATH="$PWD" pytest -q sparse_embedding/tests/test_checkpoint.py
+PYTHONPATH="$PWD" pytest -q sparse_embedding/tests/test_gravitino_lance.py
+```
+
 ## 1. Storage Hierarchies
 
 ```text

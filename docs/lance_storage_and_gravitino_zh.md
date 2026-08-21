@@ -2,6 +2,17 @@
 
 本文档记录了 Sparse Embedding 检查点系统在集成 Lance、Gravitino 和 Lance REST 时的边界条件和规范。所有的端点 (endpoint)、metalake、catalog 以及凭据 (credentials) 均依赖于部署方配置，不在本文档中记录。
 
+## 使用前提与验证
+
+本地 checkpoint 需要 Python package 和可写的 checkpoint 目录。Gravitino storage 还需要
+可访问的 control plane、Lance REST operation API、支持条件写的对象存储，以及由部署方
+secret provider 提供的凭据。可用以下命令验证本地契约：
+
+```bash
+PYTHONPATH="$PWD" pytest -q sparse_embedding/tests/test_checkpoint.py
+PYTHONPATH="$PWD" pytest -q sparse_embedding/tests/test_gravitino_lance.py
+```
+
 ## 1. 存储分层
 
 ```text
