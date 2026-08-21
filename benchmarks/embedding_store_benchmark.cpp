@@ -24,6 +24,7 @@
 #include "sparse_embedding/src/common/function.hpp"
 #include "sparse_embedding/src/execution/topology/thread_affinity.hpp"
 #include "sparse_embedding/src/interface/optimizer_interface.hpp"
+#include "sparse_embedding/src/optimizer/optimizer_contract.hpp"
 
 using namespace se;
 
@@ -54,7 +55,7 @@ struct SGDOptimizer {
   void set_state(uint32_t, std::span<const float>) {}
   uint32_t step_data(uint32_t) const { return 0; }
   void set_step(uint32_t, uint32_t) {}
-  void prefetch(uint32_t) {}
+  void prefetch_state(uint32_t) {}
   bool requires_score() const { return false; }
   void step(uint32_t, std::span<float> param, std::span<const float> grad,
             uint64_t, uint64_t /*score*/) {
@@ -62,6 +63,11 @@ struct SGDOptimizer {
     for (size_t i = 0; i < param.size(); ++i) {
       param[i] -= lr * grad[i];
     }
+  }
+  void update(const se::OptimizerBatchView<float> &batch, uint64_t) {
+    for (size_t row = 0; row < batch.size(); ++row)
+      step(batch.rows[row].index, batch.rows[row].parameters,
+           batch.rows[row].gradients, 0, batch.rows[row].score);
   }
 };
 
@@ -106,13 +112,18 @@ struct MutationBatch {
   std::vector<int64_t> row_lengths;
 };
 
-std::vector<MutationBatch> make_mutation_batches(size_t repetitions,
-                                                 std::mt19937_64 &generator) {
+std::vector<MutationBatch>
+make_mutation_batches(size_t repetitions, std::mt19937_64 &generator,
+                      std::span<const uint64_t> keys) {
+  if (keys.empty())
+    throw std::invalid_argument("mutation benchmark key pool is empty");
+  std::uniform_int_distribution<size_t> pick(0, keys.size() - 1);
   std::vector<MutationBatch> batches;
   batches.reserve(repetitions);
   for (size_t repetition = 0; repetition < repetitions; ++repetition) {
-    MutationBatch batch{
-        generate_power_law_batch(kBatchSize, kUniqueKeys, generator), {}};
+    MutationBatch batch{std::vector<uint64_t>(kBatchSize), {}};
+    for (uint64_t &key : batch.keys)
+      key = keys[pick(generator)];
     deduplicate_mutation_batch(batch.keys);
     batch.row_lengths.assign(batch.keys.size(), static_cast<int64_t>(kDim));
     batches.push_back(std::move(batch));
@@ -187,10 +198,10 @@ void run_storage_pressure_benchmark() {
   using PressureStore =
       HogwildEmbeddingStore<uint64_t, float, float, LfuScorePolicy>;
   auto opt_factory = pro::make_proxy<
-      se::FunctionFacade<pro::proxy<OptimizerFacade<float, float>>(size_t)>>(
-      [](size_t) {
-        return pro::make_proxy<OptimizerFacade<float, float>, SGDOptimizer>();
-      });
+      se::FunctionFacade<OptimizerExtension<float, float>(size_t)>>([](size_t) {
+    return pro::make_proxy<OptimizerExtensionFacade<float, float>,
+                           SGDOptimizer>();
+  });
   constexpr size_t kPressureKeys = 16'384;
   constexpr size_t kPressureBatch = 4'096;
   PressureStore store(
@@ -342,9 +353,10 @@ int main(int argc, char **argv) {
   forward_mops.reserve(thread_counts.size());
 
   auto opt_factory = pro::make_proxy<
-      se::FunctionFacade<pro::proxy<OptimizerFacade<float, float>>(size_t)>>(
+      se::FunctionFacade<OptimizerExtension<float, float>(size_t)>>(
       [](size_t d) {
-        return pro::make_proxy<OptimizerFacade<float, float>, SGDOptimizer>();
+        return pro::make_proxy<OptimizerExtensionFacade<float, float>,
+                               SGDOptimizer>();
       });
 
   for (size_t num_threads : thread_counts) {
@@ -388,11 +400,13 @@ int main(int argc, char **argv) {
     std::vector<float> flat_out(kBatchSize * kDim, 0.0f);
     std::vector<float> flat_grads(kBatchSize * kDim, 0.001f);
     std::vector<uint8_t> exists_mask(kBatchSize);
+    std::vector<uint64_t> mutation_keys;
 
     // ── 1. lookup_or_insert (cold: all new keys) ───────────────────────────
     {
       auto batch = generate_power_law_batch(kBatchSize, kUniqueKeys, gen);
       deduplicate_mutation_batch(batch);
+      mutation_keys = batch;
       // warmup
       store.lookup_or_insert<uint64_t>(
           batch, std::span<float>(flat_out).first(batch.size() * kDim),
@@ -433,7 +447,7 @@ int main(int argc, char **argv) {
     // ── 3. assign (write embedding values) ────────────────────────────────
     {
       size_t reps = 10;
-      auto batches = make_mutation_batches(reps, gen);
+      auto batches = make_mutation_batches(reps, gen, mutation_keys);
       size_t operation_count = 0;
       for (const auto &batch : batches)
         operation_count += batch.keys.size();
@@ -449,7 +463,7 @@ int main(int argc, char **argv) {
     // ── 4. accumulate_gradients ───────────────────────────────────────────
     {
       size_t reps = 10;
-      auto batches = make_mutation_batches(reps, gen);
+      auto batches = make_mutation_batches(reps, gen, mutation_keys);
       size_t operation_count = 0;
       for (const auto &batch : batches)
         operation_count += batch.keys.size();
@@ -467,7 +481,7 @@ int main(int argc, char **argv) {
     {
       // Ensure there's something accumulated
       size_t reps = 10;
-      auto batches = make_mutation_batches(reps + 1, gen);
+      auto batches = make_mutation_batches(reps + 1, gen, mutation_keys);
       store.accumulate_gradients<uint64_t>(batches.front().keys, flat_grads,
                                            batches.front().row_lengths);
       timer.start();
@@ -482,6 +496,7 @@ int main(int argc, char **argv) {
       double gbps =
           store.size() * kDim * sizeof(float) * 2 / ms / 1e6; // read+write
       print_result({"optimizer_step", mops, gbps});
+      store.optimizer_step();
     }
 
     // ── 6. contains ───────────────────────────────────────────────────────

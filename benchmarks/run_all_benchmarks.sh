@@ -8,7 +8,8 @@ echo "    Sparse Embedding Benchmark Script     "
 echo "=========================================="
 
 echo "[1/4] Running C++ Embedding Store Full Benchmark..."
-bazel run -c opt //benchmarks:embedding_store_benchmark 2>&1 | tee tmp/benchmark_cpp_full.log
+bazel run -c opt //benchmarks:embedding_store_benchmark -- \
+  --threads=16 --numa-aware-sharding --skip-pressure 2>&1 | tee tmp/benchmark_cpp_full.log
 
 echo "[2/4] Running C++ Hotpath Microbenchmarks..."
 bazel run -c opt //benchmarks:hotpath_microbench 2>&1 | tee tmp/benchmark_cpp_hotpath.log

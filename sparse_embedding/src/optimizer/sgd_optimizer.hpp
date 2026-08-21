@@ -20,10 +20,13 @@
 
 #include <cstdint>
 #include <limits>
+#include <ranges>
 #include <span>
+#include <stdexcept>
 
 #include "sparse_embedding/src/optimizer/learning_rate.hpp"
 #include "sparse_embedding/src/optimizer/optimizer_config.hpp"
+#include "sparse_embedding/src/optimizer/optimizer_contract.hpp"
 #include "sparse_embedding/src/simd/sgd_ops.hpp"
 #include "sparse_embedding/src/storage/page_storage.hpp"
 
@@ -60,7 +63,7 @@ public:
 
   void set_step(uint32_t /*idx*/, uint32_t /*s*/) {}
 
-  void prefetch(uint32_t /*idx*/) const noexcept {}
+  void prefetch_state(uint32_t /*idx*/) const noexcept {}
 
   constexpr bool requires_score() const {
     return learning_rate.requires_score();
@@ -72,6 +75,16 @@ public:
     float current_lr = learning_rate.compute(score);
     simd::simd_sgd_update(param_span.data(), grad_span.data(), current_lr,
                           config.weight_decay, param_span.size());
+  }
+
+  void update(const OptimizerBatchView<ParamT> &batch, uint64_t global_step) {
+    if (!batch.valid())
+      throw std::invalid_argument("invalid optimizer batch view");
+    for (const size_t row : std::views::iota(size_t{0}, batch.size())) {
+      prefetch_state(batch.rows[row].index);
+      step(batch.rows[row].index, batch.rows[row].parameters,
+           batch.rows[row].gradients, global_step, batch.rows[row].score);
+    }
   }
 };
 

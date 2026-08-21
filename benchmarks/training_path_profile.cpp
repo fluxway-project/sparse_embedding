@@ -13,6 +13,7 @@
 #include "sparse_embedding/src/backend/hogwild/hogwild_embedding_store.hpp"
 #include "sparse_embedding/src/common/function.hpp"
 #include "sparse_embedding/src/interface/optimizer_interface.hpp"
+#include "sparse_embedding/src/optimizer/optimizer_contract.hpp"
 
 namespace {
 
@@ -32,12 +33,17 @@ struct ProfileSgd {
   void set_state(uint32_t, std::span<const float>) {}
   uint32_t step_data(uint32_t) const { return 0; }
   void set_step(uint32_t, uint32_t) {}
-  void prefetch(uint32_t) {}
+  void prefetch_state(uint32_t) {}
   bool requires_score() const { return false; }
   void step(uint32_t, std::span<float> parameter,
             std::span<const float> gradient, uint64_t, uint64_t) {
     for (size_t index = 0; index < parameter.size(); ++index)
       parameter[index] -= 0.01F * gradient[index];
+  }
+  void update(const se::OptimizerBatchView<float> &batch, uint64_t) {
+    for (size_t row = 0; row < batch.size(); ++row)
+      step(batch.rows[row].index, batch.rows[row].parameters,
+           batch.rows[row].gradients, 0, batch.rows[row].score);
   }
 };
 
@@ -104,10 +110,12 @@ int main(int argc, char **argv) {
 
   using Store =
       se::HogwildEmbeddingStore<uint64_t, float, float, se::NoScorePolicy>;
-  auto optimizer_factory = pro::make_proxy<se::FunctionFacade<
-      pro::proxy<se::OptimizerFacade<float, float>>(size_t)>>([](size_t) {
-    return pro::make_proxy<se::OptimizerFacade<float, float>, ProfileSgd>();
-  });
+  auto optimizer_factory = pro::make_proxy<
+      se::FunctionFacade<se::OptimizerExtension<float, float>(size_t)>>(
+      [](size_t) {
+        return pro::make_proxy<se::OptimizerExtensionFacade<float, float>,
+                               ProfileSgd>();
+      });
   Store store({kDimension}, {}, optimizer_factory, se::NoScorePolicy{},
               se::HogwildStoreOptions{
                   .thread_budget = workers,

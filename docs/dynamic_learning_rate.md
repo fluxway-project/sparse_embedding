@@ -1,5 +1,11 @@
 # Dynamic Learning Rate (Score-Based LR)
 
+## Requirements
+
+This API is available from the Python package built with the repository's
+Bazel toolchain. Use a score policy when the selected learning-rate policy
+reads feature scores; policies that do not read scores can be used without one.
+
 In large-scale sparse embeddings, it is often beneficial to adjust the learning rate dynamically based on the access frequency or importance of each feature. Features that appear frequently might need a smaller learning rate to avoid oscillating or overwriting information, while rare features might need larger updates to learn effectively from limited samples.
 
 Sparse Embedding provides a set of **Score-Based Dynamic Learning Rate Policies** that can adjust the learning rate for each feature based on its score (which is typically updated by a scoring policy like LFU or LRU).
@@ -72,3 +78,11 @@ store.optimizer_step()
 
 * **Score Policy is Required:** If you specify a dynamic LR policy that depends on scores (like `SqrtDecayLrPolicy`), you **must** also enable a score policy (e.g. `score_policy="lfu"`) in the `EmbeddingStore`. Failing to do so will result in a `ValueError` during initialization.
 * **Performance:** The dynamic learning rate calculation introduces minimal overhead. The static/dynamic execution paths are resolved via `constexpr` at compile time to ensure zero overhead for static LR configurations, while dynamic LR computations are fully fused with the highly optimized SIMD vectorization updates (like AVX2/AVX-512).
+
+## Validation
+
+The public behavior is covered by the dynamic-learning-rate test module:
+
+```bash
+PYTHONPATH="$PWD" pytest -q sparse_embedding/tests/test_dynamic_lr.py
+```

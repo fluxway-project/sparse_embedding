@@ -2,7 +2,21 @@ load("@rules_cc//cc:cc_library.bzl", "cc_library")
 
 cc_library(
     name = "observability",
-    hdrs = ["telemetry_ring.hpp"],
+    hdrs = [
+        "diagnostic_event.hpp",
+        "diagnostic_sink.hpp",
+        "telemetry_ring.hpp",
+    ],
     visibility = ["//visibility:public"],
-    deps = ["//sparse_embedding/src/execution"],
+    deps = [
+        "//sparse_embedding/src/execution",
+        "//sparse_embedding/src/execution/topology",
+    ],
+)
+
+cc_test(
+    name = "telemetry_ring_test",
+    srcs = ["telemetry_ring_test.cpp"],
+    linkopts = ["-pthread"],
+    deps = [":observability"],
 )

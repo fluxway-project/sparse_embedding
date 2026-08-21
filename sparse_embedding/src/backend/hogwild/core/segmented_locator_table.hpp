@@ -1,5 +1,6 @@
 #pragma once
 
+#include <algorithm>
 #include <array>
 #include <atomic>
 #include <cstddef>
@@ -7,7 +8,9 @@
 #include <limits>
 #include <memory>
 #include <mutex>
+#include <numeric>
 #include <optional>
+#include <span>
 #include <stdexcept>
 #include <vector>
 
@@ -144,7 +147,7 @@ public:
     return slot;
   }
 
-  void prefetch_slot(uint32_t slot_id) const noexcept {
+  void prefetch_slot_cacheline(uint32_t slot_id) const noexcept {
     const LocatorSlot *slot = locate(slot_id);
     if (slot != nullptr) {
       __builtin_prefetch(slot, 0, 3);
@@ -272,6 +275,148 @@ public:
       return false;
     std::forward<Write>(write)(decode(encoded), slot.packed);
     return true;
+  }
+
+  template <typename Write>
+  bool try_write_batch(std::span<const uint32_t> slot_ids, Write &&write) {
+    if (slot_ids.empty())
+      throw std::invalid_argument("locator batch is empty");
+    struct GuardedSlot {
+      uint32_t id;
+      LocatorSlot *slot;
+      std::unique_ptr<PackedWriteGuard> guard;
+      uint32_t index;
+    };
+    std::vector<uint32_t> lock_order(slot_ids.begin(), slot_ids.end());
+    std::ranges::sort(lock_order);
+    if (std::ranges::adjacent_find(lock_order) != lock_order.end())
+      throw std::invalid_argument("locator batch contains duplicate slots");
+    std::vector<GuardedSlot> guarded;
+    guarded.reserve(lock_order.size());
+    for (uint32_t id : lock_order) {
+      LocatorSlot &slot = locate_required(id);
+      if (version_of(slot.packed.load(std::memory_order_acquire)) >=
+          kRotationSequence)
+        throw LocatorSequenceExhausted();
+      guarded.push_back(
+          {id, &slot,
+           std::make_unique<PackedWriteGuard>(slot.packed, slot.readers), 0});
+      const uint64_t current = slot.packed.load(std::memory_order_acquire);
+      const uint32_t encoded = decode_index(current);
+      if (encoded == 0)
+        return false;
+      guarded.back().index = decode(encoded);
+    }
+    std::vector<uint32_t> indices;
+    indices.reserve(slot_ids.size());
+    if (std::ranges::is_sorted(slot_ids)) {
+      for (const GuardedSlot &entry : guarded)
+        indices.push_back(entry.index);
+    } else {
+      for (uint32_t id : slot_ids) {
+        const auto it = std::ranges::find(guarded, id, &GuardedSlot::id);
+        if (it == guarded.end())
+          throw std::logic_error("locator batch lock order lost slot");
+        indices.push_back(it->index);
+      }
+    }
+    std::forward<Write>(write)(std::span<const uint32_t>(indices));
+    return true;
+  }
+
+  struct KeyedWriteSlot {
+    uint32_t slot_id;
+    uint64_t expected_key;
+  };
+
+private:
+  struct KeyedBatchScratch {
+    std::vector<size_t> lock_order;
+    std::vector<size_t> radix_scratch;
+    std::vector<LocatorSlot *> slots;
+    std::vector<se::memory::PackedWriteTarget> targets;
+    std::vector<uint32_t> indices;
+  };
+
+  static KeyedBatchScratch &keyed_batch_scratch() {
+    static thread_local KeyedBatchScratch scratch;
+    return scratch;
+  }
+
+public:
+  template <typename Write>
+  bool try_write_key_batch(std::span<const KeyedWriteSlot> entries,
+                           Write &&write) {
+    if (entries.empty())
+      throw std::invalid_argument("locator keyed batch is empty");
+    KeyedBatchScratch &scratch = keyed_batch_scratch();
+    scratch.lock_order.resize(entries.size());
+    std::ranges::iota(scratch.lock_order, size_t{0});
+    const bool already_sorted =
+        std::ranges::is_sorted(entries, {}, &KeyedWriteSlot::slot_id);
+    if (!already_sorted) {
+      scratch.radix_scratch.resize(scratch.lock_order.size());
+      for (unsigned shift = 0; shift < 32; shift += 8) {
+        std::array<size_t, 256> counts{};
+        for (const size_t position : scratch.lock_order)
+          ++counts[(entries[position].slot_id >> shift) & 0xffU];
+        size_t offset = 0;
+        for (size_t &count : counts) {
+          const size_t next = offset + count;
+          count = offset;
+          offset = next;
+        }
+        for (const size_t position : scratch.lock_order)
+          scratch.radix_scratch[counts[(entries[position].slot_id >> shift) &
+                                       0xffU]++] = position;
+        scratch.lock_order.swap(scratch.radix_scratch);
+      }
+    }
+    for (size_t position = 1; position < scratch.lock_order.size();
+         ++position) {
+      if (entries[scratch.lock_order[position - 1]].slot_id ==
+          entries[scratch.lock_order[position]].slot_id)
+        throw std::invalid_argument(
+            "locator keyed batch contains duplicate slots");
+    }
+
+    scratch.slots.resize(entries.size());
+    scratch.targets.resize(entries.size());
+    scratch.indices.resize(entries.size());
+    for (size_t lock_position = 0; lock_position < scratch.lock_order.size();
+         ++lock_position) {
+      const size_t position = scratch.lock_order[lock_position];
+      const KeyedWriteSlot entry = entries[position];
+      LocatorSlot &slot = locate_required(entry.slot_id);
+      if (version_of(slot.packed.load(std::memory_order_acquire)) >=
+          kRotationSequence)
+        throw LocatorSequenceExhausted();
+      scratch.slots[lock_position] = &slot;
+      scratch.targets[lock_position] = {&slot.packed, &slot.readers};
+    }
+
+    bool valid = true;
+    {
+      se::memory::PackedWriteGuardBatch guard_batch(scratch.targets);
+      for (size_t lock_position = 0; lock_position < scratch.lock_order.size();
+           ++lock_position) {
+        const size_t position = scratch.lock_order[lock_position];
+        LocatorSlot &slot = *scratch.slots[lock_position];
+        const uint64_t current = slot.packed.load(std::memory_order_acquire);
+        const uint32_t encoded = decode_index(current);
+        if (encoded == 0 || slot.key != entries[position].expected_key) {
+          valid = false;
+          break;
+        }
+        scratch.indices[position] = decode(encoded);
+      }
+      if (valid)
+        std::forward<Write>(write)(std::span<const uint32_t>(scratch.indices));
+    }
+    scratch.slots.clear();
+    scratch.targets.clear();
+    scratch.indices.clear();
+    return valid;
   }
 
   template <typename Retire>

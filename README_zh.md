@@ -9,6 +9,7 @@
 - **Slot Directory 读路径**：基于 `parlayhash` 实现稳定 Key→slot lookup，再通过 segmented locator table 发布 Slot→arena；warm 后的 lookup/forward 读侧不再经过 shard shared lock 或 lifecycle lock
 - **SIMD 加速**：AVX-512 向量化哈希计算与梯度 Scatter 操作
 - **Hogwild! 梯度累积**：分片 TransientArena 实现无锁梯度聚合，避免跨线程同步
+- **批级优化器扩展**：`OptimizerExtensionFacade<ParamT, OptT>` 是唯一的优化器类型擦除 seam。Store 在 shard-local SeqLock 写保护范围内解析 locator row，并按 key shard 调用一次 `update(OptimizerBatchView, global_step)`，不再对每行调用 proxy。
 - **C++23 标准并发**：基于 NVIDIA `stdexec` + `exec::static_thread_pool` 实现 Sender/Receiver 任务调度
 - **Epoch 内存安全**：通过 `epoch::with_epoch` 批次保护并发哈希表读写，避免 ABA 问题
 - **分布式 Lance Checkpoint**：框架无关的 prepare/write/commit 协议写入 manifest 固定版本的 `entries` 与物理 `page_images`，保存 slot 布局、sequence、payload/state，并进行 SHA-256 校验。精确版本恢复支持 physical participant 或调用方提供的弹性 partition function；单调提交权会拒绝过期 coordinator，不依赖特定分布式框架。
@@ -50,67 +51,41 @@ Bazel 配置使用 `-std=c++23` 编译 C++ 源码；支持 GCC 13+ 和 Bazel 7+�
 
 ### Forward scaling
 
-测试使用 memory-only store、固定 batch、预热和物理 CPU 亲和性；结果用于比较不同实现。
+测试使用 memory-only store、固定 batch、预热和物理 CPU 亲和性。完整 workload 定义和参考表格统一维护在性能报告中。
 
-#### Slot Directory Forward Scaling
+#### Slot-directory forward scaling
 
-隔离 forward proof 使用 dim=32 的 memory-only store、128 个已发布 key、4,096-key 固定 power-law batch、seed `0x5EED5CA1E`、400 次计时 `forward_lookup` 重复、48 个 allowed CPU，以及 1/2/4/8/16/64 线程。
+参考 workload 使用 dim=32、4,096-key memory-only table、4,096-key 固定 power-law
+batch、400 次计时 `forward_lookup` 重复，并在 48 个 allowed CPU 上使用物理核 affinity。
 
 | 线程数 | Forward 吞吐 |
 |---:|---:|
-| 1 | 9.632 Mops/s |
-| 2 | 16.436 Mops/s |
-| 4 | 27.914 Mops/s |
-| 8 | 40.707 Mops/s |
+| 1 | 14.988 Mops/s |
+| 2 | 21.852 Mops/s |
+| 4 | 35.165 Mops/s |
+| 8 | **45.945 Mops/s** |
 | 16 | 42.049 Mops/s |
-| 64 | 12.591 Mops/s |
+| 64 | 33.446 Mops/s |
 
-相对单线程的 scaling ratio 为：2 线程 1.706x、4 线程 2.898x、8 线程 4.226x，超过当前 1.6x/2.5x/3.5x forward-scaling gate。
+完整 workload 定义、高并发表格、compaction 扩展和可靠性校验统一维护在性能报告中。
 
-### 并发压力
-
-同一台测试机器上使用相同 workload，当前源码单次结果为 1/2/4/8/16/64 线程分别
-14.988/21.852/35.165/45.945/41.928/33.446 Mops/s。16 线程追加三次为
-36.557/39.012/39.973 Mops/s，存在明显调度和 NUMA 波动；固定物理核 affinity 与
-NUMA placement 后再作优化结论。8 producers 高并发 pressure proof 通过，未发生
-pressure page、spill 或 swap-out。
+### NUMA-aware 执行与压力校验
 
 `--numa-aware-sharding` 同时启用执行侧与内存侧 NUMA locality：worker 绑定物理核，arena
-page 按 shard 固定到对应 node。复现命令：`bazel run -c opt //benchmarks:embedding_store_benchmark -- --threads=16 --numa-aware-sharding --skip-pressure`。
-
-#### 持续 Retirement Pressure 与 Sink
-
-sustained-pressure proof 使用 8 个 producer、1,048,576 个总 key、dim=8、Auto storage、8 MiB 驻留内存限制、512 MiB spill 限制，以及 0.75/0.50 水位。该测试在压力阶段后校验已保留 payload，报告当前 retirement/Sink 契约，而不是 disk spill/swap 吞吐。
-
-| 指标 | 结果 |
-|---|---:|
-| Pressure pages (`spill_count + swap_out_count`) | 0 |
-| `spill_count` | 0 |
-| `swap_out_count` | 0 |
-| `memory_bytes` | 294,912 |
-| `spill_bytes` | 0 |
-| `retired_bytes` | 2,109,456 |
-| Allocation p95 | 1.163 ms |
-| Allocation p99 | 2.599 ms |
-| Backlog drain | 0.003 ms |
-| Producer elapsed | 129.397 ms |
-
-该 run 有意在 page spill/swap 发生前打开 retirement-pressure circuit。已接受结论是 Sink admission 能在无 payload corruption 的情况下处理压力。
-
-这些数据用于复现和回归诊断，不是跨机器性能承诺。架构设计与遥测语义见[架构与 API 契约](docs/storage_architecture_zh.md)，workload 定义和验证命令见[性能与可靠性报告](docs/performance_and_reliability_report_zh.md)。
+page 按 shard 固定到对应 node。公开 pressure 契约和验证命令统一见性能与可靠性报告。
 
 ### 无锁页迁移与扩表
 
-性能参考见[性能与可靠性报告](docs/performance_and_reliability_report_zh.md)：64 线程
-lookup 达 64.76 Mops/s，64 线程混合 lookup 达 52.63 Mops/s，预分配 destination 的
-16-worker compaction 达 13.59 M keys/s；64 MiB 换页证明产生 31 次 swap-out、13 次 spill。
+性能参考统一见[性能与可靠性报告](docs/performance_and_reliability_report_zh.md)：64 线程
+lookup 为 80.19 Mops/s，64 线程混合 lookup 为 63.17 Mops/s，预分配 destination 的
+16-worker compaction 为 11.92 M keys/s。
 扩表使用精确 per-shard 预算，不再统一向上取二次幂：目录采用 2.5× 探测预算并向 16 对齐，
 运行期 `MapBundle` 容量按 `<64K: 2×`、`64K≤capacity<1M: 1.5×`、`≥1M: 1.25×` 增长。
 
 Mutation benchmark 在调用要求唯一的 mutation API 前会先对 power-law 候选去重，并按实际
 处理行数报告吞吐。纯 assign/accumulate/optimizer 测量请使用 `training_path_profile`。
 该 profile 会在梯度路由、transient 累积和 optimizer lookup 之间复用同一次 hash；
-当前开启 affinity 的测量结果见性能报告。
+workload 定义和统计口径见性能报告。
 NUMA-aware sharding 通过 `--numa-aware-sharding` opt-in；它按 node 放置 arena page 和
 worker，并在复用线程改变目标 CPU 时重新绑定。benchmark profile 以物理核为上限，不把
 SMT sibling 当成额外内存带宽。lookup-only forward 直接使用 shard `ReadView` 并复用路由
@@ -179,7 +154,7 @@ HogwildEmbeddingStore
 ├── PageStorage                  # 自动探测 RAM 预算与文件映射 spill
 ├── TransientArena[thread_budget]  # Per-shard gradient accumulation (lock-free)
 ├── exec::static_thread_pool     # C++23 stdexec thread pool
-└── pro::proxy<OptimizerFacade<ParamT, OptT>> # Type-erased optimizer
+└── pro::proxy<OptimizerExtensionFacade<ParamT, OptT>> # 批级优化器 seam
 ```
 
 ### 关键设计决策
@@ -192,7 +167,24 @@ HogwildEmbeddingStore
 
 4. **无冲突梯度累积（Conflict-Free Gradient Accumulation）**：反向传播时为每个线程分配独立的 `TransientArena` 分片。各线程先在本地分片中累积梯度，最后再进行 SIMD 加速的汇总与优化器更新，避免了多线程同时更新同一 embedding 时的伪共享（False Sharing）和原子竞争。
 
-5. **深存储模块（Storage as a Deep Module）**：embedding、optimizer state、score 和 transient gradient arena 共享同一个页面存储接口。资源探测、磁盘选择、警告和 extent 复用全部留在分配冷路径，不进入 lookup 与 optimizer 热路径。
+5. **批级优化器分发（Batch-Scoped Optimizer Dispatch）**：locator 解析与参数修改位于同一个 packed SeqLock guard callback 内。优化器 proxy 每个已解析 shard batch 只进入一次，参数 span 不会被保存用于延迟更新。
+6. **深存储模块（Storage as a Deep Module）**：embedding、optimizer state、score 和 transient gradient arena 共享同一个页面存储接口。资源探测、磁盘选择、警告和 extent 复用全部留在分配冷路径，不进入 lookup 与 optimizer 热路径。
+
+### 训练更新路径
+
+训练路径（`accumulate_gradients()` 后接 `optimizer_step()`）将梯度保存在按
+shard 划分的 `TransientArena` 中。`optimizer_step()` 解析出 shard 批次后只进入一次
+`OptimizerExtensionFacade`，并在 locator 的 `PackedWriteGuardBatch` 释放前消费全部参数
+span。
+
+优化器扩展分发明确限定在批级。静态分派是同一契约的实现选项，`std::variant` 只用于冷配置，
+不会成为逐行运行时路径。
+
+Mutation API 要求 `(key, dimension)` 行唯一。`lookup_or_insert` 可以归并重复 miss，
+但 `assign`、`accumulate_gradients` 和 `optimizer_step` 的 batch 必须来自已发布 key；
+release 构建遇到并发 erase/recycle 竞态时由 producer 增加 relaxed counter，并向有界
+telemetry ring 发布固定大小诊断事件；单一 consumer 可以写入 `std::clog`。producer 不
+执行 I/O，ring 满载时丢弃事件且不阻塞；受影响梯度仍被丢弃，debug 构建立即抛异常。
 
 ---
 

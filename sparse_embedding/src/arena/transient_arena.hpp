@@ -44,6 +44,31 @@ template <typename ValT> class TransientArena {
   static constexpr size_t kChunkSize = 8192; // Number of elements per page
 
 public:
+  class AccumulatedBatchView {
+  public:
+    size_t size() const noexcept { return feature_ids->size(); }
+    uint64_t key(size_t position) const noexcept {
+      return (*feature_ids)[position];
+    }
+    uint64_t hash(size_t position) const noexcept {
+      return (*feature_hashes)[position];
+    }
+    const ValT *gradient(size_t position) const noexcept {
+      return arena->grad_data(static_cast<uint32_t>(position));
+    }
+    const std::vector<uint64_t> &keys() const noexcept { return *feature_ids; }
+    const std::vector<uint64_t> &hashes() const noexcept {
+      return *feature_hashes;
+    }
+    bool contiguous() const noexcept { return true; }
+
+  private:
+    friend class TransientArena;
+    const TransientArena *arena = nullptr;
+    const std::vector<uint64_t> *feature_ids = nullptr;
+    const std::vector<uint64_t> *feature_hashes = nullptr;
+  };
+
   TransientArena(size_t dim, PageStorage storage,
                  bool page_eviction_enabled = false)
       : dim_(dim), storage_(std::move(storage)),
@@ -150,6 +175,20 @@ public:
       }
       invoke_accumulated(fn, slot_index);
     }
+  }
+
+  template <typename Fn> void with_accumulated_batch(Fn &&fn) {
+    se::memory::PackedWriteGuard metadata_lock(metadata_state_,
+                                               metadata_readers_);
+    if (feature_ids_.size() != next_slot_ ||
+        feature_hashes_.size() != next_slot_)
+      throw std::logic_error(
+          "transient arena feature-id layout is inconsistent");
+    AccumulatedBatchView view;
+    view.arena = this;
+    view.feature_ids = &feature_ids_;
+    view.feature_hashes = &feature_hashes_;
+    std::forward<Fn>(fn)(view);
   }
 
   void clear() {

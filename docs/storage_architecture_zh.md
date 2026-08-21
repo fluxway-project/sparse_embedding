@@ -37,20 +37,42 @@ embedding 与 optimizer 模板使用以下规范形态：
 
 ```cpp
 using Store = se::HogwildEmbeddingStore<KeyT, ParamT, OptT, ScorePolicy>;
-using Optimizer = pro::proxy<se::OptimizerFacade<ParamT, OptT>>;
+using Optimizer = se::OptimizerExtension<ParamT, OptT>;
 using OptimizerFactory = se::Function<Optimizer(size_t)>;
 
 auto optimizer =
-    pro::make_proxy<se::OptimizerFacade<ParamT, OptT>, OptimizerImpl>();
+    pro::make_proxy<se::OptimizerExtensionFacade<ParamT, OptT>,
+                    OptimizerImpl>();
 auto optimizer_factory = pro::make_proxy<
     se::FunctionFacade<Optimizer(size_t)>>(
     [](size_t) -> Optimizer {
       return pro::make_proxy<
-          se::OptimizerFacade<ParamT, OptT>, OptimizerImpl>();
+          se::OptimizerExtensionFacade<ParamT, OptT>, OptimizerImpl>();
     });
 ```
 
-Facade 定义集中在接口头文件中；调用方使用这些完整模板参数，不再重复声明旧 facade 或 store alias。
+`OptimizerExtensionFacade<ParamT, OptT>` 是唯一的优化器扩展 seam。必需操作是
+`update(const OptimizerBatchView<ParamT>&, uint64_t)`；状态、checkpoint 和生命周期
+操作仍属于同一个 facade。Store 先解析 key 与 arena index，再按 key shard 调用一次
+批级 update。参数 span 都在对应 locator 的 `PackedWriteGuardBatch` 持有期间消费，不会
+收集裸 `ParamT*` 延迟更新。
+
+`accumulate_gradients()` 与 `optimizer_step()` 是训练 API。`std::variant` 只用于 optimizer
+与 learning-rate 冷配置，不会成为逐行长驻运行时表示。
+
+### 优化器执行不变量
+
+训练路径把梯度累积在 `TransientArena`，再按执行 shard 执行一次批级更新，并遵守以下不变量：
+
+| 不变量 | 契约 |
+|---|---|
+| Locator 生命周期 | key 解析、参数 span 构造与优化器修改都发生在同一个 `PackedWriteGuardBatch` 内。 |
+| Proxy 次数 | 优化器扩展 proxy 每个已解析 shard batch 只进入一次，不按行进入。 |
+| 禁止延迟指针 | 裸 `ParamT*` 或参数 span 不得逃逸 locator 写回调。 |
+| 失败策略 | 非法 dimension、payload 宽度、重复 locator slot 或缺失 optimizer state 立即抛异常。 |
+
+批级分发是生产 seam。静态分派和类型擦除分派实现同一批级契约，不改变 locator 生命周期，
+也不允许参数 span 逃逸写保护范围。
 
 ## Python 配置
 
@@ -107,14 +129,14 @@ telemetry partition；task 数提供足够的独立随机访存工作来隐藏�
    基于可配置的流水线步长 `forward_prefetch_distance`（默认 8～16 步），在处理当前样本时对未来的流水线阶段提前发出内存预取：
    - **第 1 级（输入特征预取）**：预取未来位置的 `keys[i + dist]`、`row_lengths` 与 `offsets`。
    - **第 2 级（输出缓冲区预取）**：对目标输出内存 `out_flat_values + offset` 发出写意图预取。
-   - **第 3 级（哈希目录桶预取）**：计算未来 key 的哈希并调用 `prefetch_entry_hashed` -> `FlatKeyDirectory::prefetch_bucket_hashed(hash)`，提前将目录哈希桶缓存行装入 L1/L2 缓存。
-   - **第 4 级（定位槽位预取）**：调用 `SegmentedLocatorTable::prefetch_slot(slot_id)` 预拉取 8 字节对齐的 `LocatorSlot`（含 `sequence` 与 `arena_index`）。
+   - **第 3 级（哈希目录桶预取）**：计算未来 key 的哈希并调用 `prefetch_entry_cacheline` -> `FlatKeyDirectory::prefetch_bucket_cacheline(hash)`，提前将目录哈希桶缓存行装入 L1/L2 缓存。
+   - **第 4 级（定位槽位预取）**：调用 `SegmentedLocatorTable::prefetch_slot_cacheline(slot_id)` 预拉取 8 字节对齐的 `LocatorSlot`（含 `sequence` 与 `arena_index`）。
 
-3. **优化器状态页流水线 (`OptimizerFacade` & `AdamOptimizer`)**：
-   - `OptimizerFacade` / `OptimizerKernel` 契约引入弱分发接口 `pro::weak_dispatch<OptMemPrefetch>` (`prefetch(uint32_t idx)`)。
-   - 训练更新（`optimizer_step` 与梯度累加）在进入 SIMD 内核计算前，提前调用 `slot->optimizer->prefetch(arena_idx)`。
-   - `OptimizerState::prefetch(index)` 定位物理页地址并发出写意图预取 `__builtin_prefetch(ptr, 1, 3)`。
-   - `AdamOptimizer` 同步并发预取一阶动量（$m$）、二阶动量（$v$）和每槽 `step_state` 所在的物理页缓存行，完全消除 SIMD 算子执行时的动量加载停顿。
+3. **优化器状态页流水线 (`OptimizerExtensionFacade` & `AdamOptimizer`)**：
+   - `OptimizerExtensionFacade` 将 `prefetch_state(uint32_t idx)` 作为优化器扩展 seam 上的可选操作。
+   - 优化器内核在每行 SIMD 更新前预取该行 state；proxy 分发仍按已解析 batch 执行，而不是逐行进入。
+   - `OptimizerState::prefetch_state_cacheline(index)` 定位物理页地址并发出写意图预取 `__builtin_prefetch(ptr, 1, 3)`，明确指示为 CPU 缓存行预热，避免与底层存储换页（I/O Page-in）混淆。
+   - `AdamOptimizer` 在 SIMD 更新前预取一阶动量（$m$）、二阶动量（$v$）和每槽 `step_state` 缓存行，降低可避免的状态加载延迟。
 
 4. **暂态内存池累加流水线 (`TransientArena`)**：
    - 在 `TransientArena::for_each_accumulated` 反向遍历梯度时，提前 8 步预取后续槽位的 `feature_ids_` 与 `feature_hashes_`。
@@ -178,6 +200,11 @@ storage facade 不接收 store 生命周期锁。启用 score 的 store 注销 p
 采样一个逻辑 partition，并以逻辑 partition 数作为观测权重，因此 partition 不依赖 task
 decomposition 或并发限流。store 析构会先停止并 join consumer，再销毁 queued event 引用的
 slot。
+
+仅 release 生效的 optimizer locator revalidation 失败也使用同一 ring。producer 只增加
+relaxed counter 并发布固定大小诊断事件，不格式化字符串，也不执行 iostream I/O。consumer
+调用配置好的 `noexcept` 诊断 sink；默认实现向 `std::clog` 写一行。诊断事件受 ring 容量
+限制，满载时允许丢弃；`dropped_diagnostic_events` 单独暴露这类丢弃数量。
 
 自适应策略使用 Boltzmann 分布：`weight_i = exp(-(utility_i - min_utility) / temperature) /
 sum_j exp(...)`。utility 越高，淘汰概率越低。min-utility 平移保持归一化分布不变，同时让

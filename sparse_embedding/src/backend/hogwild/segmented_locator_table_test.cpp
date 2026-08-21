@@ -73,6 +73,41 @@ int main() {
               }),
           "current key read failed after locator reuse");
 
+  const uint32_t batch_a = table.allocate(501, 81);
+  const uint32_t batch_b = table.allocate(502, 82);
+  std::array<uint32_t, 2> batch_slots{batch_b, batch_a};
+  std::array<uint32_t, 2> batch_indices{};
+  require(table.try_write_batch(batch_slots,
+                                [&](std::span<const uint32_t> indices) {
+                                  batch_indices = {indices[0], indices[1]};
+                                }),
+          "batch locator write failed");
+  require(batch_indices == std::array<uint32_t, 2>{82, 81},
+          "batch locator write reordered caller payload");
+  bool duplicate_rejected = false;
+  try {
+    std::array<uint32_t, 2> duplicate{batch_a, batch_a};
+    table.try_write_batch(duplicate, [](std::span<const uint32_t>) {});
+  } catch (const std::invalid_argument &) {
+    duplicate_rejected = true;
+  }
+  require(duplicate_rejected, "duplicate locator batch was accepted");
+
+  std::array<se::hogwild_internal::SegmentedLocatorTable::KeyedWriteSlot, 2>
+      keyed_batch{{{batch_b, 502}, {batch_a, 501}}};
+  std::array<uint32_t, 2> keyed_indices{};
+  require(table.try_write_key_batch(keyed_batch,
+                                    [&](std::span<const uint32_t> indices) {
+                                      keyed_indices = {indices[0], indices[1]};
+                                    }),
+          "keyed batch locator write failed");
+  require(keyed_indices == std::array<uint32_t, 2>{82, 81},
+          "keyed batch locator write reordered caller payload");
+  keyed_batch[1].expected_key = 999;
+  require(
+      !table.try_write_key_batch(keyed_batch, [](std::span<const uint32_t>) {}),
+      "stale keyed batch write succeeded");
+
   uint32_t retired_index = 0;
   require(table.retire_current(
               reused, [&](uint32_t index) noexcept { retired_index = index; }),

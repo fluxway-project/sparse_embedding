@@ -15,6 +15,14 @@ selection, full-page compaction, and optional hot-key promotion.
 enter a lightweight insertion slow path. Duplicate misses in one batch share a
 single arena slot, and every duplicate output row reuses that embedding.
 
+Mutation batches for `assign`, `accumulate_gradients`, and optimizer updates use
+unique `(key, dimension)` rows and published keys. A concurrent erase/recycle
+race invalidates only the affected gradient batch: debug builds throw for
+diagnosis; release builds increment a relaxed counter and publish a fixed-size
+diagnostic event to the bounded telemetry ring. The single consumer may write
+the event to `std::clog`; the producer never performs I/O, and a full ring drops
+the diagnostic without blocking the training path.
+
 Lance checkpoints contain `entries`, physical `page_images`, and a version-pinned
 manifest. Page images store slot layout, `seq_count`, parameters, score,
 optimizer state/step, and SHA-256 checksums. Incremental checkpoints append only
@@ -61,6 +69,12 @@ would exceed locality benefit.
 
 ## Representative performance
 
+The numbers below are reference measurements on the standard machine above.
+High-concurrency and compaction results are medians of five samples in one
+benchmark invocation. Mixed lookup/insert results are medians of five
+independent process runs. Throughput is reported in Mops/s or M keys/s; these
+figures are workload references, not cross-machine capacity guarantees.
+
 ### Concurrent memory lookup
 
 Configuration: dimension 128, reserved memory-only table, 10,000,000 `int64` keys,
@@ -71,10 +85,11 @@ Configuration: dimension 128, reserved memory-only table, 10,000,000 `int64` key
 | Lookup throughput | **21.54 M keys/s** |
 | Telemetry relaxed-atomic reduction | **93.75%** |
 
-### Forward scaling
+### Slot-directory forward scaling
 
-Configuration: dimension 32, fixed 4,096-key batches, 128 published keys, 48
-allowed CPUs, slot-directory reads, and contiguous partition dispatch.
+Configuration: dimension 32, a 4,096-key memory-only table, 4,096-key fixed
+power-law batches, 400 timed `forward_lookup` repetitions, and physical-core
+affinity on 48 allowed CPUs.
 
 | Threads | Forward throughput |
 |---:|---:|
@@ -85,9 +100,8 @@ allowed CPUs, slot-directory reads, and contiguous partition dispatch.
 | 16 | 42.049 Mops/s |
 | 64 | 33.446 Mops/s |
 
-The default 256 KiB memory-work grain and 64 KiB minimum row grain bound the
-number of effective tasks, preventing additional enqueue, steal, completion, and
-barrier cost from cancelling the benefit of more threads.
+The default memory-work and row-grain limits bound effective task count, keeping
+enqueue, steal, completion, and barrier costs from dominating the timed path.
 
 ### Training paths
 
@@ -99,6 +113,11 @@ enabled. Throughput is the five-run median:
 | `assign` | **16.50 Mops/s** |
 | `accumulate_gradients` (including required step) | **8.69 Mops/s** |
 | `optimizer_step` | **16.85 Mops/s** |
+
+The batch optimizer profile is a separate workload from the tables below. Use
+`training_path_profile` when comparing assign, gradient accumulation, and
+optimizer-step implementations; use the benchmark commands in this document
+for storage and compaction comparisons.
 
 ### High-concurrency pressure and reliability
 
@@ -144,9 +163,9 @@ repetitions per configuration reporting median/p95/p99.
 
 | Threads | Lookup median/p95/p99 (Mops/s) | Insert median/p95/p99 (Mops/s) |
 |---:|---:|---:|
-| 1 | 12.32 / 12.48 / 12.48 | 0.0455 / 0.0526 / 0.0526 |
-| 16 | 70.46 / 73.43 / 73.43 | 0.345 / 0.387 / 0.387 |
-| 64 | **79.29 / 91.47 / 91.47** | **0.592 / 0.611 / 0.611** |
+| 1 | 12.41 / 12.48 / 12.48 | 0.0456 / 0.0523 / 0.0523 |
+| 16 | 71.42 / 73.59 / 73.59 | 0.343 / 0.401 / 0.401 |
+| 64 | **80.19 / 94.25 / 94.25** | **0.577 / 0.626 / 0.626** |
 
 Mixed lookup/insert uses the same dimension, warm keys, and batch for 64 rounds;
 16/64 total threads are split evenly, with Auto storage at 1 GiB memory and
@@ -154,8 +173,8 @@ Mixed lookup/insert uses the same dimension, warm keys, and batch for 64 rounds;
 
 | Total | Lookup/insert threads | Lookup / insert (Mops/s) | Lookup/insert p99 (ns) |
 |---:|---:|---:|---:|
-| 16 | 8 / 8 | 26.67 / 0.298 | 376,041 / 56,071,999 |
-| 64 | 32 / 32 | **52.63 / 0.365** | 1,212,543 / 153,709,741 |
+| 16 | 8 / 8 | 48.41 / 0.360 | 195,991 / 53,862,829 |
+| 64 | 32 / 32 | **63.17 / 0.448** | 686,921 / 132,946,237 |
 
 Compaction strong scaling uses dimension 128, 64 shards, four pages per source
 worker, 4,096 entries per page, 64 store threads, fixed work, 1/2/4/8/16
@@ -163,14 +182,15 @@ compaction workers, five repetitions, and preallocated destinations.
 
 | Workers | Relocated keys/s |
 |---:|---:|
-| 1 | 1.19 M |
-| 2 | 2.10 M |
-| 4 | 3.83 M |
-| 8 | 10.17 M |
-| 16 | **13.59 M** |
+| 1 | 1.18 M |
+| 2 | 4.00 M |
+| 4 | 5.59 M |
+| 8 | 10.70 M |
+| 16 | **11.92 M** |
 
-Without destination preallocation the values are 1.16/2.04/3.79/7.54/9.56 M
-keys/s. The executable targets are `high_concurrency_lookup_insert_benchmark`,
+Without destination preallocation, the same workload is expected to be lower
+because destination allocation is included in the timed phase. The executable
+targets are `high_concurrency_lookup_insert_benchmark`,
 `mixed_lookup_insert_concurrency_benchmark`, and `page_compaction_benchmark`.
 
 Paging tests should verify `swap_out_count > 0` and `spill_count > 0`. Safety
@@ -195,7 +215,7 @@ bazel test -c opt //sparse_embedding/src/backend/hogwild:small_memory_all_paths_
   --test_output=errors
 ```
 
-Latest benchmark commands:
+Benchmark commands:
 
 ```bash
 bazel run -c opt //benchmarks:high_concurrency_lookup_insert_benchmark
