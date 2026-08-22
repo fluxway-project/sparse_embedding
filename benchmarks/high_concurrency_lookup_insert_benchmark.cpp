@@ -45,9 +45,13 @@ Result run(size_t threads, size_t repetition) {
   storage_options.mode = se::StorageMode::kMemoryOnly;
   storage_options.memory_limit_bytes = kBenchmarkMemoryLimitBytes;
   auto storage = se::create_page_storage(std::move(storage_options));
-  Store store(
-      {kDimension}, {}, nullptr, se::NoScorePolicy{},
-      se::HogwildStoreOptions{.thread_budget = threads, .storage = storage});
+  Store store({kDimension}, {}, nullptr, se::NoScorePolicy{},
+              se::HogwildStoreOptions{
+                  .thread_budget = threads,
+                  .storage = storage,
+                  .storage_tuning = {
+                      .workload = se::storage::StorageWorkload::kLookupInsert,
+                      .calibrate_page_geometry = true}});
   std::vector<uint64_t> warm_keys(kWarmKeys);
   std::iota(warm_keys.begin(), warm_keys.end(), uint64_t{1});
   std::vector<int64_t> warm_lengths(kWarmKeys, kDimension);

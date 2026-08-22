@@ -1,6 +1,6 @@
 import numpy as np
 
-from sparse_embedding import AutoStorage, EmbeddingConfig
+from sparse_embedding import AutoStorage, EmbeddingConfig, StorageTuningOptions
 
 
 def test_embedding_config_default():
@@ -48,3 +48,47 @@ def test_embedding_config_auto_spill(tmp_path):
     cfg = EmbeddingConfig(dims=[8], thread_budget=1, storage=storage)
 
     assert cfg.storage is storage
+
+
+def test_embedding_config_auto_tuning_parameters():
+    cfg = EmbeddingConfig(
+        dims=[64],
+        storage_tuning=StorageTuningOptions(
+            target_capacity_keys=10_000_000,
+            memory_budget_bytes=2 * 1024 * 1024 * 1024,
+            entries_per_page=8192,
+            max_pages=16384,
+        ),
+    )
+    assert cfg.storage_tuning.target_capacity_keys == 10_000_000
+    assert cfg.storage_tuning.memory_budget_bytes == 2 * 1024 * 1024 * 1024
+    assert cfg.storage_tuning.entries_per_page == 8192
+    assert cfg.storage_tuning.max_pages == 16384
+
+
+def test_embedding_table_with_auto_tuned_topology():
+    import numpy as np
+
+    from sparse_embedding import EmbeddingStore, Zeros
+
+    cfg = EmbeddingConfig(
+        dims=[32],
+        storage_tuning=StorageTuningOptions(
+            target_capacity_keys=100_000, entries_per_page=4096
+        ),
+    )
+    store = EmbeddingStore(
+        embedding_config=cfg,
+        initializer_config=Zeros(),
+    )
+    keys = np.arange(1000, dtype=np.int64)
+    values = np.random.randn(1000, 32).astype(np.float32)
+
+    store.assign(keys, values)
+    out_vals, out_lens = store.lookup(keys, dim=32)
+    np.testing.assert_allclose(
+        np.from_dlpack(out_vals).reshape(1000, 32), values, rtol=1e-5
+    )
+    np.testing.assert_array_equal(
+        np.from_dlpack(out_lens), np.full(1000, 32, dtype=np.int64)
+    )

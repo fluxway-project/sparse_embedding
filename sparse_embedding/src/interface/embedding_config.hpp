@@ -24,6 +24,7 @@
 #include <vector>
 
 #include "sparse_embedding/src/storage/page_storage.hpp"
+#include "sparse_embedding/src/storage/topology/storage_topology.hpp"
 
 namespace se {
 
@@ -35,6 +36,7 @@ struct EmbeddingConfig {
   std::string optimizer_dtype = ""; // if empty, falls back to value_dtype
   std::string key_dtype = "int64";  // int64, uint64, int32, uint32
   StorageOptions storage;
+  storage::StorageTuningOptions storage_tuning;
 };
 
 } // namespace se

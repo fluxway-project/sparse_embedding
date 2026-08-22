@@ -13,6 +13,27 @@
 #include <string>
 #include <vector>
 
+#include "sparse_embedding/src/storage/topology/storage_topology.hpp"
+
+// =============================================================================
+// CohortArenaAllocation: Group-partitioned lock-free physical slot allocator.
+//
+// A "cohort" represents an autonomous group of directory shards sharing a local
+// lock-free ticket dispenser and physical memory locality (typically 1:1 with a
+// NUMA node / CPU socket cohort).
+//
+// Why "Cohort" instead of "Numa":
+// 1. Concurrency isolation: Cohort partitioning alleviates global atomic ticket
+//    contention across threads even on single-node (UMA) architectures.
+// 2. Hardware decoupling: The allocator operates on pure geometric mathematics
+//    without hard dependencies on libnuma. Physical NUMA memory binding is
+//    applied orthogonally at the page level.
+// 3. Mathematical mapping:
+//      cohort_id = shard_id / cohort_size
+//      page_id   = (ticket >> entries_shift) * cohort_count + cohort_id
+//      index     = page_id * entries_per_page + (ticket & slot_mask)
+// =============================================================================
+
 namespace se {
 
 class CohortArenaAllocation final {
@@ -55,6 +76,11 @@ public:
     for (size_t page = 0; page < maximum_page_count_; ++page)
       page_cohorts_[page].store(kUnassigned, std::memory_order_relaxed);
   }
+
+  explicit CohortArenaAllocation(const storage::StorageTopology &topology)
+      : CohortArenaAllocation(topology.shard_count(), topology.cohort_size(),
+                              topology.entries_per_page(),
+                              topology.max_pages()) {}
 
   CohortArenaAllocation(const CohortArenaAllocation &) = delete;
   CohortArenaAllocation &operator=(const CohortArenaAllocation &) = delete;
@@ -136,8 +162,9 @@ public:
       throw std::invalid_argument("cohort reserved range is empty");
     if (end > maximum_page_count_ * entries_per_page_)
       throw std::out_of_range("cohort reserved range exceeds arena capacity");
-    const uint32_t first_page = first / entries_per_page_;
-    const uint32_t last_page = (end - 1) / entries_per_page_;
+    const uint32_t first_page = static_cast<uint32_t>(first >> entries_shift_);
+    const uint32_t last_page =
+        static_cast<uint32_t>((end - 1) >> entries_shift_);
     for (uint32_t page_id = first_page; page_id <= last_page; ++page_id)
       reserve_page(page_id);
   }
@@ -145,7 +172,7 @@ public:
   void bind_exact(uint32_t index, uint32_t shard_id) {
     if (shard_id >= shard_count_)
       throw std::out_of_range("cohort exact binding shard id is out of range");
-    const uint32_t page_id = index / entries_per_page_;
+    const uint32_t page_id = static_cast<uint32_t>(index >> entries_shift_);
     if (page_id >= maximum_page_count_)
       throw std::out_of_range("cohort exact binding page id is out of range");
     const uint32_t cohort_id = static_cast<uint32_t>(shard_id / cohort_size_);

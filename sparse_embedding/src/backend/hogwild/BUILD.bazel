@@ -20,6 +20,8 @@ cc_library(
         "//sparse_embedding/src/execution",
         "//sparse_embedding/src/execution/topology",
         "//sparse_embedding/src/memory",
+        "//sparse_embedding/src/storage/topology:storage_resource_tuner",
+        "//sparse_embedding/src/storage/topology:storage_topology",
         "@numactl//:libnuma",
     ],
 )
@@ -83,6 +85,9 @@ cc_library(
     name = "cohort_arena_allocation",
     hdrs = ["core/cohort_arena_allocation.hpp"],
     visibility = ["//visibility:public"],
+    deps = [
+        "//sparse_embedding/src/storage/topology:storage_topology",
+    ],
 )
 
 cc_library(
@@ -112,6 +117,8 @@ cc_library(
         "//sparse_embedding/src/optimizer",
         "//sparse_embedding/src/simd",
         "//sparse_embedding/src/storage",
+        "//sparse_embedding/src/storage/topology:storage_resource_tuner",
+        "//sparse_embedding/src/storage/topology:storage_topology",
         "@parlayhash",
         "@proxy",
         "@stdexec",

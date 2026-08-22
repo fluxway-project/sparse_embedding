@@ -74,6 +74,8 @@
 #include "sparse_embedding/src/simd/memory_ops.hpp"
 #include "sparse_embedding/src/simd/prefetch.hpp"
 #include "sparse_embedding/src/storage/page_storage.hpp"
+#include "sparse_embedding/src/storage/topology/storage_resource_tuner.hpp"
+#include "sparse_embedding/src/storage/topology/storage_topology.hpp"
 
 namespace se {
 
@@ -97,7 +99,6 @@ public:
     uint32_t shard_id;
   };
 
-private:
   struct OwnerRecord {
     std::atomic<uint64_t> seq_count{0};
     std::atomic<uint64_t> key{0};
@@ -105,6 +106,7 @@ private:
     std::atomic<bool> live{false};
   };
 
+private:
   enum class PageAllocationPhase : uint8_t {
     kUnallocated,
     kAllocating,
@@ -126,34 +128,40 @@ private:
   };
 
   struct ArenaPageState {
-    std::unique_ptr<PageAllocationState[]> states =
-        std::make_unique<PageAllocationState[]>(kMaxPages);
+    std::unique_ptr<PageAllocationState[]> states;
     CohortArenaAllocation allocation;
 
-    ArenaPageState(size_t partition_count, size_t cohort_size)
-        : allocation(partition_count, cohort_size, kEntriesPerPage, kMaxPages) {
-    }
+    explicit ArenaPageState(const storage::StorageTopology &topology)
+        : states(std::make_unique<PageAllocationState[]>(topology.max_pages())),
+          allocation(topology) {}
+
+    ArenaPageState(size_t partition_count, size_t cohort_size,
+                   size_t entries_per_page = 4096, size_t max_pages = 8192)
+        : states(std::make_unique<PageAllocationState[]>(max_pages)),
+          allocation(partition_count, cohort_size, entries_per_page,
+                     max_pages) {}
   };
 
 public:
   explicit EmbeddingArena(
       size_t dim, bool enable_score, PageStorage storage,
       std::shared_ptr<RetirementPressure> retirement_pressure,
-      PageAllocationObserver page_allocation_observer = nullptr,
-      void *page_allocation_context = nullptr, size_t partition_count = 1,
-      bool numa_aware_pages = false)
-      : dim_(dim), enable_score_(enable_score),
+      PageAllocationObserver page_allocation_observer,
+      void *page_allocation_context, const storage::StorageTopology &topology)
+      : dim_(dim), enable_score_(enable_score), topology_(topology),
+        page_geometry_(topology.page_geometry()),
         pages_(std::make_shared<PageTable>()), storage_(std::move(storage)),
         retirement_pressure_(std::move(retirement_pressure)),
-        partition_count_(partition_count), numa_aware_pages_(numa_aware_pages),
-        page_cohort_size_(
-            numa_page_cohort_size(partition_count_, numa_aware_pages_)),
-        data_pages_(std::make_unique<StoragePage[]>(kMaxPages)),
-        score_pages_(std::make_unique<StoragePage[]>(kMaxPages)),
-        page_state_(std::make_shared<ArenaPageState>(partition_count_,
-                                                     page_cohort_size_)),
+        partition_count_(topology.shard_count()),
+        numa_aware_pages_(topology.numa_memory()),
+        page_cohort_size_(topology.cohort_size()),
+        data_pages_(std::make_unique<StoragePage[]>(topology.max_pages())),
+        score_pages_(std::make_unique<StoragePage[]>(topology.max_pages())),
+        page_state_(std::make_shared<ArenaPageState>(topology)),
         page_allocation_observer_(page_allocation_observer),
         page_allocation_context_(page_allocation_context),
+        owner_pages_(std::make_unique<std::unique_ptr<OwnerRecord[]>[]>(
+            topology.max_pages())),
         live_words_(
             std::make_unique<std::atomic<uint64_t>[]>(live_word_count())) {
     if ((page_allocation_observer_ == nullptr) !=
@@ -172,6 +180,23 @@ public:
       live_words_[i].store(0, std::memory_order_relaxed);
   }
 
+  explicit EmbeddingArena(
+      size_t dim, bool enable_score, PageStorage storage,
+      std::shared_ptr<RetirementPressure> retirement_pressure,
+      PageAllocationObserver page_allocation_observer = nullptr,
+      void *page_allocation_context = nullptr, size_t partition_count = 1,
+      bool numa_aware_pages = false)
+      : EmbeddingArena(
+            dim, enable_score, std::move(storage),
+            std::move(retirement_pressure), page_allocation_observer,
+            page_allocation_context,
+            storage::StorageTopology(
+                partition_count, partition_count, 4096, 8192,
+                numa_aware_pages
+                    ? numa_page_cohort_size(partition_count, numa_aware_pages)
+                    : std::min(size_t{16}, partition_count),
+                numa_aware_pages, numa_aware_pages)) {}
+
   ~EmbeddingArena() = default;
 
   EmbeddingArena(const EmbeddingArena &) = delete;
@@ -179,9 +204,20 @@ public:
   EmbeddingArena(EmbeddingArena &&) = delete;
   EmbeddingArena &operator=(EmbeddingArena &&) = delete;
 
-  size_t dim() const { return dim_; }
-  bool score_enabled() const { return enable_score_; }
+  size_t dim() const noexcept { return dim_; }
+  bool score_enabled() const noexcept { return enable_score_; }
   bool numa_aware_pages() const noexcept { return numa_aware_pages_; }
+  const storage::StorageTopology &topology() const noexcept {
+    return topology_;
+  }
+  size_t entries_per_page() const noexcept {
+    return page_geometry_.entries_per_page();
+  }
+  unsigned entries_shift() const noexcept { return page_geometry_.shift(); }
+  size_t slot_mask() const noexcept { return page_geometry_.slot_mask(); }
+  size_t max_pages() const noexcept { return topology_.max_pages(); }
+  size_t max_entries() const noexcept { return topology_.max_capacity_keys(); }
+  size_t live_word_count() const noexcept { return (max_entries() + 63) / 64; }
 
   template <typename Prepare> uint32_t allocate(Prepare &&prepare) {
     uint32_t idx = next_index_.load(std::memory_order_relaxed);
@@ -249,9 +285,10 @@ public:
   }
 
   void bind_exact(uint32_t index, uint32_t shard_id) {
-    ensure_page_ready(index / kEntriesPerPage, numa_node_for_shard(shard_id));
+    const size_t pid = page_geometry_.page_id(index);
+    ensure_page_ready(pid, numa_node_for_shard(shard_id));
     page_state_->allocation.bind_exact(index, shard_id);
-    advance_allocation_watermark_past_page(index / kEntriesPerPage);
+    advance_allocation_watermark_past_page(pid);
   }
 
   template <typename Prepare>
@@ -293,7 +330,7 @@ public:
   }
 
   void reserve_exact_page(uint64_t page_id) {
-    if (page_id >= kMaxPages)
+    if (page_id >= max_pages())
       throw std::out_of_range("embedding arena page id is out of range");
     if (numa_aware_pages_)
       throw std::logic_error(
@@ -302,14 +339,14 @@ public:
   }
 
   void reserve_exact_page(uint64_t page_id, uint32_t shard_id) {
-    if (page_id >= kMaxPages)
+    if (page_id >= max_pages())
       throw std::out_of_range("embedding arena page id is out of range");
     ensure_page_ready(static_cast<size_t>(page_id),
                       numa_node_for_shard(shard_id));
   }
 
   void set_allocation_count(uint32_t count) {
-    if (count > static_cast<uint64_t>(kMaxPages) * kEntriesPerPage)
+    if (count > max_entries())
       throw std::length_error(
           "embedding arena allocation count exceeds capacity");
     if (count != 0)
@@ -318,14 +355,14 @@ public:
   }
 
   uint64_t &score_raw(uint32_t index) const {
-    auto *page = pages_->score.load(index / kEntriesPerPage);
+    auto *page = score_page_for(index);
     if (page == nullptr)
       throw std::logic_error("embedding arena score page is unavailable");
-    return page[index % kEntriesPerPage];
+    return page[slot_for(index)];
   }
 
   ValT *data(uint32_t index) const {
-    if (pages_->data.load(index / kEntriesPerPage) == nullptr)
+    if (data_page_for(index) == nullptr)
       throw std::logic_error("embedding arena index belongs to a retired page");
     return data_trusted(index);
   }
@@ -339,7 +376,7 @@ public:
   }
 
   size_t capacity() const {
-    return num_pages_.load(std::memory_order_acquire) * kEntriesPerPage;
+    return num_pages_.load(std::memory_order_acquire) * entries_per_page();
   }
 
   size_t page_count() const {
@@ -353,9 +390,9 @@ public:
   }
 
   void advance_allocation_past_page(uint64_t page_id) {
-    if (page_id >= kMaxPages)
+    if (page_id >= max_pages())
       throw std::out_of_range("arena allocation page id is out of range");
-    const uint64_t end = (page_id + 1) * kEntriesPerPage;
+    const uint64_t end = (page_id + 1) * entries_per_page();
     if (end > std::numeric_limits<uint32_t>::max())
       throw std::overflow_error("arena allocation watermark overflows");
     ensure_capacity(static_cast<uint32_t>(end));
@@ -365,9 +402,9 @@ public:
   bool page_has_live_entries(uint64_t page_id) const {
     if (page_id >= page_count())
       throw std::out_of_range("arena live-page id is out of range");
-    constexpr size_t kLiveWordsPerPage = kEntriesPerPage / 64;
-    const size_t first_word = page_id * kLiveWordsPerPage;
-    for (size_t word = 0; word < kLiveWordsPerPage; ++word) {
+    const size_t live_words_per_page = entries_per_page() / 64;
+    const size_t first_word = page_id * live_words_per_page;
+    for (size_t word = 0; word < live_words_per_page; ++word) {
       if (live_words_[first_word + word].load(std::memory_order_acquire) != 0)
         return true;
     }
@@ -388,6 +425,7 @@ public:
       uint64_t page_id;
       StoragePage data;
       StoragePage score;
+      std::unique_ptr<OwnerRecord[]> owner;
       Reclaim on_reclaimed;
 
       ~DeferredPageRelease() noexcept {
@@ -395,6 +433,7 @@ public:
         page_table->score.publish(page_id, nullptr);
         data = StoragePage{};
         score = StoragePage{};
+        owner.reset();
         page_state->states[page_id].phase.store(
             page_phase(PageAllocationPhase::kUnallocated),
             std::memory_order_release);
@@ -413,10 +452,10 @@ public:
             std::memory_order_acq_rel, std::memory_order_acquire)) {
       throw std::logic_error("arena page is not ready for retirement");
     }
-    release.emplace(pages_, page_state_, page_id,
-                    std::move(data_pages_[page_id]),
-                    std::move(score_pages_[page_id]),
-                    std::forward<OnReclaimed>(on_reclaimed));
+    release.emplace(
+        pages_, page_state_, page_id, std::move(data_pages_[page_id]),
+        std::move(score_pages_[page_id]), std::move(owner_pages_[page_id]),
+        std::forward<OnReclaimed>(on_reclaimed));
     release.publish();
     state.phase.store(page_phase(PageAllocationPhase::kRetired),
                       std::memory_order_release);
@@ -424,9 +463,8 @@ public:
 
   void reset() {
     pages_ = std::make_shared<PageTable>();
-    page_state_ =
-        std::make_shared<ArenaPageState>(partition_count_, page_cohort_size_);
-    for (size_t i = 0; i < kMaxPages; ++i) {
+    page_state_ = std::make_shared<ArenaPageState>(topology_);
+    for (size_t i = 0; i < max_pages(); ++i) {
       data_pages_[i] = StoragePage{};
       score_pages_[i] = StoragePage{};
       owner_pages_[i].reset();
@@ -437,18 +475,12 @@ public:
     next_index_.store(0, std::memory_order_relaxed);
   }
 
-  size_t data_stride() const { return data_stride_; }
-
-  static constexpr size_t max_entries() { return kEntriesPerPage * kMaxPages; }
-
-  static constexpr size_t live_word_count() {
-    return (max_entries() + 63) / 64;
-  }
+  size_t data_stride() const noexcept { return data_stride_; }
 
   void mark_live(uint32_t index, bool live) {
     const uint64_t mask = uint64_t{1} << (index % 64);
     OwnerRecord &owner =
-        owner_pages_[index / kEntriesPerPage][index % kEntriesPerPage];
+        owner_pages_[index >> entries_shift()][index & slot_mask()];
     if (live) {
       live_words_[index / 64].fetch_or(mask, std::memory_order_release);
       owner.live.store(true, std::memory_order_release);
@@ -459,9 +491,8 @@ public:
   }
 
   void mark_owner_not_live(uint32_t index) {
-    OwnerRecord &owner =
-        owner_pages_[index / kEntriesPerPage][index % kEntriesPerPage];
-    owner.live.store(false, std::memory_order_release);
+    owner_pages_[index >> entries_shift()][index & slot_mask()].live.store(
+        false, std::memory_order_release);
   }
 
   void clear_live_mask(size_t word_index, uint64_t mask) {
@@ -488,7 +519,7 @@ public:
 
   void publish_owner(uint32_t index, uint64_t key, uint32_t shard_id) {
     OwnerRecord &owner =
-        owner_pages_[index / kEntriesPerPage][index % kEntriesPerPage];
+        owner_pages_[index >> entries_shift()][index & slot_mask()];
     uint64_t seq_count = owner.seq_count.load(std::memory_order_relaxed);
     if ((seq_count & 1U) != 0)
       throw std::logic_error("embedding arena owner seq_count is unstable");
@@ -503,7 +534,7 @@ public:
     if (seq_count == 0 || (seq_count & 1U) != 0)
       throw std::invalid_argument("page-image owner seq_count is invalid");
     OwnerRecord &owner =
-        owner_pages_[index / kEntriesPerPage][index % kEntriesPerPage];
+        owner_pages_[index >> entries_shift()][index & slot_mask()];
     if (owner.live.load(std::memory_order_acquire))
       throw std::logic_error("page-image owner slot is already live");
     owner.seq_count.store(seq_count - 1, std::memory_order_release);
@@ -513,8 +544,8 @@ public:
   }
 
   std::optional<OwnerSnapshot> owner_snapshot(uint32_t index) const {
-    const OwnerRecord &owner =
-        owner_pages_[index / kEntriesPerPage][index % kEntriesPerPage];
+    OwnerRecord &owner =
+        owner_pages_[index >> entries_shift()][index & slot_mask()];
     if (!is_live(index) || !owner.live.load(std::memory_order_acquire))
       return std::nullopt;
     for (size_t attempt = 0; attempt < 8; ++attempt) {
@@ -534,11 +565,11 @@ public:
 
 private:
   uint64_t page_score(size_t page) const {
-    size_t first = page * kEntriesPerPage;
+    size_t first = page * entries_per_page();
     size_t allocated = allocated_count();
     if (first >= allocated)
       return 0;
-    size_t count = std::min(kEntriesPerPage, allocated - first);
+    size_t count = std::min(entries_per_page(), allocated - first);
     uint64_t total = 0;
     for (auto index : std::views::iota(static_cast<uint32_t>(first),
                                        static_cast<uint32_t>(first + count))) {
@@ -553,12 +584,23 @@ private:
     return total;
   }
 
-private:
   std::byte *data_raw(uint32_t index) const {
-    auto *page = pages_->data.load(index / kEntriesPerPage);
+    auto *page = data_page_for(index);
     if (page == nullptr)
       throw std::logic_error("embedding arena data page is unavailable");
-    return page + (index % kEntriesPerPage) * data_stride_;
+    return page + slot_for(index) * data_stride_;
+  }
+
+  std::byte *data_page_for(uint32_t index) const noexcept {
+    return pages_->data.load(index >> entries_shift());
+  }
+
+  uint64_t *score_page_for(uint32_t index) const noexcept {
+    return pages_->score.load(index >> entries_shift());
+  }
+
+  uint32_t slot_for(uint32_t index) const noexcept {
+    return index & page_geometry_.slot_mask();
   }
 
   static constexpr uint8_t page_phase(PageAllocationPhase phase) {
@@ -570,7 +612,7 @@ private:
     if (shard_count == 0 || !std::has_single_bit(shard_count))
       throw std::invalid_argument("arena shard count is not a power of two");
     if (!numa_aware_pages)
-      return std::min(kCohortSize, shard_count);
+      return std::min(size_t{16}, shard_count);
     if (!NumaTopology::available())
       throw std::runtime_error("NUMA-aware pages require libnuma support");
     const size_t nodes = NumaTopology::node_count();
@@ -629,9 +671,9 @@ private:
   }
 
   void advance_allocation_watermark_past_page(uint64_t page_id) {
-    if (page_id >= kMaxPages)
+    if (page_id >= max_pages())
       throw std::out_of_range("arena allocation page id is out of range");
-    const uint64_t end = (page_id + 1) * kEntriesPerPage;
+    const uint64_t end = (page_id + 1) * entries_per_page();
     if (end > std::numeric_limits<uint32_t>::max())
       throw std::overflow_error("arena allocation watermark overflows");
     uint32_t observed = next_index_.load(std::memory_order_acquire);
@@ -645,20 +687,20 @@ private:
   void ensure_range_ready(uint32_t first, uint32_t last) {
     if (last >= max_entries())
       throw std::length_error("embedding arena page capacity exceeded");
-    const size_t first_page = first / kEntriesPerPage;
-    const size_t last_page = last / kEntriesPerPage;
+    const size_t first_page = first >> entries_shift();
+    const size_t last_page = last >> entries_shift();
     for (size_t page_id = first_page; page_id <= last_page; ++page_id)
       ensure_page_ready(page_id, numa_node_for_page(page_id));
   }
 
   void ensure_capacity(uint32_t idx) {
-    ensure_page_ready(idx / kEntriesPerPage,
-                      numa_node_for_page(idx / kEntriesPerPage));
+    ensure_page_ready(idx >> entries_shift(),
+                      numa_node_for_page(idx >> entries_shift()));
   }
 
   void ensure_page_ready(size_t page_id, int numa_node) {
     const size_t page_needed = page_id;
-    if (page_needed >= kMaxPages) {
+    if (page_needed >= max_pages()) {
       throw std::length_error("embedding arena page capacity exceeded");
     }
 
@@ -722,16 +764,16 @@ private:
         numa_aware_pages_ ? PagePlacementMode::kPageAlignedMapping
                           : PagePlacementMode::kDefault;
     auto data_page =
-        storage_->allocate(kEntriesPerPage * data_stride_, kCacheLineSize,
+        storage_->allocate(entries_per_page() * data_stride_, kCacheLineSize,
                            evaluator, eviction_mode, placement_mode);
     StoragePage score_page;
     if (enable_score_) {
       score_page = storage_->allocate(
-          kEntriesPerPage * sizeof(uint64_t), kCacheLineSize,
+          entries_per_page() * sizeof(uint64_t), kCacheLineSize,
           [] { return uint64_t{0}; }, PageEvictionMode::kEnabled,
           placement_mode);
     }
-    auto owner_page = std::make_unique<OwnerRecord[]>(kEntriesPerPage);
+    auto owner_page = std::make_unique<OwnerRecord[]>(entries_per_page());
     if (numa_aware_pages_) {
       bind_page_to_numa_node(data_page.data(), data_page.allocated_size(),
                              numa_node);
@@ -746,16 +788,18 @@ private:
     owner_pages_[page_id] = std::move(owner_page);
     pages_->data.publish(page_id, data_pages_[page_id].data());
     pages_->data.advance_count();
-    if (enable_score_)
+    if (enable_score_) {
       pages_->score.publish(
           page_id, reinterpret_cast<uint64_t *>(score_pages_[page_id].data()));
-    if (enable_score_)
       pages_->score.advance_count();
+    }
   }
 
   size_t dim_;
   size_t data_stride_;
   bool enable_score_;
+  storage::StorageTopology topology_;
+  storage::PageGeometry page_geometry_;
   std::shared_ptr<PageTable> pages_;
   PageStorage storage_;
   std::shared_ptr<RetirementPressure> retirement_pressure_;
@@ -767,7 +811,7 @@ private:
   std::shared_ptr<ArenaPageState> page_state_;
   PageAllocationObserver page_allocation_observer_;
   void *page_allocation_context_;
-  std::unique_ptr<OwnerRecord[]> owner_pages_[kMaxPages];
+  std::unique_ptr<std::unique_ptr<OwnerRecord[]>[]> owner_pages_;
   std::unique_ptr<std::atomic<uint64_t>[]> live_words_;
   std::atomic<uint32_t> next_index_{0};
   std::atomic<size_t> num_pages_{0};
@@ -904,24 +948,26 @@ public:
       PageState() : state(static_cast<uint8_t>(State::kAvailable)) {}
     };
 
-    PageReuseState()
-        : page_states_(std::make_unique<PageState[]>(
-              EmbeddingArena<ParamT>::kMaxPages)) {}
+    explicit PageReuseState(size_t max_pages = 8192,
+                            size_t entries_per_page = 4096)
+        : max_pages_(max_pages), entries_shift_(static_cast<unsigned>(
+                                     std::countr_zero(entries_per_page))),
+          page_states_(std::make_unique<PageState[]>(max_pages)) {}
 
     bool unavailable(uint32_t index) const noexcept {
-      return page_states_[index / EmbeddingArena<ParamT>::kEntriesPerPage]
-                 .state.load(std::memory_order_acquire) !=
+      return page_states_[index >> entries_shift_].state.load(
+                 std::memory_order_acquire) !=
              static_cast<uint8_t>(State::kAvailable);
     }
 
     bool destination_available(uint32_t index) const noexcept {
-      const size_t page_id = index / EmbeddingArena<ParamT>::kEntriesPerPage;
+      const size_t page_id = index >> entries_shift_;
       return page_states_[page_id].state.load(std::memory_order_acquire) ==
              static_cast<uint8_t>(State::kAvailable);
     }
 
     void begin_draining(uint64_t page_id) {
-      if (page_id >= EmbeddingArena<ParamT>::kMaxPages)
+      if (page_id >= max_pages_)
         throw std::out_of_range("arena page drain id is out of range");
       uint8_t expected = static_cast<uint8_t>(State::kAvailable);
       if (page_states_[page_id].state.compare_exchange_strong(
@@ -961,13 +1007,15 @@ public:
     }
 
     void reset() noexcept {
-      for (size_t page = 0; page < EmbeddingArena<ParamT>::kMaxPages; ++page) {
+      for (size_t page = 0; page < max_pages_; ++page) {
         page_states_[page].state.store(static_cast<uint8_t>(State::kAvailable),
                                        std::memory_order_relaxed);
       }
     }
 
   private:
+    size_t max_pages_;
+    unsigned entries_shift_;
     std::unique_ptr<PageState[]> page_states_;
   };
 
@@ -1507,8 +1555,6 @@ public:
 
   struct SlotStore {
     static constexpr size_t kInitialKeysPerShard = 1;
-    static constexpr size_t kLiveWordsPerPage =
-        EmbeddingArena<ParamT>::kEntriesPerPage / 64;
 
     struct PendingKey {
       uint64_t key;
@@ -1522,7 +1568,7 @@ public:
     struct CompactionWorkspace {
       std::vector<uint64_t> sorted_page_ids;
       std::vector<PendingKey> pending;
-      std::vector<std::array<uint64_t, kLiveWordsPerPage>> source_clear_masks;
+      std::vector<uint64_t> source_clear_masks;
       std::vector<uint32_t> source_cohort_shards;
       std::vector<size_t> shard_counts;
       std::vector<uint32_t> destination_indices;
@@ -1538,15 +1584,12 @@ public:
     size_t dim;
     ScorePolicyRuntime &score_policy;
     std::atomic<uint64_t> lookup_generation{1};
-    std::shared_ptr<PageReuseState> page_reuse =
-        std::make_shared<PageReuseState>();
+    std::shared_ptr<PageReuseState> page_reuse;
     std::shared_ptr<RetirementPressure> retirement_pressure;
     std::vector<std::unique_ptr<KeyShard>> key_shards;
     size_t shard_mask;
     TelemetryRing &telemetry_ring;
-    std::shared_ptr<PageResidencyTelemetry> page_telemetry =
-        std::make_shared<PageResidencyTelemetry>(
-            EmbeddingArena<ParamT>::kMaxPages);
+    std::shared_ptr<PageResidencyTelemetry> page_telemetry;
     StripedPageAccessTelemetry access_telemetry;
     EmbeddingArena<ParamT> arena;
     SealedHotPagePool<ParamT> sealed_pages;
@@ -1602,21 +1645,25 @@ public:
     }
 
     SlotStore(size_t d, ScorePolicyRuntime &score_policy_in,
-              OptimizerFactory opt_factory_in, size_t partition_count,
+              OptimizerFactory opt_factory_in,
+              const storage::StorageTopology &topology,
               size_t transient_shard_count, bool enable_score,
               PageStorage storage,
               std::shared_ptr<RetirementPressure> retirement_pressure,
-              bool numa_aware_pages, TelemetryRing &telemetry_ring_in)
+              TelemetryRing &telemetry_ring_in)
         : dim(d), score_policy(score_policy_in),
+          page_reuse(std::make_shared<PageReuseState>(
+              topology.max_pages(), topology.entries_per_page())),
           retirement_pressure(std::move(retirement_pressure)),
-          shard_mask(partition_count - 1), telemetry_ring(telemetry_ring_in),
-          access_telemetry(EmbeddingArena<ParamT>::kMaxPages, 4096,
+          shard_mask(topology.shard_mask()), telemetry_ring(telemetry_ring_in),
+          page_telemetry(
+              std::make_shared<PageResidencyTelemetry>(topology.max_pages())),
+          access_telemetry(topology.max_pages(), topology.entries_per_page(),
                            transient_shard_count),
           arena(d, enable_score, storage, this->retirement_pressure,
                 &SlotStore::register_arena_page, page_telemetry.get(),
-                partition_count, numa_aware_pages),
-          sealed_pages(EmbeddingArena<ParamT>::kMaxPages,
-                       EmbeddingArena<ParamT>::kEntriesPerPage,
+                topology),
+          sealed_pages(topology.max_pages(), topology.entries_per_page(),
                        static_cast<uint32_t>(d)),
           opt_factory(std::move(opt_factory_in)) {
       if (opt_factory.has_value()) {
@@ -1630,11 +1677,22 @@ public:
         throw std::invalid_argument("slot retirement pressure is null");
       if (optimizer.has_value())
         optimizer->set_page_eviction_enabled(enable_score);
-      for (size_t i = 0; i < partition_count; ++i) {
+      const size_t initial_keys_per_shard =
+          topology.target_capacity_keys() > 0
+              ? std::max(size_t{1}, (topology.target_capacity_keys() +
+                                     topology.shard_count() - 1) /
+                                        topology.shard_count())
+              : kInitialKeysPerShard;
+      const size_t initial_with_headroom =
+          topology.target_capacity_keys() > 0
+              ? std::max(initial_keys_per_shard,
+                         (initial_keys_per_shard * 5 + 3) / 4)
+              : initial_keys_per_shard;
+      for (size_t i = 0; i < topology.shard_count(); ++i) {
         key_shards.push_back(std::make_unique<KeyShard>(
-            kInitialKeysPerShard, page_reuse, this->retirement_pressure,
+            initial_with_headroom, page_reuse, this->retirement_pressure,
             index_retirement_bytes(),
-            static_cast<unsigned>(std::countr_zero(partition_count))));
+            static_cast<unsigned>(std::countr_zero(topology.shard_count()))));
       }
       for (size_t i = 0; i < transient_shard_count; ++i) {
         transient_shards.push_back(
@@ -1645,6 +1703,43 @@ public:
 #endif
     }
 
+    SlotStore(size_t d, ScorePolicyRuntime &score_policy_in,
+              OptimizerFactory opt_factory_in, size_t partition_count,
+              size_t transient_shard_count, bool enable_score,
+              PageStorage storage,
+              std::shared_ptr<RetirementPressure> retirement_pressure,
+              bool numa_aware_pages, TelemetryRing &telemetry_ring_in)
+        : SlotStore(
+              d, score_policy_in, std::move(opt_factory_in),
+              storage::StorageTopology(
+                  partition_count, partition_count, 4096, 8192,
+                  numa_aware_pages
+                      ? numa_page_cohort_size(partition_count, numa_aware_pages)
+                      : std::min(size_t{16}, partition_count),
+                  numa_aware_pages, numa_aware_pages),
+              transient_shard_count, enable_score, std::move(storage),
+              std::move(retirement_pressure), telemetry_ring_in) {}
+
+  private:
+    static size_t numa_page_cohort_size(size_t shard_count,
+                                        bool numa_aware_pages) {
+      if (shard_count == 0 || !std::has_single_bit(shard_count))
+        throw std::invalid_argument("arena shard count is not a power of two");
+      if (!numa_aware_pages)
+        return std::min(size_t{16}, shard_count);
+      if (!NumaTopology::available())
+        throw std::runtime_error("NUMA-aware pages require libnuma support");
+      const size_t nodes = NumaTopology::node_count();
+      if (nodes == 0 || !std::has_single_bit(nodes) || shard_count < nodes ||
+          shard_count % nodes != 0) {
+        throw std::invalid_argument(
+            "NUMA-aware pages require a power-of-two node count that divides "
+            "the shard count");
+      }
+      return shard_count / nodes;
+    }
+
+  public:
     size_t shard_id_for_key(uint64_t key) const {
       return SplitMixHash<uint64_t>{}(key)&shard_mask;
     }
@@ -1666,8 +1761,7 @@ public:
 
     void observe_page_access(size_t worker, uint32_t index,
                              uint32_t weight) noexcept {
-      access_telemetry.observe(
-          worker, index / EmbeddingArena<ParamT>::kEntriesPerPage, weight);
+      access_telemetry.observe(worker, index >> arena.entries_shift(), weight);
     }
 
     void observe_coaccess(size_t worker, std::span<const uint64_t> keys,
@@ -1704,23 +1798,21 @@ public:
         return std::nullopt;
       StablePageSnapshot snapshot{
           page_id,
-          static_cast<uint64_t>(EmbeddingArena<ParamT>::kEntriesPerPage *
-                                arena.data_stride()),
+          static_cast<uint64_t>(arena.entries_per_page() * arena.data_stride()),
           {static_cast<float>(
                access_telemetry.hits(static_cast<uint32_t>(page_id))),
            0.0F, page_telemetry->residency_age(static_cast<uint32_t>(page_id))},
           {},
           {},
           {}};
-      snapshot.keys.reserve(EmbeddingArena<ParamT>::kEntriesPerPage);
-      snapshot.seq_counts.reserve(EmbeddingArena<ParamT>::kEntriesPerPage);
-      snapshot.values.reserve(EmbeddingArena<ParamT>::kEntriesPerPage * dim);
-      const uint32_t first = static_cast<uint32_t>(
-          page_id * EmbeddingArena<ParamT>::kEntriesPerPage);
+      snapshot.keys.reserve(arena.entries_per_page());
+      snapshot.seq_counts.reserve(arena.entries_per_page());
+      snapshot.values.reserve(arena.entries_per_page() * dim);
+      const uint32_t first =
+          static_cast<uint32_t>(page_id * arena.entries_per_page());
       const uint32_t limit = static_cast<uint32_t>(
           std::min(arena.allocated_count(),
-                   static_cast<size_t>(first) +
-                       EmbeddingArena<ParamT>::kEntriesPerPage));
+                   static_cast<size_t>(first) + arena.entries_per_page()));
       for (uint32_t index = first; index < limit; ++index) {
         auto owner = arena.owner_snapshot(index);
         if (!owner.has_value())
@@ -1763,8 +1855,7 @@ public:
 
       const auto image_for_index =
           [&](uint32_t index) -> PageImageExport<ParamT, OptT> & {
-        const uint64_t page_id =
-            index / EmbeddingArena<ParamT>::kEntriesPerPage;
+        const uint64_t page_id = index >> arena.entries_shift();
         const auto [position, inserted] =
             page_positions.try_emplace(page_id, images.size());
         if (inserted) {
@@ -1779,16 +1870,16 @@ public:
                             {},
                             {}});
           auto &image = images.back();
-          image.slot_ordinals.reserve(EmbeddingArena<ParamT>::kEntriesPerPage);
-          image.keys.reserve(EmbeddingArena<ParamT>::kEntriesPerPage);
-          image.seq_counts.reserve(EmbeddingArena<ParamT>::kEntriesPerPage);
-          image.values.reserve(EmbeddingArena<ParamT>::kEntriesPerPage * dim);
+          image.slot_ordinals.reserve(arena.entries_per_page());
+          image.keys.reserve(arena.entries_per_page());
+          image.seq_counts.reserve(arena.entries_per_page());
+          image.values.reserve(arena.entries_per_page() * dim);
           if (score_policy.enabled())
-            image.scores.reserve(EmbeddingArena<ParamT>::kEntriesPerPage);
+            image.scores.reserve(arena.entries_per_page());
           if (optimizer_state_dim != 0) {
-            image.optimizer_states.reserve(
-                EmbeddingArena<ParamT>::kEntriesPerPage * optimizer_state_dim);
-            image.steps.reserve(EmbeddingArena<ParamT>::kEntriesPerPage);
+            image.optimizer_states.reserve(arena.entries_per_page() *
+                                           optimizer_state_dim);
+            image.steps.reserve(arena.entries_per_page());
           }
         }
         return images[position->second];
@@ -1833,8 +1924,7 @@ public:
 
           std::lock_guard materialization_lock(materialization_mutex);
           auto &image = image_for_index(captured.index);
-          image.slot_ordinals.push_back(
-              captured.index % EmbeddingArena<ParamT>::kEntriesPerPage);
+          image.slot_ordinals.push_back(captured.index & arena.slot_mask());
           image.keys.push_back(key);
           image.seq_counts.push_back(captured.seq_count);
           image.values.insert(image.values.end(), captured.values.begin(),
@@ -1906,14 +1996,13 @@ public:
             optimizer.has_value() ? optimizer->state_dim() : 0;
         const size_t count = hogwild::io::validate_page_image(
             import, dim, arena.data_stride(), score_policy.enabled(),
-            optimizer_state_dim, EmbeddingArena<ParamT>::kEntriesPerPage);
+            optimizer_state_dim, arena.entries_per_page());
         page_ids.push_back(image.physical_page_id);
         maximum_page_id = std::max(maximum_page_id, image.physical_page_id);
         for (size_t offset = 0; offset < count; ++offset) {
           const uint32_t ordinal = image.slot_ordinals[offset];
           const uint64_t physical_slot =
-              image.physical_page_id * EmbeddingArena<ParamT>::kEntriesPerPage +
-              ordinal;
+              image.physical_page_id * arena.entries_per_page() + ordinal;
           if (!imported_keys.insert(image.keys[offset]).second)
             throw std::invalid_argument("page-image import has duplicate key");
           if (!imported_slots.insert(physical_slot).second)
@@ -1924,7 +2013,7 @@ public:
       std::ranges::sort(page_ids);
       if (std::ranges::adjacent_find(page_ids) != page_ids.end())
         throw std::invalid_argument("page-image import has duplicate page ids");
-      if (maximum_page_id >= EmbeddingArena<ParamT>::kMaxPages)
+      if (maximum_page_id >= arena.max_pages())
         throw std::out_of_range("page-image physical page id is out of range");
 
       for (const auto &import : images) {
@@ -1939,14 +2028,14 @@ public:
         const auto &image = import.image;
         for (size_t offset = 0; offset < image.keys.size(); ++offset) {
           const uint32_t index = static_cast<uint32_t>(
-              image.physical_page_id * EmbeddingArena<ParamT>::kEntriesPerPage +
+              image.physical_page_id * arena.entries_per_page() +
               image.slot_ordinals[offset]);
           arena.bind_exact(index, static_cast<uint32_t>(
                                       shard_id_for_key(image.keys[offset])));
         }
       }
       const uint64_t allocation_count =
-          (maximum_page_id + 1) * EmbeddingArena<ParamT>::kEntriesPerPage;
+          (maximum_page_id + 1) * arena.entries_per_page();
       if (allocation_count > std::numeric_limits<uint32_t>::max())
         throw std::overflow_error("page-image allocation watermark overflows");
       if (optimizer.has_value())
@@ -1956,11 +2045,10 @@ public:
         const auto &image = import.image;
         for (size_t offset = 0; offset < image.keys.size(); ++offset) {
           const uint32_t ordinal = image.slot_ordinals[offset];
-          if (ordinal >= EmbeddingArena<ParamT>::kEntriesPerPage)
+          if (ordinal >= arena.entries_per_page())
             throw std::out_of_range("page-image slot ordinal is out of range");
           const uint32_t index = static_cast<uint32_t>(
-              image.physical_page_id * EmbeddingArena<ParamT>::kEntriesPerPage +
-              ordinal);
+              image.physical_page_id * arena.entries_per_page() + ordinal);
           auto &key_shard = shard_for_key(image.keys[offset]);
           std::unique_lock map_lock(key_shard.writer_mutex);
           if (key_shard.find_unlocked(image.keys[offset]).has_value())
@@ -2045,8 +2133,8 @@ public:
       std::vector<uint64_t> bytes;
       std::vector<PageThermalSignal> signals;
       for (uint64_t page_id = 0; page_id < arena.page_count(); ++page_id) {
-        if (page_reuse->unavailable(static_cast<uint32_t>(
-                page_id * EmbeddingArena<ParamT>::kEntriesPerPage)))
+        if (page_reuse->unavailable(
+                static_cast<uint32_t>(page_id * arena.entries_per_page())))
           continue;
         auto snapshot = snapshot_page(page_id);
         if (!snapshot.has_value())
@@ -2424,8 +2512,8 @@ public:
       page_compaction_profile.destination_ready_calls.fetch_add(
           1, std::memory_order_relaxed);
       page_compaction_profile.destination_ready_pages.fetch_add(
-          last / EmbeddingArena<ParamT>::kEntriesPerPage -
-              first / EmbeddingArena<ParamT>::kEntriesPerPage + 1,
+          (last >> arena.entries_shift()) - (first >> arena.entries_shift()) +
+              1,
           std::memory_order_relaxed);
 #endif
       return first;
@@ -2715,10 +2803,11 @@ public:
 
     void reserve(size_t keys_count) {
       size_t shard_count = key_shards.size();
+      if (shard_count == 0)
+        return;
       std::vector<size_t> counts(shard_count, keys_count / shard_count);
-      for (size_t i = 0; i < keys_count % shard_count; ++i) {
+      for (size_t i = 0; i < keys_count % shard_count; ++i)
         ++counts[i];
-      }
       reserve_per_shard(counts);
     }
 
@@ -3000,13 +3089,12 @@ public:
           uint64_t score;
         };
         std::vector<Candidate> candidates;
-        candidates.reserve(EmbeddingArena<ParamT>::kEntriesPerPage);
-        const uint32_t first = static_cast<uint32_t>(
-            page_id * EmbeddingArena<ParamT>::kEntriesPerPage);
+        candidates.reserve(arena.entries_per_page());
+        const uint32_t first =
+            static_cast<uint32_t>(page_id * arena.entries_per_page());
         const uint32_t limit = static_cast<uint32_t>(
             std::min(arena.allocated_count(),
-                     static_cast<size_t>(first) +
-                         EmbeddingArena<ParamT>::kEntriesPerPage));
+                     static_cast<size_t>(first) + arena.entries_per_page()));
         for (uint32_t index = first; index < limit; ++index) {
           auto owner = arena.owner_snapshot(index);
           if (!owner.has_value())
@@ -3117,8 +3205,7 @@ public:
 
       auto &pending = workspace.pending;
       pending.clear();
-      pending.reserve(sorted_page_ids.size() *
-                      EmbeddingArena<ParamT>::kEntriesPerPage);
+      pending.reserve(sorted_page_ids.size() * arena.entries_per_page());
       workspace.source_cohort_shards.assign(
           sorted_page_ids.size(), std::numeric_limits<uint32_t>::max());
       auto &source_cohort_shards = workspace.source_cohort_shards;
@@ -3128,12 +3215,11 @@ public:
            source_page_position < sorted_page_ids.size();
            ++source_page_position) {
         const uint64_t page_id = sorted_page_ids[source_page_position];
-        const uint32_t first = static_cast<uint32_t>(
-            page_id * EmbeddingArena<ParamT>::kEntriesPerPage);
+        const uint32_t first =
+            static_cast<uint32_t>(page_id * arena.entries_per_page());
         const uint32_t limit = static_cast<uint32_t>(
             std::min(arena.allocated_count(),
-                     static_cast<size_t>(first) +
-                         EmbeddingArena<ParamT>::kEntriesPerPage));
+                     static_cast<size_t>(first) + arena.entries_per_page()));
         for (uint32_t index = first; index < limit; ++index) {
           auto owner = arena.owner_snapshot(index);
           if (!owner.has_value())
@@ -3146,8 +3232,8 @@ public:
           uint32_t &source_shard = source_cohort_shards[source_page_position];
           if (source_shard == std::numeric_limits<uint32_t>::max()) {
             source_shard = owner->shard_id;
-          } else if (source_shard / EmbeddingArena<ParamT>::kCohortSize !=
-                     owner->shard_id / EmbeddingArena<ParamT>::kCohortSize) {
+          } else if (source_shard / arena.topology().cohort_size() !=
+                     owner->shard_id / arena.topology().cohort_size()) {
             throw std::logic_error(
                 "compaction source page mixes shard cohorts");
           }
@@ -3167,7 +3253,7 @@ public:
           continue;
         arena.bind_exact(
             static_cast<uint32_t>(sorted_page_ids[source_page_position] *
-                                  EmbeddingArena<ParamT>::kEntriesPerPage),
+                                  arena.entries_per_page()),
             source_shard);
       }
       if (cluster_by_coaccess && anchor_count > 1) {
@@ -3204,7 +3290,9 @@ public:
       const auto preparation_started = std::chrono::steady_clock::now();
 #endif
       size_t migrated = 0;
-      workspace.source_clear_masks.assign(sorted_page_ids.size(), {});
+      const size_t live_words_per_page = arena.entries_per_page() / 64;
+      workspace.source_clear_masks.assign(
+          sorted_page_ids.size() * live_words_per_page, 0);
       auto &source_clear_masks = workspace.source_clear_masks;
       if (!pending.empty()) {
         workspace.shard_counts.assign(key_shards.size(), 0);
@@ -3339,10 +3427,9 @@ public:
             ++remaining_shards;
           }
           constexpr size_t kPublicationPagesPerChunk = 1;
-          const size_t publication_chunk_size =
-              std::max(size_t{1}, kPublicationPagesPerChunk *
-                                      EmbeddingArena<ParamT>::kEntriesPerPage /
-                                      key_shards.size());
+          const size_t publication_chunk_size = std::max(
+              size_t{1}, kPublicationPagesPerChunk * arena.entries_per_page() /
+                             key_shards.size());
           const size_t rotation = sorted_page_ids.front() & shard_mask;
           while (remaining_shards != 0) {
             bool progressed = false;
@@ -3388,10 +3475,10 @@ public:
                         1, std::memory_order_relaxed);
 #endif
                     const size_t source_slot =
-                        entry.source_index %
-                        EmbeddingArena<ParamT>::kEntriesPerPage;
-                    source_clear_masks[entry.source_page_position]
-                                      [source_slot / 64] |=
+                        entry.source_index & arena.slot_mask();
+                    source_clear_masks[entry.source_page_position *
+                                           live_words_per_page +
+                                       (source_slot / 64)] |=
                         uint64_t{1} << (source_slot % 64);
                   } else {
                     key_shard.recycle_unpublished_index(destination);
@@ -3448,11 +3535,12 @@ public:
       for (size_t source_page_position = 0;
            source_page_position < sorted_page_ids.size();
            ++source_page_position) {
-        const uint32_t first =
-            static_cast<uint32_t>(sorted_page_ids[source_page_position] *
-                                  EmbeddingArena<ParamT>::kEntriesPerPage);
-        for (size_t word = 0; word < kLiveWordsPerPage; ++word) {
-          const uint64_t mask = source_clear_masks[source_page_position][word];
+        const uint32_t first = static_cast<uint32_t>(
+            sorted_page_ids[source_page_position] * arena.entries_per_page());
+        for (size_t word = 0; word < live_words_per_page; ++word) {
+          const uint64_t mask =
+              source_clear_masks[source_page_position * live_words_per_page +
+                                 word];
           if (mask != 0)
             arena.clear_live_mask(first / 64 + word, mask);
         }
@@ -3545,9 +3633,15 @@ public:
                                      OptimizerFactory opt_factory,
                                      ScorePolicyKind score_policy_kind,
                                      HogwildStoreOptions options = {})
-      : partition_topology_(HogwildPartitionTopology::derive(
-            options.thread_budget, options.locality)),
-        num_threads_(partition_topology_.execution_workers()),
+      : storage_topology_(
+            storage::StorageResourceTuner::derive(storage::TopologyTuneRequest{
+                .thread_budget = options.thread_budget,
+                .locality = options.locality,
+                .embedding_dim = table_dims.empty() ? 0 : table_dims.front(),
+                .param_bytes_per_element = sizeof(ParamT),
+                .tuning = options.storage_tuning,
+            })),
+        num_threads_(storage_topology_.execution_workers()),
         operation_dispatch_topology_(OperationDispatchPolicy::make_topology(
             num_threads_, options.dispatch_config())),
         pool_(static_cast<uint32_t>(
@@ -3558,8 +3652,8 @@ public:
         background_page_eviction_enabled_(
             score_policy_.enabled() &&
             storage_->supports_background_page_eviction()),
-        bind_worker_affinity_(partition_topology_.numa_execution()),
-        numa_memory_locality_(partition_topology_.numa_memory()),
+        bind_worker_affinity_(storage_topology_.numa_execution()),
+        numa_memory_locality_(storage_topology_.numa_memory()),
         telemetry_ring_(1024,
                         bind_worker_affinity_
                             ? std::optional<int>(
@@ -3577,8 +3671,8 @@ public:
             "NUMA-aware sharding requires libnuma support");
       const size_t nodes = NumaTopology::node_count();
       if (nodes == 0 || !std::has_single_bit(nodes) ||
-          partition_topology_.partition_count() < nodes ||
-          partition_topology_.partition_count() % nodes != 0) {
+          storage_topology_.shard_count() < nodes ||
+          storage_topology_.shard_count() % nodes != 0) {
         throw std::invalid_argument(
             "NUMA-aware sharding requires a power-of-two node count that "
             "divides the directory shard count");
@@ -3598,10 +3692,8 @@ public:
       }
       if (dim_to_slot_[dim] == nullptr) {
         slot_storage_.push_back(std::make_unique<SlotStore>(
-            dim, score_policy_, opt_factory,
-            partition_topology_.partition_count(), num_threads_, enable_score,
-            storage_, retirement_pressure_, partition_topology_.numa_memory(),
-            telemetry_ring_));
+            dim, score_policy_, opt_factory, storage_topology_, num_threads_,
+            enable_score, storage_, retirement_pressure_, telemetry_ring_));
         dim_to_slot_[dim] = slot_storage_.back().get();
       }
     }
@@ -3661,6 +3753,10 @@ public:
   }
 
   size_t max_dim() const { return max_dim_; }
+
+  size_t entries_per_page() const noexcept {
+    return storage_topology_.entries_per_page();
+  }
 
   std::string_view name() const { return "hogwild"; }
 
@@ -3732,10 +3828,8 @@ public:
               collect_telemetry && i >= telemetry_partition_offset(worker) &&
               i < telemetry_partition_offset(worker + 1);
           const size_t prefetch_distance =
-              operation_dispatch_topology_.forward_prefetch_distance != 0
-                  ? operation_dispatch_topology_.forward_prefetch_distance
-                  : 8;
-          if (position + prefetch_distance < count) {
+              operation_dispatch_topology_.forward_prefetch_distance;
+          if (prefetch_distance != 0 && position + prefetch_distance < count) {
             const size_t prefetch_index =
                 index_at(position + prefetch_distance);
             __builtin_prefetch(&keys[prefetch_index], 0, 1);
@@ -3827,8 +3921,8 @@ public:
             if (sampled_slots[other] != sampled_slots[sample])
               continue;
             event.page_ids[event.page_count++] =
-                sampled_indices[other] /
-                EmbeddingArena<ParamT>::kEntriesPerPage;
+                sampled_indices[other] >>
+                sampled_slots[other]->arena.entries_shift();
             event.keys[event.key_count++] = sampled_keys[other];
           }
           telemetry_ring_.try_publish(event);
@@ -3861,10 +3955,10 @@ public:
     for (size_t i = 0; i < n; ++i) {
       const size_t hash = SplitMixHash<K>{}(keys[i]);
       workspace.hashes[i] = hash;
-      const size_t shard = hash & partition_topology_.shard_mask();
+      const size_t shard = hash & storage_topology_.shard_mask();
       workspace
           .indices_by_node[NumaTopology::node_ordinal_for_shard(
-              shard, partition_topology_.partition_count())]
+              shard, storage_topology_.shard_count())]
           .push_back(static_cast<uint32_t>(i));
     }
     routed_hashes = std::span<const size_t>(workspace.hashes);
@@ -4375,7 +4469,7 @@ public:
   }
 
   size_t internal_shard_count() const {
-    return partition_topology_.partition_count();
+    return storage_topology_.shard_count();
   }
 
   template <typename K>
@@ -4570,10 +4664,10 @@ private:
   void bind_worker_if_requested(size_t worker) const {
     if (!bind_worker_affinity_)
       return;
+    thread_local int bound_cpu = -1;
     const int target_cpu = numa_memory_locality_
                                ? NumaTopology::cpu_for_worker(worker)
                                : ThreadAffinity::cpu_for_worker(worker);
-    thread_local int bound_cpu = -1;
     if (bound_cpu == target_cpu)
       return;
     ThreadAffinity::bind_current_thread_to_cpu(target_cpu);
@@ -4847,7 +4941,7 @@ private:
     }
   }
 
-  HogwildPartitionTopology partition_topology_;
+  storage::StorageTopology storage_topology_;
   std::vector<SlotStore *> dim_to_slot_;
   std::vector<std::unique_ptr<SlotStore>> slot_storage_;
   std::atomic<StoreSnapshot *> snapshot_{nullptr};

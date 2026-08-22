@@ -31,8 +31,11 @@ void make_store(StoreConstructionTarget &target,
       std::vector<size_t>(target.dims.begin(), target.dims.end()),
       std::move(initializer), std::move(optimizer),
       score_policy,
-      HogwildStoreOptions{.thread_budget = thread_budget,
-                          .storage = std::move(target.storage)});
+      HogwildStoreOptions{
+          .thread_budget = thread_budget,
+          .storage = std::move(target.storage),
+          .storage_tuning = target.storage_tuning,
+      });
 }
 
 }  // namespace se::detail

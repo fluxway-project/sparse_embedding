@@ -36,8 +36,14 @@ std::vector<uint64_t> make_unique_batch() {
   return keys;
 }
 
-double run_forward(size_t threads, const std::vector<uint64_t> &batch,
-                   std::span<const int64_t> row_lengths, bool numa_aware) {
+struct ForwardResult {
+  double mops;
+  size_t entries_per_page;
+};
+
+ForwardResult run_forward(size_t threads, const std::vector<uint64_t> &batch,
+                          std::span<const int64_t> row_lengths, bool numa_aware,
+                          size_t entries_per_page) {
   const size_t physical_workers = threads;
   using Store =
       se::HogwildEmbeddingStore<uint64_t, float, float, se::NoScorePolicy>;
@@ -45,9 +51,14 @@ double run_forward(size_t threads, const std::vector<uint64_t> &batch,
       {kDimension}, {}, nullptr, se::NoScorePolicy{},
       se::HogwildStoreOptions{
           .thread_budget = physical_workers,
-          .locality = se::LocalityPolicy{
-              numa_aware ? se::LocalityMode::kNuma : se::LocalityMode::kAuto,
-              numa_aware ? se::LocalityMode::kNuma : se::LocalityMode::kAuto}});
+          .locality = se::LocalityPolicy{numa_aware ? se::LocalityMode::kNuma
+                                                    : se::LocalityMode::kAuto,
+                                         numa_aware ? se::LocalityMode::kNuma
+                                                    : se::LocalityMode::kAuto},
+          .storage_tuning = {
+              .entries_per_page = entries_per_page,
+              .workload = se::storage::StorageWorkload::kForwardLookup,
+              .calibrate_page_geometry = entries_per_page == 0}});
   store.reserve(kVocabulary, kDimension);
 
   std::vector<uint64_t> warmup_keys(kVocabulary);
@@ -66,7 +77,8 @@ double run_forward(size_t threads, const std::vector<uint64_t> &batch,
   const double seconds = std::chrono::duration<double>(elapsed).count();
   if (seconds <= 0.0)
     throw std::runtime_error("forward benchmark duration is non-positive");
-  return static_cast<double>(kBatchSize * kRepetitions) / seconds / 1e6;
+  return {static_cast<double>(kBatchSize * kRepetitions) / seconds / 1e6,
+          store.entries_per_page()};
 }
 
 } // namespace
@@ -85,11 +97,20 @@ size_t parse_thread_count(std::string_view value) {
 
 int main(int argc, char **argv) {
   bool numa_aware = false;
+  size_t entries_per_page = 0;
   std::optional<size_t> only_threads;
   for (int index = 1; index < argc; ++index) {
     const std::string_view argument(argv[index]);
     if (argument == "--numa") {
       numa_aware = true;
+      continue;
+    }
+    constexpr std::string_view page_prefix = "--entries-per-page=";
+    if (argument.starts_with(page_prefix)) {
+      if (entries_per_page != 0)
+        throw std::invalid_argument("entries per page specified twice");
+      entries_per_page =
+          parse_thread_count(argument.substr(page_prefix.size()));
       continue;
     }
     constexpr std::string_view prefix = "--threads=";
@@ -115,6 +136,7 @@ int main(int argc, char **argv) {
       << " numa_physical_cores="
       << (numa_aware ? se::NumaTopology::physical_core_count() : 0)
       << " numa_aware=" << (numa_aware ? "true" : "false")
+      << " entries_per_page=" << entries_per_page
       << " unique_keys=" << unique_keys.size()
       << " duplicate_rows=" << duplicate_rows << '\n';
   if (duplicate_rows != 0)
@@ -127,10 +149,12 @@ int main(int argc, char **argv) {
       continue;
     if (numa_aware && kThreadCounts[index] < se::NumaTopology::node_count())
       continue;
-    throughput[index] =
-        run_forward(kThreadCounts[index], batch, lengths, numa_aware);
+    const ForwardResult result = run_forward(
+        kThreadCounts[index], batch, lengths, numa_aware, entries_per_page);
+    throughput[index] = result.mops;
     std::cout << "forward_mops_" << kThreadCounts[index] << '=' << std::fixed
-              << std::setprecision(3) << throughput[index] << '\n';
+              << std::setprecision(3) << throughput[index]
+              << " entries_per_page=" << result.entries_per_page << '\n';
   }
   if (only_threads.has_value())
     return throughput[std::ranges::find(kThreadCounts, *only_threads) -

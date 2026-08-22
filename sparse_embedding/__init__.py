@@ -22,6 +22,7 @@ from ._core import (
     Partitioner,
     Sgd,
     SqrtDecayLrPolicy,
+    StorageTuningOptions,
     Uniform,
     Zeros,
     _clear_wake_queue,
@@ -93,8 +94,12 @@ class EmbeddingConfig(_EmbeddingConfig):
         optimizer_dtype: Any = "",
         key_dtype: Any = "int64",
         storage: AutoStorage | MemoryOnly | None = None,
+        storage_tuning: StorageTuningOptions | None = None,
     ):
         resolved_storage = AutoStorage() if storage is None else storage
+        resolved_tuning = (
+            StorageTuningOptions() if storage_tuning is None else storage_tuning
+        )
         super().__init__(
             dims,
             thread_budget,
@@ -102,6 +107,7 @@ class EmbeddingConfig(_EmbeddingConfig):
             _to_str(optimizer_dtype),
             _to_str(key_dtype),
             resolved_storage._native,
+            resolved_tuning,
         )
         self.storage = resolved_storage
 
@@ -137,6 +143,7 @@ __all__ = [
     "Sgd",
     "Optimizer",
     "EmbeddingConfig",
+    "StorageTuningOptions",
     "Zeros",
     "Uniform",
     "Initializer",

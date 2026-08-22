@@ -113,6 +113,11 @@ config = se.EmbeddingConfig(
     dims=[128],
     thread_budget=8,
     storage=storage,
+    storage_tuning=se.StorageTuningOptions(
+        target_capacity_keys=10_000_000,
+        memory_budget_bytes=4 << 30,
+        entries_per_page=4096,
+    ),
 )
 store = se.EmbeddingStore(config, score_policy="lfu")
 ```
@@ -122,6 +127,19 @@ exhausted. `AutoStorage(memory_limit_bytes=0, spill_directory=..., max_spill_byt
 uses the specified spill device for trainable pages.
 Invalid storage limits, alignments, watermarks, capacities, or registration
 tokens raise instead of selecting a fallback policy.
+
+## Universal Storage Topology and Hardware Auto-Tuning
+
+The storage architecture defines an immutable Single Source of Truth (SSOT) in the independent `se::storage` namespace:
+
+1. **Hardware Resource Probing (`SystemResourceProbe`)**:
+   Directly parses `MemAvailable` from `/proc/meminfo` (raising exceptions on parse errors with zero fallbacks) and queries NUMA topology and physical CPU core counts via `libnuma`.
+2. **Mathematical Resource Auto-Tuning (`StorageResourceTuner`)**:
+   - **Measured Page-Size Calibration**: At startup, `StorageResourceTuner` evaluates the small candidate set `{4096, 8192, 16384}` using the requested embedding dimension, worker budget, workload (`forward_lookup`, `lookup_insert`, `compaction`, or `training`), and NUMA mode. It selects the median-duration winner and caches the result by the complete request shape. Explicit `entries_per_page` disables calibration. `calibration_samples` defaults to three and is bounded to seven.
+   - **Dynamic Max Pages (`max_pages`)**: Automatically derives total page allocation limits based on a 75% available RAM budget and precise per-entry overheads, aligning to NUMA cohort counts.
+3. **Immutable Topology Contract (`StorageTopology`)**:
+   Enforces power-of-two invariants and precalculates branchless shift amounts and masks (`entries_shift_`, `slot_mask_`, `shard_mask_`). Hotpath page coordinate lookups replace division and modulo with single-cycle bitwise shifts:
+   $$\text{page\_id} = \text{index} \gg \text{entries\_shift}, \quad \text{slot\_offset} = \text{index} \ \& \ \text{slot\_mask}$$
 
 ## Runtime Architecture and Concurrency
 
@@ -148,6 +166,9 @@ IDs, locator slots, arena indices, pages, and store snapshots are reusable only
 after an epoch-safe retirement. If a locator sequence approaches wraparound, the
 directory rotates that key to a fresh slot and permanently retires the old slot
 rather than risking ABA.
+
+Physical page directories in `PageTable` employ a two-level L1 cache-resident pointer directory `StablePageDirectory<T>` (managing `data`, `states`, `owner`, and `locks`), completely eliminating heap-allocated `std::unique_ptr<OwnerRecord[]>*` hops. Page pointers are published atomically upon page allocation, and hotpath indexing resolves in a single flat step:
+$$\text{owner} = \text{pages\_}\to\text{owner.load}(\text{index} \gg \text{entries\_shift})[\text{index} \ \& \ \text{slot\_mask}]$$
 
 Payload access follows the Linux x86_64 GCC/Clang pure optimistic SeqLock contract.
 Operations that mutate `arena_index` mappings (such as compaction relocation) CAS an even sequence

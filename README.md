@@ -61,12 +61,14 @@ affinity on 48 allowed CPUs.
 
 | Threads | Forward throughput |
 |---:|---:|
-| 1 | 14.988 Mops/s |
-| 2 | 21.852 Mops/s |
-| 4 | 35.165 Mops/s |
-| 8 | **45.945 Mops/s** |
-| 16 | 42.049 Mops/s |
-| 64 | 33.446 Mops/s |
+| 1 | 13.40 Mops/s |
+| 2 | 20.25 Mops/s |
+| 4 | 34.37 Mops/s |
+| 8 | **44.46 Mops/s** |
+| 16 | 35.69 Mops/s |
+| 24 | 34.21 Mops/s |
+| 32 | 36.56 Mops/s |
+| 64 | 31.38 Mops/s |
 
 The performance report contains the complete workload definition, concurrency
 tables, compaction scaling, and reliability validation commands.
@@ -81,8 +83,9 @@ The public pressure contract and validation command are documented in the
 ### Lock-free migration and expansion
 
 Performance references are collected in the [Performance and Reliability Report](docs/performance_and_reliability_report.md):
-64-thread lookup reaches 80.19 Mops/s, mixed 64-thread lookup reaches 63.17 Mops/s,
-and preallocated 16-worker compaction reaches 11.92 M relocated keys/s. Expansion uses precise per-shard
+The current eight-worker `training_path_profile` reaches 20.00 Mops/s for `assign`,
+5.68 Mops/s for `accumulate_gradients`, and 11.80 Mops/s for `optimizer_step`.
+Expansion uses precise per-shard
 budgets instead of equal power-of-two rounding: directory capacity uses a 2.5x probe
 budget rounded to 16, while runtime `MapBundle` capacity grows by 2x below 64K,
 1.5x for `64K <= capacity < 1M`, and 1.25x at or above 1M.
@@ -118,6 +121,12 @@ bazel test -c opt //sparse_embedding/src/backend/hogwild:small_memory_all_paths_
 
 ### Automatic Storage Management
 
+Storage topology is calibrated once during store construction. The tuner uses
+the embedding dimension, worker budget, workload, and NUMA mode to compare the
+small candidate set `4096/8192/16384` with robust median samples. Results are
+cached by request shape; explicit `entries_per_page` remains the reproducible
+override and avoids calibration.
+
 No storage configuration is required. `EmbeddingStore` detects system and cgroup memory limits, process resource limits, filesystem capacity, and local device characteristics. Cache-line-aligned pages stay in RAM while the safe memory budget has capacity.
 
 A condition-variable-driven background thread tracks configurable watermarks (`high_watermark` and `low_watermark`, defaulting to 0.8 and 0.6). It does not poll periodically or probabilistically skip required eviction. At the high watermark, a score-enabled eviction proxy evaluates candidates and swaps cold pages through `MAP_FIXED` to an unlinked file-backed mapping until memory reaches the low watermark.
@@ -129,7 +138,13 @@ The first disk-backed page emits `SparseEmbeddingSpillWarning` to stderr. `stora
 ```python
 import sparse_embedding
 
-config = sparse_embedding.EmbeddingConfig(dims=[128])
+config = sparse_embedding.EmbeddingConfig(
+    dims=[128],
+    storage_tuning=sparse_embedding.StorageTuningOptions(
+        target_capacity_keys=10_000_000,
+        memory_budget_bytes=4 << 30,
+    ),
+)
 store = sparse_embedding.EmbeddingStore(config)
 print(store.storage_stats())
 ```

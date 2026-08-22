@@ -1,0 +1,44 @@
+load("@rules_cc//cc:defs.bzl", "cc_library", "cc_test")
+
+package(default_visibility = ["//visibility:public"])
+
+cc_library(
+    name = "system_resource_probe",
+    hdrs = ["system_resource_probe.hpp"],
+    deps = [
+        "//sparse_embedding/src/execution/topology",
+        "@numactl//:libnuma",
+    ],
+)
+
+cc_library(
+    name = "storage_topology",
+    hdrs = ["storage_topology.hpp"],
+)
+
+cc_library(
+    name = "storage_resource_tuner",
+    hdrs = ["storage_resource_tuner.hpp"],
+    deps = [
+        ":storage_topology",
+        ":system_resource_probe",
+        "//sparse_embedding/src/execution",
+    ],
+)
+
+alias(
+    name = "topology",
+    actual = ":storage_topology",
+)
+
+cc_test(
+    name = "storage_topology_test",
+    srcs = ["storage_topology_test.cpp"],
+    linkopts = ["-pthread"],
+    deps = [
+        ":storage_resource_tuner",
+        ":storage_topology",
+        ":system_resource_probe",
+        "@numactl//:libnuma",
+    ],
+)

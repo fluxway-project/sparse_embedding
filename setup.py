@@ -9,7 +9,7 @@ Environment variables
 ---------------------
 SE_BUILD_WITH_LANCE
     Set to "0", "false", "off", or "no" to disable Lance-c integration and build
-    the standalone core (//:copy_core_so). Defaults to "1" (Lance enabled).
+    the standalone core (//:package_core_extension). Defaults to "1" (Lance enabled).
 SE_SKIP_BAZEL
     Set to any non-empty value to skip the Bazel step entirely (useful when
     the .so is already present and only Python code needs repackaging).
@@ -68,18 +68,28 @@ def _bazel_bin_dir() -> Path:
     return Path(result.stdout.strip())
 
 
+def _remove_stale_extension_artifacts() -> None:
+    """Remove ABI-tagged extensions left by older setuptools builds."""
+    candidates = list(_PKG_DIR.glob("_core.*.so"))
+    build_root = _PROJECT_DIR / "build"
+    if build_root.is_dir():
+        candidates.extend(build_root.glob("lib.*/sparse_embedding/_core.*.so"))
+    for candidate in candidates:
+        candidate.unlink()
+
+
 def _invoke_bazel(with_lance: bool) -> Path:
     """Run Bazel and return the path to the compiled _core.so."""
     if with_lance:
-        bazel_target = "//:core_so_with_lance"
-        so_glob = "libcore_so_with_lance.so"
+        bazel_target = "//:core_extension_lance"
+        so_glob = "libcore_extension_lance.so"
     else:
-        bazel_target = "//:copy_core_so"
+        bazel_target = "//:package_core_extension"
         so_glob = "_core.so"
 
     cmd = ["bazel", "build", bazel_target]
     if with_lance:
-        cmd.append("//:copy_liblance_c")
+        cmd.append("//:package_liblance_c")
     env = os.environ.copy()
     if "BAZEL_COPTS" in env:
         import shlex
@@ -106,6 +116,7 @@ def _invoke_bazel(with_lance: bool) -> Path:
 def _build_native_artifacts() -> None:
     """Compile native libraries via Bazel and copy them into package directory."""
     _sync_version_py()
+    _remove_stale_extension_artifacts()
     if os.environ.get("SE_SKIP_BAZEL"):
         print("[setup.py] SE_SKIP_BAZEL set — skipping Bazel build.", file=sys.stderr)
         return

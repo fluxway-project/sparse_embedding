@@ -6,7 +6,10 @@
 
 ## 核心特性
 
+- **硬件资源自适应调优 (StorageResourceTuner)**：自动探测物理核心数、NUMA 拓扑与 `/proc/meminfo` 可用内存，数学推导 2MB HugePage 最佳对齐页容量与 75% 内存预算最大页数
+- **通用存储拓扑 (StorageTopology)**：不可变全局拓扑 SSOT 契约，预计算全位移掩码（`>> entries_shift`、`& slot_mask`），实现单周期 branchless 坐标寻址
 - **Slot Directory 读路径**：基于 `parlayhash` 实现稳定 Key→slot lookup，再通过 segmented locator table 发布 Slot→arena；warm 后的 lookup/forward 读侧不再经过 shard shared lock 或 lifecycle lock
+- **常驻页表目录 (StablePageDirectory)**：物理页表采用两级分段指针目录，零堆跳转且 L1 Cache 友好，分配新页时原子发布
 - **SIMD 加速**：AVX-512 向量化哈希计算与梯度 Scatter 操作
 - **Hogwild! 梯度累积**：分片 TransientArena 实现无锁梯度聚合，避免跨线程同步
 - **批级优化器扩展**：`OptimizerExtensionFacade<ParamT, OptT>` 是唯一的优化器类型擦除 seam。Store 在 shard-local SeqLock 写保护范围内解析 locator row，并按 key shard 调用一次 `update(OptimizerBatchView, global_step)`，不再对每行调用 proxy。
@@ -60,12 +63,14 @@ batch、400 次计时 `forward_lookup` 重复，并在 48 个 allowed CPU 上使
 
 | 线程数 | Forward 吞吐 |
 |---:|---:|
-| 1 | 14.988 Mops/s |
-| 2 | 21.852 Mops/s |
-| 4 | 35.165 Mops/s |
-| 8 | **45.945 Mops/s** |
-| 16 | 42.049 Mops/s |
-| 64 | 33.446 Mops/s |
+| 1 | 13.40 Mops/s |
+| 2 | 20.25 Mops/s |
+| 4 | 34.37 Mops/s |
+| 8 | **44.46 Mops/s** |
+| 16 | 35.69 Mops/s |
+| 24 | 34.21 Mops/s |
+| 32 | 36.56 Mops/s |
+| 64 | 31.38 Mops/s |
 
 完整 workload 定义、高并发表格、compaction 扩展和可靠性校验统一维护在性能报告中。
 
@@ -76,9 +81,8 @@ page 按 shard 固定到对应 node。公开 pressure 契约和验证命令统�
 
 ### 无锁页迁移与扩表
 
-性能参考统一见[性能与可靠性报告](docs/performance_and_reliability_report_zh.md)：64 线程
-lookup 为 80.19 Mops/s，64 线程混合 lookup 为 63.17 Mops/s，预分配 destination 的
-16-worker compaction 为 11.92 M keys/s。
+当前八 worker `training_path_profile` 的 `assign`、`accumulate_gradients` 和
+`optimizer_step` 吞吐分别约为 20.00、5.68 和 11.80 Mops/s。
 扩表使用精确 per-shard 预算，不再统一向上取二次幂：目录采用 2.5× 探测预算并向 16 对齐，
 运行期 `MapBundle` 容量按 `<64K: 2×`、`64K≤capacity<1M: 1.5×`、`≥1M: 1.25×` 增长。
 
@@ -107,6 +111,10 @@ bazel test -c opt //sparse_embedding/src/backend/hogwild:small_memory_all_paths_
 
 ### 自动存储管理
 
+存储拓扑在 store 构造阶段完成一次校准。调优器根据 embedding 维度、worker 数、workload
+和 NUMA 模式，对 `4096/8192/16384` 小候选集执行稳健中位数采样并按请求形状缓存结果；显式
+`entries_per_page` 仍是可复现实验的覆盖参数，并会跳过校准。
+
 默认无需配置存储参数。`EmbeddingStore` 会探测系统与 cgroup 内存限制、进程资源限制、文件系统容量和本地设备属性。在安全内存预算仍有余量时，64 字节对齐页面保留在 RAM。
 
 后台线程由条件变量和水位事件驱动，跟踪 `high_watermark` 与 `low_watermark`（默认 0.8 与 0.6）；它不会定时轮询，也不会按概率跳过必须执行的淘汰。触及高水位后，启用打分的 Eviction Proxy 会选择冷页，通过 `MAP_FIXED` 置换到未链接的文件后备映射，直到内存降至低水位。
@@ -118,7 +126,13 @@ bazel test -c opt //sparse_embedding/src/backend/hogwild:small_memory_all_paths_
 ```python
 import sparse_embedding
 
-config = sparse_embedding.EmbeddingConfig(dims=[128])
+config = sparse_embedding.EmbeddingConfig(
+    dims=[128],
+    storage_tuning=sparse_embedding.StorageTuningOptions(
+        target_capacity_keys=10_000_000,
+        memory_budget_bytes=4 << 30,
+    ),
+)
 store = sparse_embedding.EmbeddingStore(config)
 print(store.storage_stats())
 ```
@@ -148,9 +162,11 @@ config = sparse_embedding.EmbeddingConfig(dims=[128], storage=storage)
 
 ```
 HogwildEmbeddingStore
+├── StorageTopology (SSOT)       # 不可变全局存储拓扑与位移预计算
+├── StorageResourceTuner         # 2MB HugePage 与硬件资源自适应调优
 ├── parlayhash (KeyMap)          # 分片 Key→uint32_t mapping
 ├── EmbeddingArena               # Cache-line aligned embedding storage
-│   └── StablePageDirectory      # Stable-address segmented page metadata
+│   └── StablePageDirectory      # 零堆跳转 L1 Cache 常驻页目录
 ├── PageStorage                  # 自动探测 RAM 预算与文件映射 spill
 ├── TransientArena[thread_budget]  # Per-shard gradient accumulation (lock-free)
 ├── exec::static_thread_pool     # C++23 stdexec thread pool

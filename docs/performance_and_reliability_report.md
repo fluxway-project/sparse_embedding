@@ -82,37 +82,59 @@ Configuration: dimension 128, reserved memory-only table, 10,000,000 `int64` key
 
 | Metric | Result |
 |---|---:|
-| Lookup throughput | **21.54 M keys/s** |
+| Lookup throughput | **22.13 M keys/s** |
 | Telemetry relaxed-atomic reduction | **93.75%** |
 
 ### Slot-directory forward scaling
 
 Configuration: dimension 32, a 4,096-key memory-only table, 4,096-key fixed
-power-law batches, 400 timed `forward_lookup` repetitions, and physical-core
-affinity on 48 allowed CPUs.
+power-law batches, 400 timed `forward_lookup` repetitions, process affinity
+`taskset -c 0-47`, and the default automatic storage tuner.
 
 | Threads | Forward throughput |
 |---:|---:|
-| 1 | 14.988 Mops/s |
-| 2 | 21.852 Mops/s |
-| 4 | 35.165 Mops/s |
-| 8 | **45.945 Mops/s** |
-| 16 | 42.049 Mops/s |
-| 64 | 33.446 Mops/s |
+| 1 | 13.40 Mops/s |
+| 2 | 20.25 Mops/s |
+| 4 | 34.37 Mops/s |
+| 8 | **44.46 Mops/s** |
+| 16 | 35.69 Mops/s |
+| 24 | 34.21 Mops/s |
+| 32 | 36.56 Mops/s |
+| 64 | 31.38 Mops/s |
 
 The default memory-work and row-grain limits bound effective task count, keeping
 enqueue, steal, completion, and barrier costs from dominating the timed path.
 
+The storage tuner calibrates `{4096, 8192, 16384}` once at store construction for
+the requested workload shape and caches the median winner. On this host, the
+calibration proxy selected 4096 for all four workloads; explicit candidate
+comparisons are recorded in `tmp/forward_page_geometry_pinned_20260822.log`.
+Explicit `entries_per_page` remains available for reproducibility. The hot path
+then uses the cached shift and mask without runtime dispatch.
+
+The calibration gate requires a candidate to beat the validated 4096 profile by
+at least 50% on the median calibration sample; otherwise 4096 is retained. This
+conservative floor protects startup calibration from shared-machine noise and
+surrogate-workload mismatch while still allowing a materially better page
+geometry.
+
+All public values in this report are five-run medians from the final checkout,
+using `taskset -c 0-47`; the exact run is recorded in
+`tmp/docs_matrix_pinned_20260822.log`. The older peak table from `b61895d` is not a
+stable baseline: five-run commit probes reproduce neither its 8.69 Mops/s
+accumulation peak nor its 11.92 M relocated-keys/s compaction peak. The complete
+commit-level comparison is in `tmp/historical_performance_audit_20260822.md`.
+
 ### Training paths
 
-Dimension 128, 65,536 existing unique rows, eight workers, and affinity
-enabled. Throughput is the five-run median:
+Dimension 128, 65,536 existing unique rows, eight workers, process affinity
+`taskset -c 0-47`, and 20 timed repetitions. Throughput is the five-run median:
 
-| Operation | Throughput |
-|---|---:|
-| `assign` | **16.50 Mops/s** |
-| `accumulate_gradients` (including required step) | **8.69 Mops/s** |
-| `optimizer_step` | **16.85 Mops/s** |
+| Operation | Throughput | Bandwidth |
+|---|---:|---:|
+| `assign` | **20.00 Mops/s** | 9.54 GB/s |
+| `accumulate_gradients` (including required step) | **5.68 Mops/s** | 2.71 GB/s |
+| `optimizer_step` | **11.80 Mops/s** | 5.63 GB/s |
 
 The batch optimizer profile is a separate workload from the tables below. Use
 `training_path_profile` when comparing assign, gradient accumulation, and
@@ -140,7 +162,7 @@ and `optimizer_step`, and verifies payload integrity after paging.
 
 The current path is `key -> shard MapBundle -> locator_slot -> arena_index ->
 payload`. The logical directory remains a COW snapshot and the physical page
-directory uses stable segments; lookup, optimizer, and ordinary compaction
+directory uses stable segments (`StablePageDirectory`); lookup, optimizer, and ordinary compaction
 relocation take no mutex. Expansion runs in the writer/control plane. When a
 runtime insert exceeds the reserved budget, growth uses these exact factors:
 
@@ -163,35 +185,35 @@ repetitions per configuration reporting median/p95/p99.
 
 | Threads | Lookup median/p95/p99 (Mops/s) | Insert median/p95/p99 (Mops/s) |
 |---:|---:|---:|
-| 1 | 12.41 / 12.48 / 12.48 | 0.0456 / 0.0523 / 0.0523 |
-| 16 | 71.42 / 73.59 / 73.59 | 0.343 / 0.401 / 0.401 |
-| 64 | **80.19 / 94.25 / 94.25** | **0.577 / 0.626 / 0.626** |
+| 1 | 10.87 / 11.78 / 11.78 | 0.045 / 0.051 / 0.051 |
+| 16 | 65.61 / 67.01 / 67.01 | 0.319 / 0.354 / 0.354 |
+| 64 | **77.15 / 84.11 / 84.11** | **0.566 / 0.592 / 0.592** |
 
 Mixed lookup/insert uses the same dimension, warm keys, and batch for 64 rounds;
 16/64 total threads are split evenly, with Auto storage at 1 GiB memory and
 2 GiB spill limits.
 
 | Total | Lookup/insert threads | Lookup / insert (Mops/s) | Lookup/insert p99 (ns) |
-|---:|---:|---:|---:|
-| 16 | 8 / 8 | 48.41 / 0.360 | 195,991 / 53,862,829 |
-| 64 | 32 / 32 | **63.17 / 0.448** | 686,921 / 132,946,237 |
+|---:|---:|---:|---:|---:|
+| 16 | 8 / 8 | 47.93 / 0.343 | 210,386 / 51,778,919 |
+| 64 | 32 / 32 | **60.76 / 0.382** | 697,452 / 161,216,723 |
 
 Compaction strong scaling uses dimension 128, 64 shards, four pages per source
-worker, 4,096 entries per page, 64 store threads, fixed work, 1/2/4/8/16
-compaction workers, five repetitions, and preallocated destinations.
+worker, the calibrated page geometry (4096 entries per page on this host), 64
+store threads, fixed work, 1/2/4/8/16 workers, reporting the five-sample median.
 
 | Workers | Relocated keys/s |
 |---:|---:|
-| 1 | 1.18 M |
-| 2 | 4.00 M |
-| 4 | 5.59 M |
-| 8 | 10.70 M |
-| 16 | **11.92 M** |
+| 1 | 1.04 M |
+| 2 | 1.99 M |
+| 4 | 3.54 M |
+| 8 | 6.77 M |
+| 16 | **10.02 M** |
 
-Without destination preallocation, the same workload is expected to be lower
-because destination allocation is included in the timed phase. The executable
-targets are `high_concurrency_lookup_insert_benchmark`,
-`mixed_lookup_insert_concurrency_benchmark`, and `page_compaction_benchmark`.
+Without preallocated destinations, the timed phase also includes destination-page
+allocation, giving slightly lower throughput. Corresponding binaries are
+`high_concurrency_lookup_insert_benchmark`, `mixed_lookup_insert_concurrency_benchmark`,
+and `page_compaction_benchmark`.
 
 Paging tests should verify `swap_out_count > 0` and `spill_count > 0`. Safety
 regression must cover dimension 1, Adam, concurrent `optimizer_step()` and
@@ -203,7 +225,7 @@ handling must not replace signal detection.
 
 ```bash
 bazel test -c opt --test_output=errors //sparse_embedding/...
-bazel build -c opt //:copy_core_so
+bazel build -c opt //:package_core_extension
 PYTHONPATH="$PWD" pytest -q sparse_embedding/tests/test_checkpoint.py
 PYTHONPATH="$PWD" pytest -q
 ```

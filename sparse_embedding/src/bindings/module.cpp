@@ -33,12 +33,12 @@
 #include "sparse_embedding/src/bindings/dlpack_utils.hpp"
 #include "sparse_embedding/src/bindings/module_wrapper.hpp"
 #include "sparse_embedding/src/bindings/module_wrapper_methods.inl"
+#include "sparse_embedding/src/checkpoint/lance/layout_schema.hpp"
 #include "sparse_embedding/src/ops/partitioner.hpp"
 #include "sparse_embedding/src/ops/tensor_ops.hpp"
-#ifdef SE_ENABLE_LANCE_CHECKPOINTER
+#ifdef SE_ENABLE_LANCE_C
 #include "sparse_embedding/src/bindings/module_checkpoint_methods.inl"
 #include "sparse_embedding/src/checkpoint/checkpoint_registry.hpp"
-#include "sparse_embedding/src/checkpoint/lance/layout_schema.hpp"
 #include "sparse_embedding/src/checkpoint/lance/native_fragment_writer.hpp"
 #endif
 
@@ -54,8 +54,10 @@ namespace se::py::detail {
 
 void construct_store(EmbeddingStoreWrapper &self, const PyInitializer &init_cfg,
                      const PyOptimizer &opt_cfg, size_t thread_budget,
-                     se::StoreConstructionKind kind) {
-  se::StoreConstructionTarget target{&self.store_, self.dims_, self.storage_};
+                     se::StoreConstructionKind kind,
+                     const se::EmbeddingConfig &emb_cfg) {
+  se::StoreConstructionTarget target{&self.store_, self.dims_, self.storage_,
+                                     emb_cfg.storage_tuning};
   se::StoreConstructionRequest request{init_cfg.builder, opt_cfg.config};
   se::create_hogwild_store(kind, std::move(target), std::move(request),
                            thread_budget);
@@ -118,7 +120,8 @@ EmbeddingStoreWrapper::EmbeddingStoreWrapper(
   construct_store(*this, init_cfg, opt_cfg, thread_budget,
                   se::StoreConstructionKind{
                       to_store_dtype(value_dtype_code_),
-                      to_store_dtype(optimizer_dtype_code_), score_policy});
+                      to_store_dtype(optimizer_dtype_code_), score_policy},
+                  emb_cfg);
 }
 
 } // namespace se::py::detail
@@ -310,18 +313,49 @@ NB_MODULE(_core, m) {
         return options;
       });
 
+  nb::enum_<se::storage::StorageWorkload>(m, "StorageWorkload")
+      .value("forward_lookup", se::storage::StorageWorkload::kForwardLookup)
+      .value("lookup_insert", se::storage::StorageWorkload::kLookupInsert)
+      .value("compaction", se::storage::StorageWorkload::kCompaction)
+      .value("training", se::storage::StorageWorkload::kTraining);
+
+  nb::class_<se::storage::StorageTuningOptions>(m, "StorageTuningOptions")
+      .def(nb::init<size_t, size_t, size_t, size_t,
+                    se::storage::StorageWorkload, bool, size_t>(),
+           nb::arg("target_capacity_keys") = 0,
+           nb::arg("memory_budget_bytes") = 0, nb::arg("entries_per_page") = 0,
+           nb::arg("max_pages") = 0,
+           nb::arg("workload") = se::storage::StorageWorkload::kForwardLookup,
+           nb::arg("calibrate_page_geometry") = true,
+           nb::arg("calibration_samples") = 3)
+      .def_rw("target_capacity_keys",
+              &se::storage::StorageTuningOptions::target_capacity_keys)
+      .def_rw("memory_budget_bytes",
+              &se::storage::StorageTuningOptions::memory_budget_bytes)
+      .def_rw("entries_per_page",
+              &se::storage::StorageTuningOptions::entries_per_page)
+      .def_rw("max_pages", &se::storage::StorageTuningOptions::max_pages)
+      .def_rw("workload", &se::storage::StorageTuningOptions::workload)
+      .def_rw("calibrate_page_geometry",
+              &se::storage::StorageTuningOptions::calibrate_page_geometry)
+      .def_rw("calibration_samples",
+              &se::storage::StorageTuningOptions::calibration_samples);
+
   nb::class_<se::EmbeddingConfig>(m, "_EmbeddingConfig")
       .def(nb::init<std::vector<size_t>, size_t, std::string, std::string,
-                    std::string, se::StorageOptions>(),
+                    std::string, se::StorageOptions,
+                    se::storage::StorageTuningOptions>(),
            nb::arg("dims"), nb::arg("thread_budget") = 0,
            nb::arg("value_dtype") = "float32", nb::arg("optimizer_dtype") = "",
            nb::arg("key_dtype") = "int64",
-           nb::arg("storage") = se::StorageOptions{})
+           nb::arg("storage") = se::StorageOptions{},
+           nb::arg("storage_tuning") = se::storage::StorageTuningOptions{})
       .def_rw("dims", &se::EmbeddingConfig::dims)
       .def_rw("thread_budget", &se::EmbeddingConfig::thread_budget)
       .def_rw("value_dtype", &se::EmbeddingConfig::value_dtype)
       .def_rw("optimizer_dtype", &se::EmbeddingConfig::optimizer_dtype)
-      .def_rw("key_dtype", &se::EmbeddingConfig::key_dtype);
+      .def_rw("key_dtype", &se::EmbeddingConfig::key_dtype)
+      .def_rw("storage_tuning", &se::EmbeddingConfig::storage_tuning);
 
   nb::class_<PyInitializer>(m, "Initializer");
 
@@ -531,8 +565,77 @@ NB_MODULE(_core, m) {
 
       ;
 
-#ifdef SE_ENABLE_LANCE_CHECKPOINTER
   auto checkpoint = m.def_submodule("checkpoint");
+
+  // ---- Universal checkpoint functionality (available unconditionally for
+  // Python pylance) ----
+  checkpoint.def("lance_entries_schema_capsule", []() {
+    auto *s = new ArrowSchema(se::lance_layout::make_entries_schema());
+    return nb::capsule(s, "arrow_schema", [](void *p) noexcept {
+      auto *schema = static_cast<ArrowSchema *>(p);
+      if (schema) {
+        if (schema->release)
+          schema->release(schema);
+        delete schema;
+      }
+    });
+  });
+
+  checkpoint.def("lance_page_images_schema_capsule", []() {
+    auto *s = new ArrowSchema(se::lance_layout::make_page_images_schema());
+    return nb::capsule(s, "arrow_schema", [](void *p) noexcept {
+      auto *schema = static_cast<ArrowSchema *>(p);
+      if (schema) {
+        if (schema->release)
+          schema->release(schema);
+        delete schema;
+      }
+    });
+  });
+
+  checkpoint.def("lance_manifest_schema_capsule", []() {
+    auto *s = new ArrowSchema(se::lance_layout::make_manifest_schema());
+    return nb::capsule(s, "arrow_schema", [](void *p) noexcept {
+      auto *schema = static_cast<ArrowSchema *>(p);
+      if (schema) {
+        if (schema->release)
+          schema->release(schema);
+        delete schema;
+      }
+    });
+  });
+
+  checkpoint.def(
+      "export_batches_dlpack",
+      [](EmbeddingStoreWrapper &self, nb::callable visitor, size_t batch_size,
+         bool include_optimizer_state) {
+        self.export_batches_dlpack(visitor, batch_size,
+                                   include_optimizer_state);
+      },
+      nb::arg("store"), nb::arg("visitor"), nb::arg("batch_size") = 65536,
+      nb::arg("include_optimizer_state") = false);
+
+  checkpoint.def(
+      "export_batches_arrow",
+      [](EmbeddingStoreWrapper &self, nb::callable visitor, size_t batch_size,
+         bool include_optimizer_state) {
+        self.export_batches_arrow(visitor, batch_size, include_optimizer_state);
+      },
+      nb::arg("store"), nb::arg("visitor"), nb::arg("batch_size") = 65536,
+      nb::arg("include_optimizer_state") = false);
+
+  checkpoint.def(
+      "assign_opt_state",
+      [](EmbeddingStoreWrapper &self, nb::object keys, nb::object opt_states,
+         size_t dimension, nb::object steps) {
+        self.assign_opt_state(keys, opt_states, dimension, steps);
+      },
+      nb::arg("store"), nb::arg("keys"), nb::arg("opt_states"),
+      nb::arg("dimension"), nb::arg("steps") = nb::none());
+
+#ifdef SE_ENABLE_LANCE_C
+  // ---- Native C++ acceleration extensions (available when SE_ENABLE_LANCE_C
+  // is defined) ----
   checkpoint.def(
       "save_checkpoint",
       [](EmbeddingStoreWrapper &self, const std::string &uri,
@@ -579,31 +682,6 @@ NB_MODULE(_core, m) {
                                       std::move(factories.reader));
       },
       nb::arg("store"), nb::arg("backend"));
-  checkpoint.def(
-      "export_batches_dlpack",
-      [](EmbeddingStoreWrapper &self, nb::callable visitor, size_t batch_size,
-         bool include_optimizer_state) {
-        self.export_batches_dlpack(visitor, batch_size,
-                                   include_optimizer_state);
-      },
-      nb::arg("store"), nb::arg("visitor"), nb::arg("batch_size") = 65536,
-      nb::arg("include_optimizer_state") = false);
-  checkpoint.def(
-      "export_batches_arrow",
-      [](EmbeddingStoreWrapper &self, nb::callable visitor, size_t batch_size,
-         bool include_optimizer_state) {
-        self.export_batches_arrow(visitor, batch_size, include_optimizer_state);
-      },
-      nb::arg("store"), nb::arg("visitor"), nb::arg("batch_size") = 65536,
-      nb::arg("include_optimizer_state") = false);
-  checkpoint.def(
-      "assign_opt_state",
-      [](EmbeddingStoreWrapper &self, nb::object keys, nb::object opt_states,
-         size_t dimension, nb::object steps) {
-        self.assign_opt_state(keys, opt_states, dimension, steps);
-      },
-      nb::arg("store"), nb::arg("keys"), nb::arg("opt_states"),
-      nb::arg("dimension"), nb::arg("steps") = nb::none());
   checkpoint.def(
       "restore_native_entries",
       [](EmbeddingStoreWrapper &self, const std::string &uri, uint64_t version,
@@ -657,42 +735,6 @@ NB_MODULE(_core, m) {
       },
       nb::arg("target_uri"), nb::arg("source_uris"), nb::arg("keys"),
       nb::arg("checkpoint_version") = 0);
-
-  checkpoint.def("lance_entries_schema_capsule", []() {
-    auto *s = new ArrowSchema(se::lance_layout::make_entries_schema());
-    return nb::capsule(s, "arrow_schema", [](void *p) noexcept {
-      auto *schema = static_cast<ArrowSchema *>(p);
-      if (schema) {
-        if (schema->release)
-          schema->release(schema);
-        delete schema;
-      }
-    });
-  });
-
-  checkpoint.def("lance_page_images_schema_capsule", []() {
-    auto *s = new ArrowSchema(se::lance_layout::make_page_images_schema());
-    return nb::capsule(s, "arrow_schema", [](void *p) noexcept {
-      auto *schema = static_cast<ArrowSchema *>(p);
-      if (schema) {
-        if (schema->release)
-          schema->release(schema);
-        delete schema;
-      }
-    });
-  });
-
-  checkpoint.def("lance_manifest_schema_capsule", []() {
-    auto *s = new ArrowSchema(se::lance_layout::make_manifest_schema());
-    return nb::capsule(s, "arrow_schema", [](void *p) noexcept {
-      auto *schema = static_cast<ArrowSchema *>(p);
-      if (schema) {
-        if (schema->release)
-          schema->release(schema);
-        delete schema;
-      }
-    });
-  });
 #endif
 
   m.def(

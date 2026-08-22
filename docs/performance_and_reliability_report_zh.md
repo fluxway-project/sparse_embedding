@@ -72,35 +72,43 @@ batch、128 个并发调用方和最多 128 个内部 worker。
 
 | 指标 | 结果 |
 |---|---:|
-| 查询吞吐 | **21.54 M keys/s** |
+| 查询吞吐 | **22.13 M keys/s** |
 | telemetry relaxed atomic update 降幅 | **93.75%** |
 
 ### Slot-directory forward scaling
 
 配置为 dim=32、4,096-key memory-only table、4,096-key 固定 power-law batch、400 次
-计时 `forward_lookup` 重复，并在 48 个 allowed CPU 上使用物理核 affinity。
+计时 `forward_lookup` 重复，进程使用 `taskset -c 0-47`，并启用默认自动存储调优。
 
 | 线程数 | Forward 吞吐 |
 |---:|---:|
-| 1 | 14.988 Mops/s |
-| 2 | 21.852 Mops/s |
-| 4 | 35.165 Mops/s |
-| 8 | **45.945 Mops/s** |
-| 16 | 42.049 Mops/s |
-| 64 | 33.446 Mops/s |
+| 1 | 13.40 Mops/s |
+| 2 | 20.25 Mops/s |
+| 4 | 34.37 Mops/s |
+| 8 | **44.46 Mops/s** |
+| 16 | 35.69 Mops/s |
+| 24 | 34.21 Mops/s |
+| 32 | 36.56 Mops/s |
+| 64 | 31.38 Mops/s |
 
-默认 memory-work 与 row-grain 限制有效 task 数，避免计时路径被 enqueue、steal、
-completion 和 barrier 成本主导。
+默认 memory-work 与 row-grain 限制有效 task 数，避免计时路径被 enqueue、steal、completion 和 barrier 成本主导。存储调优器会在构造阶段针对 workload 形状校准 4096、8192、16384 三个候选页大小，并缓存中位数最优值；本机四类 workload 的校准代理均选择 4096，候选页显式对照记录在 `tmp/forward_page_geometry_pinned_20260822.log`；显式 `entries_per_page` 可用于复现实验。
+
+只有候选页大小的中位耗时至少比已验证的 4096 profile 好 50% 时才会切换，否则保留 4096。该保守门槛同时抵御共享机器噪声和校准代理 workload 与真实路径的偏差，同时允许明显更优的页几何被选中。
+
+本文所有公开数据均为最终工作区在 `taskset -c 0-47` 下的 5 次运行中位数，完整日志见
+`tmp/docs_matrix_pinned_20260822.log`。`b61895d` 中的旧峰值不是稳定基线：commit 级 5 次
+复测无法复现其 8.69 Mops/s 梯度累积峰值和 11.92 M relocated-keys/s compaction 峰值。
+完整 commit 对照见 `tmp/historical_performance_audit_20260822.md`。
 
 ### 训练路径
 
-dim=128、65,536 个已存在且唯一的 row、8 workers、affinity enabled。吞吐为 5 次运行中位数：
+dim=128、65,536 个已存在且唯一的 row、8 workers、进程使用 `taskset -c 0-47`，每次计时 20 次重复。吞吐为 5 次运行中位数：
 
 | 操作 | 吞吐 |
-|---|---:|
-| `assign` | **16.50 Mops/s** |
-| `accumulate_gradients`（含必需 step） | **8.69 Mops/s** |
-| `optimizer_step` | **16.85 Mops/s** |
+|---|---:|---:|
+| `assign` | **20.00 Mops/s** |
+| `accumulate_gradients`（含必需 step） | **5.68 Mops/s** |
+| `optimizer_step` | **11.80 Mops/s** |
 
 批级 optimizer profile 与下表使用不同 workload。比较 assign、梯度累积和 optimizer step
 时请使用 `training_path_profile`；比较存储和 compaction 时请使用本文末尾的 benchmark 命令。
@@ -125,7 +133,7 @@ payload 未改变。
 ## 运行机制与性能参考
 
 当前路径为 `key → shard MapBundle → locator_slot → arena_index → payload`。逻辑目录
-仍使用 COW 快照，物理页目录使用稳定 segment；lookup、optimizer 和普通 compaction
+仍使用 COW 快照，物理页目录使用稳定 segment（`StablePageDirectory`）；lookup、optimizer 和普通 compaction
 relocation 不获取 mutex。扩表只发生在 writer/control plane：`reserve` 在计时前完成，
 运行期超出预算时按以下精确系数增长：
 
@@ -146,29 +154,29 @@ fallback。
 
 | threads | lookup median/p95/p99 (Mops/s) | insert median/p95/p99 (Mops/s) |
 |---:|---:|---:|
-| 1 | 12.41 / 12.48 / 12.48 | 0.0456 / 0.0523 / 0.0523 |
-| 16 | 71.42 / 73.59 / 73.59 | 0.343 / 0.401 / 0.401 |
-| 64 | **80.19 / 94.25 / 94.25** | **0.577 / 0.626 / 0.626** |
+| 1 | 10.87 / 11.78 / 11.78 | 0.045 / 0.051 / 0.051 |
+| 16 | 65.61 / 67.01 / 67.01 | 0.319 / 0.354 / 0.354 |
+| 64 | **77.15 / 84.11 / 84.11** | **0.566 / 0.592 / 0.592** |
 
 混合 lookup/insert：同一 dim、warm keys、batch，64 轮；16/64 总线程各半，Auto storage
 memory=1 GiB、spill=2 GiB。
 
 | 总线程 | lookup/insert 线程 | lookup / insert (Mops/s) | lookup/insert p99 (ns) |
 |---:|---:|---:|---:|
-| 16 | 8 / 8 | 48.41 / 0.360 | 195,991 / 53,862,829 |
-| 64 | 32 / 32 | **63.17 / 0.448** | 686,921 / 132,946,237 |
+| 16 | 8 / 8 | 47.93 / 0.343 | 210,386 / 51,778,919 |
+| 64 | 32 / 32 | **60.76 / 0.382** | 697,452 / 161,216,723 |
 
-compaction 强扩展：`dim=128`、64 shards、每 source worker 4 pages、每页 4096 entries、
-store_threads=64，固定工作量，1/2/4/8/16 workers，每配置 5 次 median，destination
-预分配。
+compaction 扩展：`dim=128`、64 shards、每 source worker 4 pages；使用自动校准页几何
+（本机为每页 4096 entries）、`store_threads=64`，固定工作量，1/2/4/8/16 workers，
+每配置 5 次 median。
 
 | workers | relocated keys/s |
----:|---:|
-| 1 | 1.18 M |
-| 2 | 4.00 M |
-| 4 | 5.59 M |
-| 8 | 10.70 M |
-| 16 | **11.92 M** |
+|---:|---:|
+| 1 | 1.04 M |
+| 2 | 1.99 M |
+| 4 | 3.54 M |
+| 8 | 6.77 M |
+| 16 | **10.02 M** |
 
 未预分配 destination 时，计时阶段还包含目标页分配，因此结果通常更低。对应可执行目标
 为 `high_concurrency_lookup_insert_benchmark`、`mixed_lookup_insert_concurrency_benchmark`
@@ -182,7 +190,7 @@ store_threads=64，固定工作量，1/2/4/8/16 workers，每配置 5 次 median
 
 ```bash
 bazel test -c opt --test_output=errors //sparse_embedding/...
-bazel build -c opt //:copy_core_so
+bazel build -c opt //:package_core_extension
 PYTHONPATH="$PWD" pytest -q sparse_embedding/tests/test_checkpoint.py
 PYTHONPATH="$PWD" pytest -q
 ```

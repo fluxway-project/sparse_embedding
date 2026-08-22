@@ -25,6 +25,12 @@ filegroup(
 )
 
 filegroup(
+    name = "srcs_standalone",
+    srcs = [":srcs"],
+    visibility = ["//visibility:public"],
+)
+
+filegroup(
     name = "srcs_without_module",
     srcs = glob(
         [
@@ -48,6 +54,33 @@ filegroup(
 )
 
 cc_library(
+    name = "checkpoint_instantiations",
+    srcs = glob(["typed/module_*_checkpoint.cpp"]),
+    hdrs = glob([
+        "*.hpp",
+        "*.inl",
+        "typed/*.inl",
+    ]) + ["//sparse_embedding/src/ops:headers"],
+    copts = ["-O0"],
+    linkstatic = True,
+    tags = ["manual"],
+    visibility = ["//visibility:public"],
+    deps = [
+        "//sparse_embedding/src/backend/hogwild:hogwild_embedding_store",
+        "//sparse_embedding/src/checkpoint",
+        "//sparse_embedding/src/common",
+        "//sparse_embedding/src/eviction",
+        "//sparse_embedding/src/initializer",
+        "//sparse_embedding/src/interface",
+        "//sparse_embedding/src/optimizer",
+        "@dlpack",
+        "@nanobind",
+        "@proxy",
+    ],
+    alwayslink = True,
+)
+
+cc_library(
     name = "module_with_lance",
     srcs = ["module.cpp"],
     hdrs = glob([
@@ -55,8 +88,8 @@ cc_library(
         "*.inl",
         "typed/*.inl",
     ]) + ["//sparse_embedding/src/ops:headers"],
-    copts = ["-DSE_ENABLE_LANCE_CHECKPOINTER"],
-    tags = ["manual"],
+    copts = ["-DSE_ENABLE_LANCE_C"],
+    linkstatic = True,
     visibility = ["//visibility:public"],
     deps = [
         "//sparse_embedding/src/backend/hogwild:hogwild_embedding_store",
@@ -71,6 +104,7 @@ cc_library(
         "@nanobind",
         "@proxy",
     ],
+    alwayslink = True,
 )
 
 cc_library(
@@ -82,9 +116,10 @@ cc_library(
         "typed/*.inl",
     ]) + ["//sparse_embedding/src/ops:headers"],
     copts = [
-        "-DSE_ENABLE_LANCE_CHECKPOINTER",
+        "-DSE_ENABLE_LANCE_C",
         "-O0",
     ],
+    linkstatic = True,
     tags = ["manual"],
     visibility = ["//visibility:public"],
     deps = [

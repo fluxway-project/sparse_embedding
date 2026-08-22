@@ -15,6 +15,7 @@
 #include "sparse_embedding/src/interface/initializer_interface.hpp"
 #include "sparse_embedding/src/optimizer/optimizer_config.hpp"
 #include "sparse_embedding/src/storage/page_storage.hpp"
+#include "sparse_embedding/src/storage/topology/storage_topology.hpp"
 
 namespace se {
 
@@ -47,6 +48,7 @@ struct StoreConstructionTarget {
   StoreProxyVariant *store;
   std::span<const size_t> dims;
   PageStorage storage;
+  storage::StorageTuningOptions storage_tuning;
 };
 
 using StoreFactory = void (*)(StoreConstructionTarget &,

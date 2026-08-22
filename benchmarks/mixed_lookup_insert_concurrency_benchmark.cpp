@@ -53,8 +53,12 @@ MixedResult run(size_t total_threads) {
   storage_options.max_spill_bytes = size_t{2} << 30;
   auto storage = se::create_page_storage(std::move(storage_options));
   Store store({kDimension}, {}, nullptr, se::NoScorePolicy{},
-              se::HogwildStoreOptions{.thread_budget = total_threads,
-                                      .storage = storage});
+              se::HogwildStoreOptions{
+                  .thread_budget = total_threads,
+                  .storage = storage,
+                  .storage_tuning = {
+                      .workload = se::storage::StorageWorkload::kLookupInsert,
+                      .calibrate_page_geometry = true}});
   std::vector<uint64_t> warm_keys(kWarmKeys);
   std::iota(warm_keys.begin(), warm_keys.end(), uint64_t{1});
   std::vector<int64_t> warm_lengths(kWarmKeys, kDimension);

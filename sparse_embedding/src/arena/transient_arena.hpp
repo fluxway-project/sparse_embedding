@@ -38,10 +38,10 @@
 
 namespace se {
 
+#include <bit>
+
 template <typename ValT> class TransientArena {
   static constexpr size_t kCacheLineSize = 64;
-
-  static constexpr size_t kChunkSize = 8192; // Number of elements per page
 
 public:
   class AccumulatedBatchView {
@@ -70,12 +70,17 @@ public:
   };
 
   TransientArena(size_t dim, PageStorage storage,
-                 bool page_eviction_enabled = false)
+                 bool page_eviction_enabled = false, size_t chunk_size = 8192)
       : dim_(dim), storage_(std::move(storage)),
-        page_eviction_enabled_(page_eviction_enabled) {
+        page_eviction_enabled_(page_eviction_enabled), chunk_size_(chunk_size),
+        chunk_shift_(static_cast<unsigned>(std::countr_zero(chunk_size))),
+        chunk_mask_(chunk_size - 1) {
+    if (chunk_size_ == 0 || !std::has_single_bit(chunk_size_))
+      throw std::invalid_argument(
+          "transient arena chunk size must be a power of two");
     grad_stride_ =
         (dim * sizeof(ValT) + kCacheLineSize - 1) & ~(kCacheLineSize - 1);
-    id_map_.reserve(kChunkSize);
+    id_map_.reserve(chunk_size_);
   }
 
   ~TransientArena() = default;
@@ -291,21 +296,21 @@ private:
                                                ? PageEvictionMode::kEnabled
                                                : PageEvictionMode::kDisabled;
     grad_chunks_.push_back(
-        storage_->allocate(kChunkSize * grad_stride_, kCacheLineSize,
+        storage_->allocate(chunk_size_ * grad_stride_, kCacheLineSize,
                            std::move(evaluator), eviction_mode));
-    capacity_ += kChunkSize;
+    capacity_ += chunk_size_;
   }
 
   ValT *grad_data(uint32_t slot_index) {
-    size_t chunk_idx = slot_index / kChunkSize;
-    size_t offset = slot_index % kChunkSize;
+    size_t chunk_idx = slot_index >> chunk_shift_;
+    size_t offset = slot_index & chunk_mask_;
     return reinterpret_cast<ValT *>(grad_chunks_[chunk_idx].data() +
                                     offset * grad_stride_);
   }
 
   const ValT *grad_data(uint32_t slot_index) const {
-    size_t chunk_idx = slot_index / kChunkSize;
-    size_t offset = slot_index % kChunkSize;
+    size_t chunk_idx = slot_index >> chunk_shift_;
+    size_t offset = slot_index & chunk_mask_;
     return reinterpret_cast<const ValT *>(grad_chunks_[chunk_idx].data() +
                                           offset * grad_stride_);
   }
@@ -314,6 +319,9 @@ private:
   size_t grad_stride_;
   PageStorage storage_;
   bool page_eviction_enabled_;
+  size_t chunk_size_{8192};
+  unsigned chunk_shift_{13};
+  size_t chunk_mask_{8191};
   std::vector<StoragePage> grad_chunks_;
   size_t capacity_{0};
   static constexpr size_t kStripeCount = 64;

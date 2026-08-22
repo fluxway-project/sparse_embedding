@@ -1,7 +1,7 @@
 """
 Core BUILD file for the sparse_embedding package.
 
-Single unified _core.so target:
+Unified Python extension targets:
   multi-slot HogwildEmbeddingStore + DLPack zero-copy bindings + stdexec parallelism
 """
 
@@ -22,7 +22,7 @@ refresh_compile_commands(
     exclude_external_sources = True,
     tags = ["manual"],
     targets = {
-        "//:sparse_embedding/_core.so": "",
+        "//:core_extension_lance": "",
     },
 )
 
@@ -33,7 +33,7 @@ sh_binary(
 )
 
 cc_binary(
-    name = "_core.so",
+    name = "core_extension",
     srcs = [
         "//sparse_embedding/src/bindings:srcs",
         "//sparse_embedding/src/ops:srcs",
@@ -55,8 +55,8 @@ cc_binary(
 )
 
 genrule(
-    name = "copy_core_so",
-    srcs = [":_core.so"],
+    name = "package_core_extension",
+    srcs = [":core_extension"],
     outs = ["sparse_embedding/_core.so"],
     cmd = "cp $< $@",
 )
@@ -64,7 +64,7 @@ genrule(
 # ---- _core.so with lance-c: opt-in build ----
 
 genrule(
-    name = "copy_liblance_c",
+    name = "package_liblance_c",
     srcs = ["@lance_c//:build_lance_c"],
     outs = ["sparse_embedding/liblance_c.so"],
     cmd = "cp $< $@",
@@ -72,7 +72,7 @@ genrule(
 )
 
 cc_binary(
-    name = "core_so_with_lance",
+    name = "core_extension_lance",
     srcs = [
         "//sparse_embedding/src/bindings:srcs_without_module",
         "//sparse_embedding/src/ops:srcs",
@@ -102,7 +102,7 @@ py_library(
     name = "sparse_embedding_lib",
     srcs = glob(["sparse_embedding/**/*.py"]),
     data = [
-        ":copy_core_so",
+        ":package_core_extension",
     ],
     imports = ["."],
     visibility = ["//visibility:public"],
@@ -112,8 +112,8 @@ py_library(
     name = "sparse_embedding_lib_with_lance",
     srcs = glob(["sparse_embedding/**/*.py"]),
     data = [
-        ":copy_core_so",
-        ":copy_liblance_c",
+        ":package_core_extension",
+        ":package_liblance_c",
     ],
     imports = ["."],
     tags = ["manual"],
@@ -127,7 +127,7 @@ py_wheel(
     python_requires = PYTHON_REQUIRES,
     version = PACKAGE_VERSION,
     deps = [
-        ":copy_core_so",
+        ":package_core_extension",
         ":sparse_embedding_lib",
     ],
 )
@@ -140,8 +140,8 @@ py_wheel(
     tags = ["manual"],
     version = PACKAGE_VERSION,
     deps = [
-        ":copy_core_so",
-        ":copy_liblance_c",
+        ":package_core_extension",
+        ":package_liblance_c",
         ":sparse_embedding_lib_with_lance",
     ],
 )
