@@ -205,7 +205,12 @@ int main(int argc, char **argv) {
       se::EmbeddingArena<float>::kEntriesPerPage;
   Store residency_store(
       {8}, {}, nullptr, se::NoScorePolicy{},
-      se::HogwildStoreOptions{.thread_budget = 1, .storage = storage});
+      se::HogwildStoreOptions{
+          .thread_budget = 1,
+          .storage = storage,
+          .storage_tuning = {.entries_per_page =
+                                 se::EmbeddingArena<float>::kEntriesPerPage,
+                             .calibrate_page_geometry = false}});
   std::vector<uint64_t> residency_old_keys(residency_page_key_count);
   std::iota(residency_old_keys.begin(), residency_old_keys.end(),
             uint64_t{3000000});
@@ -351,7 +356,12 @@ int main(int argc, char **argv) {
       tight_compaction_page_count * se::EmbeddingArena<float>::kEntriesPerPage;
   Store tight_compaction_store(
       {tight_compaction_dim}, {}, nullptr, se::NoScorePolicy{},
-      se::HogwildStoreOptions{.thread_budget = 8, .storage = storage});
+      se::HogwildStoreOptions{
+          .thread_budget = 8,
+          .storage = storage,
+          .storage_tuning = {.entries_per_page =
+                                 se::EmbeddingArena<float>::kEntriesPerPage,
+                             .calibrate_page_geometry = false}});
   std::vector<uint64_t> tight_compaction_keys(tight_compaction_key_count);
   std::iota(tight_compaction_keys.begin(), tight_compaction_keys.end(),
             uint64_t{600000});
@@ -392,7 +402,12 @@ int main(int argc, char **argv) {
       });
   HotPromotionStore hot_promotion_store(
       {8}, {}, std::move(hot_training_factory), se::ManualScorePolicy{},
-      se::HogwildStoreOptions{.thread_budget = 4, .storage = storage});
+      se::HogwildStoreOptions{
+          .thread_budget = 4,
+          .storage = storage,
+          .storage_tuning = {.entries_per_page =
+                                 se::EmbeddingArena<float>::kEntriesPerPage,
+                             .calibrate_page_geometry = false}});
   constexpr size_t hot_promotion_keys =
       se::EmbeddingArena<float>::kEntriesPerPage;
   std::vector<uint64_t> hot_keys(hot_promotion_keys);
@@ -510,7 +525,12 @@ int main(int argc, char **argv) {
       parallel_page_sources * se::EmbeddingArena<float>::kEntriesPerPage;
   Store parallel_page_store(
       {8}, {}, nullptr, se::NoScorePolicy{},
-      se::HogwildStoreOptions{.thread_budget = 16, .storage = storage});
+      se::HogwildStoreOptions{
+          .thread_budget = 16,
+          .storage = storage,
+          .storage_tuning = {.entries_per_page =
+                                 se::EmbeddingArena<float>::kEntriesPerPage,
+                             .calibrate_page_geometry = false}});
   std::vector<uint64_t> parallel_page_keys(parallel_page_key_count);
   std::iota(parallel_page_keys.begin(), parallel_page_keys.end(),
             uint64_t{400000});
@@ -586,7 +606,12 @@ int main(int argc, char **argv) {
 
   Store same_page_store(
       {8}, {}, nullptr, se::NoScorePolicy{},
-      se::HogwildStoreOptions{.thread_budget = 16, .storage = storage});
+      se::HogwildStoreOptions{
+          .thread_budget = 16,
+          .storage = storage,
+          .storage_tuning = {.entries_per_page =
+                                 se::EmbeddingArena<float>::kEntriesPerPage,
+                             .calibrate_page_geometry = false}});
   std::vector<uint64_t> same_page_keys(
       se::EmbeddingArena<float>::kEntriesPerPage);
   std::iota(same_page_keys.begin(), same_page_keys.end(), uint64_t{500000});
@@ -921,7 +946,12 @@ int main(int argc, char **argv) {
       });
   AdamStore full_page_adam_store(
       {8}, {}, std::move(full_page_adam_factory), se::NoScorePolicy{},
-      se::HogwildStoreOptions{.thread_budget = 16, .storage = storage});
+      se::HogwildStoreOptions{
+          .thread_budget = 16,
+          .storage = storage,
+          .storage_tuning = {.entries_per_page =
+                                 se::EmbeddingArena<float>::kEntriesPerPage,
+                             .calibrate_page_geometry = false}});
   constexpr size_t full_page_adam_key_count =
       se::EmbeddingArena<float>::kEntriesPerPage;
   std::vector<uint64_t> full_page_adam_keys(full_page_adam_key_count);
@@ -1108,8 +1138,12 @@ int main(int argc, char **argv) {
       se::EmbeddingArena<float>::kEntriesPerPage;
   ScoredStore full_page_score_store(
       {8}, {}, nullptr, se::ManualScorePolicy{},
-      se::HogwildStoreOptions{.thread_budget = 16,
-                              .storage = duplicate_storage});
+      se::HogwildStoreOptions{
+          .thread_budget = 16,
+          .storage = duplicate_storage,
+          .storage_tuning = {.entries_per_page =
+                                 se::EmbeddingArena<float>::kEntriesPerPage,
+                             .calibrate_page_geometry = false}});
   std::vector<uint64_t> full_page_score_keys(full_page_score_key_count);
   std::iota(full_page_score_keys.begin(), full_page_score_keys.end(),
             uint64_t{620000});

@@ -42,11 +42,20 @@ cc_library(
 )
 
 cc_library(
+    name = "checkpoint_layout_schema",
+    hdrs = [
+        "lance/layout_schema.hpp",
+    ],
+    visibility = ["//visibility:public"],
+)
+
+cc_library(
     name = "checkpoint",
     visibility = ["//visibility:public"],
     deps = [
         ":checkpoint_batch_filter",
         ":checkpoint_interface",
+        ":checkpoint_layout_schema",
         ":checkpoint_registry",
         ":partitioned_checkpoint",
     ],
@@ -102,5 +111,5 @@ cc_test(
 cc_test(
     name = "lance_layout_schema_test",
     srcs = ["lance/layout_schema_test.cpp"],
-    deps = [":checkpoint_lance"],
+    deps = [":checkpoint_layout_schema"],
 )

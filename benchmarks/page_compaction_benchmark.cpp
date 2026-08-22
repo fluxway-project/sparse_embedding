@@ -20,6 +20,7 @@
 
 #include "sparse_embedding/src/backend/hogwild/hogwild_embedding_store.hpp"
 #include "sparse_embedding/src/storage/page_storage.hpp"
+#include "sparse_embedding/src/storage/topology/storage_resource_tuner.hpp"
 
 namespace {
 
@@ -34,6 +35,7 @@ using Store =
 
 struct Result {
   size_t workers;
+  size_t entries_per_page;
   double seconds;
   double relocated_keys_per_second;
 };
@@ -86,15 +88,26 @@ Result run_once(size_t workers, size_t store_threads,
   if (source_page_count % workers != 0)
     throw std::invalid_argument("strong scaling does not divide source pages");
   const size_t pages_per_worker = source_page_count / workers;
-  const size_t key_count =
-      source_page_count * se::EmbeddingArena<float>::kEntriesPerPage;
+  const auto topology = se::storage::StorageResourceTuner::derive(
+      se::storage::TopologyTuneRequest{
+          .thread_budget = store_threads,
+          .embedding_dim = kDimension,
+          .tuning = {.workload = se::storage::StorageWorkload::kCompaction,
+                     .calibrate_page_geometry = true}});
+  const size_t entries_per_page = topology.entries_per_page();
+  const size_t key_count = source_page_count * entries_per_page;
   se::StorageOptions options;
   options.mode = se::StorageMode::kMemoryOnly;
   options.memory_limit_bytes = size_t{1} << 30;
   auto storage = se::create_page_storage(std::move(options));
+  se::storage::StorageTuningOptions storage_tuning;
+  storage_tuning.entries_per_page = entries_per_page;
+  storage_tuning.workload = se::storage::StorageWorkload::kCompaction;
+  storage_tuning.calibrate_page_geometry = false;
   Store store({kDimension}, {}, nullptr, se::NoScorePolicy{},
               se::HogwildStoreOptions{.thread_budget = store_threads,
-                                      .storage = storage});
+                                      .storage = storage,
+                                      .storage_tuning = storage_tuning});
   if (preallocate_destinations && store.reserve(key_count * 2, kDimension)) {
     throw std::runtime_error(
         "page-compaction destination preallocation failed");
@@ -301,7 +314,8 @@ Result run_once(size_t workers, size_t store_threads,
     if (actual != values)
       throw std::runtime_error("page-compaction benchmark changed a payload");
   }
-  return {workers, seconds, static_cast<double>(key_count) / seconds};
+  return {workers, entries_per_page, seconds,
+          static_cast<double>(key_count) / seconds};
 }
 
 size_t parse_worker_count(std::string_view argument) {
@@ -377,6 +391,7 @@ int main(int argc, char **argv) {
     std::vector<double> seconds;
     std::vector<double> throughputs;
     std::vector<size_t> compaction_runs;
+    size_t entries_per_page = 0;
     seconds.reserve(samples);
     throughputs.reserve(samples);
     compaction_runs.reserve(samples);
@@ -384,6 +399,10 @@ int main(int argc, char **argv) {
       const Result result = run_once(
           workers, options.store_threads, options.preallocate_destinations,
           options.profile_pause, options.strong_scaling);
+      if (sample == 0)
+        entries_per_page = result.entries_per_page;
+      else if (result.entries_per_page != entries_per_page)
+        throw std::runtime_error("page geometry changed during benchmark");
       seconds.push_back(result.seconds);
       throughputs.push_back(result.relocated_keys_per_second);
       compaction_runs.push_back(1);
@@ -392,6 +411,7 @@ int main(int argc, char **argv) {
     std::ranges::sort(throughputs);
     std::ranges::sort(compaction_runs);
     std::cout << "page_compaction_workers=" << workers << " samples=" << samples
+              << " entries_per_page=" << entries_per_page
               << " preallocated_destinations="
               << static_cast<int>(options.preallocate_destinations)
               << " store_threads=" << options.store_threads

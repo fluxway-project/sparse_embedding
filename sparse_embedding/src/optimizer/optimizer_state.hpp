@@ -27,6 +27,8 @@
 #include <stdexcept>
 #include <vector>
 
+#include <bit>
+
 #include "sparse_embedding/src/optimizer/stable_page_directory.hpp"
 #include "sparse_embedding/src/storage/page_storage.hpp"
 
@@ -34,13 +36,20 @@ namespace se {
 
 template <typename T> class OptimizerStateArena {
   static constexpr size_t kCacheLineSize = 64;
-  static constexpr size_t kEntriesPerPage = 4096;
 
 public:
   explicit OptimizerStateArena(size_t dim, PageStorage storage,
-                               bool page_eviction_enabled = false)
+                               bool page_eviction_enabled = false,
+                               size_t entries_per_page = 4096)
       : dim_(dim), storage_(std::move(storage)),
-        page_eviction_enabled_(page_eviction_enabled) {
+        page_eviction_enabled_(page_eviction_enabled),
+        entries_per_page_(entries_per_page),
+        entries_shift_(
+            static_cast<unsigned>(std::countr_zero(entries_per_page))),
+        slot_mask_(entries_per_page - 1) {
+    if (entries_per_page_ == 0 || !std::has_single_bit(entries_per_page_))
+      throw std::invalid_argument(
+          "optimizer state entries per page must be a power of two");
     row_stride_ =
         (dim * sizeof(T) + kCacheLineSize - 1) & ~(kCacheLineSize - 1);
   }
@@ -62,7 +71,8 @@ public:
       return;
     }
     std::lock_guard<std::mutex> lock(alloc_mtx_);
-    size_t required_pages = (capacity + kEntriesPerPage - 1) / kEntriesPerPage;
+    size_t required_pages =
+        (capacity + entries_per_page_ - 1) >> entries_shift_;
     if (pages_.page_count() >= required_pages)
       return;
     while (pages_.page_count() < required_pages) {
@@ -75,14 +85,14 @@ public:
                                                  ? PageEvictionMode::kEnabled
                                                  : PageEvictionMode::kDisabled;
       auto page = std::make_unique<StoragePage>(
-          storage_->allocate(kEntriesPerPage * row_stride_, kCacheLineSize,
+          storage_->allocate(entries_per_page_ * row_stride_, kCacheLineSize,
                              std::move(evaluator), eviction_mode));
       StoragePage *page_ptr = page.get();
       storage_pages_.push_back(std::move(page));
       pages_.publish(pages_.page_count(), page_ptr);
       pages_.advance_count();
     }
-    capacity_.store(pages_.page_count() * kEntriesPerPage,
+    capacity_.store(pages_.page_count() * entries_per_page_,
                     std::memory_order_release);
   }
 
@@ -113,29 +123,32 @@ public:
   }
 
   void prefetch_state_cacheline(uint32_t index) const noexcept {
-    const StoragePage *page = pages_.load(index / kEntriesPerPage);
+    const StoragePage *page = pages_.load(index >> entries_shift_);
     if (page != nullptr) {
-      const std::byte *ptr =
-          page->data() + (index % kEntriesPerPage) * row_stride_;
+      const std::byte *ptr = page->data() + (index & slot_mask_) * row_stride_;
       __builtin_prefetch(ptr, 1, 3);
     }
   }
 
   constexpr size_t dim() const { return dim_; }
   constexpr size_t row_stride() const { return row_stride_; }
+  size_t entries_per_page() const noexcept { return entries_per_page_; }
 
 private:
   std::byte *raw(uint32_t index) const {
-    StoragePage *page = pages_.load(index / kEntriesPerPage);
+    StoragePage *page = pages_.load(index >> entries_shift_);
     if (page == nullptr)
       throw std::logic_error("optimizer state page is not allocated");
-    return page->data() + (index % kEntriesPerPage) * row_stride_;
+    return page->data() + (index & slot_mask_) * row_stride_;
   }
 
   size_t dim_;
   size_t row_stride_;
   PageStorage storage_;
   bool page_eviction_enabled_;
+  size_t entries_per_page_{4096};
+  unsigned entries_shift_{12};
+  size_t slot_mask_{4095};
   StablePageDirectory<StoragePage> pages_;
   std::vector<std::unique_ptr<StoragePage>> storage_pages_;
   std::atomic<size_t> capacity_{0};

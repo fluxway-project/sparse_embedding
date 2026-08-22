@@ -90,11 +90,29 @@ config = se.EmbeddingConfig(
     dims=[128],
     thread_budget=8,
     storage=storage,
+    storage_tuning=se.StorageTuningOptions(
+        target_capacity_keys=10_000_000,
+        memory_budget_bytes=4 << 30,
+        entries_per_page=4096,
+    ),
 )
 store = se.EmbeddingStore(config, score_policy="lfu")
 ```
 
 `MemoryOnly()` 禁用磁盘后备页，并在内存预算耗尽时抛异常。`AutoStorage(memory_limit_bytes=0, spill_directory=..., max_spill_bytes=...)` 使用指定 spill 设备保存可训练页面。非法存储限制、对齐、水位、容量或 registration token 都直接抛异常，不会选择 fallback 策略。
+
+## 通用存储拓扑与硬件自适应调优 (Storage Topology & Auto-Tuning)
+
+存储架构在独立公共层 `se::storage` 中统一维护跨后端的单一事实来源（SSOT）：
+
+1. **硬件资源探测 (`SystemResourceProbe`)**：
+   直接从 `/proc/meminfo` 解析高精度的 `MemAvailable`（无 fallback 伪造，解析失败直接抛出异常），并通过 `libnuma` 探测 NUMA 拓扑和物理硬件核心数。
+2. **数学推导与自适应调优 (`StorageResourceTuner`)**：
+   - **实测页大小校准**：启动时 `StorageResourceTuner` 针对 `{4096, 8192, 16384}` 候选页大小执行短校准，输入包含 embedding 维度、worker 数、workload（`forward_lookup`、`lookup_insert`、`compaction` 或 `training`）和 NUMA 模式。系统使用各候选的中位耗时选择结果，并按完整请求形状缓存。显式设置 `entries_per_page` 会关闭校准；`calibration_samples` 默认 3，最多 7。
+   - **动态最大页数 (`max_pages`)**：根据可用内存 75% 预算与单 Entry 全开销（包含 locator 与 directory 元数据）推导最大页数上限，并对齐至 NUMA Cohort 整数倍。
+3. **不可变拓扑契约 (`StorageTopology`)**：
+   构造时固化全部拓扑不变性，预计算全位移与掩码量（`entries_shift_`、`slot_mask_`、`shard_mask_`）。热路径中的页坐标与槽位寻址彻底消除除法与取模，全部采用单周期 branchless 位运算：
+   $$\text{page\_id} = \text{index} \gg \text{entries\_shift}, \quad \text{slot\_offset} = \text{index} \ \& \ \text{slot\_mask}$$
 
 ## 运行时原理与并发设计
 
@@ -105,6 +123,9 @@ store = se.EmbeddingStore(config, score_policy="lfu")
 每个 shard 原子发布不可变 `MapBundle*`。map value 是非零 `slot_id`，不是 arena index。reader acquire-load 当前 bundle，不获取 shard shared mutex。结构性 writer（insert、erase、reserve、locator rotation、checkpoint import）才持有该 shard writer mutex，克隆已发布 bundle，应用目录修改，再通过一次 atomic exchange 发布替换版本。普通 lookup、optimizer 和 compaction relocation 不获取该 mutex；它们只使用 locator packed seqlock/CAS。旧 bundle 通过共享 epoch-retirement pressure 域回收。
 
 `SegmentedLocatorTable` 拥有固定 32 KiB segment，每个 segment 含 4,096 个 8-byte locator slot。slot 保存 `{sequence, arena_index}` 并按 8-byte 对齐。slot ID、locator slot、arena index、page 与 store snapshot 都只能在 epoch 安全回收后复用。locator sequence 接近 wraparound 时，目录会把该 key rotate 到新 slot，并永久退休旧 slot，避免 ABA。
+
+物理页目录在 `PageTable` 中使用两级分段常驻指针目录 `StablePageDirectory<T>`（统一管理 `data`、`states`、`owner`、`locks`），彻底消除了堆上的 `std::unique_ptr<OwnerRecord[]>*` 指针跳转。页目录常驻 L1 Cache，分配新页时原子发布，热路径以极低延迟单步寻址：
+$$\text{owner} = \text{pages\_}\to\text{owner.load}(\text{index} \gg \text{entries\_shift})[\text{index} \ \& \ \text{slot\_mask}]$$
 
 payload 访问使用 Linux x86_64 GCC/Clang 纯乐观 SeqLock 契约。Compaction 物理搬迁等修改 `arena_index` 映射的操作通过 CAS 把偶数 sequence 改为奇数，迁移物理页 payload，再 release-publish 偶数新 sequence 与新地址。reader 与就地权重更新者（`optimizer_step`、`assign_existing`）通过纯乐观 `try_read` acquire-load sequence 与 arena 索引，经过 compiler barrier 后直接在目标内存就地读取或修改，再经过第二个 barrier 并复读 sequence 校验一致性。reader 完全 lock-free 且读路径零原子计数写入，在 writer 搬迁时自动感知版本变动并重试。
 

@@ -10,6 +10,7 @@
 #include "sparse_embedding/src/execution/dispatch_budget.hpp"
 #include "sparse_embedding/src/execution/locality_policy.hpp"
 #include "sparse_embedding/src/storage/page_storage.hpp"
+#include "sparse_embedding/src/storage/topology/storage_topology.hpp"
 
 namespace se {
 
@@ -17,6 +18,7 @@ struct HogwildStoreOptions {
   size_t thread_budget = 0;
   LocalityPolicy locality;
   PageStorage storage = create_page_storage();
+  storage::StorageTuningOptions storage_tuning;
 
   std::optional<OperationDispatchConfig> dispatch_config() const {
     if (locality.execution == LocalityMode::kAuto &&

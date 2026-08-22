@@ -122,7 +122,10 @@ int main(int argc, char **argv) {
                   .locality = se::LocalityPolicy{bind_affinity
                                                      ? se::LocalityMode::kNuma
                                                      : se::LocalityMode::kAuto,
-                                                 se::LocalityMode::kAuto}});
+                                                 se::LocalityMode::kAuto},
+                  .storage_tuning = {
+                      .workload = se::storage::StorageWorkload::kTraining,
+                      .calibrate_page_geometry = true}});
   std::vector<uint64_t> keys(kRows);
   std::vector<int64_t> lengths(kRows, static_cast<int64_t>(kDimension));
   std::vector<float> values(kRows * kDimension, 0.25F);

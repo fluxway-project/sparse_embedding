@@ -18,31 +18,27 @@
 #ifndef SPARSE_EMBEDDING_MODULE_WRAPPER_HPP_
 #define SPARSE_EMBEDDING_MODULE_WRAPPER_HPP_
 
+#include <dlpack/dlpack.h>
 #include <nanobind/nanobind.h>
 #include <nanobind/stl/optional.h>
 #include <nanobind/stl/string.h>
 #include <nanobind/stl/vector.h>
-
-#include <dlpack/dlpack.h>
 #include <proxy/proxy.h>
 
 #include <algorithm>
 #include <cstdint>
 #include <cstring>
+#include <exec/static_thread_pool.hpp>
 #include <memory>
 #include <optional>
-#include <ranges>
 #include <span>
 #include <stdexcept>
 #include <string>
 #include <system_error>
-#include <thread>
 #include <type_traits>
 #include <utility>
 #include <variant>
 #include <vector>
-
-#include <exec/static_thread_pool.hpp>
 
 #include "sparse_embedding/src/bindings/construct_api.hpp"
 #include "sparse_embedding/src/bindings/dlpack_utils.hpp"
@@ -255,7 +251,6 @@ SE_DECLARE_TYPED_BINDING_INSTANCES(se::bfloat16_t, float)
 SE_DECLARE_TYPED_BINDING_INSTANCES(se::bfloat16_t, se::float16_t)
 SE_DECLARE_TYPED_BINDING_INSTANCES(se::bfloat16_t, se::bfloat16_t)
 
-#ifdef SE_ENABLE_LANCE_CHECKPOINTER
 #define SE_DECLARE_TYPED_CHECKPOINT_INSTANCE(PARAM_T, OPT_T)                   \
   extern template struct CheckpointOpsImpl<PARAM_T, OPT_T>;
 
@@ -270,7 +265,6 @@ SE_DECLARE_TYPED_CHECKPOINT_INSTANCE(se::bfloat16_t, se::float16_t)
 SE_DECLARE_TYPED_CHECKPOINT_INSTANCE(se::bfloat16_t, se::bfloat16_t)
 
 #undef SE_DECLARE_TYPED_CHECKPOINT_INSTANCE
-#endif
 
 #undef SE_DECLARE_TYPED_BINDING_INSTANCES
 
@@ -281,7 +275,8 @@ SE_DECLARE_TYPED_CHECKPOINT_INSTANCE(se::bfloat16_t, se::bfloat16_t)
 class EmbeddingStoreWrapper {
   friend void construct_store(EmbeddingStoreWrapper &, const PyInitializer &,
                               const PyOptimizer &, size_t,
-                              se::StoreConstructionKind);
+                              se::StoreConstructionKind,
+                              const se::EmbeddingConfig &);
   template <typename, typename> friend struct SyncOpsImpl;
   template <typename, typename> friend struct AsyncOpsImpl;
   template <typename, typename> friend struct CheckpointOpsImpl;
@@ -357,7 +352,7 @@ public:
   nb::object async_assign_scores(nb::object keys, nb::object scores);
 
   // ---- Checkpoint Operations ----
-
+#ifdef SE_ENABLE_LANCE_C
   void save_checkpoint(const std::string &uri, const std::string &mode,
                        uint64_t min_score, bool include_optimizer_state,
                        bool use_compression);
@@ -380,6 +375,7 @@ public:
 
   void set_checkpoint_factories(se::CheckpointWriterFactory wf,
                                 se::CheckpointReaderFactory rf);
+#endif
 
   void export_batches_dlpack(nb::callable visitor, size_t batch_size = 65536,
                              bool include_optimizer_state = false);
