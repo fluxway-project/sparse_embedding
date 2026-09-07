@@ -14,6 +14,7 @@ from .base import (
     SparseCheckpointLocator,
     SparseCheckpointProtocol,
     SparseCheckpointStorage,
+    SparseWeightSnapshot,
 )
 
 
@@ -25,7 +26,12 @@ class SparseCheckpoint:
     def integration_protocol(self) -> SparseCheckpointProtocol:
         return self._protocol
 
-    def save(self, store: Any, name: str) -> SparseCheckpointLocator:
+    def save(
+        self,
+        store: Any,
+        name: str,
+        include_page_images: bool = False,
+    ) -> SparseCheckpointLocator:
         attempt = uuid.uuid4().hex
         identity = CheckpointSaveIdentity(
             name,
@@ -40,7 +46,7 @@ class SparseCheckpoint:
         self._protocol.prepare_checkpoint(identity)
         try:
             fragment = self._protocol.write_checkpoint_fragment(
-                store, identity, participant
+                store, identity, participant, include_page_images=include_page_images
             )
             locator = self._protocol.commit_checkpoint(identity, (fragment,))
             self._protocol.acknowledge_checkpoint(identity)
@@ -54,6 +60,19 @@ class SparseCheckpoint:
         store: Any,
         locator: SparseCheckpointLocator,
         mode: RestoreMode | None = None,
+        *,
+        load_optimizer_state: bool = True,
     ) -> None:
         selected_mode = mode or PhysicalRestore(CheckpointParticipant(0, 1))
-        self._protocol.restore_checkpoint(store, locator, selected_mode)
+        self._protocol.restore_checkpoint(
+            store, locator, selected_mode, load_optimizer_state
+        )
+
+    def restore_weight_snapshot(
+        self,
+        store: Any,
+        snapshot: SparseWeightSnapshot,
+        mode: RestoreMode | None = None,
+    ) -> None:
+        selected_mode = mode or PhysicalRestore(CheckpointParticipant(0, 1))
+        self._protocol.restore_weight_snapshot(store, snapshot, selected_mode)

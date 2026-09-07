@@ -87,10 +87,12 @@ cc_library(
         "lance/native_fragment_writer.cpp",
     ],
     hdrs = [
+        "checkpoint_stream_policy.hpp",
         "lance/arrow/c/abi.h",
         "lance/lance_checkpoint.hpp",
         "lance/layout_schema.hpp",
         "lance/native_fragment_writer.hpp",
+        "lance/storage_options.hpp",
     ],
     tags = ["manual"],
     visibility = ["//visibility:public"],

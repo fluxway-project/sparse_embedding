@@ -23,10 +23,20 @@ diagnostic event to the bounded telemetry ring. The single consumer may write
 the event to `std::clog`; the producer never performs I/O, and a full ring drops
 the diagnostic without blocking the training path.
 
-Lance checkpoints contain `entries`, physical `page_images`, and a version-pinned
-manifest. Page images store slot layout, `seq_count`, parameters, score,
-optimizer state/step, and SHA-256 checksums. Incremental checkpoints append only
-changed entries and tombstones; an external coordinator performs global commit.
+Lance checkpoints maintain canonical `entries` as the single source of truth (SSOT), with physical
+`page_images` serving as an optional fast import cache (explicitly enabled via `include_page_images=True`),
+pinned by a versioned snapshot manifest. Writing operates through a bounded producer-consumer channel
+(`BoundedChannel`) for single-transaction commits with $O(N_{live})$ compact page-index metadata plus bounded
+page/writer buffers, eliminating multi-transaction
+append overhead. Compaction leverages participant topological disjointness to eliminate in-memory hash set overhead,
+merging datasets over bounded-memory pipelines. Local directories are published via POSIX atomic `rename(2)`
+with zero auxiliary JSON files, while remote S3/S3A datasets use immutable staging and single-object strongly consistent
+pointers with full cascading cleanup across overwriting, deletion, and rollbacks to guarantee zero orphan data.
+Page images store slot layout, `seq_count`, parameters, score, optimizer state/step, and
+SHA-256 checksums. Incremental checkpoints append only changed entries and tombstones; an external coordinator
+performs global commit.
+Inference uses `EmbeddingConfig(enable_optimizer=False)` and `restore_weight_snapshot`,
+which avoids optimizer-state allocation and loading.
 
 Compaction, hot-key promotion, and page eviction update one authoritative
 directory. Source pages remain readable until epoch safety and are never reused

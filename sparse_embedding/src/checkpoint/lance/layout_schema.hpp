@@ -182,28 +182,30 @@ inline ArrowSchema make_page_images_schema(const char *metadata = nullptr) {
 }
 
 inline ArrowSchema make_manifest_schema(const char *metadata = nullptr) {
-  constexpr size_t kManifestFieldCount = 20;
+  constexpr size_t kManifestFieldCount = 22;
   auto **children = new ArrowSchema *[kManifestFieldCount];
   children[0] = make_leaf_schema("protocol_version", "I");
   children[1] = make_leaf_schema("checkpoint_name", "u");
   children[2] = make_leaf_schema("checkpoint_version", "L");
   children[3] = make_leaf_schema("parent_checkpoint_version", "L");
-  children[4] = make_leaf_schema("entries_lance_version", "L");
-  children[5] = make_leaf_schema("page_images_lance_version", "L");
-  children[6] = make_leaf_schema("participant_count", "I");
-  children[7] = make_leaf_schema("checkpoint_mode", "u");
-  children[8] = make_leaf_schema("schema_digest", "u");
-  children[9] = make_leaf_schema("fragment_digest", "u");
-  children[10] = make_leaf_schema("save_attempt", "u");
-  children[11] = make_leaf_schema("authority_scope", "u");
-  children[12] = make_leaf_schema("authority_generation", "L");
-  children[13] = make_leaf_schema("commit_authority", "u");
-  children[14] = make_leaf_schema("created_at", "tsu:UTC");
-  children[15] = make_list_schema("dimensions", "item", "I");
-  children[16] = make_leaf_schema("embedding_dtype", "u");
-  children[17] = make_leaf_schema("optimizer_dtype", "u");
-  children[18] = make_leaf_schema("score_policy", "u");
-  children[19] = make_leaf_schema("reference_id", "u");
+  children[4] = make_leaf_schema("participant_count", "I");
+  children[5] = make_leaf_schema("checkpoint_mode", "u");
+  children[6] = make_leaf_schema("schema_digest", "u");
+  children[7] = make_leaf_schema("fragment_digest", "u");
+  children[8] = make_leaf_schema("save_attempt", "u");
+  children[9] = make_leaf_schema("authority_scope", "u");
+  children[10] = make_leaf_schema("authority_generation", "L");
+  children[11] = make_leaf_schema("commit_authority", "u");
+  children[12] = make_leaf_schema("created_at", "tsu:UTC");
+  children[13] = make_list_schema("dimensions", "item", "I");
+  children[14] = make_leaf_schema("embedding_dtype", "u");
+  children[15] = make_leaf_schema("optimizer_dtype", "u");
+  children[16] = make_leaf_schema("score_policy", "u");
+  children[17] = make_leaf_schema("reference_id", "u");
+  children[18] = make_list_schema("fragment_ids", "item", "u");
+  children[19] = make_leaf_schema("compacted_version", "L");
+  children[20] = make_leaf_schema("commit_state", "u");
+  children[21] = make_leaf_schema("storage_mode", "u");
 
   return ArrowSchema{
       .format = "+s",

@@ -77,6 +77,7 @@ store.optimizer_step()
 ## Important Notes
 
 * **Score Policy is Required:** If you specify a dynamic LR policy that depends on scores (like `SqrtDecayLrPolicy`), you **must** also enable a score policy (e.g. `score_policy="lfu"`) in the `EmbeddingStore`. Failing to do so will result in a `ValueError` during initialization.
+* **Training Store Required:** Dynamic learning-rate policies are optimizer operations. Keep `EmbeddingConfig(enable_optimizer=True)` (the default) and provide `optimizer_config`; an optimizer-disabled inference store rejects gradient accumulation and optimizer steps.
 * **Performance:** The dynamic learning rate calculation introduces minimal overhead. The static/dynamic execution paths are resolved via `constexpr` at compile time to ensure zero overhead for static LR configurations, while dynamic LR computations are fully fused with the highly optimized SIMD vectorization updates (like AVX2/AVX-512).
 
 ## Validation

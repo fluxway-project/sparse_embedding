@@ -28,6 +28,7 @@
 #include <stdexcept>
 #include <string>
 #include <thread>
+#include <utility>
 
 #include "sparse_embedding/src/bindings/async_bridge.hpp"
 #include "sparse_embedding/src/bindings/dlpack_utils.hpp"
@@ -46,6 +47,23 @@ namespace nb = nanobind;
 
 using namespace se::py::detail;
 
+namespace {
+
+#ifdef SE_ENABLE_LANCE_C
+se::LanceStorageOptions
+checkpoint_storage_options(const nb::dict &storage_options) {
+  std::vector<std::pair<std::string, std::string>> options;
+  options.reserve(storage_options.size());
+  for (auto item : storage_options) {
+    options.emplace_back(nb::cast<std::string>(item.first),
+                         nb::cast<std::string>(item.second));
+  }
+  return se::LanceStorageOptions(options);
+}
+#endif
+
+} // namespace
+
 // =============================================================================
 // EmbeddingStoreWrapper constructor.
 // =============================================================================
@@ -53,12 +71,16 @@ using namespace se::py::detail;
 namespace se::py::detail {
 
 void construct_store(EmbeddingStoreWrapper &self, const PyInitializer &init_cfg,
-                     const PyOptimizer &opt_cfg, size_t thread_budget,
-                     se::StoreConstructionKind kind,
+                     const std::optional<PyOptimizer> &opt_cfg,
+                     size_t thread_budget, se::StoreConstructionKind kind,
                      const se::EmbeddingConfig &emb_cfg) {
   se::StoreConstructionTarget target{&self.store_, self.dims_, self.storage_,
                                      emb_cfg.storage_tuning};
-  se::StoreConstructionRequest request{init_cfg.builder, opt_cfg.config};
+  se::StoreConstructionRequest request{
+      init_cfg.builder,
+      opt_cfg.has_value()
+          ? std::optional<se::OptimizerConfigVariant>(opt_cfg->config)
+          : std::nullopt};
   se::create_hogwild_store(kind, std::move(target), std::move(request),
                            thread_budget);
 }
@@ -75,6 +97,7 @@ EmbeddingStoreWrapper::EmbeddingStoreWrapper(
                                                   ? emb_cfg.value_dtype
                                                   : emb_cfg.optimizer_dtype,
                                               "opt_dtype")),
+      optimizer_enabled_(emb_cfg.enable_optimizer),
       key_type_enum_(parse_key_dtype(emb_cfg.key_dtype)),
       score_policy_name_(score_policy_name),
       storage_(se::create_page_storage(emb_cfg.storage)) {
@@ -83,7 +106,12 @@ EmbeddingStoreWrapper::EmbeddingStoreWrapper(
           pro::make_proxy<se::InitializerBuilderFacade,
                           UniformInitializerBuilder>(-0.05f, 0.05f))});
 
-  PyOptimizer opt_cfg = opt_cfg_opt.value_or(PyOptimizer{se::AdamConfig{}});
+  if (!emb_cfg.enable_optimizer && opt_cfg_opt.has_value())
+    throw std::invalid_argument(
+        "optimizer_config cannot be provided when enable_optimizer is false");
+  std::optional<PyOptimizer> opt_cfg = std::move(opt_cfg_opt);
+  if (emb_cfg.enable_optimizer && !opt_cfg.has_value())
+    opt_cfg.emplace(PyOptimizer{se::AdamConfig{}});
 
   dims_ = emb_cfg.dims;
   if (dims_.empty())
@@ -94,14 +122,18 @@ EmbeddingStoreWrapper::EmbeddingStoreWrapper(
                              : emb_cfg.thread_budget;
 
   const auto score_policy = se::parse_store_score_policy(score_policy_name);
-  const bool requires_score = std::visit(
-      [](const auto &config) {
-        return config.dynamic_lr_policy.has_value() &&
-               std::visit(
-                   [](const auto &policy) { return policy.requires_score(); },
-                   *config.dynamic_lr_policy);
-      },
-      opt_cfg.config);
+  const bool requires_score =
+      opt_cfg.has_value() &&
+      std::visit(
+          [](const auto &config) {
+            return config.dynamic_lr_policy.has_value() &&
+                   std::visit(
+                       [](const auto &policy) {
+                         return policy.requires_score();
+                       },
+                       *config.dynamic_lr_policy);
+          },
+          opt_cfg->config);
   if (requires_score && score_policy == se::StoreScorePolicy::kNone)
     throw std::invalid_argument(
         "dynamic learning-rate policy requires a score policy");
@@ -344,16 +376,18 @@ NB_MODULE(_core, m) {
   nb::class_<se::EmbeddingConfig>(m, "_EmbeddingConfig")
       .def(nb::init<std::vector<size_t>, size_t, std::string, std::string,
                     std::string, se::StorageOptions,
-                    se::storage::StorageTuningOptions>(),
+                    se::storage::StorageTuningOptions, bool>(),
            nb::arg("dims"), nb::arg("thread_budget") = 0,
            nb::arg("value_dtype") = "float32", nb::arg("optimizer_dtype") = "",
            nb::arg("key_dtype") = "int64",
            nb::arg("storage") = se::StorageOptions{},
-           nb::arg("storage_tuning") = se::storage::StorageTuningOptions{})
+           nb::arg("storage_tuning") = se::storage::StorageTuningOptions{},
+           nb::arg("enable_optimizer") = true)
       .def_rw("dims", &se::EmbeddingConfig::dims)
       .def_rw("thread_budget", &se::EmbeddingConfig::thread_budget)
       .def_rw("value_dtype", &se::EmbeddingConfig::value_dtype)
       .def_rw("optimizer_dtype", &se::EmbeddingConfig::optimizer_dtype)
+      .def_rw("enable_optimizer", &se::EmbeddingConfig::enable_optimizer)
       .def_rw("key_dtype", &se::EmbeddingConfig::key_dtype)
       .def_rw("storage_tuning", &se::EmbeddingConfig::storage_tuning);
 
@@ -561,6 +595,7 @@ NB_MODULE(_core, m) {
            nb::arg("pages"))
       .def("value_dtype", &EmbeddingStoreWrapper::value_dtype)
       .def("optimizer_dtype", &EmbeddingStoreWrapper::optimizer_dtype)
+      .def("optimizer_enabled", &EmbeddingStoreWrapper::optimizer_enabled)
       .def("score_policy", &EmbeddingStoreWrapper::score_policy)
 
       ;
@@ -665,15 +700,17 @@ NB_MODULE(_core, m) {
          uint32_t participant_index, const std::vector<uint32_t> &dimensions,
          const std::string &embedding_dtype, const std::string &optimizer_dtype,
          const std::string &score_policy, uint32_t protocol_version,
-         const std::string &schema_digest) {
-        return self.write_native_fragment(
-            uri, participant_index, dimensions, embedding_dtype,
-            optimizer_dtype, score_policy, protocol_version, schema_digest);
+         const std::string &schema_digest, bool include_page_images) {
+        return self.write_native_fragment(uri, participant_index, dimensions,
+                                          embedding_dtype, optimizer_dtype,
+                                          score_policy, protocol_version,
+                                          schema_digest, include_page_images);
       },
       nb::arg("store"), nb::arg("uri"), nb::arg("participant_index"),
       nb::arg("dimensions"), nb::arg("embedding_dtype"),
       nb::arg("optimizer_dtype"), nb::arg("score_policy"),
-      nb::arg("protocol_version"), nb::arg("schema_digest"));
+      nb::arg("protocol_version"), nb::arg("schema_digest"),
+      nb::arg("include_page_images") = false);
   checkpoint.def(
       "set_checkpoint_factories",
       [](EmbeddingStoreWrapper &self, const std::string &backend) {
@@ -685,56 +722,86 @@ NB_MODULE(_core, m) {
   checkpoint.def(
       "restore_native_entries",
       [](EmbeddingStoreWrapper &self, const std::string &uri, uint64_t version,
-         nb::object selected_keys) {
-        self.restore_native_entries(uri, version, selected_keys);
+         nb::object selected_keys, const nb::dict &storage_options,
+         bool load_optimizer_state) {
+        self.restore_native_entries(uri, version, selected_keys,
+                                    checkpoint_storage_options(storage_options),
+                                    load_optimizer_state);
       },
       nb::arg("store"), nb::arg("uri"), nb::arg("version"),
-      nb::arg("selected_keys"));
+      nb::arg("selected_keys"), nb::arg("storage_options") = nb::dict(),
+      nb::arg("load_optimizer_state") = true);
   checkpoint.def(
       "restore_native_page_images",
-      [](EmbeddingStoreWrapper &self, const std::string &uri, uint64_t version,
-         uint32_t participant_index) {
-        self.restore_native_page_images(uri, version, participant_index);
+      [](EmbeddingStoreWrapper &self, const std::vector<std::string> &uris,
+         uint64_t version, uint32_t participant_index,
+         const nb::dict &storage_options, bool load_optimizer_state) {
+        self.restore_native_page_images(
+            uris, version, participant_index,
+            checkpoint_storage_options(storage_options), load_optimizer_state);
       },
-      nb::arg("store"), nb::arg("uri"), nb::arg("version"),
-      nb::arg("participant_index"));
+      nb::arg("store"), nb::arg("uris"), nb::arg("version"),
+      nb::arg("participant_index"), nb::arg("storage_options") = nb::dict(),
+      nb::arg("load_optimizer_state") = true);
   checkpoint.def(
       "active_entry_keys",
-      [](const std::string &uri, uint64_t version) {
+      [](const std::string &uri, uint64_t version,
+         const nb::dict &storage_options,
+         std::optional<uint32_t> participant_index) {
         std::vector<uint64_t> keys;
-        se::scan_native_active_entry_keys(
-            uri, version, [&](std::span<const uint64_t> batch) {
-              keys.insert(keys.end(), batch.begin(), batch.end());
-              return true;
-            });
+        const auto options = checkpoint_storage_options(storage_options);
+        {
+          nb::gil_scoped_release release;
+          se::scan_native_active_entry_keys(
+              uri, version,
+              [&](std::span<const uint64_t> batch) {
+                keys.insert(keys.end(), batch.begin(), batch.end());
+                return true;
+              },
+              participant_index, options);
+        }
         auto output = se::py::create_output_tensor<uint64_t>(
             std::array<int64_t, 1>{static_cast<int64_t>(keys.size())});
         std::copy(keys.begin(), keys.end(),
                   static_cast<uint64_t *>(output->dl_tensor.data));
         return se::py::wrap_output_tensor(output);
       },
-      nb::arg("uri"), nb::arg("version"));
+      nb::arg("uri"), nb::arg("version"),
+      nb::arg("storage_options") = nb::dict(),
+      nb::arg("participant_index") = nb::none());
   checkpoint.def(
-      "merge_native_lance_sources",
+      "validate_active_entry_keys",
+      [](const std::vector<std::string> &uris, uint64_t version,
+         const nb::dict &storage_options) {
+        const auto options = checkpoint_storage_options(storage_options);
+        nb::gil_scoped_release release;
+        se::validate_native_active_entry_keys(uris, version, options);
+      },
+      nb::arg("uris"), nb::arg("version"),
+      nb::arg("storage_options") = nb::dict());
+  checkpoint.def(
+      "compact_native_lance_sources",
       [](const std::string &target_uri,
          const std::vector<std::string> &source_uris,
-         const std::vector<std::string> &keys, uint64_t checkpoint_version) {
-        std::vector<std::string_view> key_views;
-        key_views.reserve(keys.size());
-        for (const auto &key : keys)
-          key_views.emplace_back(key);
-        const auto artifact = se::merge_native_lance_sources(
-            target_uri, source_uris, key_views, checkpoint_version);
+         const nb::dict &storage_options) {
+        const auto options = checkpoint_storage_options(storage_options);
+        se::NativeCompactionArtifact artifact;
+        {
+          nb::gil_scoped_release release;
+          artifact = se::compact_native_lance_sources(target_uri, source_uris,
+                                                      options);
+        }
         nb::dict result;
         result["locator"] = artifact.locator;
         result["target_version"] = artifact.target_version;
         result["inserted_rows"] = artifact.inserted_rows;
         result["updated_rows"] = artifact.updated_rows;
         result["deleted_rows"] = artifact.deleted_rows;
+        result["content_digest"] = artifact.content_digest;
         return result;
       },
-      nb::arg("target_uri"), nb::arg("source_uris"), nb::arg("keys"),
-      nb::arg("checkpoint_version") = 0);
+      nb::arg("target_uri"), nb::arg("source_uris"),
+      nb::arg("storage_options") = nb::dict());
 #endif
 
   m.def(

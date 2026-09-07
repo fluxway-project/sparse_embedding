@@ -20,6 +20,7 @@
 
 #include <ankerl/unordered_dense.h>
 #include <parlay/parallel.h>
+#include <unistd.h>
 
 #include <algorithm>
 #include <atomic>
@@ -42,7 +43,6 @@
 #include <system_error>
 #include <thread>
 #include <type_traits>
-#include <unistd.h>
 #include <unordered_map>
 #include <unordered_set>
 #include <utility>
@@ -1846,130 +1846,195 @@ public:
       return snapshot;
     }
 
-    std::vector<PageImageExport<ParamT, OptT>> materialize_page_images() {
+    struct PageSlotEntry {
+      uint64_t key;
+      uint64_t seq_count;
+      uint32_t slot_id;
+      uint32_t slot_ordinal;
+    };
+    static_assert(sizeof(PageSlotEntry) == 24);
+
+    template <typename Visitor> bool export_page_images(Visitor &&visitor) {
       const size_t optimizer_state_dim =
           optimizer.has_value() ? optimizer->state_dim() : 0;
-      std::unordered_map<uint64_t, size_t> page_positions;
-      std::vector<PageImageExport<ParamT, OptT>> images;
-      std::mutex materialization_mutex;
-
-      const auto image_for_index =
-          [&](uint32_t index) -> PageImageExport<ParamT, OptT> & {
-        const uint64_t page_id = index >> arena.entries_shift();
-        const auto [position, inserted] =
-            page_positions.try_emplace(page_id, images.size());
-        if (inserted) {
-          images.push_back({page_id,
-                            static_cast<uint32_t>(dim),
-                            static_cast<uint32_t>(arena.data_stride()),
-                            {},
-                            {},
-                            {},
-                            {},
-                            {},
-                            {},
-                            {}});
-          auto &image = images.back();
-          image.slot_ordinals.reserve(arena.entries_per_page());
-          image.keys.reserve(arena.entries_per_page());
-          image.seq_counts.reserve(arena.entries_per_page());
-          image.values.reserve(arena.entries_per_page() * dim);
-          if (score_policy.enabled())
-            image.scores.reserve(arena.entries_per_page());
-          if (optimizer_state_dim != 0) {
-            image.optimizer_states.reserve(arena.entries_per_page() *
-                                           optimizer_state_dim);
-            image.steps.reserve(arena.entries_per_page());
-          }
-        }
-        return images[position->second];
-      };
+      std::vector<std::vector<PageSlotEntry>> page_entries;
+      page_entries.reserve(arena.max_pages());
+      page_entries.resize(arena.page_count());
 
       for (const auto &key_shard : key_shards) {
         key_shard->for_each_entry([&](uint64_t key, uint32_t slot_id) {
-          struct CapturedEntry {
-            uint32_t index = 0;
-            uint64_t seq_count = 0;
-            uint64_t score = 0;
-            uint32_t step = 0;
-            bool mapped = false;
-            std::vector<ParamT> values;
-            std::vector<OptT> optimizer_state;
-          } captured;
-          key_shard->locators->try_read(slot_id, [&](uint32_t index) {
-            captured.mapped = false;
-            const auto owner = arena.owner_snapshot(index);
-            if (!owner.has_value() || owner->key != key ||
-                owner->shard_id != shard_id_for_key(key))
-              return;
+          std::optional<PageSlotEntry> candidate;
+          uint64_t candidate_page_id = 0;
+          const bool stable =
+              key_shard->locators->try_read(slot_id, [&](uint32_t index) {
+                candidate.reset();
+                const auto owner = arena.owner_snapshot(index);
+                if (!owner.has_value() || owner->key != key ||
+                    owner->shard_id != shard_id_for_key(key))
+                  return;
 
-            captured.index = index;
-            captured.seq_count = owner->seq_count;
-            captured.values.resize(dim);
-            const ParamT *source = arena.data(index);
-            simd::simd_copy(source, captured.values.data(), dim);
-            if (score_policy.enabled()) {
-              captured.score = std::atomic_ref<uint64_t>(arena.score_raw(index))
-                                   .load(std::memory_order_relaxed);
-            }
-            if (optimizer_state_dim != 0) {
-              captured.optimizer_state.resize(optimizer_state_dim);
-              optimizer->state_data(index, captured.optimizer_state);
-              captured.step = optimizer->step_data(index);
-            }
-            captured.mapped = true;
+                candidate = PageSlotEntry{
+                    key,
+                    owner->seq_count,
+                    slot_id,
+                    static_cast<uint32_t>(index & arena.slot_mask()),
+                };
+                candidate_page_id = index >> arena.entries_shift();
+              });
+          if (!stable || !candidate.has_value())
+            return;
+          if (candidate_page_id >= arena.max_pages())
+            throw std::out_of_range(
+                "page-image export observed an invalid source page");
+          if (candidate_page_id >= page_entries.size())
+            page_entries.resize(candidate_page_id + 1);
+          page_entries[candidate_page_id].push_back(*candidate);
+        });
+      }
+
+      for (uint64_t page_id = 0; page_id < page_entries.size(); ++page_id) {
+        auto &entries = page_entries[page_id];
+        if (entries.empty())
+          continue;
+
+        std::vector<ParamT> value_scratch(dim);
+        std::vector<OptT> optimizer_scratch(optimizer_state_dim);
+        uint64_t score_scratch = 0;
+        uint32_t step_scratch = 0;
+        PageImageExport<ParamT, OptT> image;
+        while (true) {
+          std::ranges::sort(entries, [](const auto &left, const auto &right) {
+            return left.slot_ordinal < right.slot_ordinal;
           });
-          if (!captured.mapped)
-            return;
+          if (std::ranges::adjacent_find(
+                  entries, [](const auto &left, const auto &right) {
+                    return left.slot_ordinal == right.slot_ordinal;
+                  }) != entries.end())
+            throw std::logic_error(
+                "page-image export observed duplicate slot ordinals");
 
-          std::lock_guard materialization_lock(materialization_mutex);
-          auto &image = image_for_index(captured.index);
-          image.slot_ordinals.push_back(captured.index & arena.slot_mask());
-          image.keys.push_back(key);
-          image.seq_counts.push_back(captured.seq_count);
-          image.values.insert(image.values.end(), captured.values.begin(),
-                              captured.values.end());
+          image = PageImageExport<ParamT, OptT>{
+              page_id,
+              static_cast<uint32_t>(dim),
+              static_cast<uint32_t>(arena.data_stride()),
+              {},
+              {},
+              {},
+              {},
+              {},
+              {},
+              {}};
+          image.slot_ordinals.reserve(entries.size());
+          image.keys.reserve(entries.size());
+          image.seq_counts.reserve(entries.size());
+          image.values.reserve(entries.size() * dim);
           if (score_policy.enabled())
-            image.scores.push_back(captured.score);
+            image.scores.reserve(entries.size());
           if (optimizer_state_dim != 0) {
-            image.optimizer_states.insert(image.optimizer_states.end(),
-                                          captured.optimizer_state.begin(),
-                                          captured.optimizer_state.end());
-            image.steps.push_back(captured.step);
+            image.optimizer_states.reserve(entries.size() *
+                                           optimizer_state_dim);
+            image.steps.reserve(entries.size());
           }
-        });
-      }
 
-      for (auto &image : images) {
-        std::vector<size_t> order(image.slot_ordinals.size());
-        std::iota(order.begin(), order.end(), size_t{0});
-        std::ranges::sort(order, [&image](size_t left, size_t right) {
-          return image.slot_ordinals[left] < image.slot_ordinals[right];
-        });
-        const auto reorder = [&order](auto &column, size_t stride) {
-          if (column.empty())
-            return;
-          if (stride == 0 || column.size() != order.size() * stride)
-            throw std::logic_error("page-image column stride is inconsistent");
-          using Column = std::remove_reference_t<decltype(column)>;
-          Column reordered;
-          reordered.reserve(column.size());
-          for (size_t source : order) {
-            const auto first = column.begin() + source * stride;
-            reordered.insert(reordered.end(), first, first + stride);
+          bool restart = false;
+          size_t survivor_count = 0;
+          for (const auto &entry : entries) {
+            const uint32_t expected_slot_ordinal = entry.slot_ordinal;
+            bool captured = false;
+            uint32_t resolved_index = static_cast<uint32_t>(
+                page_id * arena.entries_per_page() + entry.slot_ordinal);
+            uint32_t resolved_slot_ordinal = entry.slot_ordinal;
+            uint64_t resolved_seq_count = entry.seq_count;
+            const auto &key_shard = shard_for_key(entry.key);
+            if (!key_shard.locators->try_read(
+                    entry.slot_id, [&](uint32_t current_index) {
+                      captured = false;
+                      const auto owner = arena.owner_snapshot(current_index);
+                      if (!owner.has_value() || owner->key != entry.key ||
+                          owner->shard_id != shard_id_for_key(entry.key))
+                        return;
+                      resolved_index = current_index;
+                      resolved_slot_ordinal = static_cast<uint32_t>(
+                          current_index & arena.slot_mask());
+                      resolved_seq_count = owner->seq_count;
+                      simd::simd_copy(arena.data(current_index),
+                                      value_scratch.data(), dim);
+                      if (score_policy.enabled())
+                        score_scratch = std::atomic_ref<uint64_t>(
+                                            arena.score_raw(current_index))
+                                            .load(std::memory_order_relaxed);
+                      if (optimizer_state_dim != 0) {
+                        optimizer->state_data(
+                            current_index,
+                            std::span<OptT>(optimizer_scratch.data(),
+                                            optimizer_state_dim));
+                        step_scratch = optimizer->step_data(current_index);
+                      }
+                      captured = true;
+                    }))
+              continue;
+            if (!captured)
+              continue;
+
+            const uint64_t resolved_page_id =
+                resolved_index >> arena.entries_shift();
+            if (resolved_page_id != page_id) {
+              if (resolved_page_id < page_id)
+                throw std::logic_error("page-image export observed a "
+                                       "relocation to an emitted page");
+              if (resolved_page_id >= arena.max_pages())
+                throw std::out_of_range(
+                    "page-image export observed an invalid relocation page");
+              if (resolved_page_id >= page_entries.size())
+                page_entries.resize(resolved_page_id + 1);
+              page_entries[resolved_page_id].push_back(
+                  {entry.key, resolved_seq_count, entry.slot_id,
+                   resolved_slot_ordinal});
+              continue;
+            }
+
+            const PageSlotEntry resolved{entry.key, resolved_seq_count,
+                                         entry.slot_id, resolved_slot_ordinal};
+            entries[survivor_count++] = resolved;
+            if (resolved_slot_ordinal != expected_slot_ordinal) {
+              restart = true;
+              continue;
+            }
+            image.slot_ordinals.push_back(resolved_slot_ordinal);
+            image.keys.push_back(entry.key);
+            image.seq_counts.push_back(resolved_seq_count);
+            image.values.insert(image.values.end(), value_scratch.begin(),
+                                value_scratch.end());
+            if (score_policy.enabled())
+              image.scores.push_back(score_scratch);
+            if (optimizer_state_dim != 0) {
+              image.optimizer_states.insert(image.optimizer_states.end(),
+                                            optimizer_scratch.begin(),
+                                            optimizer_scratch.end());
+              image.steps.push_back(step_scratch);
+            }
           }
-          column = std::move(reordered);
-        };
-        reorder(image.slot_ordinals, 1);
-        reorder(image.keys, 1);
-        reorder(image.seq_counts, 1);
-        reorder(image.values, dim);
-        reorder(image.scores, 1);
-        reorder(image.optimizer_states, optimizer_state_dim);
-        reorder(image.steps, 1);
+          entries.resize(survivor_count);
+          if (!restart)
+            break;
+        }
+
+        entries.clear();
+        entries.shrink_to_fit();
+
+        if (image.keys.empty())
+          continue;
+        if (!visitor(std::move(image)))
+          return false;
       }
-      std::ranges::sort(images, [](const auto &left, const auto &right) {
-        return left.physical_page_id < right.physical_page_id;
+      return true;
+    }
+
+    std::vector<PageImageExport<ParamT, OptT>> materialize_page_images() {
+      std::vector<PageImageExport<ParamT, OptT>> images;
+      export_page_images([&](PageImageExport<ParamT, OptT> &&image) {
+        images.push_back(std::move(image));
+        return true;
       });
       return images;
     }
@@ -1993,7 +2058,9 @@ public:
             image.page_slot_stride_bytes != arena.data_stride())
           throw std::invalid_argument("page-image layout does not match slot");
         const size_t optimizer_state_dim =
-            optimizer.has_value() ? optimizer->state_dim() : 0;
+            (optimizer.has_value() && !image.optimizer_states.empty())
+                ? optimizer->state_dim()
+                : 0;
         const size_t count = hogwild::io::validate_page_image(
             import, dim, arena.data_stride(), score_policy.enabled(),
             optimizer_state_dim, arena.entries_per_page());
@@ -2069,7 +2136,14 @@ public:
             std::atomic_ref<uint64_t>(arena.score_raw(index))
                 .store(score, std::memory_order_relaxed);
           }
-          if (optimizer.has_value() && optimizer->state_dim() != 0) {
+          if (optimizer.has_value() && optimizer->state_dim() != 0 &&
+              !image.optimizer_states.empty()) {
+            if (image.optimizer_states.size() !=
+                    image.keys.size() * optimizer->state_dim() ||
+                (!image.steps.empty() &&
+                 image.steps.size() != image.keys.size()))
+              throw std::invalid_argument(
+                  "page-image optimizer state payload is inconsistent");
             const size_t state_dim = optimizer->state_dim();
             optimizer->set_state(
                 index, std::span<const OptT>(image.optimizer_states.data() +
@@ -3628,6 +3702,47 @@ public:
     return storage;
   }
 
+  static size_t checked_slot_table_bytes(size_t max_dim) {
+    if (max_dim >
+        (std::numeric_limits<size_t>::max() - 1) / sizeof(SlotStore *)) {
+      throw std::overflow_error("slot index table size overflows");
+    }
+    return (max_dim + 1) * sizeof(SlotStore *);
+  }
+
+  static const std::vector<size_t> &
+  validate_table_dims(const std::vector<size_t> &table_dims,
+                      const HogwildStoreOptions &options) {
+    if (table_dims.empty()) {
+      throw std::invalid_argument("table_dims must not be empty");
+    }
+    size_t memory_budget = options.storage_tuning.memory_budget_bytes;
+    if (memory_budget == 0) {
+      const size_t available_ram =
+          storage::SystemResourceProbe::available_ram_bytes();
+      memory_budget = static_cast<size_t>(available_ram * 0.75);
+    }
+    const size_t max_d = std::ranges::max(table_dims);
+    const size_t slot_table_bytes = checked_slot_table_bytes(max_d);
+    if (slot_table_bytes > memory_budget) {
+      throw std::invalid_argument(
+          "dim is too large: slot index table exceeds memory budget");
+    }
+    for (size_t dim : table_dims) {
+      if (dim == 0) {
+        throw std::invalid_argument("dim must be > 0");
+      }
+      storage::StorageResourceTuner::derive(storage::TopologyTuneRequest{
+          .thread_budget = options.thread_budget,
+          .locality = options.locality,
+          .embedding_dim = dim,
+          .param_bytes_per_element = sizeof(ParamT),
+          .tuning = options.storage_tuning,
+      });
+    }
+    return table_dims;
+  }
+
   explicit HogwildEmbeddingStoreCore(const std::vector<size_t> &table_dims,
                                      Initializer initializer,
                                      OptimizerFactory opt_factory,
@@ -3637,7 +3752,8 @@ public:
             storage::StorageResourceTuner::derive(storage::TopologyTuneRequest{
                 .thread_budget = options.thread_budget,
                 .locality = options.locality,
-                .embedding_dim = table_dims.empty() ? 0 : table_dims.front(),
+                .embedding_dim =
+                    validate_table_dims(table_dims, options).front(),
                 .param_bytes_per_element = sizeof(ParamT),
                 .tuning = options.storage_tuning,
             })),
@@ -3662,9 +3778,6 @@ public:
                         &write_diagnostic_to_clog) {
     bool enable_score = score_policy_.enabled();
 
-    if (table_dims.empty()) {
-      throw std::invalid_argument("table_dims must not be empty");
-    }
     if (numa_memory_locality_) {
       if (!NumaTopology::available())
         throw std::runtime_error(
@@ -3679,17 +3792,10 @@ public:
       }
     }
 
-    size_t max_d = std::ranges::max(table_dims);
-    if (max_d > 1048576) {
-      throw std::invalid_argument("dim is too large (max 1048576)");
-    }
-    max_dim_ = max_d;
+    max_dim_ = std::ranges::max(table_dims);
     dim_to_slot_.resize(max_dim_ + 1, nullptr);
 
     for (size_t dim : table_dims) {
-      if (dim == 0) {
-        throw std::invalid_argument("dim must be > 0");
-      }
       if (dim_to_slot_[dim] == nullptr) {
         slot_storage_.push_back(std::make_unique<SlotStore>(
             dim, score_policy_, opt_factory, storage_topology_, num_threads_,
@@ -5341,12 +5447,12 @@ public:
     se::concurrency::with_epoch([&] {
       bool keep_exporting = true;
       for (SlotStore *slot : snapshot->slots) {
-        auto images = slot->materialize_page_images();
-        for (auto &image : images) {
-          if (!keep_exporting)
-            break;
-          keep_exporting = visitor(slot->dim, std::move(image));
-        }
+        if (!keep_exporting)
+          break;
+        keep_exporting = slot->export_page_images(
+            [&](PageImageExport<ParamT, OptT> &&image) {
+              return visitor(slot->dim, std::move(image));
+            });
       }
     });
   }

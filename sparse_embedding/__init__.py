@@ -95,6 +95,7 @@ class EmbeddingConfig(_EmbeddingConfig):
         key_dtype: Any = "int64",
         storage: AutoStorage | MemoryOnly | None = None,
         storage_tuning: StorageTuningOptions | None = None,
+        enable_optimizer: bool = True,
     ):
         resolved_storage = AutoStorage() if storage is None else storage
         resolved_tuning = (
@@ -108,6 +109,7 @@ class EmbeddingConfig(_EmbeddingConfig):
             _to_str(key_dtype),
             resolved_storage._native,
             resolved_tuning,
+            enable_optimizer,
         )
         self.storage = resolved_storage
 

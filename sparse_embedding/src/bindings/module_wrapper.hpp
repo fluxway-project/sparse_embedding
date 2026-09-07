@@ -43,6 +43,9 @@
 #include "sparse_embedding/src/bindings/construct_api.hpp"
 #include "sparse_embedding/src/bindings/dlpack_utils.hpp"
 #include "sparse_embedding/src/bindings/dtype_dispatch.hpp"
+#if defined(SE_ENABLE_LANCE_C)
+#include "sparse_embedding/src/checkpoint/lance/storage_options.hpp"
+#endif
 #include "sparse_embedding/src/checkpoint/checkpoint_interface.hpp"
 #include "sparse_embedding/src/common/function.hpp"
 #include "sparse_embedding/src/common/numeric_types.hpp"
@@ -204,6 +207,7 @@ template <typename ParamT, typename OptT> struct AsyncOpsImpl {
 };
 
 template <typename ParamT, typename OptT> struct CheckpointOpsImpl {
+#if defined(SE_ENABLE_LANCE_C)
   static void save_checkpoint(EmbeddingStoreWrapper &self,
                               const std::string &uri, const std::string &mode,
                               uint64_t min_score, bool include_optimizer_state,
@@ -218,14 +222,19 @@ template <typename ParamT, typename OptT> struct CheckpointOpsImpl {
       uint32_t participant_index, const std::vector<uint32_t> &dimensions,
       const std::string &embedding_dtype, const std::string &optimizer_dtype,
       const std::string &score_policy, uint32_t protocol_version,
-      const std::string &schema_digest);
-  static void restore_native_entries(EmbeddingStoreWrapper &self,
-                                     const std::string &uri, uint64_t version,
-                                     nb::object selected_keys);
-  static void restore_native_page_images(EmbeddingStoreWrapper &self,
-                                         const std::string &uri,
-                                         uint64_t version,
-                                         uint32_t participant_index);
+      const std::string &schema_digest, bool include_page_images = false);
+  static void
+  restore_native_entries(EmbeddingStoreWrapper &self, const std::string &uri,
+                         uint64_t version, nb::object selected_keys,
+                         const se::LanceStorageOptions &storage_options,
+                         bool load_optimizer_state);
+  static void
+  restore_native_page_images(EmbeddingStoreWrapper &self,
+                             const std::vector<std::string> &uris,
+                             uint64_t version, uint32_t participant_index,
+                             const se::LanceStorageOptions &storage_options,
+                             bool load_optimizer_state);
+#endif
   static void export_batches_dlpack(EmbeddingStoreWrapper &self,
                                     nb::callable visitor, size_t batch_size,
                                     bool include_optimizer_state);
@@ -274,7 +283,7 @@ SE_DECLARE_TYPED_CHECKPOINT_INSTANCE(se::bfloat16_t, se::bfloat16_t)
 
 class EmbeddingStoreWrapper {
   friend void construct_store(EmbeddingStoreWrapper &, const PyInitializer &,
-                              const PyOptimizer &, size_t,
+                              const std::optional<PyOptimizer> &, size_t,
                               se::StoreConstructionKind,
                               const se::EmbeddingConfig &);
   template <typename, typename> friend struct SyncOpsImpl;
@@ -286,6 +295,7 @@ class EmbeddingStoreWrapper {
   exec::static_thread_pool async_pool_;
   ValueDType value_dtype_code_;
   ValueDType optimizer_dtype_code_;
+  bool optimizer_enabled_;
   KeyDType key_type_enum_;
   std::string score_policy_name_;
   std::vector<size_t> dims_;
@@ -321,6 +331,7 @@ public:
   std::vector<size_t> table_dims() const;
   std::string value_dtype() const;
   std::string optimizer_dtype() const;
+  bool optimizer_enabled() const;
   std::string score_policy() const;
   size_t internal_shard_count();
   nb::dict storage_stats();
@@ -360,18 +371,21 @@ public:
                        bool load_optimizer_state,
                        nb::object filter_fn = nb::none(),
                        uint32_t target_shard_id = 0, size_t batch_size = 65536);
-  nb::dict write_native_fragment(const std::string &uri,
-                                 uint32_t participant_index,
-                                 const std::vector<uint32_t> &dimensions,
-                                 const std::string &embedding_dtype,
-                                 const std::string &optimizer_dtype,
-                                 const std::string &score_policy,
-                                 uint32_t protocol_version,
-                                 const std::string &schema_digest);
+  nb::dict write_native_fragment(
+      const std::string &uri, uint32_t participant_index,
+      const std::vector<uint32_t> &dimensions,
+      const std::string &embedding_dtype, const std::string &optimizer_dtype,
+      const std::string &score_policy, uint32_t protocol_version,
+      const std::string &schema_digest, bool include_page_images = false);
   void restore_native_entries(const std::string &uri, uint64_t version,
-                              nb::object selected_keys);
-  void restore_native_page_images(const std::string &uri, uint64_t version,
-                                  uint32_t participant_index);
+                              nb::object selected_keys,
+                              const se::LanceStorageOptions &storage_options,
+                              bool load_optimizer_state);
+  void
+  restore_native_page_images(const std::vector<std::string> &uris,
+                             uint64_t version, uint32_t participant_index,
+                             const se::LanceStorageOptions &storage_options,
+                             bool load_optimizer_state);
 
   void set_checkpoint_factories(se::CheckpointWriterFactory wf,
                                 se::CheckpointReaderFactory rf);

@@ -5,6 +5,7 @@ from __future__ import annotations
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass
 from datetime import datetime
+from enum import Enum
 from typing import Any, Protocol, TypeAlias
 
 
@@ -170,12 +171,36 @@ class SparseCheckpointLocator:
             raise ValueError("checkpoint_version must be a positive integer")
 
 
+@dataclass(frozen=True, slots=True)
+class SparseWeightSnapshot:
+    """Immutable content identity used by inference weight sources."""
+
+    snapshot_digest: str
+
+    def __post_init__(self) -> None:
+        if (
+            not isinstance(self.snapshot_digest, str)
+            or not self.snapshot_digest.strip()
+        ):
+            raise ValueError("snapshot_digest must be a non-empty string")
+
+
 PartitionFn: TypeAlias = Callable[[Any, int], Any]
+
+
+class PhysicalRestoreStrategy(str, Enum):
+    RECONSTRUCT_ENTRIES = "reconstruct_entries"
+    FAST_PAGE_CACHE = "fast_page_cache"
 
 
 @dataclass(frozen=True, slots=True)
 class PhysicalRestore:
     participant: CheckpointParticipant
+    strategy: PhysicalRestoreStrategy = PhysicalRestoreStrategy.RECONSTRUCT_ENTRIES
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.strategy, PhysicalRestoreStrategy):
+            raise TypeError("strategy must be a PhysicalRestoreStrategy")
 
 
 @dataclass(frozen=True, slots=True)
@@ -308,6 +333,7 @@ class SparseCheckpointProtocol(Protocol):
         store: Any,
         identity: CheckpointSaveIdentity,
         participant: CheckpointParticipant,
+        include_page_images: bool = False,
     ) -> CheckpointFragment: ...
 
     def finalize_checkpoint(self, identity: CheckpointSaveIdentity) -> None: ...
@@ -329,6 +355,14 @@ class SparseCheckpointProtocol(Protocol):
         store: Any,
         locator: SparseCheckpointLocator,
         mode: RestoreMode,
+        load_optimizer_state: bool = True,
+    ) -> None: ...
+
+    def restore_weight_snapshot(
+        self,
+        store: Any,
+        snapshot: SparseWeightSnapshot,
+        mode: RestoreMode,
     ) -> None: ...
 
 
@@ -339,3 +373,34 @@ class SparseCheckpointStorage(
     Protocol,
 ):
     def close(self) -> None: ...
+
+    def compact_checkpoints(self) -> None: ...
+
+    def compact_checkpoint(self, locator: SparseCheckpointLocator) -> None: ...
+
+    def compact_fragments(
+        self,
+        source_path: str,
+        target_path: str | None = None,
+    ) -> str: ...
+
+    async def compact_checkpoints_async(self) -> None: ...
+
+    async def compact_checkpoint_async(
+        self, locator: SparseCheckpointLocator
+    ) -> None: ...
+
+    async def compact_fragments_async(
+        self,
+        source_path: str,
+        target_path: str | None = None,
+    ) -> str: ...
+
+
+class SparseWeightSnapshotReader(Protocol):
+    def restore_weight_snapshot(
+        self,
+        store: Any,
+        snapshot: SparseWeightSnapshot,
+        mode: RestoreMode,
+    ) -> None: ...

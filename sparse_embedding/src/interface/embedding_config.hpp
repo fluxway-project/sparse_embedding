@@ -37,6 +37,7 @@ struct EmbeddingConfig {
   std::string key_dtype = "int64";  // int64, uint64, int32, uint32
   StorageOptions storage;
   storage::StorageTuningOptions storage_tuning;
+  bool enable_optimizer = true;
 };
 
 } // namespace se

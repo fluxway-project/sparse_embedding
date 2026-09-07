@@ -7,8 +7,9 @@ import shutil
 import threading
 import time
 import uuid
-from collections.abc import Iterator, Mapping
+from collections.abc import Callable, Iterator, Mapping
 from contextlib import contextmanager
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Protocol
 from urllib.parse import urlparse
@@ -17,10 +18,36 @@ import lance
 import pyarrow as pa
 
 
+def _resolve_pointer_relative(
+    relative: str,
+    read_pointer: Callable[[str], str | None],
+    seen: set[str] | None = None,
+) -> str:
+    clean = relative.strip("/")
+    if not clean:
+        return ""
+    visited = seen if seen is not None else set()
+    if clean in visited:
+        raise ValueError(f"manifest pointer cycle detected at: {clean}")
+    visited.add(clean)
+    parts = clean.split("/")
+    for index in range(len(parts), 0, -1):
+        prefix = "/".join(parts[:index])
+        staged = read_pointer(prefix)
+        if staged:
+            suffix = "/".join(parts[index:])
+            return _resolve_pointer_relative(
+                f"{staged}/{suffix}", read_pointer, visited
+            )
+    return clean
+
+
 class LanceWorkspace(Protocol):
     def ensure_root(self) -> None: ...
 
     def uri(self, relative: str) -> str: ...
+
+    def storage_options(self) -> Mapping[str, str]: ...
 
     def dataset(
         self, relative: str, *, version: int | None = None
@@ -34,9 +61,11 @@ class LanceWorkspace(Protocol):
 
     def create_prefix(self, relative: str) -> None: ...
 
-    def delete_prefix(self, relative: str) -> None: ...
+    def delete_prefix(self, relative: str, *, missing_ok: bool = False) -> None: ...
 
     def child_prefixes(self, relative: str) -> tuple[str, ...]: ...
+
+    def publish_prefix(self, staged_relative: str, target_relative: str) -> None: ...
 
     def storage_bytes(self) -> int: ...
 
@@ -55,8 +84,32 @@ class LocalLanceWorkspace:
     def ensure_root(self) -> None:
         self._root.mkdir(parents=True, exist_ok=True)
 
+    def _read_pointer(self, relative: str) -> str | None:
+        pointer_file = self._root / relative / ".manifest_pointer.json"
+        if not pointer_file.is_file():
+            return None
+        data = json.loads(pointer_file.read_text(encoding="utf-8"))
+        if not isinstance(data, dict):
+            raise ValueError(f"manifest pointer is not an object: {pointer_file}")
+        staged = data.get("staged_relative")
+        if not isinstance(staged, str) or not staged.strip("/"):
+            raise ValueError(f"manifest pointer has no staged_relative: {pointer_file}")
+        clean = staged.strip("/")
+        if any(part in {"", ".", ".."} for part in Path(clean).parts):
+            raise ValueError(
+                f"manifest pointer target escapes workspace: {pointer_file}"
+            )
+        return clean
+
+    def _resolve_relative(self, relative: str) -> str:
+        return _resolve_pointer_relative(relative, self._read_pointer)
+
     def uri(self, relative: str) -> str:
-        return str(self._root / relative)
+        resolved = self._resolve_relative(relative)
+        return str(self._root / resolved)
+
+    def storage_options(self) -> Mapping[str, str]:
+        return {}
 
     def dataset(self, relative: str, *, version: int | None = None):
         return lance.dataset(self.uri(relative), version=version)
@@ -65,14 +118,21 @@ class LocalLanceWorkspace:
         return lance.write_dataset(table, self.uri(relative), mode=mode)
 
     def exists(self, relative: str) -> bool:
-        return (self._root / relative).exists()
+        resolved = self._resolve_relative(relative)
+        return (self._root / resolved).exists()
 
     def create_prefix(self, relative: str) -> None:
         (self._root / relative).mkdir(parents=True, exist_ok=False)
 
-    def delete_prefix(self, relative: str) -> None:
+    def delete_prefix(self, relative: str, *, missing_ok: bool = False) -> None:
         path = self._root / relative
-        if path.exists():
+        if not path.exists():
+            if not missing_ok:
+                raise FileNotFoundError(f"prefix does not exist: {relative}")
+            return
+        if path.is_file():
+            path.unlink()
+        else:
             shutil.rmtree(path)
 
     def child_prefixes(self, relative: str) -> tuple[str, ...]:
@@ -80,6 +140,12 @@ class LocalLanceWorkspace:
         if not path.exists():
             return ()
         return tuple(item.name for item in path.iterdir() if item.is_dir())
+
+    def publish_prefix(self, staged_relative: str, target_relative: str) -> None:
+        source = Path(self.uri(staged_relative))
+        target = Path(self.uri(target_relative))
+        target.parent.mkdir(parents=True, exist_ok=True)
+        source.replace(target)
 
     def storage_bytes(self) -> int:
         if not self._root.exists():
@@ -115,8 +181,10 @@ class S3LanceWorkspace:
         lock_ttl_seconds: float = 300.0,
     ) -> None:
         parsed = urlparse(root_uri)
-        if parsed.scheme != "s3" or not parsed.netloc:
-            raise ValueError("Gravitino checkpoint location must be an s3:// URI")
+        if parsed.scheme not in {"s3", "s3a"} or not parsed.netloc:
+            raise ValueError(
+                "Gravitino checkpoint location must be an s3:// or s3a:// URI"
+            )
         if lock_timeout_seconds <= 0 or lock_ttl_seconds <= 0:
             raise ValueError("lock timeout and TTL must be positive")
         required = ("endpoint", "region", "access_key_id", "secret_access_key")
@@ -145,8 +213,45 @@ class S3LanceWorkspace:
     def ensure_root(self) -> None:
         return None
 
+    def _pointer_key(self, relative: str) -> str:
+        clean = relative.strip("/")
+        return self._key(f"{clean}/.manifest_pointer.json")
+
+    def _read_pointer(self, relative: str) -> str | None:
+        key = self._pointer_key(relative)
+        try:
+            response = self._client.get_object(Bucket=self._bucket, Key=key)
+            data = json.loads(response["Body"].read().decode("utf-8"))
+        except Exception as error:
+            from botocore.exceptions import ClientError
+
+            if isinstance(error, ClientError):
+                code = error.response.get("Error", {}).get("Code")
+                status = error.response.get("ResponseMetadata", {}).get(
+                    "HTTPStatusCode"
+                )
+                if code in {"NoSuchKey", "NotFound"} or status == 404:
+                    return None
+            raise
+        if not isinstance(data, dict):
+            raise ValueError(f"manifest pointer is not an object: {key}")
+        staged = data.get("staged_relative")
+        if not isinstance(staged, str) or not staged.strip("/"):
+            raise ValueError(f"manifest pointer has no staged_relative: {key}")
+        clean = staged.strip("/")
+        if any(part in {"", ".", ".."} for part in Path(clean).parts):
+            raise ValueError(f"manifest pointer target escapes workspace: {key}")
+        return clean
+
+    def _resolve_relative(self, relative: str) -> str:
+        return _resolve_pointer_relative(relative, self._read_pointer)
+
     def uri(self, relative: str) -> str:
-        return f"{self._root_uri}/{relative.strip('/')}"
+        resolved = self._resolve_relative(relative)
+        return f"{self._root_uri}/{resolved.strip('/')}"
+
+    def storage_options(self) -> Mapping[str, str]:
+        return dict(self._storage_options)
 
     def dataset(self, relative: str, *, version: int | None = None):
         return lance.dataset(
@@ -164,9 +269,13 @@ class S3LanceWorkspace:
         )
 
     def exists(self, relative: str) -> bool:
+        pointer = self._read_pointer(relative)
+        if pointer is not None:
+            return self.exists(pointer)
+        resolved = self._resolve_relative(relative)
         response = self._client.list_objects_v2(
             Bucket=self._bucket,
-            Prefix=self._key(relative, directory=True),
+            Prefix=self._key(resolved, directory=True),
             MaxKeys=1,
         )
         return bool(response.get("KeyCount"))
@@ -187,8 +296,17 @@ class S3LanceWorkspace:
                 raise FileExistsError(relative) from error
             raise
 
-    def delete_prefix(self, relative: str) -> None:
+    def delete_prefix(self, relative: str, *, missing_ok: bool = False) -> None:
+        pointer_key = self._pointer_key(relative)
+        old_staged = self._read_pointer(relative)
+        if old_staged is not None:
+            self._client.delete_object(Bucket=self._bucket, Key=pointer_key)
+            self.delete_prefix(old_staged, missing_ok=True)
+            return
+
         prefix = self._key(relative, directory=True)
+        deleted_any = False
+        staged_to_cleanup: list[str] = []
         while True:
             response = self._client.list_objects_v2(
                 Bucket=self._bucket,
@@ -196,15 +314,34 @@ class S3LanceWorkspace:
             )
             objects = response.get("Contents", ())
             if objects:
+                deleted_any = True
+                for item in objects:
+                    k = item["Key"]
+                    if k.endswith("/.manifest_pointer.json"):
+                        resp = self._client.get_object(Bucket=self._bucket, Key=k)
+                        data = json.loads(resp["Body"].read().decode("utf-8"))
+                        if not isinstance(data, dict):
+                            raise ValueError(f"manifest pointer is not an object: {k}")
+                        staged_val = data.get("staged_relative")
+                        if not isinstance(staged_val, str) or not staged_val.strip("/"):
+                            raise ValueError(
+                                f"manifest pointer has no staged_relative: {k}"
+                            )
+                        staged_to_cleanup.append(staged_val.strip("/"))
                 self._client.delete_objects(
                     Bucket=self._bucket,
                     Delete={"Objects": [{"Key": item["Key"]} for item in objects]},
                 )
             if not response.get("IsTruncated"):
-                return
+                break
+        for staged in staged_to_cleanup:
+            self.delete_prefix(staged, missing_ok=True)
+        if not deleted_any and not missing_ok:
+            raise FileNotFoundError(f"prefix does not exist: {relative}")
 
     def child_prefixes(self, relative: str) -> tuple[str, ...]:
-        prefix = self._key(relative, directory=True)
+        resolved = self._resolve_relative(relative)
+        prefix = self._key(resolved, directory=True)
         response = self._client.list_objects_v2(
             Bucket=self._bucket,
             Prefix=prefix,
@@ -213,9 +350,28 @@ class S3LanceWorkspace:
         result = []
         for item in response.get("CommonPrefixes", ()):
             child = item["Prefix"].removeprefix(prefix).rstrip("/")
-            if child:
+            if child and not child.startswith("."):
                 result.append(child)
         return tuple(result)
+
+    def publish_prefix(self, staged_relative: str, target_relative: str) -> None:
+        if not self.exists(staged_relative):
+            raise FileNotFoundError(f"staged prefix does not exist: {staged_relative}")
+        pointer_key = self._pointer_key(target_relative)
+        old_staged = self._read_pointer(target_relative)
+        payload = {
+            "staged_relative": staged_relative.strip("/"),
+            "published_at": datetime.now(timezone.utc).isoformat(),
+        }
+        body = json.dumps(payload, indent=2).encode("utf-8")
+        self._client.put_object(
+            Bucket=self._bucket,
+            Key=pointer_key,
+            Body=body,
+            ContentType="application/json",
+        )
+        if old_staged and old_staged != staged_relative.strip("/"):
+            self.delete_prefix(old_staged, missing_ok=True)
 
     def storage_bytes(self) -> int:
         total = 0

@@ -42,6 +42,10 @@ inline std::string EmbeddingStoreWrapper::optimizer_dtype() const {
   throw std::invalid_argument("unsupported optimizer dtype");
 }
 
+inline bool EmbeddingStoreWrapper::optimizer_enabled() const {
+  return optimizer_enabled_;
+}
+
 inline std::string EmbeddingStoreWrapper::score_policy() const {
   return score_policy_name_;
 }
@@ -148,12 +152,17 @@ inline nb::object EmbeddingStoreWrapper::contains(nb::object keys) {
 
 inline void EmbeddingStoreWrapper::accumulate_gradients(nb::object keys,
                                                          nb::object grads) {
+  if (!optimizer_enabled_)
+    throw std::runtime_error(
+        "accumulate_gradients requires optimizer enabled");
   dispatch_types([&]<typename P, typename O>() {
     SyncOpsImpl<P, O>::accumulate_gradients(*this, keys, grads);
   });
 }
 
 inline void EmbeddingStoreWrapper::optimizer_step() {
+  if (!optimizer_enabled_)
+    throw std::runtime_error("optimizer_step requires optimizer enabled");
   dispatch_types([&]<typename P, typename O>() {
     SyncOpsImpl<P, O>::optimizer_step(*this);
   });
@@ -294,12 +303,17 @@ inline nb::object EmbeddingStoreWrapper::async_lookup_or_insert(
 
 inline nb::object EmbeddingStoreWrapper::async_accumulate_gradients(
     nb::object keys, nb::object grads) {
+  if (!optimizer_enabled_)
+    throw std::runtime_error(
+        "async_accumulate_gradients requires optimizer enabled");
   return dispatch_types([&]<typename P, typename O>() -> nb::object {
     return AsyncOpsImpl<P, O>::async_accumulate_gradients(*this, keys, grads);
   });
 }
 
 inline nb::object EmbeddingStoreWrapper::async_optimizer_step() {
+  if (!optimizer_enabled_)
+    throw std::runtime_error("async_optimizer_step requires optimizer enabled");
   return dispatch_types([&]<typename P, typename O>() -> nb::object {
     return AsyncOpsImpl<P, O>::async_optimizer_step(*this);
   });

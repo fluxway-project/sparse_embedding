@@ -41,7 +41,7 @@ struct StoreConstructionKind {
 
 struct StoreConstructionRequest {
   std::shared_ptr<pro::proxy<InitializerBuilderFacade>> initializer_builder;
-  OptimizerConfigVariant optimizer_config;
+  std::optional<OptimizerConfigVariant> optimizer_config;
 };
 
 struct StoreConstructionTarget {

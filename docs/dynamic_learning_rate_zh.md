@@ -76,6 +76,7 @@ store.optimizer_step()
 ## 重要注意事项
 
 * **依赖得分策略 (Score Policy is Required)：**如果你在优化器中指定了需要依赖得分的策略（例如 `SqrtDecayLrPolicy`），你就**必须**在创建 `EmbeddingStore` 时同时启用得分策略（例如 `score_policy="lfu"`）。如果未启用，系统在初始化时会抛出 `ValueError`。
+* **仅适用于训练 Store：**动态学习率策略属于优化器操作。请保持 `EmbeddingConfig(enable_optimizer=True)`（默认值）并提供 `optimizer_config`；禁用 optimizer 的推理 store 调用梯度累积或 optimizer step 会直接抛出异常。
 * **极致性能 (Performance)：**动态学习率引入的额外开销微乎其微。底层的 C++ 实现使用了 `constexpr` 来在编译期决议静态和动态学习率代码路径，确保对于普通的静态学习率没有任何额外开销；而对于动态学习率，其计算逻辑已完全融合到了底层深度优化的 SIMD (如 AVX2/AVX-512) 向量化更新流程中，做到了高效并行计算。
 
 ## 验证
