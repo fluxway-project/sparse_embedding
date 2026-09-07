@@ -35,10 +35,30 @@ public:
   static constexpr size_t kMinEntriesPerPage = 4096;
   static constexpr size_t kMaxEntriesPerPage = 16384;
   static constexpr size_t kTargetPagePayloadBytes = 512 * 1024;
+  static constexpr size_t kMaxCalibrationBudgetBytes = 32 * 1024 * 1024;
 
   static StorageTopology derive(const TopologyTuneRequest &req) {
     if (req.embedding_dim == 0)
       throw std::invalid_argument("embedding dim must be positive");
+
+    size_t memory_budget = req.tuning.memory_budget_bytes;
+    if (memory_budget == 0) {
+      const size_t available_ram = SystemResourceProbe::available_ram_bytes();
+      memory_budget = static_cast<size_t>(available_ram * 0.75);
+    }
+
+    const size_t param_total_bytes =
+        checked_product(req.embedding_dim, req.param_bytes_per_element);
+    const size_t entry_cost =
+        checked_add(checked_add(param_total_bytes, req.opt_bytes_per_entry),
+                    64); // directory + locator overhead
+    const size_t min_page_cost =
+        checked_product(kMinEntriesPerPage, entry_cost);
+
+    if (min_page_cost > memory_budget || entry_cost > memory_budget) {
+      throw std::invalid_argument("dim is too large: minimum page memory "
+                                  "requirement exceeds memory budget");
+    }
 
     // 1. Thread & Shard Derivation
     const size_t automatic = SystemResourceProbe::hardware_concurrency();
@@ -86,14 +106,6 @@ public:
       max_pages = req.tuning.max_pages;
     } else if (req.tuning.target_capacity_keys != 0 ||
                req.tuning.memory_budget_bytes != 0) {
-      size_t memory_budget = req.tuning.memory_budget_bytes;
-      if (memory_budget == 0) {
-        const size_t available_ram = SystemResourceProbe::available_ram_bytes();
-        memory_budget = static_cast<size_t>(available_ram * 0.75);
-      }
-      const size_t entry_cost =
-          req.embedding_dim * req.param_bytes_per_element +
-          req.opt_bytes_per_entry + 64; // directory + locator overhead
       const size_t page_cost = checked_product(entries_per_page, entry_cost);
       max_pages = memory_budget / std::max(size_t{1}, page_cost);
 
@@ -153,7 +165,7 @@ private:
   static size_t calibrate_entries_per_page(const TopologyTuneRequest &req,
                                            size_t workers) {
     if (!req.tuning.calibrate_page_geometry)
-      return derive_entries_per_page(req);
+      return compute_explicit_entries_per_page(req);
     if (req.tuning.calibration_samples == 0)
       throw std::invalid_argument("page calibration samples must be positive");
     const CalibrationKey key{req.embedding_dim,
@@ -183,8 +195,17 @@ private:
     const size_t row_bytes = checked_add(
         checked_product(req.embedding_dim, req.param_bytes_per_element),
         req.opt_bytes_per_entry);
+    const size_t working_set_entries = std::min<size_t>(
+        1u << 18, kMaxCalibrationBudgetBytes / std::max<size_t>(1, row_bytes));
+
+    if (row_bytes >= kTargetPagePayloadBytes ||
+        working_set_entries < kMinEntriesPerPage) {
+      throw std::invalid_argument(
+          "StorageResourceTuner calibration budget exceeded for requested "
+          "embedding configuration");
+    }
+
     const size_t row_words = std::max<size_t>(1, (row_bytes + 63) / 64);
-    const size_t working_set_entries = 1u << 18;
     uint64_t sink = 0;
     for (size_t candidate_index = 0; candidate_index < candidates.size();
          ++candidate_index) {
@@ -254,9 +275,8 @@ private:
     return selected;
   }
 
-  static size_t derive_entries_per_page(const TopologyTuneRequest &req) {
-    if (!req.tuning.calibrate_page_geometry)
-      return kMinEntriesPerPage;
+  static size_t
+  compute_explicit_entries_per_page(const TopologyTuneRequest &req) {
     const size_t row_bytes = checked_add(
         checked_product(req.embedding_dim, req.param_bytes_per_element),
         checked_add(req.opt_bytes_per_entry, 64));

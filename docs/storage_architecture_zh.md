@@ -62,6 +62,10 @@ auto optimizer_factory = pro::make_proxy<
 
 ### 优化器执行不变量
 
+优化器分配由构造策略显式控制。设置
+`EmbeddingConfig(enable_optimizer=False)` 会创建 weight-only store，并跳过优化器状态
+的 reserve/allocation。该 store 适用于推理；若训练恢复请求加载优化器状态，将直接抛出异常。
+
 训练路径把梯度累积在 `TransientArena`，再按执行 shard 执行一次批级更新，并遵守以下不变量：
 
 | 不变量 | 契约 |
@@ -254,16 +258,29 @@ compaction 目的地按 shard 批量执行 ticket-CAS 预留；普通 compaction
 generation 和 authority identity，不包含任何特定编排框架的类型或标识。
 
 `LocalLanceStorage` 与 `GravitinoLanceStorage` 复用唯一的 Lance checkpoint 事务引擎。
-该引擎保存物化的 `(dim, key)` entry 状态、物理 page image 和 snapshot manifest；两个
+该引擎以规范的物化 `(dim, key)` entry 状态作为唯一事实来源 (SSOT)，物理 page image
+作为可选的高速物理导入缓存 (仅在 `include_page_images=True` 时生成)。写入采用有界生产者-消费者
+管道 (`BoundedChannel`) 进行单事务流式落盘，$O(N_{live})$ 紧凑索引元数据 + 有界单页/写入器缓冲，且版本号恒为 1。两个
 storage adapter 只提供 dataset 定位、staging prefix、持久小记录和 commit lock。
-manifest 是唯一可见性边界，并固定 entries 与 page-image 的精确 Lance version。跨
-participant 重复 key、participant 覆盖不完整、schema 不一致和过期提交权都会显式失败。
+manifest 是唯一可见性边界，并固定 entries 的精确 Lance version。跨 participant 重复 key、
+participant 覆盖不完整、schema 不一致和过期提交权都会显式失败。
 
-恢复选择精确的 `SparseCheckpointLocator`。`PhysicalRestore` 要求保存时的 participant
-拓扑并重建原生 page 布局。`ElasticRestore` 接收调用方稳定的
-`partition_fn(keys, partition_count)` 和目标 partition；实现先只扫描 key 与 row state，
-再读取分配给当前 partition 的 payload 列。Sparse Embedding 内部不提供拓扑或路由
+恢复选择精确的 `SparseCheckpointLocator`。`PhysicalRestore` 支持显式策略：
+`PhysicalRestoreStrategy.RECONSTRUCT_ENTRIES` (默认) 从规范 entries 确定性重建原生物理页布局，
+即使经过 Checkpoint Compaction 跨拓扑合流，也能按 `source_participant_index` 精准还原目标分区参数；
+`PhysicalRestoreStrategy.FAST_PAGE_CACHE` 则直接导入物理页缓存，若缓存缺失则严格抛出 `FileNotFoundError`，
+零隐式 fallback。`ElasticRestore` 接收调用方稳定的 `partition_fn(keys, partition_count)` 和目标 partition；
+实现先只扫描 key 与 row state，再读取分配给当前 partition 的 payload 列。Sparse Embedding 内部不提供拓扑或路由
 fallback。
+
+Compaction 流式合并利用分布式 Participant 天然互斥性消灭去重哈希集开销；Native scanner、channel
+与 page import 统一使用 `checkpoint_stream_policy.hpp` 中的 `CheckpointStreamPolicy`，因此驻留内存受固定 batch/channel 容量约束。
+在目录与对象发布上：
+- Local 使用 POSIX `rename(2)` 原子发布，零额外 JSON 辅助文件；
+- S3/S3A 远端使用不可变 Staged 前缀写入 + 单对象强一致性 Pointer (`.manifest_pointer.json`) 进行线性化原子发布；
+- 成功覆盖更新、显式 `delete_prefix`、递归父目录删除与回滚路径都会严格级联清理指针和 staged 目录；清理失败直接抛出并保留已发布 root 供重试；
+- 存储前缀删除 `delete_prefix(..., missing_ok=False)` 默认严格抛出 `FileNotFoundError`，杜绝吞异常 fallback；
+- 协议版本保持 `_PROTOCOL_VERSION = 1`。
 
 原生 `ModuloPartitioner` 遵循 Python/NumPy 的语言无关规范化求余约定：即使 key 为负数，
 owner 也始终位于 `[0, partition_count)`；用户自定义的 `partition_fn` 负责自身的路由语义。

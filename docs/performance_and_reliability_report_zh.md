@@ -18,9 +18,16 @@ slow path。同一批次的重复 miss 共享一个 arena slot，输出位置复
 telemetry ring 发布固定大小诊断事件。单一后台 consumer 可以把事件写入 `std::clog`；
 producer 不执行 I/O，ring 满载时丢弃诊断且不阻塞训练路径。
 
-Lance checkpoint 包含 `entries`、物理 `page_images` 和固定版本的 manifest。page image
-保存 slot 布局、`seq_count`、参数、score、optimizer state/step 和 SHA-256 checksum。
+Lance checkpoint 以规范的 `entries` 数据集作为唯一事实来源 (SSOT)，以可选的物理 `page_images`
+作为加速物理导入缓存（`include_page_images=True` 显式开启），并通过固定版本的 manifest 提供唯一可见性边界。
+写入采用有界生产者-消费者流式管道 (`BoundedChannel`) 进行单次单事务提交，内存为 $O(N_{live})$ 紧凑页索引元数据加有界的单页与 writer 缓冲，消灭多版本事务追加。
+Compaction 利用分布式 Participant 天然互斥性消除哈希去重堆开销，以有界内存管道流式合流。本地目录采用 POSIX 原生
+原子 rename（零额外 JSON 文件）；S3/S3A 远端采用不可变暂存目录与单对象强一致性 Pointer 线性发布，并在覆盖、删除和回滚时
+严格级联清理指针与暂存数据，实现零孤儿残留。
+page image 保存 slot 布局、`seq_count`、参数、score、optimizer state/step 和 SHA-256 checksum。
 增量 checkpoint 只追加变化 entry 与 tombstone，并由外部 coordinator 完成全局提交。
+推理使用 `EmbeddingConfig(enable_optimizer=False)` 与 `restore_weight_snapshot`，
+避免分配和加载优化器状态。
 
 Compaction、热 Key 提升和 page eviction 都通过唯一权威目录更新 locator。源 page 在
 epoch 安全前保持可读，不会被重新用作 destination。

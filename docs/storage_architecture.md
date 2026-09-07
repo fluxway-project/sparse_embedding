@@ -83,6 +83,11 @@ it is not a long-lived per-row runtime representation.
 
 ### Optimizer Execution Invariants
 
+Optimizer allocation is an explicit construction policy. Setting
+`EmbeddingConfig(enable_optimizer=False)` creates a weight-only store and
+skips optimizer-state reserve/allocation. Such a store is suitable for
+inference and rejects a training restore that requests optimizer state.
+
 The training path accumulates gradients in `TransientArena` and then executes
 one batch update per execution shard. It obeys the following invariants:
 
@@ -411,19 +416,31 @@ opaque scope, monotonic generation, and authority identity; it contains no type
 or identifier from a particular orchestration framework.
 
 `LocalLanceStorage` and `GravitinoLanceStorage` share one Lance checkpoint
-transaction engine. It stores one materialized `(dim, key)` entry state,
-physical page images, and a snapshot manifest. Storage adapters only provide
+transaction engine. It treats canonical materialized `(dim, key)` entry states
+as the single source of truth (SSOT), with physical page images serving as an
+optional fast import cache (persisted only when `include_page_images=True`).
+Writing uses a bounded channel (`BoundedChannel`) streaming pipeline for single-commit
+transactions with $O(N_{live})$ compact page-index metadata plus bounded single-page and writer buffers, and single version generation. Storage adapters only provide
 dataset locations, staging prefixes, durable records, and commit locking. The
-manifest is the visibility boundary and pins exact entries and page-image Lance
+manifest is the visibility boundary and pins exact canonical entry Lance
 versions. Duplicate keys across participants, incomplete participant coverage,
 schema disagreement, and stale commit authority fail explicitly.
 
-Restore selects an exact `SparseCheckpointLocator`. `PhysicalRestore` requires
-the saved participant topology and rebuilds native page layout.
-`ElasticRestore` accepts the caller's stable `partition_fn(keys,
-partition_count)` and target partition. It first scans only keys and row state,
-then reads payload columns only for rows assigned to the target partition; no
-topology or routing fallback exists inside Sparse Embedding.
+Restore selects an exact `SparseCheckpointLocator`. `PhysicalRestore` supports explicit strategies:
+`PhysicalRestoreStrategy.RECONSTRUCT_ENTRIES` (default) rebuilds native page layouts deterministically
+from canonical entries, even across multi-participant topologies after compaction by filtering
+`source_participant_index`; `PhysicalRestoreStrategy.FAST_PAGE_CACHE` imports physical page images directly,
+strictly raising `FileNotFoundError` if the cache is absent (zero implicit fallback).
+`ElasticRestore` accepts the caller's stable `partition_fn(keys, partition_count)` and target partition.
+It first scans only keys and row state, then reads payload columns only for rows assigned to the target partition;
+no topology or routing fallback exists inside Sparse Embedding.
+
+Compaction streaming merge leverages participant topological disjointness to eliminate in-memory deduplication hash sets. Native scanners, channels, and page imports use the single C++ `CheckpointStreamPolicy` in `checkpoint_stream_policy.hpp`, so resident compaction memory is bounded by fixed batch/channel capacities. For directory and object publication:
+- Local workspaces use POSIX atomic `rename(2)` with zero auxiliary JSON files.
+- Remote S3/S3A workspaces use immutable staged prefixes and single-object strongly consistent pointers (`.manifest_pointer.json`) for atomic linearization without partial exposure.
+- Successful overwrites, explicit `delete_prefix`, recursive parent deletion, and rollback paths strictly clean pointer files and staged datasets; cleanup failures propagate while preserving the published root for retry.
+- Workspace prefix deletion `delete_prefix(..., missing_ok=False)` strictly raises `FileNotFoundError` by default with zero silent fallbacks.
+- Checkpoint protocol version remains pinned at `_PROTOCOL_VERSION = 1`.
 
 The native `ModuloPartitioner` follows the language-independent normalized
 modulo contract used by Python and NumPy: every owner is in

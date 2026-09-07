@@ -32,31 +32,22 @@ int main() {
   }
 
   std::set<std::string_view> manifest_names;
-  constexpr std::array<std::string_view, 20> manifest_columns = {
-      "protocol_version",
-      "checkpoint_name",
-      "checkpoint_version",
-      "parent_checkpoint_version",
-      "entries_lance_version",
-      "page_images_lance_version",
-      "participant_count",
-      "checkpoint_mode",
-      "schema_digest",
-      "fragment_digest",
-      "save_attempt",
-      "authority_scope",
-      "authority_generation",
-      "commit_authority",
-      "created_at",
-      "dimensions",
-      "embedding_dtype",
-      "optimizer_dtype",
-      "score_policy",
-      "reference_id"};
+  constexpr std::array<std::string_view, 22> manifest_columns = {
+      "protocol_version",     "checkpoint_name",
+      "checkpoint_version",   "parent_checkpoint_version",
+      "participant_count",    "checkpoint_mode",
+      "schema_digest",        "fragment_digest",
+      "save_attempt",         "authority_scope",
+      "authority_generation", "commit_authority",
+      "created_at",           "dimensions",
+      "embedding_dtype",      "optimizer_dtype",
+      "score_policy",         "reference_id",
+      "fragment_ids",         "compacted_version",
+      "commit_state",         "storage_mode"};
   manifest_names.insert(manifest_columns.begin(), manifest_columns.end());
   for (std::string_view required :
-       {"protocol_version", "entries_lance_version",
-        "page_images_lance_version", "schema_digest", "dimensions"}) {
+       {"protocol_version", "fragment_ids", "compacted_version", "commit_state",
+        "storage_mode", "schema_digest", "dimensions"}) {
     if (!manifest_names.contains(required))
       throw std::runtime_error("Lance snapshot manifest schema is incomplete");
   }

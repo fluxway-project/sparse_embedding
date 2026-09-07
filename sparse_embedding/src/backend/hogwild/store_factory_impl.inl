@@ -24,8 +24,13 @@ void make_store(StoreConstructionTarget &target,
                 StoreConstructionRequest request, size_t thread_budget,
                 StoreScorePolicy score_policy) {
   auto initializer = make_initializer<ParamT>(request);
-  auto optimizer = create_optimizer_factory<ParamT, OptT>(
-      request.optimizer_config, target.storage);
+  using OptimizerFactory =
+      se::Function<OptimizerExtension<ParamT, OptT>(size_t)>;
+  OptimizerFactory optimizer;
+  if (request.optimizer_config.has_value()) {
+    optimizer = create_optimizer_factory<ParamT, OptT>(
+        *request.optimizer_config, target.storage);
+  }
   using Store = HogwildEmbeddingStore<uint64_t, ParamT, OptT>;
   *target.store = pro::make_proxy<EmbeddingTableFacade<ParamT, OptT>, Store>(
       std::vector<size_t>(target.dims.begin(), target.dims.end()),

@@ -3,6 +3,7 @@
 #include "sparse_embedding/src/backend/hogwild/public/store_construction.hpp"
 #include <cstddef>
 #include <memory>
+#include <optional>
 
 namespace se::py::detail {
 
@@ -17,6 +18,7 @@ struct PyInitializer {
 };
 
 void construct_store(EmbeddingStoreWrapper &, const PyInitializer &,
-                     const PyOptimizer &, size_t, se::StoreConstructionKind);
+                     const std::optional<PyOptimizer> &, size_t,
+                     se::StoreConstructionKind);
 
 } // namespace se::py::detail

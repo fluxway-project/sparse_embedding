@@ -19,9 +19,9 @@ PYTHONPATH="$PWD" pytest -q sparse_embedding/tests/test_gravitino_lance.py
 SparseCheckpoint
     |
     +-- LocalLanceStorage
-    |       +-- entries
-    |       +-- page_images
-    |       +-- snapshot_manifest
+    |       +-- snapshot_manifest (唯一可见性边界)
+    |       +-- _staging/<fragment_id>/entries (Canonical SSOT 规范事实来源)
+    |       +-- _staging/<fragment_id>/page_images (可选物理页高速缓存，按需生成)
     |
     +-- GravitinoLanceStorage
             +-- Gravitino control-plane API base URI
@@ -30,7 +30,7 @@ SparseCheckpoint
 ```
 
 `LocalLanceStorage` 与 `GravitinoLanceStorage` 使用唯一的 Lance checkpoint 事务引擎。
-schema 校验、staging、物化合并、manifest 发布、精确版本恢复、提交权、lease、retention、
+schema 校验、Fragment staging、manifest 发布、Fragment 恢复、提交权、lease、retention、
 reclaim 与完成记录只实现一次。storage adapter 只提供 dataset 定位、prefix 操作、持久小记录
 与 commit lock。
 
@@ -41,22 +41,88 @@ Local storage 使用文件系统目录、原子文件与 `flock`；Gravitino sto
 ## 2. 本地 Lance 集成
 
 ```python
-from sparse_embedding.checkpoint import LocalLanceStorage, SparseCheckpoint
+from sparse_embedding.checkpoint import (
+    LocalLanceStorage,
+    PhysicalRestore,
+    PhysicalRestoreStrategy,
+    SparseCheckpoint,
+)
 
 checkpoint = SparseCheckpoint(
     LocalLanceStorage("/checkpoints/user_embedding")
 )
+
+# 默认仅持久化 canonical entries (节约 50% 写入带宽与磁盘空间)
 locator = checkpoint.save(store, "step-1000")
-checkpoint.restore(restored_store, locator)
+
+# 可选生成物理 page_images 缓存以获得最快恢复导入速度：
+# locator = checkpoint.save(store, "step-1000", include_page_images=True)
+
+# 恢复：显式选择策略 (零隐式 Fallback)
+checkpoint.restore(
+    restored_store,
+    locator,
+    mode=PhysicalRestore(participant, strategy=PhysicalRestoreStrategy.RECONSTRUCT_ENTRIES),
+)
 ```
 
-固定的 Lance 表三元组 (triplet) 包含：
+训练与推理使用相同的 checkpoint 格式，但优化器状态策略必须显式区分。
+`EmbeddingConfig(enable_optimizer=False)` 会构造不分配优化器状态页的权重-only
+store。普通 `checkpoint.restore(..., load_optimizer_state=True)` 保持训练恢复语义，
+也可以设置为 `False` 执行权重-only 恢复；目标 store 禁用 optimizer 时请求加载状态会
+直接抛异常。`restore_weight_snapshot` 是推理入口，始终只加载 embedding，不加载优化器状态。
 
-- `entries`: 物化的逻辑状态 `(dim, key)`。
-- `page_images`: 物理页镜像及校验和。
+选择性加载契约由 `sparse_embedding/tests/test_lance_optimizer_loading.py` 独立覆盖；修改该
+链路时应与 checkpoint/config/mixed-precision focused tests 一起运行。
+
+检查点不再依赖共享的物化表；每个 participant 将快照写入独立 Fragment，
+数据写入采用基于 `BoundedChannel` 的真流式单事务管道，使用 $O(N_{live})$ 的紧凑页索引元数据，
+并将单页与 writer 缓冲限制在有界范围内，
+单次生成版本 1（随后元数据发布追加版本 2），彻底消除 Lance Append 多事务与版本爆炸。
+Manifest 记录其 `fragment_ids`、digest、`commit_state`、`compacted_version` 与协议版本。
+固定的可见性元数据表为：
+
 - `snapshot_manifest`: 检查点唯一的可见性边界。
 
-manifest 记录两个精确的 Lance 版本；恢复操作 (restore) 不会读取最新版本。写入失败时，合并版本会被回滚，暂存分片 (staging fragment) 将通过中止或协调 (abort/reconciliation) 机制被清理。
+### 恢复策略与单事实来源 (SSOT)
+
+- **Canonical `entries` 作为唯一事实来源**：
+  默认仅写入 `entries` 表，承载所有键值与优化器状态。
+  - `ElasticRestore`: 弹性恢复，按新集群的 `partition_fn` 重新分片，与历史物理布局完全解耦。
+  - `PhysicalRestore(..., strategy=PhysicalRestoreStrategy.RECONSTRUCT_ENTRIES)`: 从规范 `entries`
+    确定性重建物理页表结构，支持在经过 Checkpoint Compaction 合流后，按 `source_participant_index`
+    精确还原目标 worker 的参数。
+- **可选 `page_images` 缓存与零 Fallback**：
+  仅当保存时显式设置 `include_page_images=True` 时落盘。
+  - `PhysicalRestore(..., strategy=PhysicalRestoreStrategy.FAST_PAGE_CACHE)`：以有界批次导入物理页缓存，避免将完整缓存长期保留在 RAM 中。
+  - **零 Fallback 规范**：若请求 `FAST_PAGE_CACHE` 但检查点未保存物理缓存，**严格抛出 `FileNotFoundError`**，
+    绝不进行隐式回退。
+
+### 独立 Compaction 与远端支持
+
+训练结束后的导出阶段可仅凭落盘路径执行流式合并，无需打开 `LocalLanceStorage` 或读取完整数据：
+
+```python
+from sparse_embedding.checkpoint import compact_fragments
+
+# 本地路径压缩
+compact_fragments("/checkpoints/user_embedding/_staging", "/exports/user_embedding")
+
+# 远端对象存储压缩 (支持 s3:// 与 s3a:// 协议与 storage_options)
+compact_fragments(
+    "s3://my-bucket/checkpoints/user_embedding/_staging",
+    "s3://my-bucket/exports/user_embedding",
+    storage_options={"endpoint": "http://s3.us-east-1.amazonaws.com", "region": "us-east-1"},
+)
+```
+
+该操作使用 Native Lance scanner/streaming writer；scanner batch、`BoundedChannel` 容量和 page-import 批次统一由 `checkpoint_stream_policy.hpp` 中的 C++ policy 定义，避免重复硬编码，驻留内存受这些固定容量约束，不将全表加载到 Python 内存。
+在发布机制上严格遵循原子性与资源清理规范：
+- **本地文件系统 (Local)**: 直接利用 POSIX `rename(2)` 原子系统调用发布目录，**零额外 JSON 文件产生**；
+- **远端对象存储 (S3 / S3A)**: 由于对象存储无目录原子重命名，为杜绝读者中途读取到部分写出的碎片，采用不可变 Staged 前缀写入 + 单对象强一致性 Pointer (`.manifest_pointer.json`) 进行原子线性化发布；
+- **全生命周期清理保证 (Zero Orphans)**: 额外 JSON 仅在远端对象存储中作为必要原子载体使用。成功覆盖更新、显式 `delete_prefix`、递归级联父目录删除与回滚路径都会严格清理指针及 staged 数据；清理失败会直接抛出并保留已发布 root 以便重试，绝不静默报告成功；
+- **严格零 Fallback 目录删除**: `delete_prefix(..., missing_ok=False)` 默认严格抛出 `FileNotFoundError`，禁止吞异常返回成功；仅在显式传入 `missing_ok=True` 时允许幂等安全退出；
+- **协议版本一致性**: 协议版本严格保持为 `_PROTOCOL_VERSION = 1`。多 Participant 合流后元数据记录包含完整的 `participant_indices` 映射列表。
 
 分布式框架通过 SPI 提供框架无关的提交权限 (commit authority)：
 

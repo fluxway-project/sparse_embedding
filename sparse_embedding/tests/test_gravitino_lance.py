@@ -210,19 +210,22 @@ class _RegistrationFailureCatalog:
         return None
 
 
-def test_gravitino_storage_rolls_back_new_tables_when_initialization_fails() -> None:
+def test_gravitino_storage_provisions_manifest_table_only() -> None:
     catalog = _RegistrationFailureCatalog()
 
-    with pytest.raises(ValueError, match="different storage options"):
-        GravitinoLanceStorage(
-            SdkConfig.for_rest(lance_rest_api_base_uri="http://lance/v1"),
-            namespace=("catalog", "checkpoint"),
-            component_id="embedding",
-            location="s3://bucket/checkpoints/embedding",
-            catalog=catalog,
-        )
+    storage = GravitinoLanceStorage(
+        SdkConfig.for_rest(lance_rest_api_base_uri="http://lance/v1"),
+        namespace=("catalog", "checkpoint"),
+        component_id="embedding",
+        location="s3://bucket/checkpoints/embedding",
+        catalog=catalog,
+    )
+    storage.close()
 
-    assert catalog.dropped == list(reversed(catalog.registered))
+    assert catalog.registered == [
+        ("catalog", "checkpoint", "embedding_snapshot_manifest")
+    ]
+    assert catalog.dropped == []
 
 
 @pytest.mark.parametrize("location", (None, 0, " "))
@@ -239,3 +242,139 @@ def test_register_table_rejects_invalid_locations(location: object) -> None:
             ["catalog", "schema", "table"],
             location=location,
         )
+
+
+def test_s3_lance_workspace_atomic_publish_and_pointer_resolution() -> None:
+    from io import BytesIO
+    from unittest.mock import MagicMock
+
+    from botocore.exceptions import ClientError
+
+    from sparse_embedding.checkpoint._lance_workspace import S3LanceWorkspace
+
+    s3_store: dict[str, bytes] = {}
+
+    def mock_get_object(Bucket: str, Key: str) -> dict[str, object]:
+        if Key in s3_store:
+            return {"Body": BytesIO(s3_store[Key])}
+        raise ClientError({"Error": {"Code": "NoSuchKey"}}, "GetObject")
+
+    def mock_put_object(
+        Bucket: str, Key: str, Body: bytes | str, **kwargs: object
+    ) -> dict[str, object]:
+        s3_store[Key] = Body if isinstance(Body, bytes) else Body.encode("utf-8")
+        return {}
+
+    def mock_list_objects_v2(
+        Bucket: str, Prefix: str, **kwargs: object
+    ) -> dict[str, object]:
+        matches = [k for k in s3_store if k.startswith(Prefix)]
+        contents = [{"Key": k, "Size": len(s3_store[k])} for k in matches]
+        return {"Contents": contents, "KeyCount": len(contents), "IsTruncated": False}
+
+    def mock_delete_objects(
+        Bucket: str, Delete: dict[str, list[dict[str, str]]]
+    ) -> dict[str, object]:
+        for obj in Delete["Objects"]:
+            s3_store.pop(obj["Key"], None)
+        return {}
+
+    def mock_delete_object(Bucket: str, Key: str) -> dict[str, object]:
+        s3_store.pop(Key, None)
+        return {}
+
+    mock_client = MagicMock()
+    mock_client.get_object.side_effect = mock_get_object
+    mock_client.put_object.side_effect = mock_put_object
+    mock_client.list_objects_v2.side_effect = mock_list_objects_v2
+    mock_client.delete_objects.side_effect = mock_delete_objects
+    mock_client.delete_object.side_effect = mock_delete_object
+
+    opts = {
+        "endpoint": "http://127.0.0.1:9000",
+        "region": "us-east-1",
+        "access_key_id": "key",
+        "secret_access_key": "secret",
+    }
+    ws = S3LanceWorkspace("s3://test-bucket/root", opts)
+    ws._client = mock_client
+    reader = S3LanceWorkspace("s3://test-bucket/root", opts)
+    reader._client = mock_client
+
+    target = "exports/user_embedding"
+    staged = "_staging/compaction-uuid-123"
+    mock_put_object("test-bucket", f"root/{staged}/entries/data.lance", b"sample_data")
+
+    # Before publication: target is not visible
+    assert not reader.exists(target)
+
+    # Publish via single atomic pointer write
+    ws.publish_prefix(staged, target)
+    assert reader.exists(target)
+    assert reader.uri(f"{target}/entries") == f"s3://test-bucket/root/{staged}/entries"
+
+    # Strict delete_prefix requires missing_ok=True if not exists
+    with pytest.raises(FileNotFoundError):
+        ws.delete_prefix("nonexistent_path")
+
+    # Deleting published target deletes pointer and staged data
+    ws.delete_prefix(target)
+    assert not ws.exists(target)
+    assert not ws.exists(staged)
+
+
+def test_s3_lance_workspace_schemes() -> None:
+    from unittest.mock import MagicMock
+
+    from sparse_embedding.checkpoint._lance_workspace import S3LanceWorkspace
+
+    opts = {
+        "endpoint": "http://127.0.0.1:9000",
+        "region": "us-east-1",
+        "access_key_id": "key",
+        "secret_access_key": "secret",
+    }
+    mock_client = MagicMock()
+    from botocore.exceptions import ClientError
+
+    mock_client.get_object.side_effect = ClientError(
+        {"Error": {"Code": "NoSuchKey"}}, "GetObject"
+    )
+    ws_s3 = S3LanceWorkspace("s3://test-bucket/root", opts)
+    ws_s3._client = mock_client
+    ws_s3a = S3LanceWorkspace("s3a://test-bucket/root", opts)
+    ws_s3a._client = mock_client
+    assert ws_s3.uri("fragment") == "s3://test-bucket/root/fragment"
+    assert ws_s3a.uri("fragment") == "s3a://test-bucket/root/fragment"
+
+    with pytest.raises(ValueError, match="s3:// or s3a://"):
+        S3LanceWorkspace("file:///local/path", opts)
+
+
+def test_pointer_failures_are_not_fallbacks(tmp_path):
+    from unittest.mock import MagicMock
+
+    from sparse_embedding.checkpoint._lance_workspace import (
+        LocalLanceWorkspace,
+        S3LanceWorkspace,
+    )
+
+    local = tmp_path / "local"
+    pointer = local / "published" / ".manifest_pointer.json"
+    pointer.parent.mkdir(parents=True)
+    pointer.write_text("not-json", encoding="utf-8")
+    with pytest.raises(ValueError):
+        LocalLanceWorkspace(local).uri("published/entries")
+
+    options = {
+        "endpoint": "http://127.0.0.1:9000",
+        "region": "us-east-1",
+        "access_key_id": "key",
+        "secret_access_key": "secret",
+    }
+    client = MagicMock()
+    client.get_object.side_effect = RuntimeError("network failure")
+    remote = S3LanceWorkspace("s3://bucket/root", options)
+    remote._client = client
+    with pytest.raises(RuntimeError, match="network failure"):
+        remote.uri("published/entries")

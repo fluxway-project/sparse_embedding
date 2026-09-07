@@ -102,6 +102,38 @@ int main() {
   }
   require(invalid_page_rejected, "tuner accepted an undersized page");
 
+  // Test 5: Dynamic Dimension Budget Rejection & Calibration Safety
+  bool huge_dim_rejected = false;
+  try {
+    se::storage::StorageResourceTuner::derive(se::storage::TopologyTuneRequest{
+        .thread_budget = 1,
+        .embedding_dim = 2000000000,
+        .tuning = {.memory_budget_bytes = 1024 * 1024 * 1024}});
+  } catch (const std::invalid_argument &) {
+    huge_dim_rejected = true;
+  }
+  require(huge_dim_rejected,
+          "tuner accepted dimension exceeding memory budget");
+
+  // Test 6: Large dimension safe calibration fallback without bad_alloc
+  se::storage::TopologyTuneRequest req_large_dim{
+      .thread_budget = 1,
+      .embedding_dim = 65536,
+      .param_bytes_per_element = sizeof(float),
+      .tuning = {.memory_budget_bytes = 16ULL * 1024 * 1024 * 1024,
+                 .calibrate_page_geometry = true},
+  };
+  bool threw_calibration_exceeded = false;
+  try {
+    [[maybe_unused]] auto tuned_large =
+        se::storage::StorageResourceTuner::derive(req_large_dim);
+  } catch (const std::invalid_argument &) {
+    threw_calibration_exceeded = true;
+  }
+  require(threw_calibration_exceeded,
+          "large dim calibration must throw invalid_argument when budget is "
+          "exceeded");
+
   std::cout << "All StorageTopology tests passed successfully!" << std::endl;
   return 0;
 }

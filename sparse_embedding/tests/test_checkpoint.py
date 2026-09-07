@@ -10,7 +10,9 @@ from sparse_embedding.checkpoint import (
     ElasticRestore,
     LocalLanceStorage,
     PhysicalRestore,
+    PhysicalRestoreStrategy,
     SparseCheckpoint,
+    SparseWeightSnapshot,
 )
 from sparse_embedding.checkpoint.spi import (
     CheckpointCommitAuthority,
@@ -56,17 +58,24 @@ def test_user_facade_roundtrip(tmp_path):
     np.testing.assert_allclose(lookup(restored, (1, 2)), 3)
 
 
-def test_materialized_upsert_and_exact_version_restore(tmp_path):
+def test_fragment_manifests_restore_exact_checkpoint(tmp_path):
     root = tmp_path / "checkpoint"
-    checkpoint = SparseCheckpoint(LocalLanceStorage(root))
+    storage = LocalLanceStorage(root)
+    checkpoint = SparseCheckpoint(storage)
     first = checkpoint.save(populated_store((1, 2), 1), "first")
     second = checkpoint.save(populated_store((2, 3), 2), "second")
-    current = lance.dataset(str(root / "entries")).to_table().to_pylist()
-    assert {(row["key"], row["row_state"]) for row in current} == {
-        (1, "deleted"),
-        (2, "active"),
-        (3, "active"),
-    }
+    manifests = lance.dataset(str(root / "snapshot_manifest")).to_table().to_pylist()
+    assert len(manifests[0]["fragment_ids"]) == 1
+    assert len(manifests[1]["fragment_ids"]) == 1
+    assert manifests[0]["fragment_ids"] != manifests[1]["fragment_ids"]
+    assert all(
+        (root / r).exists() for r in storage._manifest_fragment_roots(manifests[0])
+    )
+    assert all(
+        (root / r).exists() for r in storage._manifest_fragment_roots(manifests[1])
+    )
+    assert not (root / "entries").exists()
+    assert not (root / "page_images").exists()
     old_store = se.EmbeddingStore(config())
     checkpoint.restore(old_store, first)
     np.testing.assert_allclose(lookup(old_store, (1, 2)), 1)
@@ -80,6 +89,116 @@ def test_materialized_upsert_and_exact_version_restore(tmp_path):
         ElasticRestore(lambda keys, count: keys % count, 1, 0),
     )
     np.testing.assert_allclose(lookup(elastic_store, (2, 3)), 2)
+
+
+def test_inference_snapshot_restores_by_content_digest(tmp_path):
+    root = tmp_path / "checkpoint"
+    storage = LocalLanceStorage(root)
+    checkpoint = SparseCheckpoint(storage)
+    checkpoint.save(populated_store((1, 2), 7), "training-name")
+    manifest = lance.dataset(str(root / "snapshot_manifest")).to_table().to_pylist()[0]
+    restored = se.EmbeddingStore(config())
+    storage.restore_weight_snapshot(
+        restored,
+        SparseWeightSnapshot(manifest["fragment_digest"]),
+        ElasticRestore(lambda keys, count: keys % count, 1, 0),
+    )
+    np.testing.assert_allclose(lookup(restored, (1, 2)), 7)
+
+
+def test_inference_snapshot_does_not_require_training_optimizer_spec(tmp_path):
+    root = tmp_path / "checkpoint"
+    storage = LocalLanceStorage(root)
+    source_config = se.EmbeddingConfig(
+        dims=[4], thread_budget=1, value_dtype="float32", optimizer_dtype="float16"
+    )
+    source = se.EmbeddingStore(source_config)
+    keys = np.asarray([3], dtype=np.uint64)
+    source.assign(keys, np.ones((1, 4), dtype=np.float32))
+    locator = SparseCheckpoint(storage).save(source, "training-config")
+    manifest = lance.dataset(str(root / "snapshot_manifest")).to_table().to_pylist()[0]
+    inference_target = se.EmbeddingStore(config())
+    storage.restore_weight_snapshot(
+        inference_target,
+        SparseWeightSnapshot(manifest["fragment_digest"]),
+        ElasticRestore(lambda values, count: values % count, 1, 0),
+    )
+    np.testing.assert_allclose(lookup(inference_target, (3,)), 1)
+    with pytest.raises(ValueError, match="restore target does not match"):
+        storage.restore_checkpoint(
+            se.EmbeddingStore(config()),
+            locator,
+            ElasticRestore(lambda values, count: values % count, 1, 0),
+        )
+
+
+def test_inference_snapshot_restores_into_optimizer_disabled_store(tmp_path):
+    root = tmp_path / "checkpoint"
+    source = se.EmbeddingStore(
+        se.EmbeddingConfig(
+            dims=[4], thread_budget=1, value_dtype="float32", optimizer_dtype="float16"
+        )
+    )
+    keys = np.asarray([3], dtype=np.uint64)
+    source.assign(keys, np.ones((1, 4), dtype=np.float32))
+    storage = LocalLanceStorage(root)
+    checkpoint = SparseCheckpoint(storage)
+    locator = checkpoint.save(source, "inference-only")
+    manifest = lance.dataset(str(root / "snapshot_manifest")).to_table().to_pylist()[0]
+
+    target = se.EmbeddingStore(
+        se.EmbeddingConfig(dims=[4], thread_budget=1, enable_optimizer=False)
+    )
+    assert target.optimizer_enabled() is False
+    storage.restore_weight_snapshot(
+        target,
+        SparseWeightSnapshot(manifest["fragment_digest"]),
+        ElasticRestore(lambda values, count: values % count, 1, 0),
+    )
+    np.testing.assert_allclose(lookup(target, (3,)), 1)
+    with pytest.raises(ValueError, match="optimizer enabled"):
+        storage.restore_checkpoint(
+            target,
+            locator,
+            ElasticRestore(lambda values, count: values % count, 1, 0),
+        )
+
+
+def test_training_restore_can_skip_optimizer_state(tmp_path):
+    storage = LocalLanceStorage(tmp_path / "checkpoint")
+    source = se.EmbeddingStore(config(), optimizer_config=se.Adam(lr=0.01))
+    keys = np.asarray([5], dtype=np.uint64)
+    source.assign(keys, np.ones((1, 4), dtype=np.float32))
+    locator = SparseCheckpoint(storage).save(source, "weights-only")
+    target = se.EmbeddingStore(config(), optimizer_config=se.Adam(lr=0.01))
+    SparseCheckpoint(storage).restore(
+        target,
+        locator,
+        ElasticRestore(lambda values, count: values % count, 1, 0),
+        load_optimizer_state=False,
+    )
+    np.testing.assert_allclose(lookup(target, (5,)), 1)
+
+
+def test_page_image_restore_can_skip_optimizer_state(tmp_path):
+    storage = LocalLanceStorage(tmp_path / "checkpoint")
+    source = se.EmbeddingStore(config(), optimizer_config=se.Adam(lr=0.01))
+    keys = np.asarray([6], dtype=np.uint64)
+    source.assign(keys, np.ones((1, 4), dtype=np.float32))
+    locator = SparseCheckpoint(storage).save(
+        source, "page-weights-only", include_page_images=True
+    )
+    target = se.EmbeddingStore(config(), optimizer_config=se.Adam(lr=0.01))
+    SparseCheckpoint(storage).restore(
+        target,
+        locator,
+        PhysicalRestore(
+            CheckpointParticipant(0, 1),
+            strategy=PhysicalRestoreStrategy.FAST_PAGE_CACHE,
+        ),
+        load_optimizer_state=False,
+    )
+    np.testing.assert_allclose(lookup(target, (6,)), 1)
 
 
 def test_four_participants_restore_to_seven_partitions(tmp_path):
@@ -133,7 +252,7 @@ def test_four_participants_restore_to_seven_partitions(tmp_path):
     assert partition_calls >= 14
 
 
-def test_duplicate_key_across_fragments_is_rejected(tmp_path):
+def test_duplicate_key_across_fragments_is_rejected_on_restore(tmp_path):
     storage = LocalLanceStorage(tmp_path / "checkpoint")
     identity = CheckpointSaveIdentity("duplicate", "attempt", authority())
     storage.prepare_checkpoint(identity)
@@ -145,8 +264,13 @@ def test_duplicate_key_across_fragments_is_rejected(tmp_path):
         )
         for index, value in enumerate((1, 2))
     ]
+    locator = storage.commit_checkpoint(identity, fragments)
     with pytest.raises(InvalidCheckpointFragment, match="duplicate"):
-        storage.commit_checkpoint(identity, fragments)
+        storage.restore_checkpoint(
+            se.EmbeddingStore(config()),
+            locator,
+            ElasticRestore(lambda keys, count: keys % count, 1, 0),
+        )
 
 
 def test_partition_function_validation_precedes_store_mutation(tmp_path):
@@ -174,32 +298,28 @@ def test_checkpoint_fragment_contains_no_physical_location(tmp_path):
     assert not hasattr(fragment, "uri")
 
 
-def test_repeated_updates_keep_logical_rows_bounded(tmp_path):
+def test_repeated_checkpoints_keep_manifest_fragments_independent(tmp_path):
     root = tmp_path / "checkpoint"
     checkpoint = SparseCheckpoint(LocalLanceStorage(root))
     for version in range(30):
         checkpoint.save(populated_store(range(64), version), f"v{version}")
-    entries = lance.dataset(str(root / "entries")).to_table()
-    pages = lance.dataset(str(root / "page_images")).to_table()
-    assert entries.num_rows == 64
-    assert pages.num_rows == 1
-    names = {path.name for path in root.rglob("*")}
-    assert not names.intersection(
-        {"payload.pkl", "metadata.json", "fragment.json", "artifact.json"}
-    )
+    manifests = lance.dataset(str(root / "snapshot_manifest")).to_table().to_pylist()
+    assert len(manifests) == 30
+    assert all(len(row["fragment_ids"]) == 1 for row in manifests)
+    assert not (root / "entries").exists()
+    assert not (root / "page_images").exists()
 
 
-def test_reclaim_bounds_physical_versions_after_repeated_updates(tmp_path):
+def test_reclaim_removes_released_fragment_manifests(tmp_path):
     root = tmp_path / "checkpoint"
     storage = LocalLanceStorage(root)
     checkpoint = SparseCheckpoint(storage)
     for version in range(20):
-        checkpoint.save(populated_store(range(32), version), f"v{version}")
-    assert len(lance.dataset(str(root / "entries")).versions()) > 10
-    assert len(lance.dataset(str(root / "page_images")).versions()) > 10
+        checkpoint.save(populated_store(range(32), version), "series")
     storage.reclaim(older_than=timedelta(0))
-    assert len(lance.dataset(str(root / "entries")).versions()) == 1
-    assert len(lance.dataset(str(root / "page_images")).versions()) == 1
+    manifests = lance.dataset(str(root / "snapshot_manifest")).to_table().to_pylist()
+    assert len(manifests) == 1
+    assert manifests[0]["checkpoint_name"] == "series"
 
 
 def test_stale_commit_authority_is_rejected(tmp_path):
@@ -247,26 +367,33 @@ def test_retention_lease_pins_exact_version(tmp_path):
     root = tmp_path / "checkpoint"
     storage = LocalLanceStorage(root)
     checkpoint = SparseCheckpoint(storage)
-    old = checkpoint.save(populated_store((1,), 1), "old")
+    old = checkpoint.save(populated_store((1,), 1), "series")
     lease = storage.acquire_checkpoint_lease(
         old, CheckpointLeaseRequest("trainer", 60, "request-1")
     )
-    checkpoint.save(populated_store((1,), 2), "new")
+    checkpoint.save(populated_store((1,), 2), "series")
     manifest_rows = (
         lance.dataset(str(root / "snapshot_manifest")).to_table().to_pylist()
     )
-    old_entries_version = next(
-        row["entries_lance_version"]
+    old_fragment_id = next(
+        row["fragment_ids"][0]
         for row in manifest_rows
         if row["checkpoint_name"] == old.checkpoint_name
         and row["checkpoint_version"] == old.checkpoint_version
     )
     storage.reclaim(older_than=timedelta(0))
-    lance.dataset(str(root / "entries"), version=old_entries_version)
+    assert old_fragment_id in {
+        item
+        for row in lance.dataset(str(root / "snapshot_manifest")).to_table().to_pylist()
+        for item in row["fragment_ids"]
+    }
     storage.release_checkpoint_lease(lease)
     storage.reclaim(older_than=timedelta(0))
-    with pytest.raises(Exception):
-        lance.dataset(str(root / "entries"), version=old_entries_version)
+    assert old_fragment_id not in {
+        item
+        for row in lance.dataset(str(root / "snapshot_manifest")).to_table().to_pylist()
+        for item in row["fragment_ids"]
+    }
 
 
 def test_reclaim_reservation_removes_only_released_reference(tmp_path):
@@ -344,7 +471,9 @@ def test_active_lease_blocks_reclaim_reservation(tmp_path):
     storage.release_checkpoint_lease(renewed)
 
 
-def test_committed_attempt_is_idempotent_and_abortable_after_storage_restart(tmp_path):
+def test_committed_attempt_is_idempotent_and_not_abortable_after_storage_restart(
+    tmp_path,
+):
     root = tmp_path / "checkpoint"
     identity = CheckpointSaveIdentity("snapshot", "attempt", authority())
     first_storage = LocalLanceStorage(root)
@@ -371,16 +500,15 @@ def test_committed_attempt_is_idempotent_and_abortable_after_storage_restart(tmp
         == locator
     )
     restarted.abort_checkpoint(identity)
-    with pytest.raises(LookupError):
-        restarted.restore_checkpoint(
-            se.EmbeddingStore(config()),
-            locator,
-            PhysicalRestore(CheckpointParticipant(0, 1)),
-        )
+    restarted.restore_checkpoint(
+        se.EmbeddingStore(config()),
+        locator,
+        PhysicalRestore(CheckpointParticipant(0, 1)),
+    )
 
     checkpoint = SparseCheckpoint(LocalLanceStorage(root))
     replacement = checkpoint.save(populated_store((3, 4), 8), "replacement")
-    assert replacement.checkpoint_version == 1
+    assert replacement.checkpoint_version == 2
 
 
 def test_concurrent_commits_receive_unique_publication_versions(tmp_path):
@@ -462,5 +590,16 @@ def test_commit_rejects_post_merge_storage_budget(tmp_path):
         checkpoint.save(source, "over-budget")
     manifests = lance.dataset(str(root / "snapshot_manifest")).to_table().to_pylist()
     assert [row["checkpoint_name"] for row in manifests] == [baseline.checkpoint_name]
-    current = lance.dataset(str(root / "entries")).to_table().to_pylist()
-    assert {(row["key"], row["row_state"]) for row in current} == {(1, "active")}
+    assert not (root / "entries").exists()
+    assert not (root / "page_images").exists()
+
+
+def test_compact_checkpoint_locator_is_explicit_and_idempotent(tmp_path):
+    storage = LocalLanceStorage(tmp_path / "checkpoint")
+    checkpoint = SparseCheckpoint(storage)
+    locator = checkpoint.save(populated_store((1,), 1), "compact-me")
+    storage.compact_checkpoint(locator)
+    storage.compact_checkpoint(locator)
+    manifest = storage._resolve_manifest(locator)
+    assert manifest["compacted_version"] == locator.checkpoint_version
+    assert len(manifest["fragment_ids"]) == 1

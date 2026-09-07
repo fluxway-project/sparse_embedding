@@ -21,9 +21,9 @@ PYTHONPATH="$PWD" pytest -q sparse_embedding/tests/test_gravitino_lance.py
 SparseCheckpoint
     |
     +-- LocalLanceStorage
-    |       +-- entries
-    |       +-- page_images
-    |       +-- snapshot_manifest
+    |       +-- snapshot_manifest (sole visibility boundary)
+    |       +-- _staging/<fragment_id>/entries (Canonical SSOT dataset)
+    |       +-- _staging/<fragment_id>/page_images (Optional page image cache, generated on-demand)
     |
     +-- GravitinoLanceStorage
             +-- Gravitino control-plane API base URI
@@ -32,8 +32,8 @@ SparseCheckpoint
 ```
 
 `LocalLanceStorage` and `GravitinoLanceStorage` use one shared Lance checkpoint
-transaction engine. Schema validation, staging, materialized merge, manifest
-publication, exact-version restore, commit authority, leases, retention, reclaim,
+transaction engine. Schema validation, Fragment staging, manifest publication,
+Fragment restore, commit authority, leases, retention, reclaim,
 and completion records are implemented once. The storage adapters only supply
 dataset locations, prefix operations, durable records, and commit locking.
 
@@ -45,22 +45,97 @@ local or process-memory fallback exists.
 ## 2. Local Lance Integration
 
 ```python
-from sparse_embedding.checkpoint import LocalLanceStorage, SparseCheckpoint
+from sparse_embedding.checkpoint import (
+    LocalLanceStorage,
+    PhysicalRestore,
+    PhysicalRestoreStrategy,
+    SparseCheckpoint,
+)
 
 checkpoint = SparseCheckpoint(
     LocalLanceStorage("/checkpoints/user_embedding")
 )
+
+# Default: persist only canonical entries (saves 50% write bandwidth and storage space)
 locator = checkpoint.save(store, "step-1000")
-checkpoint.restore(restored_store, locator)
+
+# Optional: persist physical page_images cache for fastest restore speed in fixed topologies:
+# locator = checkpoint.save(store, "step-1000", include_page_images=True)
+
+# Restore with explicit strategy (zero implicit fallback)
+checkpoint.restore(
+    restored_store,
+    locator,
+    mode=PhysicalRestore(participant, strategy=PhysicalRestoreStrategy.RECONSTRUCT_ENTRIES),
+)
 ```
 
-The fixed Lance table triplet consists of:
+Training and inference stores use the same checkpoint format but have explicit
+optimizer-state policies. `EmbeddingConfig(enable_optimizer=False)` constructs
+a weight-only store without allocating optimizer-state pages. Ordinary
+`checkpoint.restore(..., load_optimizer_state=True)` preserves the training
+round trip and can be set to `False` for weight-only restore. A disabled target
+rejects optimizer-state loading. `restore_weight_snapshot` is the inference
+entry point and always loads embeddings without optimizer state.
 
-- `entries`: The materialized logical state `(dim, key)`.
-- `page_images`: Physical page images and their checksums.
+The selective-loading contract is covered by
+`sparse_embedding/tests/test_lance_optimizer_loading.py`; run it together with
+the checkpoint/config/mixed-precision focused tests when changing this path.
+
+Checkpoints no longer use shared materialized tables. Each participant writes a
+snapshot into an independent Fragment via a true streaming pipeline based on
+`BoundedChannel`, maintaining $O(N_{live})$ compact page-index metadata plus
+bounded single-page and writer buffers, and writing in a single commit (data
+version 1, followed by metadata publish version 2).
+This completely eliminates Lance multi-transaction append loops and manifest explosion.
+The Manifest records `fragment_ids`, digests, `commit_state`, `compacted_version`,
+and protocol version. The sole visibility metadata table is:
+
 - `snapshot_manifest`: The unique visibility boundary for checkpoints.
 
-The manifest records two exact Lance versions; the restoration process does not read the latest version. During write failures, merged versions are rolled back, and staging fragments are cleaned up via abort/reconciliation.
+### Restore Strategies and Single Source of Truth (SSOT)
+
+- **Canonical `entries` as Sole Source of Truth**:
+  Default writes persist only the `entries` dataset containing all keys, embedding vectors,
+  and optimizer states.
+  - `ElasticRestore`: Elastic resharding with new `partition_fn`, completely decoupled
+    from historical participant/page topologies.
+  - `PhysicalRestore(..., strategy=PhysicalRestoreStrategy.RECONSTRUCT_ENTRIES)`: Rebuilds
+    physical pages deterministically from canonical `entries`. Even after multi-participant
+    checkpoint compaction, it precisely filters by `source_participant_index` to restore only
+    the targeted worker's parameters.
+- **Optional `page_images` Cache and Zero Fallback**:
+  Only persisted when explicitly enabled with `include_page_images=True`.
+  - `PhysicalRestore(..., strategy=PhysicalRestoreStrategy.FAST_PAGE_CACHE)`: bounded-batch
+    import of physical page images (avoids retaining the complete cache in RAM).
+  - **Zero Fallback Contract**: If `FAST_PAGE_CACHE` is requested but the checkpoint does not
+    contain physical page images, it **strictly raises `FileNotFoundError`** with zero implicit fallback.
+
+### Standalone Compaction and Remote Storage Support
+
+Export jobs can compact persisted Fragments by path alone without instantiating storage:
+
+```python
+from sparse_embedding.checkpoint import compact_fragments
+
+# Local directory compaction
+compact_fragments("/checkpoints/user_embedding/_staging", "/exports/user_embedding")
+
+# Remote object storage compaction (supports s3:// and s3a:// URIs with storage_options)
+compact_fragments(
+    "s3://my-bucket/checkpoints/user_embedding/_staging",
+    "s3://my-bucket/exports/user_embedding",
+    storage_options={"endpoint": "http://s3.us-east-1.amazonaws.com", "region": "us-east-1"},
+)
+```
+
+Native Lance scanning and streaming writing use the single C++ policy in `checkpoint_stream_policy.hpp` for scanner batch rows, channel capacity, and page-import batch pages. This avoids duplicating batch literals; resident compaction memory is bounded by those fixed capacities.
+Publication strictly enforces atomicity and zero-orphan cleanup rules:
+- **Local File System (Local)**: Uses POSIX atomic `rename(2)` to publish directories with **zero auxiliary JSON files**.
+- **Remote Object Storage (S3 / S3A)**: Since object storage lacks atomic directory rename, a single, strongly-consistent pointer object (`.manifest_pointer.json`) is written over an immutable staged prefix to provide linearized atomic publication without partial visibility.
+- **Full Lifecycle Cleanup (Zero Orphans)**: Auxiliary JSON files are used exclusively on remote object stores as an atomic pointer. Successful overwrite, explicit `delete_prefix`, recursive parent deletion, and rollback paths strictly clean pointer objects and staged directories; cleanup failures are propagated and preserve the published root for retry instead of reporting success.
+- **Strict Zero Fallback Deletion**: `delete_prefix(..., missing_ok=False)` strictly raises `FileNotFoundError` when the target prefix does not exist; idempotent exit is permitted only when `missing_ok=True` is explicitly passed.
+- **Protocol Version Stability**: Protocol version remains `_PROTOCOL_VERSION = 1`. Multi-participant compaction records the complete `participant_indices` array in the compacted fragment metadata.
 
 The distributed framework provides framework-agnostic commit authority via the SPI:
 

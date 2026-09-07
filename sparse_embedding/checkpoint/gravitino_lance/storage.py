@@ -8,7 +8,7 @@ from ..lance_backend import _LanceCheckpointStorage
 from .config import SdkConfig
 from .rest import LanceRestCatalog, LanceRestError
 
-_DATASETS = ("entries", "page_images", "snapshot_manifest")
+_DATASETS = ("snapshot_manifest",)
 
 
 class GravitinoLanceStorage(_LanceCheckpointStorage):
@@ -130,7 +130,7 @@ class GravitinoLanceStorage(_LanceCheckpointStorage):
         location: str,
     ) -> Mapping[str, str]:
         if len(handles) != len(_DATASETS):
-            raise ValueError("Gravitino checkpoint requires exactly three tables")
+            raise ValueError("Gravitino checkpoint requires exactly one manifest table")
         first = dict(handles[0].storage_options)
         if not first:
             raise ValueError("Gravitino checkpoint storage options are empty")

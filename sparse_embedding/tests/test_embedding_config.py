@@ -1,6 +1,13 @@
 import numpy as np
+import pytest
 
-from sparse_embedding import AutoStorage, EmbeddingConfig, StorageTuningOptions
+from sparse_embedding import (
+    Adam,
+    AutoStorage,
+    EmbeddingConfig,
+    EmbeddingStore,
+    StorageTuningOptions,
+)
 
 
 def test_embedding_config_default():
@@ -9,6 +16,23 @@ def test_embedding_config_default():
     assert cfg.optimizer_dtype == ""
     assert cfg.key_dtype == "int64"
     assert isinstance(cfg.storage, AutoStorage)
+
+
+def test_embedding_config_can_disable_optimizer():
+    cfg = EmbeddingConfig(dims=[128], enable_optimizer=False)
+    assert cfg.enable_optimizer is False
+    store = EmbeddingStore(cfg)
+    assert store.optimizer_enabled() is False
+    with pytest.raises(RuntimeError, match="optimizer enabled"):
+        store.optimizer_step()
+
+
+def test_disabled_optimizer_rejects_optimizer_config():
+    with pytest.raises(ValueError, match="optimizer_config cannot be provided"):
+        EmbeddingStore(
+            EmbeddingConfig(dims=[4], enable_optimizer=False),
+            optimizer_config=Adam(),
+        )
 
 
 def test_embedding_config_native_types():
