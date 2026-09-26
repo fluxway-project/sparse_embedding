@@ -116,7 +116,7 @@ void SyncOpsImpl<ParamT, OptT>::assign(EmbeddingStoreWrapper &self,
       } else {
         throw std::invalid_argument("values must be a 1D or 2D tensor");
       }
-      thread_local std::vector<int64_t> tls_row_lengths;
+      auto& tls_row_lengths = get_tls_row_lengths();
       tls_row_lengths.resize(n);
       fill_uniform_row_lengths(tls_row_lengths, dim);
       ec = self.get_store<ParamT, OptT>()->assign(ks, val_span,
@@ -176,13 +176,15 @@ void SyncOpsImpl<ParamT, OptT>::accumulate_gradients(
   std::error_code ec;
   {
     nb::gil_scoped_release release;
-    auto grads_span = se::py::dlpack_to_span<const ParamT>(dlm_grads);
-    dispatch_on_key(dlm_keys, self.key_type_enum_, [&](auto ks) {
-      thread_local std::vector<int64_t> tls_row_lengths;
-      tls_row_lengths.resize(n);
-      fill_uniform_row_lengths(tls_row_lengths, dim);
-      ec = self.get_store<ParamT, OptT>()->accumulate_gradients(
-          ks, grads_span, tls_row_lengths);
+    dispatch_value_dtype(self.gradient_dtype_code_, [&]<typename GradT>() {
+      auto grads_span = se::py::dlpack_to_span<const GradT>(dlm_grads);
+      dispatch_on_key(dlm_keys, self.key_type_enum_, [&](auto ks) {
+        auto& tls_row_lengths = get_tls_row_lengths();
+        tls_row_lengths.resize(n);
+        fill_uniform_row_lengths(tls_row_lengths, dim);
+        ec = self.get_store<ParamT, OptT>()->accumulate_gradients(
+            ks, grads_span, tls_row_lengths);
+      });
     });
   }
   check_error(ec);

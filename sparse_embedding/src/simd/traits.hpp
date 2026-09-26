@@ -20,6 +20,9 @@
 
 #include <cstddef>
 #include <type_traits>
+#if defined(__x86_64__) || defined(_M_X64)
+#include <immintrin.h>
+#endif
 
 #include "sparse_embedding/src/common/numeric_types.hpp"
 

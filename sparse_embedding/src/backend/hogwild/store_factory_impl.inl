@@ -40,6 +40,8 @@ void make_store(StoreConstructionTarget &target,
           .thread_budget = thread_budget,
           .storage = std::move(target.storage),
           .storage_tuning = target.storage_tuning,
+          .gradient_dtype = request.gradient_dtype,
+          .gradient_scale = request.gradient_scale,
       });
 }
 

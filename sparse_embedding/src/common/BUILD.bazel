@@ -7,6 +7,7 @@ load("@rules_cc//cc:defs.bzl", "cc_library")
 cc_library(
     name = "common",
     hdrs = [
+        "checked_numeric.hpp",
         "embedding_error.hpp",
         "function.hpp",
         "numeric_types.hpp",

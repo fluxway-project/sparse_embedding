@@ -9,6 +9,7 @@
 
 #include <proxy/proxy.h>
 
+#include "sparse_embedding/src/arena/gradient_accumulator.hpp"
 #include "sparse_embedding/src/common/numeric_types.hpp"
 #include "sparse_embedding/src/eviction/score_policy.hpp"
 #include "sparse_embedding/src/interface/embedding_table_interface.hpp"
@@ -36,12 +37,16 @@ using StoreScorePolicy = ScorePolicyKind;
 struct StoreConstructionKind {
   StoreParamDType param_dtype;
   StoreParamDType optimizer_dtype;
+  GradientDType gradient_dtype;
+  float gradient_scale;
   StoreScorePolicy score_policy;
 };
 
 struct StoreConstructionRequest {
   std::shared_ptr<pro::proxy<InitializerBuilderFacade>> initializer_builder;
   std::optional<OptimizerConfigVariant> optimizer_config;
+  GradientDType gradient_dtype = GradientDType::kFloat32;
+  float gradient_scale = 1.0f;
 };
 
 struct StoreConstructionTarget {

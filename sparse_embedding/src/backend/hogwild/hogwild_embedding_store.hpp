@@ -48,6 +48,7 @@
 #include <utility>
 #include <vector>
 
+#include "sparse_embedding/src/arena/gradient_accumulator.hpp"
 #include "sparse_embedding/src/arena/transient_arena.hpp"
 #include "sparse_embedding/src/backend/hogwild/compaction/page_compaction_profile.hpp"
 #include "sparse_embedding/src/backend/hogwild/core/cohort_arena_allocation.hpp"
@@ -1595,7 +1596,7 @@ public:
     SealedHotPagePool<ParamT> sealed_pages;
     OptimizerExtension<ParamT, OptT> optimizer;
     std::atomic<uint64_t> optimizer_locator_revalidation_failures{0};
-    std::vector<std::unique_ptr<TransientArena<ParamT>>> transient_shards;
+    std::vector<std::unique_ptr<GradientAccumulator<ParamT>>> transient_shards;
     OptimizerFactory opt_factory;
     std::atomic<uint64_t> global_step{0};
     std::atomic<uint64_t> sealed_page_layout_generation{0};
@@ -1650,7 +1651,8 @@ public:
               size_t transient_shard_count, bool enable_score,
               PageStorage storage,
               std::shared_ptr<RetirementPressure> retirement_pressure,
-              TelemetryRing &telemetry_ring_in)
+              TelemetryRing &telemetry_ring_in, GradientDType gradient_dtype,
+              float gradient_scale)
         : dim(d), score_policy(score_policy_in),
           page_reuse(std::make_shared<PageReuseState>(
               topology.max_pages(), topology.entries_per_page())),
@@ -1696,7 +1698,8 @@ public:
       }
       for (size_t i = 0; i < transient_shard_count; ++i) {
         transient_shards.push_back(
-            std::make_unique<TransientArena<ParamT>>(d, storage, enable_score));
+            std::make_unique<GradientAccumulator<ParamT>>(
+                d, storage, enable_score, gradient_dtype, gradient_scale));
       }
 #if defined(PAGE_COMPACTION_SHARD_PROFILE)
       configure_page_compaction_shard_profile(key_shards.size());
@@ -1708,7 +1711,8 @@ public:
               size_t transient_shard_count, bool enable_score,
               PageStorage storage,
               std::shared_ptr<RetirementPressure> retirement_pressure,
-              bool numa_aware_pages, TelemetryRing &telemetry_ring_in)
+              bool numa_aware_pages, TelemetryRing &telemetry_ring_in,
+              GradientDType gradient_dtype, float gradient_scale)
         : SlotStore(
               d, score_policy_in, std::move(opt_factory_in),
               storage::StorageTopology(
@@ -1718,7 +1722,8 @@ public:
                       : std::min(size_t{16}, partition_count),
                   numa_aware_pages, numa_aware_pages),
               transient_shard_count, enable_score, std::move(storage),
-              std::move(retirement_pressure), telemetry_ring_in) {}
+              std::move(retirement_pressure), telemetry_ring_in, gradient_dtype,
+              gradient_scale) {}
 
   private:
     static size_t numa_page_cohort_size(size_t shard_count,
@@ -3799,7 +3804,8 @@ public:
       if (dim_to_slot_[dim] == nullptr) {
         slot_storage_.push_back(std::make_unique<SlotStore>(
             dim, score_policy_, opt_factory, storage_topology_, num_threads_,
-            enable_score, storage_, retirement_pressure_, telemetry_ring_));
+            enable_score, storage_, retirement_pressure_, telemetry_ring_,
+            options.gradient_dtype, options.gradient_scale));
         dim_to_slot_[dim] = slot_storage_.back().get();
       }
     }
@@ -4104,11 +4110,22 @@ public:
   std::error_code accumulate_gradients(std::span<const K> keys,
                                        std::span<const ParamT> flat_grads,
                                        std::span<const int64_t> row_lengths) {
+    return accumulate_gradients<K, ParamT>(keys, flat_grads, row_lengths);
+  }
+
+  template <typename K, typename GradT>
+  std::error_code accumulate_gradients(std::span<const K> keys,
+                                       std::span<const GradT> flat_grads,
+                                       std::span<const int64_t> row_lengths) {
     ActiveInvocationGuard invocation(invocation_gate_, &storage_);
     StoreSnapshot *snapshot = snapshot_.load(std::memory_order_acquire);
     if (snapshot == nullptr)
       throw std::runtime_error("store snapshot is unavailable");
     size_t n = keys.size();
+    if (!snapshot->slots.empty() &&
+        !snapshot->slots.front()->transient_shards.empty())
+      snapshot->slots.front()->transient_shards.front()->validate_input(
+          flat_grads);
     auto offsets = compute_offsets(row_lengths);
     const size_t worker_count =
         n == 0
@@ -4232,7 +4249,7 @@ public:
                 std::to_string(dim));
           }
           auto &slot = *snapshot->dim_to_slot[dim];
-          const ParamT *grad_src = flat_grads.data() + offsets[i];
+          const GradT *grad_src = flat_grads.data() + offsets[i];
           slot.transient_shards[shard_id]->accumulate_hashed(
               key, gradient_hashes[i], grad_src);
         }

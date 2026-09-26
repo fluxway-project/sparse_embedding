@@ -1400,7 +1400,7 @@ void scan_native_entries(std::string_view uri, uint64_t version,
 void scan_native_page_images(std::string_view uri, uint64_t version,
                              uint32_t participant_index,
                              NativePageImageVisitor visitor,
-                             bool load_optimizer_state,
+                             bool /*load_optimizer_state*/,
                              const LanceStorageOptions &storage_options) {
   if (!visitor)
     throw std::invalid_argument("native Lance page visitor is empty");
@@ -1462,11 +1462,9 @@ void scan_native_page_images(std::string_view uri, uint64_t version,
                 binary_value(batch_array.children[indices[10]], row);
             const auto steps_bytes =
                 binary_value(batch_array.children[indices[13]], row);
-            if (load_optimizer_state) {
-              page.optimizer_values.assign(optimizer_bytes.begin(),
-                                           optimizer_bytes.end());
-              steps.assign(steps_bytes.begin(), steps_bytes.end());
-            }
+            page.optimizer_values.assign(optimizer_bytes.begin(),
+                                         optimizer_bytes.end());
+            steps.assign(steps_bytes.begin(), steps_bytes.end());
             page.slot_ordinals.assign(
                 reinterpret_cast<const uint32_t *>(slots.data()),
                 reinterpret_cast<const uint32_t *>(slots.data() +
@@ -1482,11 +1480,9 @@ void scan_native_page_images(std::string_view uri, uint64_t version,
                 reinterpret_cast<const uint64_t *>(scores.data()),
                 reinterpret_cast<const uint64_t *>(scores.data() +
                                                    scores.size()));
-            if (load_optimizer_state)
-              page.steps.assign(
-                  reinterpret_cast<const uint32_t *>(steps.data()),
-                  reinterpret_cast<const uint32_t *>(steps.data() +
-                                                     steps.size()));
+            page.steps.assign(reinterpret_cast<const uint32_t *>(steps.data()),
+                              reinterpret_cast<const uint32_t *>(steps.data() +
+                                                                 steps.size()));
             page.optimizer_dtype =
                 binary_string(batch_array.children[indices[11]], row);
             page.optimizer_stride =

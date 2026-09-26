@@ -73,6 +73,16 @@ def _combo_id(combo):
 
 
 ALL_COMBO_IDS = [_combo_id(c) for c in ALL_COMBOS]
+GRADIENT_COMBOS = [
+    (param_dtype, optimizer_dtype, gradient_dtype)
+    for param_dtype in DTYPES
+    for optimizer_dtype in DTYPES
+    for gradient_dtype in DTYPES
+]
+GRADIENT_COMBO_IDS = [
+    f"{_combo_id((p, o))}_grad_{g.replace('float', 'f').replace('b', 'b')}"
+    for p, o, g in GRADIENT_COMBOS
+]
 
 
 # ---------------------------------------------------------------------------
@@ -260,3 +270,113 @@ def test_checkpoint_roundtrip(param_dtype, optimizer_dtype, tmp_path):
         atol=optimizer_tolerance,
         err_msg="optimizer state diverged after checkpoint restore",
     )
+
+
+@pytest.mark.parametrize(
+    "param_dtype,optimizer_dtype,gradient_dtype",
+    GRADIENT_COMBOS,
+    ids=GRADIENT_COMBO_IDS,
+)
+def test_independent_gradient_accumulator_dtype(
+    param_dtype, optimizer_dtype, gradient_dtype
+):
+    """Gradient storage dtype is independent from params and optimizer state."""
+    if "bfloat16" in (param_dtype, optimizer_dtype, gradient_dtype) and not _HAS_JAX:
+        pytest.skip("JAX required for bfloat16")
+
+    cfg = se.EmbeddingConfig(
+        dims=[4],
+        thread_budget=1,
+        value_dtype=param_dtype,
+        optimizer_dtype=optimizer_dtype,
+        gradient_dtype=gradient_dtype,
+    )
+    store = se.EmbeddingStore(
+        cfg,
+        optimizer_config=se.Sgd(lr=0.01),
+        initializer_config=se.Zeros(),
+    )
+    keys = np.array([7], dtype=np.uint64)
+    store.lookup_or_insert(keys, dim=4)
+    gradients = _make_array((1, 4), gradient_dtype, np.random.default_rng(17))
+    store.accumulate_gradients(keys, gradients)
+    store.optimizer_step()
+
+    out, _ = store.lookup(keys, dim=4)
+    values = _to_numpy_f32(out, (1, 4), param_dtype)
+    assert np.all(np.isfinite(values))
+    assert np.any(values != 0.0)
+
+
+@pytest.mark.parametrize(
+    "param_dtype,gradient_dtype",
+    [("float16", "float32"), ("float32", "float16"), ("bfloat16", "float32")],
+)
+@pytest.mark.asyncio
+async def test_async_accumulate_accepts_configured_gradient_dtype(
+    param_dtype, gradient_dtype
+):
+    if "bfloat16" in (param_dtype, gradient_dtype) and not _HAS_JAX:
+        pytest.skip("JAX required for bfloat16")
+
+    cfg = se.EmbeddingConfig(
+        dims=[4],
+        thread_budget=1,
+        value_dtype=param_dtype,
+        optimizer_dtype="float32",
+        gradient_dtype=gradient_dtype,
+    )
+    store = se.EmbeddingStore(
+        cfg,
+        optimizer_config=se.Sgd(lr=0.01),
+        initializer_config=se.Zeros(),
+    )
+    keys = np.array([8], dtype=np.uint64)
+    store.lookup_or_insert(keys, dim=4)
+    gradients = _make_array((1, 4), gradient_dtype, np.random.default_rng(23))
+    await store.async_accumulate_gradients(keys, gradients)
+    store.optimizer_step()
+
+
+@pytest.mark.parametrize("gradient_scale", [1.0, 8.0])
+def test_gradient_scale_round_trip(gradient_scale):
+    """Scaling the stored FP16 gradient does not change the optimizer update."""
+    key = np.array([11], dtype=np.uint64)
+    grad = np.array([[1.0, 2.0, 3.0, 4.0]], dtype=np.float16)
+    values = []
+    for scale in (1.0, gradient_scale):
+        cfg = se.EmbeddingConfig(
+            dims=[4],
+            thread_budget=1,
+            value_dtype="float16",
+            optimizer_dtype="float32",
+            gradient_dtype="float16",
+            gradient_scale=scale,
+        )
+        store = se.EmbeddingStore(
+            cfg,
+            optimizer_config=se.Sgd(lr=0.01),
+            initializer_config=se.Zeros(),
+        )
+        store.lookup_or_insert(key, dim=4)
+        store.accumulate_gradients(key, grad)
+        store.optimizer_step()
+        out, _ = store.lookup(key, dim=4)
+        values.append(np.from_dlpack(out).astype(np.float32))
+    np.testing.assert_allclose(values[0], values[1], atol=2e-4)
+
+
+@pytest.mark.parametrize("gradient_scale", [0.0, -1.0, float("nan"), float("inf")])
+def test_gradient_scale_rejects_invalid_values(gradient_scale):
+    with pytest.raises(ValueError, match="gradient_scale"):
+        se.EmbeddingStore(
+            se.EmbeddingConfig(
+                dims=[2],
+                thread_budget=1,
+                value_dtype="float16",
+                optimizer_dtype="float32",
+                gradient_dtype="float16",
+                gradient_scale=gradient_scale,
+            ),
+            optimizer_config=se.Sgd(lr=0.01),
+        )

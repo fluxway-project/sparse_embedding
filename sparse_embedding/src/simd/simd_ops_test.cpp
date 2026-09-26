@@ -18,8 +18,11 @@
 #include <array>
 #include <cmath>
 #include <cstddef>
+#include <limits>
 #include <stdexcept>
 #include <vector>
+
+#include "sparse_embedding/src/common/numeric_types.hpp"
 
 int main() {
   static_assert(se::simd::kCacheLineSize == 64);
