@@ -104,7 +104,7 @@ nb::object AsyncOpsImpl<ParamT, OptT>::async_assign(
        values_keeper = std::make_shared<se::py::AsyncPyObjectKeeper>(
            cap_values)]() -> std::error_code {
         auto do_assign = [&](auto ks) -> std::error_code {
-          thread_local std::vector<int64_t> tls_row_lengths;
+          auto& tls_row_lengths = get_tls_row_lengths();
           tls_row_lengths.resize(n);
           fill_uniform_row_lengths(tls_row_lengths, val_dim);
           return wrapper_ptr->get_store<ParamT, OptT>()->assign(
@@ -211,45 +211,45 @@ nb::object AsyncOpsImpl<ParamT, OptT>::async_accumulate_gradients(
     throw std::invalid_argument("grads must be a 1D or 2D tensor");
   }
   auto kdt = detect_key_dtype(dlm_keys);
-  const void *keys_data =
-      reinterpret_cast<const char *>(dlm_keys->dl_tensor.data) +
-      dlm_keys->dl_tensor.byte_offset;
-  const void *grads_data =
-      reinterpret_cast<const char *>(dlm_grads->dl_tensor.data) +
-      dlm_grads->dl_tensor.byte_offset;
   auto *wrapper_ptr = &self;
-  return se::py::async_dispatch(
-      self.async_pool_,
-      [wrapper_ptr, n, kdt, keys_data, grads_data, dim,
-       keys_keeper =
-           std::make_shared<se::py::AsyncPyObjectKeeper>(cap_keys),
-       grads_keeper = std::make_shared<se::py::AsyncPyObjectKeeper>(
-           cap_grads)]() -> std::error_code {
-        auto do_acc = [&](auto ks) -> std::error_code {
-          thread_local std::vector<int64_t> tls_row_lengths;
-          tls_row_lengths.resize(n);
-          fill_uniform_row_lengths(tls_row_lengths, dim);
-          return wrapper_ptr->get_store<ParamT, OptT>()
-              ->accumulate_gradients(
-                  ks,
-                  std::span<const ParamT>(
-                      static_cast<const ParamT *>(grads_data), n * dim),
-                  tls_row_lengths);
-        };
-        if (kdt == KeyDType::kInt64)
-          return do_acc(std::span<const int64_t>(
-              static_cast<const int64_t *>(keys_data), n));
-        return do_acc(std::span<const uint64_t>(
-            static_cast<const uint64_t *>(keys_data), n));
-      },
-      [](nb::object future, std::error_code ec) {
-        if (!ec)
-          future.attr("set_result")(nb::none());
-        else
-          future.attr("set_exception")(
-              nb::module_::import_("builtins")
+  return dispatch_value_dtype(self.gradient_dtype_code_,
+                             [&]<typename GradT>() -> nb::object {
+    auto grads_span = se::py::dlpack_to_span<const GradT>(dlm_grads);
+    const GradT *grads_data = grads_span.data();
+    const void *keys_data =
+        reinterpret_cast<const char *>(dlm_keys->dl_tensor.data) +
+        dlm_keys->dl_tensor.byte_offset;
+    return se::py::async_dispatch(
+        self.async_pool_,
+        [wrapper_ptr, n, kdt, keys_data, grads_data, dim,
+         keys_keeper =
+             std::make_shared<se::py::AsyncPyObjectKeeper>(cap_keys),
+         grads_keeper = std::make_shared<se::py::AsyncPyObjectKeeper>(
+             cap_grads)]() -> std::error_code {
+          auto do_acc = [&](auto ks) -> std::error_code {
+            auto& tls_row_lengths = get_tls_row_lengths();
+            tls_row_lengths.resize(n);
+            fill_uniform_row_lengths(tls_row_lengths, dim);
+            return wrapper_ptr->get_store<ParamT, OptT>()
+                ->accumulate_gradients(
+                    ks, std::span<const GradT>(grads_data, n * dim),
+                    tls_row_lengths);
+          };
+          if (kdt == KeyDType::kInt64)
+            return do_acc(std::span<const int64_t>(
+                static_cast<const int64_t *>(keys_data), n));
+          return do_acc(std::span<const uint64_t>(
+              static_cast<const uint64_t *>(keys_data), n));
+        },
+        [](nb::object future, std::error_code ec) {
+          if (!ec)
+            future.attr("set_result")(nb::none());
+          else
+            future.attr("set_exception")(
+                nb::module_::import_("builtins")
                   .attr("RuntimeError")(ec.message()));
       });
+  });
 }
 
 template <typename ParamT, typename OptT>

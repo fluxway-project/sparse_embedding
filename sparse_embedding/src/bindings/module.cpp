@@ -22,6 +22,7 @@
 #include <nanobind/stl/vector.h>
 
 #include <algorithm>
+#include <cmath>
 #include <cstdint>
 #include <memory>
 #include <span>
@@ -80,7 +81,10 @@ void construct_store(EmbeddingStoreWrapper &self, const PyInitializer &init_cfg,
       init_cfg.builder,
       opt_cfg.has_value()
           ? std::optional<se::OptimizerConfigVariant>(opt_cfg->config)
-          : std::nullopt};
+          : std::nullopt,
+      se::GradientDType::kFloat32, 1.0f};
+  request.gradient_dtype = kind.gradient_dtype;
+  request.gradient_scale = kind.gradient_scale;
   se::create_hogwild_store(kind, std::move(target), std::move(request),
                            thread_budget);
 }
@@ -97,6 +101,11 @@ EmbeddingStoreWrapper::EmbeddingStoreWrapper(
                                                   ? emb_cfg.value_dtype
                                                   : emb_cfg.optimizer_dtype,
                                               "opt_dtype")),
+      gradient_dtype_code_(parse_value_dtype(emb_cfg.gradient_dtype.empty()
+                                                 ? emb_cfg.value_dtype
+                                                 : emb_cfg.gradient_dtype,
+                                             "gradient_dtype")),
+      gradient_scale_(emb_cfg.gradient_scale),
       optimizer_enabled_(emb_cfg.enable_optimizer),
       key_type_enum_(parse_key_dtype(emb_cfg.key_dtype)),
       score_policy_name_(score_policy_name),
@@ -149,11 +158,27 @@ EmbeddingStoreWrapper::EmbeddingStoreWrapper(
     }
     throw std::invalid_argument("unsupported value dtype");
   };
-  construct_store(*this, init_cfg, opt_cfg, thread_budget,
-                  se::StoreConstructionKind{
-                      to_store_dtype(value_dtype_code_),
-                      to_store_dtype(optimizer_dtype_code_), score_policy},
-                  emb_cfg);
+  if (!std::isfinite(gradient_scale_) || gradient_scale_ <= 0.0f)
+    throw std::invalid_argument(
+        "gradient_scale must be finite and greater than zero");
+  const auto to_gradient_dtype = [](ValueDType dtype) {
+    switch (dtype) {
+    case ValueDType::kFloat32:
+      return se::GradientDType::kFloat32;
+    case ValueDType::kFloat16:
+      return se::GradientDType::kFloat16;
+    case ValueDType::kBFloat16:
+      return se::GradientDType::kBFloat16;
+    }
+    throw std::invalid_argument("unsupported gradient dtype");
+  };
+  construct_store(
+      *this, init_cfg, opt_cfg, thread_budget,
+      se::StoreConstructionKind{to_store_dtype(value_dtype_code_),
+                                to_store_dtype(optimizer_dtype_code_),
+                                to_gradient_dtype(gradient_dtype_code_),
+                                gradient_scale_, score_policy},
+      emb_cfg);
 }
 
 } // namespace se::py::detail
@@ -375,10 +400,11 @@ NB_MODULE(_core, m) {
 
   nb::class_<se::EmbeddingConfig>(m, "_EmbeddingConfig")
       .def(nb::init<std::vector<size_t>, size_t, std::string, std::string,
-                    std::string, se::StorageOptions,
+                    std::string, float, std::string, se::StorageOptions,
                     se::storage::StorageTuningOptions, bool>(),
            nb::arg("dims"), nb::arg("thread_budget") = 0,
            nb::arg("value_dtype") = "float32", nb::arg("optimizer_dtype") = "",
+           nb::arg("gradient_dtype") = "", nb::arg("gradient_scale") = 1.0f,
            nb::arg("key_dtype") = "int64",
            nb::arg("storage") = se::StorageOptions{},
            nb::arg("storage_tuning") = se::storage::StorageTuningOptions{},
@@ -387,6 +413,8 @@ NB_MODULE(_core, m) {
       .def_rw("thread_budget", &se::EmbeddingConfig::thread_budget)
       .def_rw("value_dtype", &se::EmbeddingConfig::value_dtype)
       .def_rw("optimizer_dtype", &se::EmbeddingConfig::optimizer_dtype)
+      .def_rw("gradient_dtype", &se::EmbeddingConfig::gradient_dtype)
+      .def_rw("gradient_scale", &se::EmbeddingConfig::gradient_scale)
       .def_rw("enable_optimizer", &se::EmbeddingConfig::enable_optimizer)
       .def_rw("key_dtype", &se::EmbeddingConfig::key_dtype)
       .def_rw("storage_tuning", &se::EmbeddingConfig::storage_tuning);

@@ -44,6 +44,8 @@ template <typename ValT> class TransientArena {
   static constexpr size_t kCacheLineSize = 64;
 
 public:
+  using value_type = ValT;
+
   class AccumulatedBatchView {
   public:
     size_t size() const noexcept { return feature_ids->size(); }

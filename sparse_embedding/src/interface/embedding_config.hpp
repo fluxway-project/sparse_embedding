@@ -34,7 +34,9 @@ struct EmbeddingConfig {
   size_t thread_budget = 0; // 0 means automatic local execution budget
   std::string value_dtype = "float32";
   std::string optimizer_dtype = ""; // if empty, falls back to value_dtype
-  std::string key_dtype = "int64";  // int64, uint64, int32, uint32
+  std::string gradient_dtype = "";  // if empty, falls back to value_dtype
+  float gradient_scale = 1.0f;
+  std::string key_dtype = "int64"; // int64, uint64, int32, uint32
   StorageOptions storage;
   storage::StorageTuningOptions storage_tuning;
   bool enable_optimizer = true;

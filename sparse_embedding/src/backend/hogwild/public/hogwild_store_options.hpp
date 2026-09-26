@@ -6,6 +6,7 @@
 #include <stdexcept>
 #include <thread>
 
+#include "sparse_embedding/src/arena/gradient_accumulator.hpp"
 #include "sparse_embedding/src/backend/hogwild/operation_dispatch_policy.hpp"
 #include "sparse_embedding/src/execution/dispatch_budget.hpp"
 #include "sparse_embedding/src/execution/locality_policy.hpp"
@@ -19,6 +20,8 @@ struct HogwildStoreOptions {
   LocalityPolicy locality;
   PageStorage storage = create_page_storage();
   storage::StorageTuningOptions storage_tuning;
+  GradientDType gradient_dtype = GradientDType::kFloat32;
+  float gradient_scale = 1.0f;
 
   std::optional<OperationDispatchConfig> dispatch_config() const {
     if (locality.execution == LocalityMode::kAuto &&

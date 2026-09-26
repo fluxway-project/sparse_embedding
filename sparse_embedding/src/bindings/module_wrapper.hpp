@@ -112,6 +112,11 @@ inline void fill_uniform_row_lengths(std::span<int64_t> out, int64_t dim) {
   std::fill(out.begin(), out.end(), dim);
 }
 
+inline std::vector<int64_t> &get_tls_row_lengths() {
+  thread_local std::vector<int64_t> tls_row_lengths;
+  return tls_row_lengths;
+}
+
 // =============================================================================
 // Builder Proxies for Initializers and Optimizers
 // =============================================================================
@@ -295,6 +300,8 @@ class EmbeddingStoreWrapper {
   exec::static_thread_pool async_pool_;
   ValueDType value_dtype_code_;
   ValueDType optimizer_dtype_code_;
+  ValueDType gradient_dtype_code_;
+  float gradient_scale_;
   bool optimizer_enabled_;
   KeyDType key_type_enum_;
   std::string score_policy_name_;

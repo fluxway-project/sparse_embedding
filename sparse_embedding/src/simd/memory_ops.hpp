@@ -41,9 +41,11 @@ inline void simd_accumulate(const ValT *__restrict__ src,
   [[assume(count > 0)]];
 #if defined(__AVX512F__)
   if constexpr (is_simd_supported_v<ValT>) {
-    for (; i + 16 <= count; i += 16) {
-      store_from_ps(dst + i,
-                    _mm512_add_ps(load_to_ps(dst + i), load_to_ps(src + i)));
+    {
+      for (; i + 16 <= count; i += 16) {
+        store_from_ps(dst + i,
+                      _mm512_add_ps(load_to_ps(dst + i), load_to_ps(src + i)));
+      }
     }
   }
 #elif defined(__AVX2__)
@@ -52,19 +54,17 @@ inline void simd_accumulate(const ValT *__restrict__ src,
                 || std::is_same_v<ValT, float16_t>
 #endif
   ) {
-    for (; i + 8 <= count; i += 8) {
-      store256_from_ps(dst + i, _mm256_add_ps(load256_to_ps(dst + i),
-                                              load256_to_ps(src + i)));
+    {
+      for (; i + 8 <= count; i += 8) {
+        store256_from_ps(dst + i, _mm256_add_ps(load256_to_ps(dst + i),
+                                                load256_to_ps(src + i)));
+      }
     }
   }
 #endif
   for (; i < count; ++i) {
-    if constexpr (std::is_same_v<ValT, float>) {
-      dst[i] += src[i];
-    } else {
-      dst[i] = static_cast<ValT>(static_cast<float>(dst[i]) +
-                                 static_cast<float>(src[i]));
-    }
+    dst[i] = static_cast<ValT>(static_cast<float>(dst[i]) +
+                               static_cast<float>(src[i]));
   }
 }
 

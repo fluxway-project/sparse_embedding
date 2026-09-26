@@ -334,11 +334,10 @@ nb::dict CheckpointOpsImpl<ParamT, OptT>::write_native_fragment(
     const std::string &score_policy, uint32_t protocol_version,
     const std::string &schema_digest, bool include_page_images) {
   se::NativeFragmentWriter writer;
-  writer.begin_fragment(uri, participant_index, dimensions, embedding_dtype,
-                        optimizer_dtype, score_policy, protocol_version,
-                        schema_digest,
-                        self.get_store<ParamT, OptT>()->has_score_policy(),
-                        include_page_images);
+  writer.begin_fragment(
+      uri, participant_index, dimensions, embedding_dtype, optimizer_dtype,
+      score_policy, protocol_version, schema_digest,
+      self.get_store<ParamT, OptT>()->has_score_policy(), include_page_images);
   {
     nb::gil_scoped_release release;
     self.get_store<ParamT, OptT>()->export_page_images(
@@ -381,8 +380,8 @@ nb::dict CheckpointOpsImpl<ParamT, OptT>::write_native_fragment(
 template <typename ParamT, typename OptT>
 void CheckpointOpsImpl<ParamT, OptT>::restore_native_entries(
     EmbeddingStoreWrapper &self, const std::string &uri, uint64_t version,
-    nb::object selected_keys,
-    const se::LanceStorageOptions &storage_options, bool load_optimizer_state) {
+    nb::object selected_keys, const se::LanceStorageOptions &storage_options,
+    bool load_optimizer_state) {
   auto [dlm, cap] = se::py::extract_dlpack_tensor(selected_keys);
   if (dlm->dl_tensor.dtype.code != kDLUInt || dlm->dl_tensor.dtype.bits != 64)
     throw std::invalid_argument("native restore selected_keys must be uint64");
@@ -537,8 +536,8 @@ void CheckpointOpsImpl<ParamT, OptT>::restore_native_page_images(
             image.values.assign(values,
                                 values + page.values.size() / sizeof(ParamT));
             if (load_optimizer_state) {
-              const auto *optimizer = reinterpret_cast<const OptT *>(
-                  page.optimizer_values.data());
+              const auto *optimizer =
+                  reinterpret_cast<const OptT *>(page.optimizer_values.data());
               image.optimizer_states.assign(
                   optimizer,
                   optimizer + page.optimizer_values.size() / sizeof(OptT));
@@ -629,7 +628,11 @@ inline std::vector<DstT> cast_vector_owned(std::vector<SrcT> &&src) {
   if constexpr (std::is_same_v<DstT, SrcT>) {
     return std::move(src);
   } else {
-    return std::vector<DstT>(src.begin(), src.end());
+    std::vector<DstT> result;
+    result.reserve(src.size());
+    for (SrcT value : src)
+      result.push_back(static_cast<DstT>(static_cast<float>(value)));
+    return result;
   }
 }
 

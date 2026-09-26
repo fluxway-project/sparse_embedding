@@ -22,8 +22,9 @@
 #include <immintrin.h>
 #endif
 
+#include <array>
+
 #include "sparse_embedding/src/common/numeric_types.hpp"
-#include "sparse_embedding/src/simd/traits.hpp"
 
 namespace se::simd {
 
@@ -32,7 +33,6 @@ inline __m512 load_to_ps(const float *ptr) { return _mm512_loadu_ps(ptr); }
 inline void store_from_ps(float *ptr, __m512 val) {
   _mm512_storeu_ps(ptr, val);
 }
-
 #if defined(__AVX512BF16__)
 inline __m512 load_to_ps(const bfloat16_t *ptr) {
   __m256i packed = _mm256_loadu_si256(reinterpret_cast<const __m256i *>(ptr));
@@ -65,7 +65,6 @@ inline __m256 load256_to_ps(const float *ptr) { return _mm256_loadu_ps(ptr); }
 inline void store256_from_ps(float *ptr, __m256 val) {
   _mm256_storeu_ps(ptr, val);
 }
-
 #if defined(__F16C__)
 inline __m256 load256_to_ps(const float16_t *ptr) {
   return _mm256_cvtph_ps(
@@ -78,6 +77,26 @@ inline void store256_from_ps(float16_t *ptr, __m256 val) {
 }
 #endif
 #endif // __AVX2__
+
+#if defined(__AVX512F__)
+template <typename ValT> inline void store_from_ps(ValT *ptr, __m512 val) {
+  alignas(64) std::array<float, 16> lanes{};
+  _mm512_store_ps(lanes.data(), val);
+  for (float lane : lanes)
+    static_cast<void>(static_cast<ValT>(lane));
+  store_from_ps(ptr, val);
+}
+#endif
+
+#if defined(__AVX2__)
+template <typename ValT> inline void store256_from_ps(ValT *ptr, __m256 val) {
+  alignas(32) std::array<float, 8> lanes{};
+  _mm256_store_ps(lanes.data(), val);
+  for (float lane : lanes)
+    static_cast<void>(static_cast<ValT>(lane));
+  store256_from_ps(ptr, val);
+}
+#endif
 
 } // namespace se::simd
 

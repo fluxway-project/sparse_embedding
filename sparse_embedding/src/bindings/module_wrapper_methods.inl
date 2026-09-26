@@ -1,10 +1,10 @@
+
 namespace se::py::detail {
 
 inline size_t EmbeddingStoreWrapper::total_size() {
   size_t size = 0;
-  dispatch_types([&]<typename P, typename O>() {
-    size = get_store<P, O>()->size();
-  });
+  dispatch_types(
+      [&]<typename P, typename O>() { size = get_store<P, O>()->size(); });
   return size;
 }
 
@@ -108,8 +108,9 @@ inline void EmbeddingStoreWrapper::reserve(size_t keys_count, int64_t dim) {
   check_error(error);
 }
 
-inline void EmbeddingStoreWrapper::reserve_per_shard(
-    const std::vector<size_t> &counts, int64_t dim) {
+inline void
+EmbeddingStoreWrapper::reserve_per_shard(const std::vector<size_t> &counts,
+                                         int64_t dim) {
   if (dim <= 0)
     throw std::invalid_argument("dim must be > 0");
   std::error_code error;
@@ -130,7 +131,7 @@ inline nb::tuple EmbeddingStoreWrapper::lookup(nb::object keys, int64_t dim) {
 }
 
 inline nb::tuple EmbeddingStoreWrapper::lookup_or_insert(nb::object keys,
-                                                          int64_t dim) {
+                                                         int64_t dim) {
   if (dim <= 0)
     throw std::invalid_argument("dim must be > 0");
   return dispatch_types([&]<typename P, typename O>() {
@@ -151,10 +152,9 @@ inline nb::object EmbeddingStoreWrapper::contains(nb::object keys) {
 }
 
 inline void EmbeddingStoreWrapper::accumulate_gradients(nb::object keys,
-                                                         nb::object grads) {
+                                                        nb::object grads) {
   if (!optimizer_enabled_)
-    throw std::runtime_error(
-        "accumulate_gradients requires optimizer enabled");
+    throw std::runtime_error("accumulate_gradients requires optimizer enabled");
   dispatch_types([&]<typename P, typename O>() {
     SyncOpsImpl<P, O>::accumulate_gradients(*this, keys, grads);
   });
@@ -169,35 +169,36 @@ inline void EmbeddingStoreWrapper::optimizer_step() {
 }
 
 inline void EmbeddingStoreWrapper::erase(nb::object keys) {
-  dispatch_types([&]<typename P, typename O>() {
-    SyncOpsImpl<P, O>::erase(*this, keys);
-  });
+  dispatch_types(
+      [&]<typename P, typename O>() { SyncOpsImpl<P, O>::erase(*this, keys); });
 }
 
 inline void EmbeddingStoreWrapper::clear() {
-  dispatch_types([&]<typename P, typename O>() {
-    SyncOpsImpl<P, O>::clear(*this);
-  });
+  dispatch_types(
+      [&]<typename P, typename O>() { SyncOpsImpl<P, O>::clear(*this); });
 }
 
 inline void EmbeddingStoreWrapper::assign_scores(nb::object keys,
-                                                  nb::object scores) {
+                                                 nb::object scores) {
   dispatch_types([&]<typename P, typename O>() {
     SyncOpsImpl<P, O>::assign_scores(*this, keys, scores);
   });
 }
 
-inline size_t EmbeddingStoreWrapper::compact_page(size_t dim, uint64_t page_id) {
+inline size_t EmbeddingStoreWrapper::compact_page(size_t dim,
+                                                  uint64_t page_id) {
   return dispatch_types([&]<typename P, typename O>() {
     return get_store<P, O>()->compact_page(dim, page_id);
   });
 }
 
-inline size_t EmbeddingStoreWrapper::promote_hot_keys(
-    size_t dim, uint64_t page_id, size_t maximum_keys, uint64_t minimum_score) {
+inline size_t EmbeddingStoreWrapper::promote_hot_keys(size_t dim,
+                                                      uint64_t page_id,
+                                                      size_t maximum_keys,
+                                                      uint64_t minimum_score) {
   return dispatch_types([&]<typename P, typename O>() {
     return get_store<P, O>()->promote_hot_keys(dim, page_id, maximum_keys,
-                                                minimum_score);
+                                               minimum_score);
   });
 }
 
@@ -211,8 +212,8 @@ inline nb::list EmbeddingStoreWrapper::export_page_images() {
   nb::list result;
   dispatch_types([&]<typename P, typename O>() {
     get_store<P, O>()->export_page_images(
-        pro::make_proxy<se::FunctionFacade<bool(
-            size_t, se::PageImageExport<P, O> &&)>>(
+        pro::make_proxy<
+            se::FunctionFacade<bool(size_t, se::PageImageExport<P, O> &&)>>(
             [&](size_t dim, se::PageImageExport<P, O> &&image) {
               if (image.embedding_dim != dim)
                 throw std::logic_error(
@@ -229,11 +230,11 @@ inline nb::list EmbeddingStoreWrapper::export_page_images() {
               std::vector<float> values;
               values.reserve(image.values.size());
               for (P value : image.values)
-                values.push_back(static_cast<float>(value));
+                values.push_back(static_cast<float>(static_cast<float>(value)));
               std::vector<float> optimizer_states;
               optimizer_states.reserve(image.optimizer_states.size());
               for (O value : image.optimizer_states)
-                optimizer_states.push_back(static_cast<float>(value));
+                optimizer_states.push_back(static_cast<float>(static_cast<float>(value)));
               page["values"] = std::move(values);
               page["optimizer_states"] = std::move(optimizer_states);
               result.append(std::move(page));
@@ -263,12 +264,14 @@ inline void EmbeddingStoreWrapper::import_page_images(nb::list pages) {
       const auto values = nb::cast<std::vector<float>>(page["values"]);
       image.values.reserve(values.size());
       for (float value : values)
-        image.values.push_back(static_cast<P>(value));
+        image.values.push_back(
+            static_cast<P>(value));
       const auto optimizer_states =
           nb::cast<std::vector<float>>(page["optimizer_states"]);
       image.optimizer_states.reserve(optimizer_states.size());
       for (float value : optimizer_states)
-        image.optimizer_states.push_back(static_cast<O>(value));
+        image.optimizer_states.push_back(
+            static_cast<O>(value));
       imports.push_back(
           {nb::cast<size_t>(page["embedding_dim"]), std::move(image)});
     }
@@ -277,7 +280,7 @@ inline void EmbeddingStoreWrapper::import_page_images(nb::list pages) {
 }
 
 inline nb::object EmbeddingStoreWrapper::async_lookup(nb::object keys,
-                                                       int64_t dim) {
+                                                      int64_t dim) {
   if (dim <= 0)
     throw std::invalid_argument("dim must be > 0");
   return dispatch_types([&]<typename P, typename O>() -> nb::object {
@@ -286,14 +289,14 @@ inline nb::object EmbeddingStoreWrapper::async_lookup(nb::object keys,
 }
 
 inline nb::object EmbeddingStoreWrapper::async_assign(nb::object keys,
-                                                       nb::object values) {
+                                                      nb::object values) {
   return dispatch_types([&]<typename P, typename O>() -> nb::object {
     return AsyncOpsImpl<P, O>::async_assign(*this, keys, values);
   });
 }
 
-inline nb::object EmbeddingStoreWrapper::async_lookup_or_insert(
-    nb::object keys, int64_t dim) {
+inline nb::object EmbeddingStoreWrapper::async_lookup_or_insert(nb::object keys,
+                                                                int64_t dim) {
   if (dim <= 0)
     throw std::invalid_argument("dim must be > 0");
   return dispatch_types([&]<typename P, typename O>() -> nb::object {
@@ -301,8 +304,9 @@ inline nb::object EmbeddingStoreWrapper::async_lookup_or_insert(
   });
 }
 
-inline nb::object EmbeddingStoreWrapper::async_accumulate_gradients(
-    nb::object keys, nb::object grads) {
+inline nb::object
+EmbeddingStoreWrapper::async_accumulate_gradients(nb::object keys,
+                                                  nb::object grads) {
   if (!optimizer_enabled_)
     throw std::runtime_error(
         "async_accumulate_gradients requires optimizer enabled");
@@ -337,8 +341,8 @@ inline nb::object EmbeddingStoreWrapper::async_clear() {
   });
 }
 
-inline nb::object EmbeddingStoreWrapper::async_assign_scores(
-    nb::object keys, nb::object scores) {
+inline nb::object
+EmbeddingStoreWrapper::async_assign_scores(nb::object keys, nb::object scores) {
   return dispatch_types([&]<typename P, typename O>() -> nb::object {
     return AsyncOpsImpl<P, O>::async_assign_scores(*this, keys, scores);
   });
@@ -360,9 +364,10 @@ inline void EmbeddingStoreWrapper::export_batches_arrow(
   });
 }
 
-inline void EmbeddingStoreWrapper::assign_opt_state(
-    nb::object keys_obj, nb::object opt_states_obj, size_t dimension,
-    nb::object steps_obj) {
+inline void EmbeddingStoreWrapper::assign_opt_state(nb::object keys_obj,
+                                                    nb::object opt_states_obj,
+                                                    size_t dimension,
+                                                    nb::object steps_obj) {
   dispatch_types([&]<typename P, typename O>() {
     CheckpointOpsImpl<P, O>::assign_opt_state(*this, keys_obj, opt_states_obj,
                                               dimension, steps_obj);

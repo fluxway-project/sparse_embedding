@@ -159,9 +159,9 @@ using WeakMemOptimizerStep = pro::weak_dispatch<MemOptimizerStep>;
   std::error_code(std::span<const key_t> keys, std::span<ParamT> out_values,   \
                   std::span<const int64_t> row_lengths)
 
-#define SE_ACCUMULATE_GRADIENTS_FACADE_SIG(key_t)                              \
+#define SE_ACCUMULATE_GRADIENTS_FACADE_SIG(key_t, grad_t)                      \
   std::error_code(std::span<const key_t> keys,                                 \
-                  std::span<const ParamT> grad_values,                         \
+                  std::span<const grad_t> grad_values,                         \
                   std::span<const int64_t> row_lengths)
 
 // evict_by_score: asynchronous-safe GC operation.
@@ -302,8 +302,18 @@ struct EmbeddingTableFacade : pro //
 
   // --- Training: Backward ---------------------------------------------------
   ::add_convention<WeakMemAccumulateGradients,
-                   SE_ACCUMULATE_GRADIENTS_FACADE_SIG(int32_t), SE_ACCUMULATE_GRADIENTS_FACADE_SIG(uint32_t),
-                   SE_ACCUMULATE_GRADIENTS_FACADE_SIG(int64_t), SE_ACCUMULATE_GRADIENTS_FACADE_SIG(uint64_t)> //
+                   SE_ACCUMULATE_GRADIENTS_FACADE_SIG(int32_t, float),
+                   SE_ACCUMULATE_GRADIENTS_FACADE_SIG(uint32_t, float),
+                   SE_ACCUMULATE_GRADIENTS_FACADE_SIG(int64_t, float),
+                   SE_ACCUMULATE_GRADIENTS_FACADE_SIG(uint64_t, float),
+                   SE_ACCUMULATE_GRADIENTS_FACADE_SIG(int32_t, se::float16_t),
+                   SE_ACCUMULATE_GRADIENTS_FACADE_SIG(uint32_t, se::float16_t),
+                   SE_ACCUMULATE_GRADIENTS_FACADE_SIG(int64_t, se::float16_t),
+                   SE_ACCUMULATE_GRADIENTS_FACADE_SIG(uint64_t, se::float16_t),
+                   SE_ACCUMULATE_GRADIENTS_FACADE_SIG(int32_t, se::bfloat16_t),
+                   SE_ACCUMULATE_GRADIENTS_FACADE_SIG(uint32_t, se::bfloat16_t),
+                   SE_ACCUMULATE_GRADIENTS_FACADE_SIG(int64_t, se::bfloat16_t),
+                   SE_ACCUMULATE_GRADIENTS_FACADE_SIG(uint64_t, se::bfloat16_t)> //
   ::add_convention<WeakMemOptimizerStep,
                    std::error_code()> //
 

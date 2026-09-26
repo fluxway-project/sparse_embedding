@@ -10,6 +10,7 @@ cc_library(
     hdrs = glob(["*.hpp"]),
     visibility = ["//visibility:public"],
     deps = [
+        "//sparse_embedding/src/common",
         "//sparse_embedding/src/memory",
         "//sparse_embedding/src/simd",
         "//sparse_embedding/src/storage",
