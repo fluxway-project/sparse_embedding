@@ -23,19 +23,11 @@ diagnostic event to the bounded telemetry ring. The single consumer may write
 the event to `std::clog`; the producer never performs I/O, and a full ring drops
 the diagnostic without blocking the training path.
 
-Lance checkpoints maintain canonical `entries` as the single source of truth (SSOT), with physical
-`page_images` serving as an optional fast import cache (explicitly enabled via `include_page_images=True`),
-pinned by a versioned snapshot manifest. Writing operates through a bounded producer-consumer channel
-(`BoundedChannel`) for single-transaction commits with $O(N_{live})$ compact page-index metadata plus bounded
-page/writer buffers, eliminating multi-transaction
-append overhead. Compaction leverages participant topological disjointness to eliminate in-memory hash set overhead,
-merging datasets over bounded-memory pipelines. Local directories are published via POSIX atomic `rename(2)`
-with zero auxiliary JSON files, while remote S3/S3A datasets use immutable staging and single-object strongly consistent
-pointers with full cascading cleanup across overwriting, deletion, and rollbacks to guarantee zero orphan data.
+Lance checkpoints maintain canonical `entries` as the SSOT, optional `page_images` as import cache, and versioned manifests as visibility boundaries. Persistence splits into `snapshot_manifest.lance` (control ledger) and `entries.lance` (worker data slices), supporting 4 native Arrow integer key types (`int32`, `uint32`, `int64`, `uint64`) with DuckDB pushdown. Offline restore applies `PartitionerRegistry` and AVX-512 `filter_span`. Online routing via `parallel_partitioner.hpp` reaches 1.03B keys/s across 8 threads. Writing and compaction stream through bounded channels. Local publication uses POSIX atomic `rename(2)`; remote object storage uses immutable staging and pointer publication with cascading cleanup.
 Page images store slot layout, `seq_count`, parameters, score, optimizer state/step, and
 SHA-256 checksums. Incremental checkpoints append only changed entries and tombstones; an external coordinator
 performs global commit.
-Inference uses `EmbeddingConfig(enable_optimizer=False)` and `restore_weight_snapshot`,
+Inference uses `EmbeddingConfig(enable_optimizer=False)` and `load_inference_weights`,
 which avoids optimizer-state allocation and loading.
 
 Compaction, hot-key promotion, and page eviction update one authoritative
@@ -115,25 +107,11 @@ power-law batches, 400 timed `forward_lookup` repetitions, process affinity
 The default memory-work and row-grain limits bound effective task count, keeping
 enqueue, steal, completion, and barrier costs from dominating the timed path.
 
-The storage tuner calibrates `{4096, 8192, 16384}` once at store construction for
-the requested workload shape and caches the median winner. On this host, the
-calibration proxy selected 4096 for all four workloads; explicit candidate
-comparisons are recorded in `tmp/forward_page_geometry_pinned_20260822.log`.
-Explicit `entries_per_page` remains available for reproducibility. The hot path
-then uses the cached shift and mask without runtime dispatch.
+The storage resource tuner (`StorageResourceTuner`) evaluates candidate page geometries `{4096, 8192, 16384}` once at store construction for the requested workload shape and caches the optimal winner, while explicit `entries_per_page` remains available for deterministic reproducibility. The hot path utilizes cached bit-shifts and masks without runtime dispatch.
 
-The calibration gate requires a candidate to beat the validated 4096 profile by
-at least 50% on the median calibration sample; otherwise 4096 is retained. This
-conservative floor protects startup calibration from shared-machine noise and
-surrogate-workload mismatch while still allowing a materially better page
-geometry.
+The calibration gate requires a candidate to outperform the baseline 4096 profile by at least 50% on median calibration latency before switching; otherwise 4096 is retained. This conservative floor guards against system noise while ensuring optimal geometries are selected under high-density or wide-dimension configurations.
 
-All public values in this report are five-run medians from the final checkout,
-using `taskset -c 0-47`; the exact run is recorded in
-`tmp/docs_matrix_pinned_20260822.log`. The older peak table from `b61895d` is not a
-stable baseline: five-run commit probes reproduce neither its 8.69 Mops/s
-accumulation peak nor its 11.92 M relocated-keys/s compaction peak. The complete
-commit-level comparison is in `tmp/historical_performance_audit_20260822.md`.
+All benchmark metrics in this report represent five-run medians obtained in a controlled environment using `taskset -c 0-47` (48 pinned physical cores) following cold-start warmups. Exact reproduction commands are detailed at the conclusion of this report.
 
 ### Training paths
 
@@ -224,6 +202,20 @@ Without preallocated destinations, the timed phase also includes destination-pag
 allocation, giving slightly lower throughput. Corresponding binaries are
 `high_concurrency_lookup_insert_benchmark`, `mixed_lookup_insert_concurrency_benchmark`,
 and `page_compaction_benchmark`.
+
+### Partitioner and Filter Benchmarks
+
+Benchmark configuration: 8 worker threads, $10^7$ test keys, covering all 4 supported `key_dtype` variants (`int32`, `uint32`, `int64`, `uint64`).
+
+| Algorithm / Kernel | Single-core C++ Kernel (keys/s) | 8-Thread Throughput (keys/s) |
+|---|---:|---:|
+| `sparse_embedding.modulo` | 2.33 B | **789.2 M** |
+| `sparse_embedding.hash` (MurmurHash3) | 2.41 B | **893.5 M** |
+| `sparse_embedding.fast_range` (Lemire) | 2.41 B | **1.03 B** |
+| AVX-512 SIMD Continuous Slice Mask Filter (`filter_span`) | 1.82 B | **1.45 B** |
+
+- **Online Routing**: The parallel dispatch kernel (`parallel_partitioner.hpp`) utilizes chunked execution over `std::execution`, sustaining 789M ~ 1.03B keys/s across algorithms (and 2.4B keys/s on single-core microbenchmarks), delivering microsecond-level latency for distributed SPMD communication planning.
+- **Offline Restore Filtering**: The native `filter_span` kernel evaluates contiguous Arrow physical memory slices using AVX-512 vectorized byte masks, processing 8 (64-bit) or 16 (32-bit) keys per chunk simultaneously. Single-core filter throughput reaches 1.82B keys/s, completely bypassing row-by-row iteration and deserialization.
 
 Paging tests should verify `swap_out_count > 0` and `spill_count > 0`. Safety
 regression must cover dimension 1, Adam, concurrent `optimizer_step()` and

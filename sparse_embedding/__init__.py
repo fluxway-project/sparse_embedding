@@ -29,9 +29,11 @@ from ._core import (
     _EmbeddingConfig,
     _StorageOptions,
     async_unique,
+    create_partitioner,
     decode_keys,
     drain_wake_queue,
     encode_keys,
+    is_partitioner_registered,
     set_leak_warnings,
     wake_fd,
 )
@@ -40,6 +42,23 @@ from ._version import (
     __lance_c_version__,
     __python_requires__,
     __version__,
+)
+from .checkpoint.base import (
+    ElasticRestore,
+    PartitionSpec,
+    PhysicalRestore,
+    PhysicalRestoreStrategy,
+    RestorePlan,
+    SparsePartitionAssignmentSpec,
+)
+from .partitioner import (
+    FastRangePartition,
+    HashPartition,
+    ModuloPartition,
+    PartitionStrategy,
+    create_strategy,
+    filter_partition,
+    partition,
 )
 
 
@@ -162,6 +181,8 @@ __all__ = [
     "MemoryOnly",
     "FastRangePartitioner",
     "HashPartitioner",
+    "create_partitioner",
+    "is_partitioner_registered",
     "wake_fd",
     "drain_wake_queue",
     "ConstantLrPolicy",
@@ -170,4 +191,17 @@ __all__ = [
     "InverseDecayLrPolicy",
     "CosineFrequencyLrPolicy",
     "CustomLutLrPolicy",
+    "ElasticRestore",
+    "FastRangePartition",
+    "HashPartition",
+    "ModuloPartition",
+    "PartitionSpec",
+    "PartitionStrategy",
+    "PhysicalRestore",
+    "PhysicalRestoreStrategy",
+    "RestorePlan",
+    "SparsePartitionAssignmentSpec",
+    "create_strategy",
+    "filter_partition",
+    "partition",
 ]

@@ -1,17 +1,15 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
 from math import isfinite
 from types import MappingProxyType
 from typing import Mapping
 from urllib.parse import urlsplit
 
 
-@dataclass(frozen=True, slots=True, init=False)
 class SdkConfig:
     """Immutable configuration with separate REST and catalog-admin scopes."""
 
-    _items: tuple[tuple[str, str], ...]
+    __slots__ = ("_items",)
 
     def __init__(self, values: Mapping[str, str]) -> None:
         items = tuple(sorted(dict(values).items()))
@@ -20,11 +18,22 @@ class SdkConfig:
             for key, value in items
         ):
             raise ValueError("SDK configuration must contain string values")
-        object.__setattr__(self, "_items", items)
+        self._items = items
 
     @property
     def values(self) -> Mapping[str, str]:
         return MappingProxyType(dict(self._items))
+
+    def __eq__(self, other: object) -> bool:
+        if isinstance(other, SdkConfig):
+            return self._items == other._items
+        return False
+
+    def __hash__(self) -> int:
+        return hash(self._items)
+
+    def __repr__(self) -> str:
+        return f"SdkConfig({dict(self._items)!r})"
 
     @classmethod
     def for_rest(

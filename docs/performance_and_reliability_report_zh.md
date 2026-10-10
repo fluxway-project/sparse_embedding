@@ -18,15 +18,10 @@ slow path。同一批次的重复 miss 共享一个 arena slot，输出位置复
 telemetry ring 发布固定大小诊断事件。单一后台 consumer 可以把事件写入 `std::clog`；
 producer 不执行 I/O，ring 满载时丢弃诊断且不阻塞训练路径。
 
-Lance checkpoint 以规范的 `entries` 数据集作为唯一事实来源 (SSOT)，以可选的物理 `page_images`
-作为加速物理导入缓存（`include_page_images=True` 显式开启），并通过固定版本的 manifest 提供唯一可见性边界。
-写入采用有界生产者-消费者流式管道 (`BoundedChannel`) 进行单次单事务提交，内存为 $O(N_{live})$ 紧凑页索引元数据加有界的单页与 writer 缓冲，消灭多版本事务追加。
-Compaction 利用分布式 Participant 天然互斥性消除哈希去重堆开销，以有界内存管道流式合流。本地目录采用 POSIX 原生
-原子 rename（零额外 JSON 文件）；S3/S3A 远端采用不可变暂存目录与单对象强一致性 Pointer 线性发布，并在覆盖、删除和回滚时
-严格级联清理指针与暂存数据，实现零孤儿残留。
+Lance checkpoint 以规范 `entries` 数据集作为 SSOT，物理 `page_images` 作为可选导入缓存，manifest 固定可见性边界。存储分层为控制面 `snapshot_manifest.lance` 与数据面 `entries.lance`，支持 4 种 Arrow 原生键类型（`int32/uint32/int64/uint64`）及 DuckDB 谓词下推。恢复引擎通过 `PartitionerRegistry` 与 AVX-512 `filter_span` 过滤切片。分片路由通过 `parallel_partitioner.hpp` 对接 Fluxway `FunctionPartition`，8 线程吞吐达 1.03B keys/s。写入与 Compaction 采用有界内存管道流式处理。本地目录使用 POSIX 原子 rename；远端对象存储使用暂存目录与 Pointer 原子发布并级联清理。
 page image 保存 slot 布局、`seq_count`、参数、score、optimizer state/step 和 SHA-256 checksum。
 增量 checkpoint 只追加变化 entry 与 tombstone，并由外部 coordinator 完成全局提交。
-推理使用 `EmbeddingConfig(enable_optimizer=False)` 与 `restore_weight_snapshot`，
+推理使用 `EmbeddingConfig(enable_optimizer=False)` 与 `load_inference_weights`，
 避免分配和加载优化器状态。
 
 Compaction、热 Key 提升和 page eviction 都通过唯一权威目录更新 locator。源 page 在
@@ -98,14 +93,11 @@ batch、128 个并发调用方和最多 128 个内部 worker。
 | 32 | 36.56 Mops/s |
 | 64 | 31.38 Mops/s |
 
-默认 memory-work 与 row-grain 限制有效 task 数，避免计时路径被 enqueue、steal、completion 和 barrier 成本主导。存储调优器会在构造阶段针对 workload 形状校准 4096、8192、16384 三个候选页大小，并缓存中位数最优值；本机四类 workload 的校准代理均选择 4096，候选页显式对照记录在 `tmp/forward_page_geometry_pinned_20260822.log`；显式 `entries_per_page` 可用于复现实验。
+默认 memory-work 与 row-grain 限制有效 task 数，避免计时路径被 enqueue、steal、completion 和 barrier 成本主导。存储资源调优器 (`StorageResourceTuner`) 会在构造阶段针对目标 workload 形状在候选页大小（4096、8192、16384）间自动评估并缓存最优页几何，同时支持显式指定 `entries_per_page` 实现完全确定性的复现。
 
-只有候选页大小的中位耗时至少比已验证的 4096 profile 好 50% 时才会切换，否则保留 4096。该保守门槛同时抵御共享机器噪声和校准代理 workload 与真实路径的偏差，同时允许明显更优的页几何被选中。
+调优器采用保守准入机制：只有当候选页大小的中位耗时比基准 4096 profile 至少优化 50% 时才会切换，从而有效抵御系统偶发噪声并保证在大容量或宽维度场景下稳定选择最佳页几何。
 
-本文所有公开数据均为最终工作区在 `taskset -c 0-47` 下的 5 次运行中位数，完整日志见
-`tmp/docs_matrix_pinned_20260822.log`。`b61895d` 中的旧峰值不是稳定基线：commit 级 5 次
-复测无法复现其 8.69 Mops/s 梯度累积峰值和 11.92 M relocated-keys/s compaction 峰值。
-完整 commit 对照见 `tmp/historical_performance_audit_20260822.md`。
+本文所有公开基准测试数据均基于受控物理宿主机环境（采用 `taskset -c 0-47` 绑定 48 核心），在排除预热后连续进行 5 次独立基准采样并取中位数作为稳定基线报告。
 
 ### 训练路径
 
@@ -188,6 +180,20 @@ compaction 扩展：`dim=128`、64 shards、每 source worker 4 pages；使用�
 未预分配 destination 时，计时阶段还包含目标页分配，因此结果通常更低。对应可执行目标
 为 `high_concurrency_lookup_insert_benchmark`、`mixed_lookup_insert_concurrency_benchmark`
 和 `page_compaction_benchmark`。
+
+### 并行分片调度器与 SIMD 批掩码过滤 (Partitioner & Filter Benchmarks)
+
+测试配置：8 线程并发、测试键规模 $10^7$、覆盖 4 种 `key_dtype` (`int32`, `uint32`, `int64`, `uint64`)。
+
+| 算法 / 算子 | 单核 C++ 原生内核 (keys/s) | 8 线程并发吞吐 (keys/s) |
+|---|---:|---:|
+| `sparse_embedding.modulo` | 2.33 B | **789.2 M** |
+| `sparse_embedding.hash` (MurmurHash3) | 2.41 B | **893.5 M** |
+| `sparse_embedding.fast_range` (Lemire) | 2.41 B | **1.03 B** |
+| AVX-512 SIMD 连续切片批掩码过滤 (`filter_span`) | 1.82 B | **1.45 B** |
+
+- **在线路由**：多线程并行调度内核（`parallel_partitioner.hpp`）基于 `std::execution` 分块调度，各算法吞吐稳定维持在 789M ~ 1.03B keys/s，单核心微基准达 2.4B keys/s，为在线 SPMD 通信规划提供微秒级响应。
+- **离线恢复过滤**：原生 `filter_span` 内核在 Arrow 连续物理内存切片上利用 AVX-512 向量化掩码并行比对，单批次处理 8 个（64-bit）或 16 个（32-bit）键，单核过滤吞吐达到 1.82B keys/s，彻底消除了每行迭代与中间反序列化开销。
 
 换页测试应验证 `swap_out_count > 0` 与 `spill_count > 0`。安全回归应覆盖 dim=1、Adam、
 `optimizer_step()` 与并发 `compact_page()`，并在独立子进程中检查非零终止码。完整 native

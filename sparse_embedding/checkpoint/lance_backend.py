@@ -5,6 +5,8 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import json
+import os
+import struct
 import uuid
 from base64 import urlsafe_b64decode, urlsafe_b64encode
 from collections.abc import Mapping, Sequence
@@ -25,30 +27,43 @@ from .base import (
     CheckpointCommitAuthority,
     CheckpointConflictError,
     CheckpointFragment,
+    CheckpointHandle,
     CheckpointLease,
     CheckpointLeaseRequest,
     CheckpointParticipant,
     CheckpointSaveIdentity,
     CleanupReservation,
+    CommittedCheckpoint,
     ElasticRestore,
     InvalidCheckpointFragment,
     PhysicalRestore,
     PhysicalRestoreStrategy,
     RestoreMode,
     SparseCheckpointLocator,
-    SparseWeightSnapshot,
     StorageBudgetExceeded,
     TableSpecification,
 )
-from .schema import ENTRY_SCHEMA, MANIFEST_SCHEMA, PAGE_IMAGE_SCHEMA
+from .restore_options import _decode_restore_options
+from .schema import (
+    ENTRIES_DATASET,
+    ENTRY_SCHEMA,
+    MANIFEST_SCHEMA,
+    PAGE_IMAGE_SCHEMA,
+    PAGE_IMAGES_DATASET,
+    SNAPSHOT_MANIFEST_DATASET,
+    entry_schema,
+)
 
 _checkpoint_native = _native.checkpoint
-_PROTOCOL_VERSION = 1
 _ACTIVE = "active"
 _DELETED = "deleted"
 _PREPARED = "PREPARED"
 _COMMITTED = "COMMITTED"
 _FRAGMENT_STORAGE_MODE = "fragment_manifest"
+_WEIGHT_REFERENCE_FILENAME = ".sparse_embedding_reference"
+_CHECKPOINT_HANDLE_MAGIC = b"sparse_embedding.checkpoint_handle\0"
+_UINT32 = struct.Struct("!I")
+_UINT64 = struct.Struct("!Q")
 
 
 class _RestoreScope(str, Enum):
@@ -63,6 +78,12 @@ class _CommitOutcome:
     manifest_before: int
 
 
+@dataclass(frozen=True, slots=True)
+class _LeaseRecord:
+    lease: CheckpointLease
+    locator: SparseCheckpointLocator
+
+
 def _empty_table(schema: pa.Schema) -> pa.Table:
     return pa.Table.from_arrays(
         [pa.array([], type=field.type) for field in schema], schema=schema
@@ -70,9 +91,14 @@ def _empty_table(schema: pa.Schema) -> pa.Table:
 
 
 def _schema_digest(specification: TableSpecification | None = None) -> str:
+    entry_s = (
+        entry_schema(specification.key_dtype)
+        if specification is not None
+        else ENTRY_SCHEMA
+    )
     payload = b"".join(
         schema.serialize().to_pybytes()
-        for schema in (ENTRY_SCHEMA, PAGE_IMAGE_SCHEMA, MANIFEST_SCHEMA)
+        for schema in (entry_s, PAGE_IMAGE_SCHEMA, MANIFEST_SCHEMA)
     )
     if specification is not None:
         payload += _canonical_digest(
@@ -82,7 +108,7 @@ def _schema_digest(specification: TableSpecification | None = None) -> str:
                     "embedding_dtype": specification.embedding_dtype,
                     "optimizer_dtype": specification.optimizer_dtype,
                     "score_policy": specification.score_policy,
-                    "protocol_version": specification.protocol_version,
+                    "key_dtype": specification.key_dtype,
                 }
             ]
         ).encode()
@@ -103,6 +129,72 @@ def _canonical_digest(rows: Sequence[dict[str, Any]]) -> str:
 
     payload = json.dumps(normalize(rows), sort_keys=True, separators=(",", ":"))
     return hashlib.sha256(payload.encode()).hexdigest()
+
+
+def _encode_checkpoint_handle(
+    storage_uri: str,
+    locator: SparseCheckpointLocator,
+    reference_id: str,
+) -> bytes:
+    storage_bytes = storage_uri.encode("utf-8")
+    name_bytes = locator.checkpoint_name.encode("utf-8")
+    reference_bytes = reference_id.encode("utf-8")
+    if any(
+        len(value) >= 1 << 32 for value in (storage_bytes, name_bytes, reference_bytes)
+    ):
+        raise ValueError("checkpoint handle field is too large")
+    return b"".join(
+        (
+            _CHECKPOINT_HANDLE_MAGIC,
+            _UINT32.pack(len(storage_bytes)),
+            storage_bytes,
+            _UINT32.pack(len(name_bytes)),
+            name_bytes,
+            _UINT64.pack(locator.checkpoint_version),
+            _UINT32.pack(len(reference_bytes)),
+            reference_bytes,
+        )
+    )
+
+
+def _decode_checkpoint_handle(
+    payload: bytes,
+) -> tuple[str, SparseCheckpointLocator, str]:
+    if not isinstance(payload, bytes):
+        raise TypeError("checkpoint handle must be bytes")
+    offset = len(_CHECKPOINT_HANDLE_MAGIC)
+    if not payload.startswith(_CHECKPOINT_HANDLE_MAGIC):
+        raise ValueError("sparse checkpoint handle has an unsupported format")
+
+    def read_bytes() -> bytes:
+        nonlocal offset
+        if offset + _UINT32.size > len(payload):
+            raise ValueError("sparse checkpoint handle is truncated")
+        length = _UINT32.unpack_from(payload, offset)[0]
+        offset += _UINT32.size
+        end = offset + length
+        if end > len(payload):
+            raise ValueError("sparse checkpoint handle is truncated")
+        value = payload[offset:end]
+        offset = end
+        return value
+
+    storage_uri = read_bytes().decode("utf-8")
+    checkpoint_name = read_bytes().decode("utf-8")
+    if offset + _UINT64.size > len(payload):
+        raise ValueError("sparse checkpoint handle has trailing data")
+    checkpoint_version = _UINT64.unpack_from(payload, offset)[0]
+    offset += _UINT64.size
+    reference_id = read_bytes().decode("utf-8")
+    if offset != len(payload):
+        raise ValueError("sparse checkpoint handle has trailing data")
+    if not storage_uri or not checkpoint_name:
+        raise ValueError("sparse checkpoint handle contains empty identity fields")
+    return (
+        storage_uri,
+        SparseCheckpointLocator(checkpoint_name, checkpoint_version),
+        reference_id,
+    )
 
 
 def compact_fragments(
@@ -192,6 +284,7 @@ class _LanceCheckpointStorage:
         if max_storage_bytes is not None and max_storage_bytes <= 0:
             raise ValueError("max_storage_bytes must be positive")
         self._max_storage_bytes = max_storage_bytes
+        self._bound_handle: CheckpointHandle | None = None
 
     def prepare_checkpoint(self, identity: CheckpointSaveIdentity) -> None:
         self._ensure_tables()
@@ -230,7 +323,7 @@ class _LanceCheckpointStorage:
             specification.embedding_dtype,
             specification.optimizer_dtype or "",
             specification.score_policy,
-            specification.protocol_version,
+            specification.key_dtype,
             _schema_digest(specification),
             include_page_images,
         )
@@ -277,12 +370,48 @@ class _LanceCheckpointStorage:
         identity: CheckpointSaveIdentity,
         fragments: Sequence[CheckpointFragment],
         lease_request: CheckpointLeaseRequest | None = None,
-        reference_id: str | None = None,
-    ) -> SparseCheckpointLocator:
+    ) -> CommittedCheckpoint:
+        reference_id = self._owner_reference_id(identity)
         with self._commit_lock():
-            return self._commit_checkpoint_locked(
+            locator = self._commit_checkpoint_locked(
                 identity, fragments, lease_request, reference_id
             )
+            manifest = self._resolve_manifest(locator)
+            return self._committed_checkpoint(locator, str(manifest["reference_id"]))
+
+    def _committed_checkpoint(
+        self, locator: SparseCheckpointLocator, reference_id: str
+    ) -> CommittedCheckpoint:
+        return CommittedCheckpoint(
+            _encode_checkpoint_handle(self._workspace.uri(""), locator, reference_id),
+            self._checkpoint_version_id(locator),
+        )
+
+    def _resolve_handle(
+        self, handle: CheckpointHandle
+    ) -> tuple[SparseCheckpointLocator, str]:
+        storage_uri, locator, reference_id = _decode_checkpoint_handle(handle)
+        self._validate_handle_storage_uri(storage_uri)
+        manifest = self._resolve_manifest(locator)
+        if str(manifest["reference_id"]) != reference_id:
+            raise ValueError("checkpoint handle reference identity does not match")
+        return locator, reference_id
+
+    def _validate_handle_storage_uri(self, storage_uri: str) -> None:
+        expected_uri = self._workspace.uri("")
+        if isinstance(self._workspace, LocalLanceWorkspace):
+            if Path(storage_uri).expanduser().resolve() != Path(expected_uri).resolve():
+                raise ValueError("checkpoint handle belongs to another storage root")
+        elif storage_uri.rstrip("/") != expected_uri.rstrip("/"):
+            raise ValueError("checkpoint handle belongs to another storage root")
+
+    @staticmethod
+    def _checkpoint_version_id(locator: SparseCheckpointLocator) -> bytes:
+        return f"{locator.checkpoint_name}:{locator.checkpoint_version}".encode("utf-8")
+
+    @staticmethod
+    def _owner_reference_id(identity: CheckpointSaveIdentity) -> str:
+        return f"owner:{identity.checkpoint_name}:{identity.save_attempt}"
 
     def finalize_checkpoint(self, identity: CheckpointSaveIdentity) -> None:
         self._require_authority(identity)
@@ -341,7 +470,7 @@ class _LanceCheckpointStorage:
             for fragment in validated
         )
         for root in fragment_roots:
-            if not self._workspace.exists(f"{root}/entries"):
+            if not self._workspace.exists(f"{root}/{ENTRIES_DATASET}"):
                 raise InvalidCheckpointFragment(
                     "checkpoint fragment payload is missing"
                 )
@@ -351,7 +480,6 @@ class _LanceCheckpointStorage:
             fragment_ids, fragment_roots
         )
         manifest = {
-            "protocol_version": _PROTOCOL_VERSION,
             "checkpoint_name": identity.checkpoint_name,
             "checkpoint_version": checkpoint_version,
             "parent_checkpoint_version": previous,
@@ -368,18 +496,19 @@ class _LanceCheckpointStorage:
             "embedding_dtype": specification.embedding_dtype,
             "optimizer_dtype": specification.optimizer_dtype or "",
             "score_policy": specification.score_policy,
+            "key_dtype": specification.key_dtype,
             "reference_id": reference_id or "",
             "fragment_ids": list(fragment_ids),
             "compacted_version": 0,
             "commit_state": _PREPARED,
             "storage_mode": _FRAGMENT_STORAGE_MODE,
         }
-        manifest_before = self._workspace.dataset("snapshot_manifest").version
+        manifest_before = self._workspace.dataset(SNAPSHOT_MANIFEST_DATASET).version
         locator = SparseCheckpointLocator(identity.checkpoint_name, checkpoint_version)
         lease: CheckpointLease | None = None
         try:
             intent = self._intent_tag(identity, locator)
-            tags = self._workspace.dataset("snapshot_manifest").tags
+            tags = self._workspace.dataset(SNAPSHOT_MANIFEST_DATASET).tags
             if intent not in tags.list():
                 tags.create(intent, manifest_before)
             elif tags.get_version(intent) > manifest_before:
@@ -389,7 +518,7 @@ class _LanceCheckpointStorage:
             self._workspace.assert_commit_lock()
             self._workspace.write_dataset(
                 pa.Table.from_pylist([manifest], schema=MANIFEST_SCHEMA),
-                "snapshot_manifest",
+                SNAPSHOT_MANIFEST_DATASET,
                 mode="append",
             )
             self._workspace.assert_commit_lock()
@@ -398,7 +527,7 @@ class _LanceCheckpointStorage:
             if reference_id:
                 self._create_reference_tags(locator, reference_id, manifest)
             self._workspace.assert_commit_lock()
-            updated = self._workspace.dataset("snapshot_manifest").update(
+            updated = self._workspace.dataset(SNAPSHOT_MANIFEST_DATASET).update(
                 {"commit_state": f"'{_COMMITTED}'"},
                 where=(
                     f"checkpoint_name = '{self._sql_literal(identity.checkpoint_name)}' "
@@ -411,12 +540,13 @@ class _LanceCheckpointStorage:
             committed_tag = self._committed_tag(locator)
             if committed_tag not in tags.list():
                 tags.create(
-                    committed_tag, self._workspace.dataset("snapshot_manifest").version
+                    committed_tag,
+                    self._workspace.dataset(SNAPSHOT_MANIFEST_DATASET).version,
                 )
             self._record_pending_outcome(identity, locator, manifest_before)
         except BaseException:
             if lease is not None:
-                self._delete_lease_tag(lease)
+                self._delete_lease_tag(lease, locator)
             if reference_id:
                 self._delete_reference_tags(locator, reference_id)
             raise
@@ -440,7 +570,7 @@ class _LanceCheckpointStorage:
                             "checkpoint manifest commit state is corrupt"
                         )
                     version = int(row["checkpoint_version"])
-                    self._workspace.dataset("snapshot_manifest").delete(
+                    self._workspace.dataset(SNAPSHOT_MANIFEST_DATASET).delete(
                         f"checkpoint_name = '{self._sql_literal(identity.checkpoint_name)}' "
                         f"AND checkpoint_version = {version}"
                     )
@@ -463,8 +593,9 @@ class _LanceCheckpointStorage:
                     self._delete_intent_tag(identity, int(row["checkpoint_version"]))
 
     def acquire_checkpoint_lease(
-        self, locator: SparseCheckpointLocator, request: CheckpointLeaseRequest
+        self, handle: CheckpointHandle, request: CheckpointLeaseRequest
     ) -> CheckpointLease:
+        locator, _ = self._resolve_handle(handle)
         with self._commit_lock():
             return self._acquire_checkpoint_lease_locked(locator, request)
 
@@ -474,12 +605,13 @@ class _LanceCheckpointStorage:
         manifest = self._resolve_manifest(locator)
         if self._locator_has_reservation(locator):
             raise CheckpointConflictError("checkpoint is reserved for reclaim")
-        for existing in self._active_checkpoint_leases_unlocked():
+        for record in self._active_checkpoint_lease_records_unlocked():
+            existing = record.lease
             if existing.request_id != request.request_id:
                 continue
             if (
                 existing.lease_holder_id != request.lease_holder_id
-                or existing.locator != locator
+                or record.locator != locator
             ):
                 raise CheckpointConflictError(
                     "lease request ID belongs to another checkpoint or lease holder"
@@ -487,14 +619,13 @@ class _LanceCheckpointStorage:
             return existing
         lease = CheckpointLease(
             lease_id=uuid.uuid4().hex,
-            locator=locator,
             lease_holder_id=request.lease_holder_id,
             expires_at=datetime.now(timezone.utc)
             + timedelta(seconds=request.ttl_seconds),
             generation=0,
             request_id=request.request_id,
         )
-        self._create_lease_tags(lease, manifest)
+        self._create_lease_tags(lease, locator, manifest)
         return lease
 
     def renew_checkpoint_lease(
@@ -504,40 +635,43 @@ class _LanceCheckpointStorage:
             raise ValueError("ttl_seconds must be positive")
         with self._commit_lock():
             matches = tuple(
-                active
-                for active in self._active_checkpoint_leases_unlocked()
-                if active.lease_id == lease.lease_id
+                record
+                for record in self._active_checkpoint_lease_records_unlocked()
+                if record.lease.lease_id == lease.lease_id
             )
-            if len(matches) != 1 or matches[0] != lease:
+            if len(matches) != 1 or matches[0].lease != lease:
                 raise CheckpointConflictError("lease generation CAS conflict")
             renewed = CheckpointLease(
                 lease_id=lease.lease_id,
-                locator=lease.locator,
                 lease_holder_id=lease.lease_holder_id,
                 expires_at=datetime.now(timezone.utc) + timedelta(seconds=ttl_seconds),
                 generation=lease.generation + 1,
                 request_id=lease.request_id,
             )
-            self._create_lease_tags(renewed, self._resolve_manifest(lease.locator))
-            self._delete_lease_tag(lease)
+            self._create_lease_tags(
+                renewed, matches[0].locator, self._resolve_manifest(matches[0].locator)
+            )
+            self._delete_lease_tag(lease, matches[0].locator)
             return renewed
 
     def release_checkpoint_lease(self, lease: CheckpointLease) -> None:
         with self._commit_lock():
             matches = tuple(
-                active
-                for active in self._active_checkpoint_leases_unlocked()
-                if active.lease_id == lease.lease_id
+                record
+                for record in self._active_checkpoint_lease_records_unlocked()
+                if record.lease.lease_id == lease.lease_id
             )
             if not matches:
                 return
-            if len(matches) != 1 or matches[0] != lease:
+            if len(matches) != 1 or matches[0].lease != lease:
                 raise CheckpointConflictError("lease generation CAS conflict")
-            self._delete_lease_tag(lease)
+            self._delete_lease_tag(lease, matches[0].locator)
 
-    def _delete_lease_tag(self, lease: CheckpointLease) -> None:
-        tag = self._lease_tag(lease)
-        tags = self._workspace.dataset("snapshot_manifest").tags
+    def _delete_lease_tag(
+        self, lease: CheckpointLease, locator: SparseCheckpointLocator
+    ) -> None:
+        tag = self._lease_tag(lease, locator)
+        tags = self._workspace.dataset(SNAPSHOT_MANIFEST_DATASET).tags
         if tag in tags.list():
             tags.delete(tag)
 
@@ -549,21 +683,26 @@ class _LanceCheckpointStorage:
         if selected_now.tzinfo is None:
             raise ValueError("now must be timezone-aware")
         with self._commit_lock():
-            return self._active_checkpoint_leases_unlocked(selected_now)
+            return tuple(
+                record.lease
+                for record in self._active_checkpoint_lease_records_unlocked(
+                    selected_now
+                )
+            )
 
-    def _active_checkpoint_leases_unlocked(
+    def _active_checkpoint_lease_records_unlocked(
         self, now: datetime | None = None
-    ) -> tuple[CheckpointLease, ...]:
+    ) -> tuple[_LeaseRecord, ...]:
         selected_now = now or datetime.now(timezone.utc)
-        dataset = self._workspace.dataset("snapshot_manifest")
+        dataset = self._workspace.dataset(SNAPSHOT_MANIFEST_DATASET)
         leases = []
         for tag in tuple(dataset.tags.list()):
             if not tag.startswith("selease."):
                 continue
-            lease = self._decode_lease_tag(tag)
-            if lease.expires_at > selected_now:
-                leases.append(lease)
-        return tuple(sorted(leases, key=lambda item: item.lease_id))
+            record = self._decode_lease_tag(tag)
+            if record.lease.expires_at > selected_now:
+                leases.append(record)
+        return tuple(sorted(leases, key=lambda item: item.lease.lease_id))
 
     def reclaim(self, *, older_than: timedelta = timedelta(0)) -> None:
         self._ensure_tables()
@@ -678,11 +817,11 @@ class _LanceCheckpointStorage:
         return value
 
     def _fragment_roots_in_workspace(self, source: str) -> tuple[str, ...]:
-        if self._workspace.exists(f"{source}/entries"):
+        if self._workspace.exists(f"{source}/{ENTRIES_DATASET}"):
             nested = tuple(
                 child
                 for child in self._workspace.child_prefixes(source)
-                if self._workspace.exists(f"{source}/{child}/entries")
+                if self._workspace.exists(f"{source}/{child}/{ENTRIES_DATASET}")
             )
             if nested:
                 raise ValueError("fragment source path has an ambiguous nested layout")
@@ -690,7 +829,7 @@ class _LanceCheckpointStorage:
         roots = tuple(
             f"{source}/{child}"
             for child in sorted(self._workspace.child_prefixes(source))
-            if self._workspace.exists(f"{source}/{child}/entries")
+            if self._workspace.exists(f"{source}/{child}/{ENTRIES_DATASET}")
         )
         if not roots:
             raise ValueError(
@@ -704,9 +843,8 @@ class _LanceCheckpointStorage:
             raise ValueError("fragment source path contains unrelated child prefixes")
         return roots
 
-    def compact_checkpoint(self, locator: SparseCheckpointLocator) -> None:
-        if not isinstance(locator, SparseCheckpointLocator):
-            raise TypeError("locator must be SparseCheckpointLocator")
+    def compact_checkpoint(self, handle: CheckpointHandle) -> None:
+        locator, _ = self._resolve_handle(handle)
         with self._commit_lock():
             row = self._resolve_manifest(locator)
             if int(row["compacted_version"]) != 0:
@@ -729,14 +867,15 @@ class _LanceCheckpointStorage:
                 self._validate_manifest_fragments(current)
                 source_roots = self._manifest_fragment_roots(current)
                 protections = self._compaction_tags(current, source_roots, compact_root)
-                tags = self._workspace.dataset("snapshot_manifest").tags
+                tags = self._workspace.dataset(SNAPSHOT_MANIFEST_DATASET).tags
                 if any(tag in tags.list() for tag in protections):
                     raise CheckpointConflictError(
                         "checkpoint compaction intent already exists"
                     )
                 for protection in protections:
                     tags.create(
-                        protection, self._workspace.dataset("snapshot_manifest").version
+                        protection,
+                        self._workspace.dataset(SNAPSHOT_MANIFEST_DATASET).version,
                     )
                 expected_digest = str(current["fragment_digest"])
             published = False
@@ -764,7 +903,9 @@ class _LanceCheckpointStorage:
                         raise CheckpointConflictError(
                             "checkpoint changed during compaction"
                         )
-                    manifest_dataset = self._workspace.dataset("snapshot_manifest")
+                    manifest_dataset = self._workspace.dataset(
+                        SNAPSHOT_MANIFEST_DATASET
+                    )
                     updated = manifest_dataset.update(
                         {
                             "fragment_ids": self._sql_list_literal([compact_root]),
@@ -792,7 +933,7 @@ class _LanceCheckpointStorage:
                         "compaction retired fragment deletion was partial"
                     ) from error
                 with self._commit_lock():
-                    tags = self._workspace.dataset("snapshot_manifest").tags
+                    tags = self._workspace.dataset(SNAPSHOT_MANIFEST_DATASET).tags
                     for protection in protections:
                         if protection in tags.list():
                             tags.delete(protection)
@@ -806,7 +947,9 @@ class _LanceCheckpointStorage:
                         cleanup_error = error
                     if cleanup_error is None:
                         with self._commit_lock():
-                            tags = self._workspace.dataset("snapshot_manifest").tags
+                            tags = self._workspace.dataset(
+                                SNAPSHOT_MANIFEST_DATASET
+                            ).tags
                             for protection in protections:
                                 if protection in tags.list():
                                     tags.delete(protection)
@@ -819,8 +962,8 @@ class _LanceCheckpointStorage:
     async def compact_checkpoints_async(self) -> None:
         await asyncio.to_thread(self.compact_checkpoints)
 
-    async def compact_checkpoint_async(self, locator: SparseCheckpointLocator) -> None:
-        await asyncio.to_thread(self.compact_checkpoint, locator)
+    async def compact_checkpoint_async(self, handle: CheckpointHandle) -> None:
+        await asyncio.to_thread(self.compact_checkpoint, handle)
 
     def _reclaim_unlocked(self, older_than: timedelta) -> None:
         self._reclaim_unlocked_for(older_than, frozenset())
@@ -831,13 +974,10 @@ class _LanceCheckpointStorage:
         authorized_locators: frozenset[SparseCheckpointLocator],
     ) -> None:
         now = datetime.now(timezone.utc)
-        active_ids = {
-            lease.lease_id for lease in self._active_checkpoint_leases_unlocked(now)
-        }
-        leased_locators = {
-            lease.locator for lease in self._active_checkpoint_leases_unlocked(now)
-        }
-        manifest_dataset = self._workspace.dataset("snapshot_manifest")
+        active_records = self._active_checkpoint_lease_records_unlocked(now)
+        active_ids = {record.lease.lease_id for record in active_records}
+        leased_locators = {record.locator for record in active_records}
+        manifest_dataset = self._workspace.dataset(SNAPSHOT_MANIFEST_DATASET)
         rows = self._manifest_rows()
         tags = manifest_dataset.tags
         for tag in tuple(tags.list()):
@@ -910,7 +1050,7 @@ class _LanceCheckpointStorage:
         self._reconcile_staging()
 
     def _reconcile_reclaiming(self) -> None:
-        tags = self._workspace.dataset("snapshot_manifest").tags
+        tags = self._workspace.dataset(SNAPSHOT_MANIFEST_DATASET).tags
         for tag in tuple(tags.list()):
             if not tag.startswith("sereclaiming."):
                 continue
@@ -940,7 +1080,7 @@ class _LanceCheckpointStorage:
                         self._workspace.delete_prefix(root)
             except BaseException as error:
                 raise RuntimeError("checkpoint reclaim recovery was partial") from error
-            self._workspace.dataset("snapshot_manifest").delete(
+            self._workspace.dataset(SNAPSHOT_MANIFEST_DATASET).delete(
                 f"checkpoint_name = '{self._sql_literal(locator.checkpoint_name)}' "
                 f"AND checkpoint_version = {locator.checkpoint_version}"
             )
@@ -961,7 +1101,7 @@ class _LanceCheckpointStorage:
             raise RuntimeError("checkpoint reclaim marker is corrupt") from error
 
     def _reconcile_compaction_retirements(self) -> None:
-        tags = self._workspace.dataset("snapshot_manifest").tags
+        tags = self._workspace.dataset(SNAPSHOT_MANIFEST_DATASET).tags
         for tag in tuple(tags.list()):
             if not tag.startswith("secompact."):
                 continue
@@ -1032,19 +1172,22 @@ class _LanceCheckpointStorage:
     def reserve_cleanup(
         self,
         reservation_id: str,
-        ordered_candidates: Sequence[SparseCheckpointLocator],
+        ordered_candidates: Sequence[CheckpointHandle],
         required_count: int,
     ) -> CleanupReservation:
         if required_count <= 0:
             raise ValueError("required_count must be positive")
         with self._commit_lock():
             leased = {
-                lease.locator for lease in self._active_checkpoint_leases_unlocked()
+                record.locator
+                for record in self._active_checkpoint_lease_records_unlocked()
             }
-            tags = self._workspace.dataset("snapshot_manifest").tags
+            tags = self._workspace.dataset(SNAPSHOT_MANIFEST_DATASET).tags
             names = tuple(tags.list())
-            selected = []
-            for locator in ordered_candidates:
+            selected: list[SparseCheckpointLocator] = []
+            selected_handles: list[CheckpointHandle] = []
+            for handle in ordered_candidates:
+                locator, _ = self._resolve_handle(handle)
                 self._resolve_manifest(locator)
                 if locator in leased:
                     continue
@@ -1059,17 +1202,26 @@ class _LanceCheckpointStorage:
                 if conflicts:
                     continue
                 selected.append(locator)
+                selected_handles.append(handle)
                 if len(selected) == required_count:
                     break
             if len(selected) != required_count:
                 raise CheckpointConflictError(
                     "not enough unleased checkpoints are reclaimable"
                 )
-            reservation = CleanupReservation(reservation_id, tuple(selected))
-            manifest_version = self._workspace.dataset("snapshot_manifest").version
+            owner_handle = self._reservation_owner_handle(
+                reservation_id, tuple(selected_handles)
+            )
+            reservation = CleanupReservation(
+                reservation_id, owner_handle, tuple(selected_handles)
+            )
+            manifest_version = self._workspace.dataset(
+                SNAPSHOT_MANIFEST_DATASET
+            ).version
             created = []
             try:
-                for locator in reservation.locators:
+                for handle in reservation.handles:
+                    locator, _ = self._resolve_handle(handle)
                     expected = self._reservation_tag(
                         "reserved", reservation.reservation_id, locator
                     )
@@ -1084,9 +1236,11 @@ class _LanceCheckpointStorage:
             return reservation
 
     def commit_cleanup(self, reservation: CleanupReservation) -> None:
+        self._validate_cleanup_reservation(reservation)
         with self._commit_lock():
-            tags = self._workspace.dataset("snapshot_manifest").tags
-            for locator in reservation.locators:
+            tags = self._workspace.dataset(SNAPSHOT_MANIFEST_DATASET).tags
+            for handle in reservation.handles:
+                locator, _ = self._resolve_handle(handle)
                 reserved = self._reservation_tag(
                     "reserved", reservation.reservation_id, locator
                 )
@@ -1102,14 +1256,16 @@ class _LanceCheckpointStorage:
                     )
                 tags.create(
                     pending,
-                    self._workspace.dataset("snapshot_manifest").version,
+                    self._workspace.dataset(SNAPSHOT_MANIFEST_DATASET).version,
                 )
                 tags.delete(reserved)
 
     def rollback_cleanup(self, reservation: CleanupReservation) -> None:
+        self._validate_cleanup_reservation(reservation)
         with self._commit_lock():
-            tags = self._workspace.dataset("snapshot_manifest").tags
-            for locator in reservation.locators:
+            tags = self._workspace.dataset(SNAPSHOT_MANIFEST_DATASET).tags
+            for handle in reservation.handles:
+                locator, _ = self._resolve_handle(handle)
                 for status in ("reserved", "pending"):
                     tag = self._reservation_tag(
                         status, reservation.reservation_id, locator
@@ -1120,15 +1276,20 @@ class _LanceCheckpointStorage:
     def cleanup_checkpoint(
         self,
         reservation: CleanupReservation,
-        locator: SparseCheckpointLocator,
-        reference_id: str,
+        handle: CheckpointHandle,
     ) -> None:
-        if locator not in reservation.locators:
-            raise ValueError("checkpoint locator is outside reclaim reservation")
-        if not reference_id:
-            raise ValueError("reference_id must be non-empty")
+        if handle not in reservation.handles:
+            raise ValueError("checkpoint handle is outside reclaim reservation")
+        self._validate_cleanup_reservation(reservation)
+        storage_uri, locator, reference_id = _decode_checkpoint_handle(handle)
+        self._validate_handle_storage_uri(storage_uri)
+        expected_owner = self._reservation_owner_handle(
+            reservation.reservation_id, reservation.handles
+        )
+        if reservation.owner_handle != expected_owner:
+            raise CheckpointConflictError("cleanup reservation owner handle is invalid")
         with self._commit_lock():
-            tags = self._workspace.dataset("snapshot_manifest").tags
+            tags = self._workspace.dataset(SNAPSHOT_MANIFEST_DATASET).tags
             pending = self._reservation_tag(
                 "pending", reservation.reservation_id, locator
             )
@@ -1145,41 +1306,138 @@ class _LanceCheckpointStorage:
             if pending in tags.list():
                 tags.delete(pending)
 
-    def release_reference(
-        self, locator: SparseCheckpointLocator, reference_id: str
-    ) -> None:
-        if not reference_id:
-            raise ValueError("reference_id must be non-empty")
+    def release_reference(self, handle: CheckpointHandle) -> None:
+        locator, reference_id = self._resolve_handle(handle)
         with self._commit_lock():
             self._delete_reference_tags(locator, reference_id)
             self._reclaim_unlocked(timedelta(0))
 
-    def restore_checkpoint(
+    def _validate_cleanup_reservation(self, reservation: CleanupReservation) -> None:
+        expected = self._reservation_owner_handle(
+            reservation.reservation_id, reservation.handles
+        )
+        if reservation.owner_handle != expected:
+            raise CheckpointConflictError("cleanup reservation owner handle is invalid")
+
+    def load_component_checkpoint(
         self,
         store: Any,
-        locator: SparseCheckpointLocator,
-        mode: RestoreMode,
+        storage_locator: CheckpointHandle,
+        owner_restore_options: bytes,
+        *,
         load_optimizer_state: bool = True,
     ) -> None:
         if not isinstance(load_optimizer_state, bool):
             raise TypeError("load_optimizer_state must be bool")
+        mode = _decode_restore_options(owner_restore_options)
+        locator, _ = self._resolve_handle(storage_locator)
+        self._load_component_checkpoint_by_locator(
+            store, locator, mode, load_optimizer_state=load_optimizer_state
+        )
+
+    def _load_component_checkpoint_by_locator(
+        self,
+        store: Any,
+        locator: SparseCheckpointLocator,
+        mode: RestoreMode,
+        *,
+        load_optimizer_state: bool = True,
+    ) -> None:
         manifest = self._resolve_manifest(locator)
-        self._restore_manifest(
+        self._restore_committed_record(
             store, manifest, mode, _RestoreScope.TRAINING, load_optimizer_state
         )
 
-    def restore_weight_snapshot(
+    def load_inference_weights(
         self,
         store: Any,
-        snapshot: SparseWeightSnapshot,
-        mode: RestoreMode,
+        owner_restore_options: bytes,
     ) -> None:
-        if not isinstance(snapshot, SparseWeightSnapshot):
-            raise TypeError("snapshot must be SparseWeightSnapshot")
-        manifest = self._resolve_manifest_by_digest(snapshot.snapshot_digest)
-        self._restore_manifest(store, manifest, mode, _RestoreScope.INFERENCE, False)
+        if self._bound_handle is None:
+            raise RuntimeError(
+                "inference weights require LocalLanceStorage.from_weight_path"
+            )
+        mode = _decode_restore_options(owner_restore_options)
+        if not isinstance(mode, ElasticRestore):
+            raise ValueError("inference weight restore requires an elastic mode")
+        locator, _ = self._resolve_handle(self._bound_handle)
+        manifest = self._resolve_manifest(locator)
+        self._restore_committed_record(
+            store, manifest, mode, _RestoreScope.INFERENCE, False
+        )
 
-    def _restore_manifest(
+    def write_weight_reference(
+        self,
+        path: str,
+        handle: CheckpointHandle,
+    ) -> None:
+        locator, _ = self._resolve_handle(handle)
+        if not isinstance(self._workspace, LocalLanceWorkspace):
+            raise NotImplementedError(
+                "weight reference writing is only implemented for local Lance paths"
+            )
+        manifest = self._resolve_manifest(locator)
+        if not str(manifest["reference_id"]):
+            raise CheckpointConflictError(
+                "weight reference requires a committed checkpoint reference"
+            )
+        asset_root = Path(path).expanduser()
+        if asset_root.is_symlink() or not asset_root.is_dir():
+            raise FileNotFoundError(
+                f"sparse weight reference directory does not exist: {asset_root}"
+            )
+        if any(
+            (asset_root / name).exists()
+            for name in (
+                SNAPSHOT_MANIFEST_DATASET,
+                ENTRIES_DATASET,
+                PAGE_IMAGES_DATASET,
+            )
+        ):
+            raise ValueError(
+                "sparse weight path must contain a reference asset, not a checkpoint root"
+            )
+        reference_path = asset_root / _WEIGHT_REFERENCE_FILENAME
+        if any(
+            item.name != _WEIGHT_REFERENCE_FILENAME for item in asset_root.iterdir()
+        ):
+            raise ValueError("sparse weight reference directory has an unknown layout")
+        if reference_path.is_symlink():
+            raise ValueError("sparse weight reference must not be a symlink")
+        payload = handle
+        if reference_path.exists():
+            if not reference_path.is_file() or reference_path.read_bytes() != payload:
+                raise CheckpointConflictError(
+                    "sparse weight reference already exists with another identity"
+                )
+            return
+        temporary = asset_root / f".{_WEIGHT_REFERENCE_FILENAME}.tmp-{uuid.uuid4().hex}"
+        try:
+            flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL
+            descriptor = os.open(temporary, flags, 0o600)
+            try:
+                with os.fdopen(descriptor, "wb") as stream:
+                    descriptor = -1
+                    stream.write(payload)
+                    stream.flush()
+                    os.fsync(stream.fileno())
+            finally:
+                if descriptor >= 0:
+                    os.close(descriptor)
+            os.replace(temporary, reference_path)
+            directory_descriptor = os.open(asset_root, os.O_RDONLY)
+            try:
+                os.fsync(directory_descriptor)
+            finally:
+                os.close(directory_descriptor)
+            if reference_path.read_bytes() != payload:
+                raise RuntimeError("sparse weight reference verification failed")
+        except BaseException:
+            if temporary.exists():
+                temporary.unlink()
+            raise
+
+    def _restore_committed_record(
         self,
         store: Any,
         manifest: dict[str, Any],
@@ -1194,12 +1452,23 @@ class _LanceCheckpointStorage:
             raise ValueError(
                 "load_optimizer_state requires a target store with optimizer enabled"
             )
+        mode_key_dtype = (
+            mode.key_dtype
+            if isinstance(mode, (PhysicalRestore, ElasticRestore))
+            else None
+        )
+        if mode_key_dtype != specification.key_dtype:
+            raise ValueError(
+                "restore options sparse ID dtype does not match checkpoint"
+            )
         self._validate_restore_target(store, specification, scope, load_optimizer_state)
         if manifest["commit_state"] != _COMMITTED:
             raise LookupError("checkpoint manifest is not committed")
         if manifest["storage_mode"] != _FRAGMENT_STORAGE_MODE:
             raise RuntimeError("checkpoint storage mode is unsupported")
         self._validate_manifest_fragments(manifest)
+        if store.total_size() != 0:
+            raise RuntimeError("restore requires an empty target store")
         if isinstance(mode, PhysicalRestore):
             if mode.participant.participant_index >= int(manifest["participant_count"]):
                 raise ValueError("restore participant is outside saved topology")
@@ -1224,7 +1493,7 @@ class _LanceCheckpointStorage:
                 target.dimensions != specification.dimensions
                 or target.embedding_dtype != specification.embedding_dtype
                 or target.score_policy != specification.score_policy
-                or target.protocol_version != specification.protocol_version
+                or target.key_dtype != specification.key_dtype
                 or (
                     load_optimizer_state
                     and target.optimizer_dtype != specification.optimizer_dtype
@@ -1236,15 +1505,20 @@ class _LanceCheckpointStorage:
             return
         if scope is not _RestoreScope.INFERENCE:
             raise ValueError(f"unsupported restore scope: {scope!r}")
-        dimensions = tuple(sorted(int(dim) for dim in store.table_dims()))
-        if dimensions != specification.dimensions:
-            raise ValueError("inference target dimensions do not match snapshot")
-        if store.value_dtype() != specification.embedding_dtype:
-            raise ValueError("inference target value dtype does not match snapshot")
+        if not hasattr(store, "optimizer_enabled") or store.optimizer_enabled():
+            raise ValueError("inference target store must have optimizer enabled=False")
+        target = cls._store_specification(store)
+        if (
+            target.dimensions != specification.dimensions
+            or target.embedding_dtype != specification.embedding_dtype
+            or target.score_policy != specification.score_policy
+            or target.key_dtype != specification.key_dtype
+        ):
+            raise ValueError("inference target does not match weight reference")
 
     def _ensure_tables(self) -> None:
         self._workspace.ensure_root()
-        for name, schema in (("snapshot_manifest", MANIFEST_SCHEMA),):
+        for name, schema in ((SNAPSHOT_MANIFEST_DATASET, MANIFEST_SCHEMA),):
             if not self._workspace.exists(name):
                 self._workspace.write_dataset(_empty_table(schema), name, mode="create")
             elif self._workspace.dataset(name).schema != schema:
@@ -1253,7 +1527,7 @@ class _LanceCheckpointStorage:
                 )
 
     def _publish_authority(self, identity: CheckpointSaveIdentity) -> None:
-        dataset = self._workspace.dataset("snapshot_manifest")
+        dataset = self._workspace.dataset(SNAPSHOT_MANIFEST_DATASET)
         tags = dataset.tags
         names = tuple(tags.list())
         current_generation = self._current_authority_generation(identity, names)
@@ -1290,7 +1564,7 @@ class _LanceCheckpointStorage:
         self._reconcile_staging()
 
     def _require_authority(self, identity: CheckpointSaveIdentity) -> None:
-        tags = self._workspace.dataset("snapshot_manifest").tags.list()
+        tags = self._workspace.dataset(SNAPSHOT_MANIFEST_DATASET).tags.list()
         if (
             self._current_authority_generation(identity, tuple(tags))
             != identity.commit_authority.generation
@@ -1299,9 +1573,9 @@ class _LanceCheckpointStorage:
             raise CheckpointConflictError("checkpoint commit authority is stale")
 
     def _clear_authority(self, identity: CheckpointSaveIdentity) -> None:
-        if not self._workspace.exists("snapshot_manifest"):
+        if not self._workspace.exists(SNAPSHOT_MANIFEST_DATASET):
             return
-        tags = self._workspace.dataset("snapshot_manifest").tags
+        tags = self._workspace.dataset(SNAPSHOT_MANIFEST_DATASET).tags
         name = self._authority_tag(identity)
         if name in tags.list():
             tags.delete(name)
@@ -1309,7 +1583,7 @@ class _LanceCheckpointStorage:
     def _reconcile_staging(self) -> None:
         if not self._workspace.exists("_staging"):
             return
-        tags = self._workspace.dataset("snapshot_manifest").tags.list()
+        tags = self._workspace.dataset(SNAPSHOT_MANIFEST_DATASET).tags.list()
         active = {
             ".".join(tag.split(".")[1:])
             for tag in tags
@@ -1348,9 +1622,12 @@ class _LanceCheckpointStorage:
                 self._workspace.delete_prefix(f"_staging/{attempt}", missing_ok=True)
 
     def _create_lease_tags(
-        self, lease: CheckpointLease, manifest: dict[str, Any]
+        self,
+        lease: CheckpointLease,
+        locator: SparseCheckpointLocator,
+        manifest: dict[str, Any],
     ) -> None:
-        self._create_version_tags(self._lease_tag(lease), manifest)
+        self._create_version_tags(self._lease_tag(lease, locator), manifest)
 
     def _create_reference_tags(
         self,
@@ -1363,15 +1640,15 @@ class _LanceCheckpointStorage:
         self._create_version_tags(self._reference_tag(locator, reference_id), manifest)
 
     def _create_version_tags(self, tag: str, manifest: dict[str, Any]) -> None:
-        tags = self._workspace.dataset("snapshot_manifest").tags
+        tags = self._workspace.dataset(SNAPSHOT_MANIFEST_DATASET).tags
         if tag not in tags.list():
-            tags.create(tag, self._workspace.dataset("snapshot_manifest").version)
+            tags.create(tag, self._workspace.dataset(SNAPSHOT_MANIFEST_DATASET).version)
 
     def _delete_reference_tags(
         self, locator: SparseCheckpointLocator, reference_id: str
     ) -> None:
         tag = self._reference_tag(locator, reference_id)
-        tags = self._workspace.dataset("snapshot_manifest").tags
+        tags = self._workspace.dataset(SNAPSHOT_MANIFEST_DATASET).tags
         if tag in tags.list():
             tags.delete(tag)
 
@@ -1437,7 +1714,9 @@ class _LanceCheckpointStorage:
     def _decode(value: str) -> str:
         return urlsafe_b64decode(value + "=" * (-len(value) % 4)).decode()
 
-    def _lease_tag(self, lease: CheckpointLease) -> str:
+    def _lease_tag(
+        self, lease: CheckpointLease, locator: SparseCheckpointLocator
+    ) -> str:
         expires = int(lease.expires_at.timestamp() * 1_000_000)
         return ".".join(
             (
@@ -1445,24 +1724,27 @@ class _LanceCheckpointStorage:
                 lease.lease_id,
                 str(lease.generation),
                 str(expires),
-                str(lease.locator.checkpoint_version),
-                self._encode(lease.locator.checkpoint_name),
+                str(locator.checkpoint_version),
+                self._encode(locator.checkpoint_name),
                 self._encode(lease.lease_holder_id),
                 self._encode(lease.request_id),
             )
         )
 
-    def _decode_lease_tag(self, tag: str) -> CheckpointLease:
+    def _decode_lease_tag(self, tag: str) -> _LeaseRecord:
         parts = tag.split(".")
         if len(parts) != 8:
             raise RuntimeError("invalid sparse checkpoint lease tag")
-        return CheckpointLease(
+        lease = CheckpointLease(
             lease_id=parts[1],
-            locator=SparseCheckpointLocator(self._decode(parts[5]), int(parts[4])),
             lease_holder_id=self._decode(parts[6]),
             expires_at=datetime.fromtimestamp(int(parts[3]) / 1_000_000, timezone.utc),
             generation=int(parts[2]),
             request_id=self._decode(parts[7]),
+        )
+        return _LeaseRecord(
+            lease,
+            SparseCheckpointLocator(self._decode(parts[5]), int(parts[4])),
         )
 
     def _reference_tag(
@@ -1494,6 +1776,22 @@ class _LanceCheckpointStorage:
             )
         )
 
+    @staticmethod
+    def _reservation_owner_handle(
+        reservation_id: str, handles: Sequence[CheckpointHandle]
+    ) -> CheckpointHandle:
+        if not reservation_id or any(
+            not isinstance(handle, bytes) or not handle for handle in handles
+        ):
+            raise ValueError("cleanup reservation identity is invalid")
+        digest = hashlib.sha256()
+        digest.update(b"sparse_embedding.cleanup_owner\0")
+        digest.update(reservation_id.encode("utf-8"))
+        for handle in handles:
+            digest.update(_UINT32.pack(len(handle)))
+            digest.update(handle)
+        return digest.digest()
+
     def _outcome_tag(
         self,
         checkpoint_name: str,
@@ -1524,7 +1822,7 @@ class _LanceCheckpointStorage:
         prefix = f"setransaction.{self._short_token(identity.checkpoint_name)}."
         tags = tuple(
             tag
-            for tag in self._workspace.dataset("snapshot_manifest").tags.list()
+            for tag in self._workspace.dataset(SNAPSHOT_MANIFEST_DATASET).tags.list()
             if tag.startswith(prefix)
         )
         if not tags:
@@ -1605,12 +1903,12 @@ class _LanceCheckpointStorage:
             locator.checkpoint_version,
             manifest_before,
         )
-        tags = self._workspace.dataset("snapshot_manifest").tags
+        tags = self._workspace.dataset(SNAPSHOT_MANIFEST_DATASET).tags
         if tag not in tags.list():
-            tags.create(tag, self._workspace.dataset("snapshot_manifest").version)
+            tags.create(tag, self._workspace.dataset(SNAPSHOT_MANIFEST_DATASET).version)
 
     def _delete_pending_outcome(self, checkpoint_name: str) -> None:
-        tags = self._workspace.dataset("snapshot_manifest").tags
+        tags = self._workspace.dataset(SNAPSHOT_MANIFEST_DATASET).tags
         prefix = f"setransaction.{self._short_token(checkpoint_name)}."
         for tag in tuple(tags.list()):
             if tag.startswith(prefix):
@@ -1636,7 +1934,7 @@ class _LanceCheckpointStorage:
         locator: SparseCheckpointLocator,
     ) -> bool:
         tag = self._reclaim_completion_tag(reservation, locator)
-        return tag in self._workspace.dataset("snapshot_manifest").tags.list()
+        return tag in self._workspace.dataset(SNAPSHOT_MANIFEST_DATASET).tags.list()
 
     def _record_reclaim_completion(
         self,
@@ -1645,9 +1943,9 @@ class _LanceCheckpointStorage:
     ) -> None:
         if self._reclaim_completed(reservation, locator):
             return
-        self._workspace.dataset("snapshot_manifest").tags.create(
+        self._workspace.dataset(SNAPSHOT_MANIFEST_DATASET).tags.create(
             self._reclaim_completion_tag(reservation, locator),
-            self._workspace.dataset("snapshot_manifest").version,
+            self._workspace.dataset(SNAPSHOT_MANIFEST_DATASET).version,
         )
 
     @staticmethod
@@ -1658,7 +1956,7 @@ class _LanceCheckpointStorage:
         return f".{locator.checkpoint_version}.{self._encode(locator.checkpoint_name)}"
 
     def _locator_has_reservation(self, locator: SparseCheckpointLocator) -> bool:
-        tags = self._workspace.dataset("snapshot_manifest").tags.list()
+        tags = self._workspace.dataset(SNAPSHOT_MANIFEST_DATASET).tags.list()
         suffix = self._reservation_locator_suffix(locator)
         return any(
             self._is_reservation_tag(tag) and tag.endswith(suffix) for tag in tags
@@ -1702,18 +2000,22 @@ class _LanceCheckpointStorage:
                 raise RuntimeError("checkpoint fragment metadata identifier mismatch")
             if metadata["schema_digest"] != item.schema_digest:
                 raise RuntimeError("checkpoint fragment metadata schema mismatch")
+            if metadata["key_dtype"] != specification.key_dtype:
+                raise InvalidCheckpointFragment(
+                    "checkpoint fragment key encoding mismatch"
+                )
             if tuple(int(index) for index in metadata["participant_indices"]) != (
                 item.participant.participant_index,
             ):
                 raise RuntimeError("checkpoint fragment metadata participant mismatch")
             if (
                 int(metadata["entry_count"])
-                != self._workspace.dataset(f"{root}/entries").count_rows()
+                != self._workspace.dataset(f"{root}/{ENTRIES_DATASET}").count_rows()
             ):
                 raise RuntimeError("checkpoint fragment entry count mismatch")
-            if self._workspace.exists(f"{root}/page_images") and (
+            if self._workspace.exists(f"{root}/{PAGE_IMAGES_DATASET}") and (
                 int(metadata["page_count"])
-                != self._workspace.dataset(f"{root}/page_images").count_rows()
+                != self._workspace.dataset(f"{root}/{PAGE_IMAGES_DATASET}").count_rows()
             ):
                 raise RuntimeError("checkpoint fragment page count mismatch")
             if (
@@ -1723,9 +2025,10 @@ class _LanceCheckpointStorage:
                 or int(metadata["page_count"]) != item.page_count
                 or metadata["schema_digest"] != item.schema_digest
                 or metadata["content_digest"] != item.content_digest
+                or metadata["key_dtype"] != specification.key_dtype
             ):
                 raise InvalidCheckpointFragment("checkpoint fragment metadata mismatch")
-            if not self._workspace.exists(f"{root}/entries"):
+            if not self._workspace.exists(f"{root}/{ENTRIES_DATASET}"):
                 raise InvalidCheckpointFragment(
                     "checkpoint fragment payload is missing"
                 )
@@ -1735,7 +2038,7 @@ class _LanceCheckpointStorage:
         )
 
     def _manifest_rows(self) -> list[dict[str, Any]]:
-        return self._workspace.dataset("snapshot_manifest").to_table().to_pylist()
+        return self._workspace.dataset(SNAPSHOT_MANIFEST_DATASET).to_table().to_pylist()
 
     def _manifest_for_version(
         self, checkpoint_name: str, version: int
@@ -1761,17 +2064,6 @@ class _LanceCheckpointStorage:
             raise LookupError("checkpoint locator is missing or ambiguous")
         if matches[0]["commit_state"] != _COMMITTED:
             raise LookupError("checkpoint manifest is not committed")
-        return matches[0]
-
-    def _resolve_manifest_by_digest(self, snapshot_digest: str) -> dict[str, Any]:
-        matches = [
-            row
-            for row in self._manifest_rows()
-            if row["commit_state"] == _COMMITTED
-            and str(row["fragment_digest"]) == snapshot_digest
-        ]
-        if len(matches) != 1:
-            raise LookupError("weight snapshot digest is missing or ambiguous")
         return matches[0]
 
     def _manifest_fragment_roots(self, manifest: dict[str, Any]) -> tuple[str, ...]:
@@ -1821,7 +2113,7 @@ class _LanceCheckpointStorage:
         token = self._token(identity.save_attempt)
         return tuple(
             tag
-            for tag in self._workspace.dataset("snapshot_manifest").tags.list()
+            for tag in self._workspace.dataset(SNAPSHOT_MANIFEST_DATASET).tags.list()
             if tag.startswith(f"seintent.{token}.")
         )
 
@@ -1835,18 +2127,23 @@ class _LanceCheckpointStorage:
             raise RuntimeError("checkpoint manifest fragment digest mismatch")
         all_participants: set[int] = set()
         for fragment_id, root in zip(fragment_ids, roots, strict=True):
-            entries = f"{root}/entries"
+            entries = f"{root}/{ENTRIES_DATASET}"
             if not self._workspace.exists(entries):
                 raise LookupError("checkpoint manifest references a missing fragment")
             dataset = self._workspace.dataset(entries)
-            if dataset.schema.remove_metadata() != ENTRY_SCHEMA.remove_metadata():
+            if (
+                dataset.schema.remove_metadata()
+                != entry_schema(manifest["key_dtype"]).remove_metadata()
+            ):
                 raise RuntimeError("checkpoint fragment schema mismatch")
             metadata = dataset.schema.metadata or {}
             specification = self._decode_specification(metadata)
+            if specification.key_dtype != manifest["key_dtype"]:
+                raise RuntimeError("checkpoint fragment key encoding mismatch")
             if _schema_digest(specification) != str(manifest["schema_digest"]):
                 raise RuntimeError("checkpoint fragment schema digest mismatch")
-            if self._workspace.exists(f"{root}/page_images"):
-                pages_ds = self._workspace.dataset(f"{root}/page_images")
+            if self._workspace.exists(f"{root}/{PAGE_IMAGES_DATASET}"):
+                pages_ds = self._workspace.dataset(f"{root}/{PAGE_IMAGES_DATASET}")
                 if (
                     pages_ds.schema.remove_metadata()
                     != PAGE_IMAGE_SCHEMA.remove_metadata()
@@ -1857,14 +2154,16 @@ class _LanceCheckpointStorage:
                 raise RuntimeError("checkpoint fragment metadata identifier mismatch")
             if metadata["schema_digest"] != str(manifest["schema_digest"]):
                 raise RuntimeError("checkpoint fragment metadata schema mismatch")
+            if metadata["key_dtype"] != manifest["key_dtype"]:
+                raise RuntimeError("checkpoint fragment key encoding mismatch")
             if (
                 int(metadata["entry_count"])
-                != self._workspace.dataset(f"{root}/entries").count_rows()
+                != self._workspace.dataset(f"{root}/{ENTRIES_DATASET}").count_rows()
             ):
                 raise RuntimeError("checkpoint fragment entry count mismatch")
-            if self._workspace.exists(f"{root}/page_images") and (
+            if self._workspace.exists(f"{root}/{PAGE_IMAGES_DATASET}") and (
                 int(metadata["page_count"])
-                != self._workspace.dataset(f"{root}/page_images").count_rows()
+                != self._workspace.dataset(f"{root}/{PAGE_IMAGES_DATASET}").count_rows()
             ):
                 raise RuntimeError("checkpoint fragment page count mismatch")
             participants = {int(index) for index in metadata["participant_indices"]}
@@ -1920,7 +2219,7 @@ class _LanceCheckpointStorage:
         )
 
     def _metadata_for_root(self, root: str) -> dict[str, Any]:
-        entries = self._workspace.dataset(f"{root}/entries")
+        entries = self._workspace.dataset(f"{root}/{ENTRIES_DATASET}")
         entry_metadata = entries.schema_metadata
         required = {
             "sparse_embedding.fragment_id",
@@ -1930,11 +2229,12 @@ class _LanceCheckpointStorage:
             "sparse_embedding.page_count",
             "sparse_embedding.fragment_schema_digest",
             "sparse_embedding.fragment_content_digest",
+            "sparse_embedding.key_dtype",
         }
         if not required.issubset(entry_metadata):
             raise LookupError("fragment metadata is missing or inconsistent")
-        if self._workspace.exists(f"{root}/page_images"):
-            pages = self._workspace.dataset(f"{root}/page_images")
+        if self._workspace.exists(f"{root}/{PAGE_IMAGES_DATASET}"):
+            pages = self._workspace.dataset(f"{root}/{PAGE_IMAGES_DATASET}")
             page_metadata = pages.schema_metadata
             if not required.issubset(page_metadata) or entry_metadata != page_metadata:
                 raise LookupError("fragment metadata is missing or inconsistent")
@@ -1959,6 +2259,7 @@ class _LanceCheckpointStorage:
             "content_digest": entry_metadata[
                 "sparse_embedding.fragment_content_digest"
             ],
+            "key_dtype": entry_metadata["sparse_embedding.key_dtype"],
         }
 
     def _publish_fragment_metadata(
@@ -1987,7 +2288,7 @@ class _LanceCheckpointStorage:
             "sparse_embedding.fragment_schema_digest": schema_digest,
             "sparse_embedding.fragment_content_digest": content_digest,
         }
-        for name in ("entries", "page_images"):
+        for name in (ENTRIES_DATASET, PAGE_IMAGES_DATASET):
             if not self._workspace.exists(f"{root}/{name}"):
                 continue
             dataset = self._workspace.dataset(f"{root}/{name}")
@@ -2003,21 +2304,25 @@ class _LanceCheckpointStorage:
             raise RuntimeError(
                 "native checkpoint compaction requires a Lance-enabled _core extension"
             )
-        source_uris = [self._workspace.uri(f"{root}/entries") for root in source_roots]
+        source_uris = [
+            self._workspace.uri(f"{root}/{ENTRIES_DATASET}") for root in source_roots
+        ]
         entry_artifact = _checkpoint_native.compact_native_lance_sources(
-            self._workspace.uri(f"{compact_root}/entries"),
+            self._workspace.uri(f"{compact_root}/{ENTRIES_DATASET}"),
             source_uris,
             dict(self._workspace.storage_options()),
         )
         has_pages = all(
-            self._workspace.exists(f"{root}/page_images") for root in source_roots
+            self._workspace.exists(f"{root}/{PAGE_IMAGES_DATASET}")
+            for root in source_roots
         )
         if has_pages:
             source_uris = [
-                self._workspace.uri(f"{root}/page_images") for root in source_roots
+                self._workspace.uri(f"{root}/{PAGE_IMAGES_DATASET}")
+                for root in source_roots
             ]
             page_artifact = _checkpoint_native.compact_native_lance_sources(
-                self._workspace.uri(f"{compact_root}/page_images"),
+                self._workspace.uri(f"{compact_root}/{PAGE_IMAGES_DATASET}"),
                 source_uris,
                 dict(self._workspace.storage_options()),
             )
@@ -2078,6 +2383,10 @@ class _LanceCheckpointStorage:
             and participant_count != expected_participant_count
         ):
             raise RuntimeError("compaction participant count mismatch")
+        key_dtypes = {str(metadata["key_dtype"]) for metadata in source_metadata}
+        if len(key_dtypes) != 1:
+            raise RuntimeError("fragment key dtypes are inconsistent")
+        key_dtype = key_dtypes.pop()
         schema_digests = {
             str(metadata["schema_digest"]) for metadata in source_metadata
         }
@@ -2097,11 +2406,13 @@ class _LanceCheckpointStorage:
             participant_indices != tuple(range(participant_count))
         ):
             raise RuntimeError("compaction participant coverage is incomplete")
-        entry_count = self._workspace.dataset(f"{compact_root}/entries").count_rows()
+        entry_count = self._workspace.dataset(
+            f"{compact_root}/{ENTRIES_DATASET}"
+        ).count_rows()
         if int(compaction_artifact["entries"]["inserted_rows"]) != entry_count:
             raise RuntimeError("compaction output row counts differ from sources")
-        schema = self._workspace.dataset(f"{compact_root}/entries").schema
-        if schema.remove_metadata() != ENTRY_SCHEMA.remove_metadata():
+        schema = self._workspace.dataset(f"{compact_root}/{ENTRIES_DATASET}").schema
+        if schema.remove_metadata() != entry_schema(key_dtype).remove_metadata():
             raise RuntimeError("compaction output schema mismatch")
         specification = self._decode_specification(schema.metadata or {})
         if _schema_digest(specification) != schema_digest:
@@ -2109,11 +2420,13 @@ class _LanceCheckpointStorage:
 
         if "page_images" in compaction_artifact:
             page_count = self._workspace.dataset(
-                f"{compact_root}/page_images"
+                f"{compact_root}/{PAGE_IMAGES_DATASET}"
             ).count_rows()
             if int(compaction_artifact["page_images"]["inserted_rows"]) != page_count:
                 raise RuntimeError("compaction output row counts differ from sources")
-            page_schema = self._workspace.dataset(f"{compact_root}/page_images").schema
+            page_schema = self._workspace.dataset(
+                f"{compact_root}/{PAGE_IMAGES_DATASET}"
+            ).schema
             if page_schema.remove_metadata() != PAGE_IMAGE_SCHEMA.remove_metadata():
                 raise RuntimeError("compaction output schema mismatch")
             page_digest = str(compaction_artifact["page_images"]["content_digest"])
@@ -2216,7 +2529,7 @@ class _LanceCheckpointStorage:
         )
 
     def _locator_has_compaction(self, locator: SparseCheckpointLocator) -> bool:
-        for tag in self._workspace.dataset("snapshot_manifest").tags.list():
+        for tag in self._workspace.dataset(SNAPSHOT_MANIFEST_DATASET).tags.list():
             if not tag.startswith("secompact."):
                 continue
             parts = tag.split(".")
@@ -2233,7 +2546,7 @@ class _LanceCheckpointStorage:
     def _delete_intent_tag(
         self, identity: CheckpointSaveIdentity, version: int
     ) -> None:
-        tags = self._workspace.dataset("snapshot_manifest").tags
+        tags = self._workspace.dataset(SNAPSHOT_MANIFEST_DATASET).tags
         tag = self._intent_tag(
             identity, SparseCheckpointLocator(identity.checkpoint_name, version)
         )
@@ -2278,7 +2591,7 @@ class _LanceCheckpointStorage:
                 self._acquire_checkpoint_lease_locked(locator, lease_request)
             if reference_id:
                 self._create_reference_tags(locator, reference_id, row)
-            tags = self._workspace.dataset("snapshot_manifest").tags
+            tags = self._workspace.dataset(SNAPSHOT_MANIFEST_DATASET).tags
             intent = self._intent_tag(identity, locator)
             if intent in tags.list():
                 intent_manifest_before = tags.get_version(intent)
@@ -2291,10 +2604,11 @@ class _LanceCheckpointStorage:
                 self._clear_authority(identity)
                 return locator
             committed_tag = self._committed_tag(locator)
-            tags = self._workspace.dataset("snapshot_manifest").tags
+            tags = self._workspace.dataset(SNAPSHOT_MANIFEST_DATASET).tags
             if committed_tag not in tags.list():
                 tags.create(
-                    committed_tag, self._workspace.dataset("snapshot_manifest").version
+                    committed_tag,
+                    self._workspace.dataset(SNAPSHOT_MANIFEST_DATASET).version,
                 )
             self._record_pending_outcome(
                 identity,
@@ -2307,7 +2621,7 @@ class _LanceCheckpointStorage:
         if row["commit_state"] != _PREPARED:
             raise RuntimeError("checkpoint manifest commit state is corrupt")
         intent = self._intent_tag(identity, locator)
-        tags = self._workspace.dataset("snapshot_manifest").tags
+        tags = self._workspace.dataset(SNAPSHOT_MANIFEST_DATASET).tags
         if intent not in tags.list():
             raise CheckpointConflictError(
                 "prepared checkpoint intent is missing or ambiguous"
@@ -2322,7 +2636,7 @@ class _LanceCheckpointStorage:
             self._acquire_checkpoint_lease_locked(locator, lease_request)
         if reference_id:
             self._create_reference_tags(locator, reference_id, row)
-        updated = self._workspace.dataset("snapshot_manifest").update(
+        updated = self._workspace.dataset(SNAPSHOT_MANIFEST_DATASET).update(
             {"commit_state": f"'{_COMMITTED}'"},
             where=(
                 f"checkpoint_name = '{self._sql_literal(identity.checkpoint_name)}' "
@@ -2336,7 +2650,8 @@ class _LanceCheckpointStorage:
         committed_tag = self._committed_tag(locator)
         if committed_tag not in tags.list():
             tags.create(
-                committed_tag, self._workspace.dataset("snapshot_manifest").version
+                committed_tag,
+                self._workspace.dataset(SNAPSHOT_MANIFEST_DATASET).version,
             )
         intent = self._intent_tag(identity, locator)
         manifest_before = tags.get_version(intent)
@@ -2356,22 +2671,17 @@ class _LanceCheckpointStorage:
         load_optimizer_state: bool,
     ) -> None:
         roots = self._manifest_fragment_roots(manifest)
-        if not hasattr(_checkpoint_native, "active_entry_keys"):
+        if not hasattr(_checkpoint_native, "restore_native_partition_entries"):
             raise RuntimeError(
                 "native checkpoint restore requires a Lance-enabled _core extension"
             )
-        fragment_keys: list[np.ndarray] = []
-        for root in roots:
-            keys_capsule = _checkpoint_native.active_entry_keys(
-                self._workspace.uri(f"{root}/entries"),
-                0,
-                dict(self._workspace.storage_options()),
+        if not hasattr(_checkpoint_native, "validate_active_entry_keys"):
+            raise RuntimeError(
+                "native checkpoint duplicate validation requires a Lance-enabled _core extension"
             )
-            current = np.from_dlpack(keys_capsule).astype(np.uint64, copy=False)
-            fragment_keys.append(current)
         try:
             _checkpoint_native.validate_active_entry_keys(
-                [self._workspace.uri(f"{root}/entries") for root in roots],
+                [self._workspace.uri(f"{root}/{ENTRIES_DATASET}") for root in roots],
                 0,
                 dict(self._workspace.storage_options()),
             )
@@ -2381,40 +2691,23 @@ class _LanceCheckpointStorage:
             raise InvalidCheckpointFragment(
                 "duplicate active checkpoint key"
             ) from error
-        key_parts = tuple(fragment_keys)
-        keys = (
-            np.unique(np.concatenate(key_parts))
-            if key_parts
-            else np.empty(0, dtype=np.uint64)
-        )
-        first = np.asarray(mode.partition_fn(keys, mode.partition_count))
-        second = np.asarray(mode.partition_fn(keys, mode.partition_count))
-        if first.shape != keys.shape:
-            raise ValueError("partition_fn output length does not match keys")
-        if first.dtype.kind not in "iu":
-            raise TypeError("partition_fn must return integer partition IDs")
-        if not np.array_equal(first, second):
-            raise ValueError("partition_fn is not stable")
-        if np.any(first < 0) or np.any(first >= mode.partition_count):
-            raise ValueError("partition_fn returned an out-of-range partition ID")
-        selected_keys = np.ascontiguousarray(
-            keys[first == mode.target_partition_id], dtype=np.uint64
-        )
-        if selected_keys.size == 0:
-            return
-        for root, root_keys in zip(roots, fragment_keys, strict=True):
-            selected_fragment_keys = np.intersect1d(
-                root_keys, selected_keys, assume_unique=False
-            ).astype(np.uint64, copy=False)
-            if selected_fragment_keys.size == 0:
-                continue
-            _checkpoint_native.restore_native_entries(
+        assignment_name = mode.spec.name
+        assignment_parameters = {
+            str(k): str(v) for k, v in mode.spec.parameters.items()
+        }
+        for root in roots:
+            _checkpoint_native.restore_native_partition_entries(
                 store,
-                self._workspace.uri(f"{root}/entries"),
+                self._workspace.uri(f"{root}/{ENTRIES_DATASET}"),
                 0,
-                selected_fragment_keys,
+                mode.partition_count,
+                mode.partition_id,
+                mode.key_dtype,
+                None,
                 dict(self._workspace.storage_options()),
                 load_optimizer_state,
+                assignment_name,
+                assignment_parameters,
             )
 
     def _restore_physical(
@@ -2426,13 +2719,12 @@ class _LanceCheckpointStorage:
     ) -> None:
         if mode.participant.participant_count != int(manifest["participant_count"]):
             raise ValueError("physical restore requires the saved participant topology")
-        if store.total_size() != 0:
-            raise RuntimeError("physical restore requires an empty store")
         roots = self._manifest_fragment_roots(manifest)
 
         if mode.strategy == PhysicalRestoreStrategy.FAST_PAGE_CACHE:
             has_page_cache = all(
-                self._workspace.exists(f"{root}/page_images") for root in roots
+                self._workspace.exists(f"{root}/{PAGE_IMAGES_DATASET}")
+                for root in roots
             )
             if not has_page_cache:
                 raise FileNotFoundError(
@@ -2445,9 +2737,13 @@ class _LanceCheckpointStorage:
                 )
             _checkpoint_native.restore_native_page_images(
                 store,
-                [self._workspace.uri(f"{root}/page_images") for root in roots],
+                [
+                    self._workspace.uri(f"{root}/{PAGE_IMAGES_DATASET}")
+                    for root in roots
+                ],
                 0,
                 mode.participant.participant_index,
+                mode.key_dtype,
                 dict(self._workspace.storage_options()),
                 load_optimizer_state,
             )
@@ -2458,10 +2754,6 @@ class _LanceCheckpointStorage:
                 f"unsupported physical restore strategy: {mode.strategy!r}"
             )
 
-        if not hasattr(_checkpoint_native, "restore_native_entries"):
-            raise RuntimeError(
-                "native checkpoint restore requires a Lance-enabled _core extension"
-            )
         target_root = None
         for root in roots:
             meta = self._metadata_for_root(root)
@@ -2472,18 +2764,18 @@ class _LanceCheckpointStorage:
             raise RuntimeError(
                 f"no fragment root covers participant {mode.participant.participant_index}"
             )
-        keys_capsule = _checkpoint_native.active_entry_keys(
-            self._workspace.uri(f"{target_root}/entries"),
-            0,
-            dict(self._workspace.storage_options()),
-            mode.participant.participant_index,
-        )
-        keys = np.array(np.from_dlpack(keys_capsule), dtype=np.uint64, copy=True)
-        _checkpoint_native.restore_native_entries(
+        if not hasattr(_checkpoint_native, "restore_native_partition_entries"):
+            raise RuntimeError(
+                "native checkpoint restore requires a Lance-enabled _core extension"
+            )
+        _checkpoint_native.restore_native_partition_entries(
             store,
-            self._workspace.uri(f"{target_root}/entries"),
+            self._workspace.uri(f"{target_root}/{ENTRIES_DATASET}"),
             0,
-            keys,
+            1,
+            0,
+            mode.key_dtype,
+            mode.participant.participant_index,
             dict(self._workspace.storage_options()),
             load_optimizer_state,
         )
@@ -2491,12 +2783,14 @@ class _LanceCheckpointStorage:
     @staticmethod
     def _store_specification(store: Any) -> TableSpecification:
         dimensions = tuple(sorted(int(dim) for dim in store.table_dims()))
+        if not hasattr(store, "key_dtype") or not callable(store.key_dtype):
+            raise TypeError("store must expose key_dtype()")
         return TableSpecification(
             dimensions=dimensions,
             embedding_dtype=store.value_dtype(),
             optimizer_dtype=store.optimizer_dtype(),
             score_policy=store.score_policy(),
-            protocol_version=_PROTOCOL_VERSION,
+            key_dtype=store.key_dtype(),
         )
 
     @staticmethod
@@ -2504,24 +2798,17 @@ class _LanceCheckpointStorage:
         metadata: dict[bytes, bytes] | None,
     ) -> TableSpecification:
         required = {
-            b"sparse_embedding.protocol_version",
             b"sparse_embedding.dimensions",
             b"sparse_embedding.embedding_dtype",
             b"sparse_embedding.optimizer_dtype",
             b"sparse_embedding.score_policy",
+            b"sparse_embedding.key_dtype",
         }
         if metadata is None or not required.issubset(metadata):
             raise InvalidCheckpointFragment(
                 "checkpoint fragment specification is missing"
             )
         try:
-            parsed_protocol_version = int(
-                metadata[b"sparse_embedding.protocol_version"]
-            )
-            if parsed_protocol_version != _PROTOCOL_VERSION:
-                raise InvalidCheckpointFragment(
-                    "unsupported checkpoint protocol version"
-                )
             dimensions = tuple(
                 int(item)
                 for item in metadata[b"sparse_embedding.dimensions"].decode().split(",")
@@ -2533,7 +2820,7 @@ class _LanceCheckpointStorage:
                 optimizer_dtype=metadata[b"sparse_embedding.optimizer_dtype"].decode()
                 or None,
                 score_policy=metadata[b"sparse_embedding.score_policy"].decode(),
-                protocol_version=parsed_protocol_version,
+                key_dtype=metadata[b"sparse_embedding.key_dtype"].decode(),
             )
         except (TypeError, ValueError) as error:
             raise InvalidCheckpointFragment(
@@ -2543,7 +2830,9 @@ class _LanceCheckpointStorage:
     def _fragment_specification(
         self, identity: CheckpointSaveIdentity, fragment: CheckpointFragment
     ) -> TableSpecification:
-        path = f"{self._attempt_prefix(identity)}/{fragment.fragment_id}/entries"
+        path = (
+            f"{self._attempt_prefix(identity)}/{fragment.fragment_id}/{ENTRIES_DATASET}"
+        )
         if not self._workspace.exists(path):
             raise InvalidCheckpointFragment("checkpoint fragment is missing")
         return self._decode_specification(self._workspace.dataset(path).schema.metadata)
@@ -2551,14 +2840,12 @@ class _LanceCheckpointStorage:
     @staticmethod
     def _manifest_specification(manifest: dict[str, Any]) -> TableSpecification:
         try:
-            if int(manifest["protocol_version"]) != _PROTOCOL_VERSION:
-                raise RuntimeError("unsupported checkpoint protocol version")
             return TableSpecification(
                 dimensions=tuple(int(dim) for dim in manifest["dimensions"]),
                 embedding_dtype=manifest["embedding_dtype"],
                 optimizer_dtype=manifest["optimizer_dtype"] or None,
                 score_policy=manifest["score_policy"],
-                protocol_version=int(manifest["protocol_version"]),
+                key_dtype=manifest["key_dtype"],
             )
         except (KeyError, TypeError, ValueError) as error:
             raise RuntimeError(
@@ -2592,6 +2879,61 @@ class _LanceCheckpointStorage:
 
 
 class LocalLanceStorage(_LanceCheckpointStorage):
+    @classmethod
+    def from_checkpoint_root(
+        cls,
+        root: str | Path,
+        *,
+        max_storage_bytes: int | None = None,
+    ) -> LocalLanceStorage:
+        return cls(root, max_storage_bytes=max_storage_bytes)
+
+    @classmethod
+    def from_weight_path(cls, path: str | Path) -> LocalLanceStorage:
+        asset_root = Path(path).expanduser()
+        if asset_root.is_symlink() or not asset_root.is_dir():
+            raise FileNotFoundError(
+                f"sparse weight reference directory does not exist: {asset_root}"
+            )
+        reference_path = asset_root / _WEIGHT_REFERENCE_FILENAME
+        if not reference_path.is_file() or reference_path.is_symlink():
+            raise FileNotFoundError(
+                f"sparse weight reference is missing: {reference_path}"
+            )
+        if any(
+            item.name.startswith(_WEIGHT_REFERENCE_FILENAME)
+            and item.name != _WEIGHT_REFERENCE_FILENAME
+            for item in asset_root.iterdir()
+        ):
+            raise LookupError("sparse weight reference directory is ambiguous")
+        if any(
+            item.name != _WEIGHT_REFERENCE_FILENAME for item in asset_root.iterdir()
+        ):
+            raise ValueError("sparse weight reference directory has an unknown layout")
+        handle = reference_path.read_bytes()
+        storage_uri, _, _ = _decode_checkpoint_handle(handle)
+        parsed = urlparse(storage_uri)
+        if parsed.scheme not in ("", "file"):
+            raise NotImplementedError(
+                f"sparse weight reference backend is unsupported: {parsed.scheme}"
+            )
+        if parsed.scheme == "file" and parsed.netloc not in ("", "localhost"):
+            raise ValueError("sparse weight reference file URI host is unsupported")
+        backend_root = (
+            Path(parsed.path if parsed.scheme == "file" else storage_uri)
+            .expanduser()
+            .resolve()
+        )
+        if backend_root == asset_root.resolve():
+            raise ValueError("sparse weight reference points to its own asset path")
+        if not backend_root.is_dir():
+            raise FileNotFoundError(
+                f"sparse checkpoint root does not exist: {backend_root}"
+            )
+        storage = cls(backend_root)
+        storage._bound_handle = handle
+        return storage
+
     def __init__(
         self,
         root: str | Path,

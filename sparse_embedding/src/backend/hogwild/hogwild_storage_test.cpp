@@ -159,6 +159,21 @@ int main(int argc, char **argv) {
   Store store({8}, {}, nullptr, se::NoScorePolicy{},
               se::HogwildStoreOptions{.thread_budget = 1, .storage = storage});
   require_throws([&] { store.promote_hot_keys(8, 0, 1, 0); });
+  {
+    constexpr std::array<uint64_t, 2> invalid_keys{1, 2};
+    constexpr std::array<int64_t, 1> missing_length{8};
+    constexpr std::array<int64_t, 2> valid_lengths{8, 8};
+    std::array<float, 16> valid_gradients{};
+    std::array<float, 15> short_gradients{};
+    require_throws([&] {
+      store.accumulate_gradients<uint64_t>(invalid_keys, valid_gradients,
+                                           missing_length);
+    });
+    require_throws([&] {
+      store.accumulate_gradients<uint64_t>(invalid_keys, short_gradients,
+                                           valid_lengths);
+    });
+  }
 
   constexpr std::array<uint64_t, 3> keys{11, 22, 33};
   constexpr std::array<int64_t, 3> lengths{8, 8, 8};

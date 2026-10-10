@@ -26,10 +26,7 @@ unregistration. The proxy generation changes when the active proxy identity or
 lifetime transitions, so a candidate scored by an older active-proxy generation
 cannot be swapped out.
 
-The legacy virtual storage hierarchy and `PageStorage::create()` are not part
-of the contract.
-
-Runtime replacement remains confined to the `PageStorage` and
+Runtime polymorphism remains confined to the `PageStorage` and
 `PageEvictionProxy` facades. `SwapScheduler`, `SpillAllocator`, and
 `PageRegistry` are private concrete classes rather than facades: the scheduler
 owns wake, stop, join, and exception propagation; the spill allocator owns the
@@ -242,8 +239,8 @@ grows only to its own required key budget. `reserve(keys_count, dim)` distribute
 the total budget exactly across shards, while `reserve_per_shard(counts, dim)`
 accepts caller-provided per-shard budgets and avoids equal power-of-two rounding.
 Directory bucket counts use a 2.5x probe budget rounded to 16 buckets; a
-power-of-two bucket count is used only when the smaller legacy 4x bound still
-fits. Large tables therefore do not pay a per-shard power-of-two memory spike.
+power-of-two bucket count is selected only when the smaller 4x power-of-two bound is
+more compact. Large tables therefore do not pay a per-shard power-of-two memory spike.
 Growth steps are 2x below 64K keys, 1.5x from 64K to 1M, and 1.25x at or above
 1M, with every step covering the required capacity.
 
@@ -407,45 +404,96 @@ zero. PageStorage swap/spill mutexes and its condition variable are background
 control-plane mechanisms and never enter lookup, optimizer, or relocation hot
 paths.
 
+## Partitioner Architecture and Registry
+
+Sparse Embedding provides a native C++ partitioner subsystem for high-throughput feature routing and offline checkpoint restore partitioning.
+
+### 1. Registry and Facade (`PartitionerRegistry`)
+
+Partitioners are accessed via `pro::proxy<PartitionerFacade>`:
+
+```cpp
+using PartitionerProxy = pro::proxy<PartitionerFacade>;
+using PartitionerFactory = std::function<PartitionerProxy(
+    uint32_t num_partitions,
+    const std::unordered_map<std::string, std::string> &parameters)>;
+```
+
+The centralized registry `se::ops::PartitionerRegistry` manages algorithm factories:
+- `sparse_embedding.modulo`: Normalized integer modulo mapping negative keys to $[0, \text{num\_partitions})$.
+- `sparse_embedding.hash`: MurmurHash3 avalanche hash with optional `seed`.
+- `sparse_embedding.fast_range`: Lemire FastRange division-free range partitioner.
+- Extension: Register via `register_factory(name, factory)`; unregistered names or malformed parameters throw `std::invalid_argument`.
+
+### 2. Vectorized Slice Filtering (`filter_span`)
+
+The AVX-512 `filter_span` kernel evaluates contiguous Arrow key slices in batch, producing compact `uint8_t` byte masks and matching row indices for offline restore.
+
+### 3. Parallel Dispatcher and Elastic Strategies
+
+- **Dispatcher Kernel (`parallel_partitioner.hpp`)**: Chunked execution based on `stdexec` multithreading, outputting DLPack Capsules.
+- **Python Elastic Strategy (`PartitionStrategy`)**:
+  - Decoupled Declaration and Topology: `ModuloPartition`, `HashPartition`, `FastRangePartition` declare algorithm and parameters without fixed shard counts.
+  - Late-Binding Contract: Implements `__call__(values, *, partition_count, ...)`, matching Fluxway `FunctionPartition(target=...)`.
+  - Specialization Cache and Pre-binding: Lazily caches specialized C++ kernels per `partition_count`; hot loops can pre-fetch via `bind(partition_count)`.
+  - Strict Invariant Defense: Throws `ValueError` if supplied `partition_count` mismatches bound topology.
+  - Single Source of Truth: `.spec` exports `SparsePartitionAssignmentSpec` aligned with Checkpoint metadata.
+  - Functional APIs: Top-level `se.partition(keys, partition_count=...)` and `se.filter_partition(...)`.
+- **Integration Boundary**: Partitioners compute target partition IDs (`ranks`). Cluster routing layout (`sort_indices`, `send_counts`) is derived by Fluxway `TransportPlanner`.
+
 ## Framework-neutral Lance Checkpoint Protocol
 
 Distributed integrations use `SparseCheckpointProtocol` and supply a
 `CheckpointSaveIdentity`, one `CheckpointParticipant` per writer, and one final
 commit call containing all fragments. `CheckpointCommitAuthority` carries an
-opaque scope, monotonic generation, and authority identity; it contains no type
-or identifier from a particular orchestration framework.
+opaque scope, monotonic generation, and authority identity.
 
 `LocalLanceStorage` and `GravitinoLanceStorage` share one Lance checkpoint
-transaction engine. It treats canonical materialized `(dim, key)` entry states
-as the single source of truth (SSOT), with physical page images serving as an
-optional fast import cache (persisted only when `include_page_images=True`).
-Writing uses a bounded channel (`BoundedChannel`) streaming pipeline for single-commit
-transactions with $O(N_{live})$ compact page-index metadata plus bounded single-page and writer buffers, and single version generation. Storage adapters only provide
-dataset locations, staging prefixes, durable records, and commit locking. The
-manifest is the visibility boundary and pins exact canonical entry Lance
-versions. Duplicate keys across participants, incomplete participant coverage,
-schema disagreement, and stale commit authority fail explicitly.
+transaction engine. Materialized `(dim, key)` entry states serve as the SSOT,
+with physical page images as an optional import cache. Writing uses a bounded channel
+(`BoundedChannel`) streaming pipeline. Storage adapters only provide dataset locations,
+staging prefixes, durable records, and commit locking. The manifest is the visibility boundary.
 
-Restore selects an exact `SparseCheckpointLocator`. `PhysicalRestore` supports explicit strategies:
-`PhysicalRestoreStrategy.RECONSTRUCT_ENTRIES` (default) rebuilds native page layouts deterministically
-from canonical entries, even across multi-participant topologies after compaction by filtering
-`source_participant_index`; `PhysicalRestoreStrategy.FAST_PAGE_CACHE` imports physical page images directly,
-strictly raising `FileNotFoundError` if the cache is absent (zero implicit fallback).
-`ElasticRestore` accepts the caller's stable `partition_fn(keys, partition_count)` and target partition.
-It first scans only keys and row state, then reads payload columns only for rows assigned to the target partition;
-no topology or routing fallback exists inside Sparse Embedding.
+### Dual-Lance 2PC Storage Layering
+
+Persistence is split into two physical Lance datasets:
+1. **`snapshot_manifest.lance`** (Control-plane ledger and visibility boundary):
+   - Records transaction transitions (`PREPARED` $\to$ `COMMITTED` / `ABORT`), leases, fencing markers, and `fragment_ids`. Compact (1 row appended per commit).
+2. **`entries.lance`** (Data-plane physical slices):
+   - Workers write concurrently to isolated paths `_staging/<attempt>/<fragment_id>/entries.lance`, enabling lock-free writes and offline streaming compaction.
+
+### Native Arrow Key Types and Pushdown
+
+The system standardizes on `key_dtype` as the type SSOT across 4 native fixed-width integer types: `int32`, `uint32`, `int64`, `uint64`. Tables store native integer columns, enabling direct Lance/DuckDB predicate pushdown (e.g. `WHERE key = -1`).
+
+### Restore Strategies
+
+Restore targets `SparseCheckpointLocator`:
+- **`PhysicalRestore`**:
+  - `PhysicalRestoreStrategy.RECONSTRUCT_ENTRIES` (default): Reconstructs native page layouts from canonical entries, filtering by `source_participant_index` after compaction.
+  - `PhysicalRestoreStrategy.FAST_PAGE_CACHE`: Directly imports physical page cache; missing cache raises `FileNotFoundError`.
+- **`ElasticRestore`**:
+  - Encodes `SparsePartitionAssignmentSpec` (`modulo()`, `hash()`, `fast_range()`, or registered custom algorithms).
+  - The C++ restore engine applies `PartitionerRegistry` and AVX-512 `filter_span` to filter the target logical partition.
+
+### Reference Vector Consistency Validation
+
+To guarantee bit-identical partitioning across online routing and offline restore:
+```python
+from sparse_embedding.checkpoint import generate_reference_vectors
+
+sample_keys, expected_ranks = generate_reference_vectors(
+    assignment_name="sparse_embedding.modulo",
+    key_dtype="uint64",
+    partition_count=4,
+)
+```
 
 Compaction streaming merge leverages participant topological disjointness to eliminate in-memory deduplication hash sets. Native scanners, channels, and page imports use the single C++ `CheckpointStreamPolicy` in `checkpoint_stream_policy.hpp`, so resident compaction memory is bounded by fixed batch/channel capacities. For directory and object publication:
 - Local workspaces use POSIX atomic `rename(2)` with zero auxiliary JSON files.
 - Remote S3/S3A workspaces use immutable staged prefixes and single-object strongly consistent pointers (`.manifest_pointer.json`) for atomic linearization without partial exposure.
 - Successful overwrites, explicit `delete_prefix`, recursive parent deletion, and rollback paths strictly clean pointer files and staged datasets; cleanup failures propagate while preserving the published root for retry.
 - Workspace prefix deletion `delete_prefix(..., missing_ok=False)` strictly raises `FileNotFoundError` by default with zero silent fallbacks.
-- Checkpoint protocol version remains pinned at `_PROTOCOL_VERSION = 1`.
-
-The native `ModuloPartitioner` follows the language-independent normalized
-modulo contract used by Python and NumPy: every owner is in
-`[0, partition_count)`, including for negative signed keys. Custom partition
-functions remain responsible for their own routing semantics.
 
 Thermal tier, heat, coaccess, and residency scheduling metadata are intentionally
 not checkpointed. They are re-observed after restore.

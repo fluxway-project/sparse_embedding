@@ -13,6 +13,7 @@
 
 #include "sparse_embedding/src/checkpoint/lance/arrow/c/abi.h"
 #include "sparse_embedding/src/checkpoint/lance/storage_options.hpp"
+#include "sparse_embedding/src/ops/partitioner.hpp"
 
 namespace se {
 
@@ -56,7 +57,7 @@ public:
                       std::span<const uint32_t> dimensions,
                       std::string_view embedding_dtype,
                       std::string_view optimizer_dtype,
-                      std::string_view score_policy, uint32_t protocol_version,
+                      std::string_view score_policy, std::string_view key_dtype,
                       std::string_view schema_digest, bool has_score,
                       bool include_page_images = false);
 
@@ -118,14 +119,23 @@ void scan_native_active_entry_keys(
 void validate_native_active_entry_keys(
     std::span<const std::string> uris, uint64_t version,
     const LanceStorageOptions &storage_options = LanceStorageOptions{});
-void scan_native_entries(
+void scan_native_partition_entries(
     std::string_view uri, uint64_t version,
-    std::span<const uint64_t> selected_keys, NativeEntryBatchVisitor visitor,
+    pro::proxy<se::ops::PartitionerFacade> partitioner, uint32_t partition_id,
+    std::string_view key_dtype, NativeEntryBatchVisitor visitor,
     bool load_optimizer_state = true,
-    const LanceStorageOptions &storage_options = LanceStorageOptions{});
+    const LanceStorageOptions &storage_options = LanceStorageOptions{},
+    std::optional<uint32_t> source_participant_index = std::nullopt);
+void scan_native_partition_entries(
+    std::string_view uri, uint64_t version, uint64_t partition_count,
+    uint64_t partition_id, std::string_view key_dtype,
+    NativeEntryBatchVisitor visitor, bool load_optimizer_state = true,
+    const LanceStorageOptions &storage_options = LanceStorageOptions{},
+    std::optional<uint32_t> source_participant_index = std::nullopt);
 void scan_native_page_images(
     std::string_view uri, uint64_t version, uint32_t participant_index,
-    NativePageImageVisitor visitor, bool load_optimizer_state = true,
+    std::string_view key_dtype, NativePageImageVisitor visitor,
+    bool load_optimizer_state = true,
     const LanceStorageOptions &storage_options = LanceStorageOptions{});
 
 } // namespace se

@@ -10,334 +10,28 @@
 
 #include "sparse_embedding/src/bindings/arrow_c_bridge.hpp"
 #include "sparse_embedding/src/bindings/module_wrapper.hpp"
-#include "sparse_embedding/src/checkpoint/checkpoint_batch_filter.hpp"
 #include "sparse_embedding/src/checkpoint/checkpoint_stream_policy.hpp"
-#include "sparse_embedding/src/ops/partitioner.hpp"
 
 #ifdef SE_ENABLE_LANCE_C
 #include "sparse_embedding/src/checkpoint/lance/native_fragment_writer.hpp"
+#include "sparse_embedding/src/ops/partitioner_registry.hpp"
 #endif
 
 namespace se::py::detail {
 
 #ifdef SE_ENABLE_LANCE_C
 template <typename ParamT, typename OptT>
-void CheckpointOpsImpl<ParamT, OptT>::save_checkpoint(
-    EmbeddingStoreWrapper &self, const std::string &uri,
-    const std::string &mode, uint64_t min_score, bool include_optimizer_state,
-    bool use_compression) {
-  se::CheckpointExportOptions options;
-  options.mode = (mode == "incremental")
-                     ? se::CheckpointExportOptions::Mode::kIncremental
-                     : se::CheckpointExportOptions::Mode::kFull;
-  options.min_score = min_score;
-  options.include_optimizer_state = include_optimizer_state;
-  options.use_compression = use_compression;
-
-  auto writer = self.checkpoint_writer_factory_;
-  if (!writer.has_value())
-    throw std::runtime_error("checkpoint backend not configured");
-  bool has_score_policy = self.get_store<ParamT, OptT>()->has_score_policy();
-
-  switch (self.key_type_enum_) {
-  case KeyDType::kInt32:
-    options.key_schema = "i";
-    break;
-  case KeyDType::kUInt32:
-    options.key_schema = "I";
-    break;
-  case KeyDType::kInt64:
-    options.key_schema = "l";
-    break;
-  case KeyDType::kUInt64:
-    options.key_schema = "L";
-    break;
-  }
-
-  auto dispatch_key = [&]<typename Fn>(Fn &&fn) {
-    switch (self.key_type_enum_) {
-    case KeyDType::kInt32:
-      return fn.template operator()<int32_t>();
-    case KeyDType::kUInt32:
-      return fn.template operator()<uint32_t>();
-    case KeyDType::kInt64:
-      return fn.template operator()<int64_t>();
-    case KeyDType::kUInt64:
-      return fn.template operator()<uint64_t>();
-    }
-    throw std::invalid_argument("unsupported key_dtype");
-  };
-
-  dispatch_key([&]<typename KeyT>() {
-    nb::gil_scoped_release release;
-    auto dims = self.table_dims();
-    for (size_t table_idx = 0; table_idx < dims.size(); ++table_idx) {
-      size_t dim = dims[table_idx];
-
-      if (include_optimizer_state) {
-        // Use export_opt_state_batch to capture keys+vals+scores+opts+steps
-        // in a single pass. Defer writer->begin until the first batch so we
-        // know opt_state_dim in bytes.
-        bool begun = false;
-        se::FilteredCheckpointBatch<KeyT, ParamT, OptT> filtered;
-        self.get_store<ParamT, OptT>()->export_opt_state_batch(
-            pro::make_proxy<se::FunctionFacade<bool(
-                size_t, std::span<const KeyT>, std::span<const ParamT>,
-                std::span<const uint64_t>, std::span<const OptT>,
-                std::span<const uint32_t>)>>(
-                [&](size_t /*dim_arg*/, std::span<const KeyT> keys,
-                    std::span<const ParamT> vals,
-                    std::span<const uint64_t> scores,
-                    std::span<const OptT> opt_states,
-                    std::span<const uint32_t> steps) -> bool {
-                  if (!begun) {
-                    size_t opt_dim_bytes =
-                        keys.empty()
-                            ? 0
-                            : (opt_states.size() / keys.size()) * sizeof(OptT);
-                    writer->begin(uri, static_cast<uint32_t>(dim),
-                                  opt_dim_bytes, has_score_policy, options);
-                    begun = true;
-                  }
-                  if (options.mode ==
-                          se::CheckpointExportOptions::Mode::kIncremental &&
-                      has_score_policy) {
-                    if (filtered.assign(keys, vals, scores, opt_states, steps,
-                                        dim, options.min_score) != 0) {
-                      writer->write_batch(
-                          filtered.keys.size(), filtered.keys.data(),
-                          filtered.keys.size() * sizeof(KeyT),
-                          filtered.values.data(),
-                          filtered.values.size() * sizeof(ParamT),
-                          filtered.scores, filtered.optimizer_states.data(),
-                          filtered.optimizer_states.size() * sizeof(OptT),
-                          filtered.steps);
-                    }
-                  } else {
-                    writer->write_batch(
-                        keys.size(), keys.data(), keys.size() * sizeof(KeyT),
-                        vals.data(), vals.size() * sizeof(ParamT), scores,
-                        opt_states.data(), opt_states.size() * sizeof(OptT),
-                        steps);
-                  }
-                  return true;
-                }),
-            options.batch_size);
-        if (!begun) {
-          // Empty table — still need begin+commit.
-          writer->begin(uri, static_cast<uint32_t>(dim), 0, has_score_policy,
-                        options);
-        }
-      } else {
-        writer->begin(uri, static_cast<uint32_t>(dim), 0, has_score_policy,
-                      options);
-        se::FilteredCheckpointBatch<KeyT, ParamT, OptT> filtered;
-        self.get_store<ParamT, OptT>()->export_batch(
-            pro::make_proxy<se::FunctionFacade<bool(
-                std::size_t, std::span<const KeyT>, std::span<const ParamT>,
-                std::span<const uint64_t>)>>(
-                [&](std::size_t /*dim_arg*/, std::span<const KeyT> keys,
-                    std::span<const ParamT> vals,
-                    std::span<const uint64_t> scores) -> bool {
-                  if (options.mode ==
-                          se::CheckpointExportOptions::Mode::kIncremental &&
-                      has_score_policy) {
-                    if (filtered.assign(keys, vals, scores,
-                                        std::span<const OptT>{},
-                                        std::span<const uint32_t>{}, dim,
-                                        options.min_score) != 0) {
-                      writer->write_batch(
-                          filtered.keys.size(), filtered.keys.data(),
-                          filtered.keys.size() * sizeof(KeyT),
-                          filtered.values.data(),
-                          filtered.values.size() * sizeof(ParamT),
-                          filtered.scores, nullptr, 0, {});
-                    }
-                  } else {
-                    writer->write_batch(keys.size(), keys.data(),
-                                        keys.size() * sizeof(KeyT), vals.data(),
-                                        vals.size() * sizeof(ParamT), scores,
-                                        nullptr, 0, {});
-                  }
-                  return true;
-                }),
-            options.batch_size);
-      }
-
-      writer->commit();
-    }
-  });
-}
-
-template <typename ParamT, typename OptT>
-void CheckpointOpsImpl<ParamT, OptT>::load_checkpoint(
-    EmbeddingStoreWrapper &self, const std::string &uri, uint64_t version,
-    bool clear, bool load_optimizer_state, nb::object filter_fn,
-    uint32_t target_shard_id, size_t batch_size) {
-  se::CheckpointLoadOptions options;
-  options.version = version;
-  options.clear_before_load = clear;
-  options.load_optimizer_state = load_optimizer_state;
-  options.batch_size = batch_size;
-
-  auto reader = self.checkpoint_reader_factory_;
-  if (!reader.has_value())
-    throw std::runtime_error("checkpoint backend not configured");
-
-  std::shared_ptr<pro::proxy<se::ops::PartitionerFacade>> cpp_partitioner =
-      nullptr;
-  if (!filter_fn.is_none() && nb::isinstance<PyPartitioner>(filter_fn)) {
-    cpp_partitioner = nb::cast<PyPartitioner>(filter_fn).facade;
-  }
-
-  auto dispatch_key = [&]<typename Fn>(Fn &&fn) {
-    switch (self.key_type_enum_) {
-    case KeyDType::kInt32:
-      return fn.template operator()<int32_t>();
-    case KeyDType::kUInt32:
-      return fn.template operator()<uint32_t>();
-    case KeyDType::kInt64:
-      return fn.template operator()<int64_t>();
-    case KeyDType::kUInt64:
-      return fn.template operator()<uint64_t>();
-    }
-    throw std::invalid_argument("unsupported key_dtype");
-  };
-
-  dispatch_key([&]<typename KeyT>() {
-    nb::gil_scoped_release release;
-    if (clear)
-      self.get_store<ParamT, OptT>()->clear();
-
-    bool has_score = self.get_store<ParamT, OptT>()->has_score_policy();
-    auto dims = self.table_dims();
-
-    for (size_t table_idx = 0; table_idx < dims.size(); ++table_idx) {
-      size_t dim = dims[table_idx];
-      reader->open(uri, static_cast<uint32_t>(dim), version,
-                   static_cast<int64_t>(options.batch_size));
-
-      std::vector<std::byte> keys_buf;
-      std::vector<std::byte> embs;
-      std::vector<uint64_t> scores;
-      std::vector<std::byte> opt_states;
-      std::vector<uint32_t> steps;
-      std::unique_ptr<bool[]> cpp_mask;
-      size_t cpp_mask_capacity = 0;
-
-      while (reader->read_batch(options.batch_size, keys_buf, embs, scores,
-                                opt_states, steps)) {
-        size_t n = keys_buf.size() / sizeof(KeyT);
-        KeyT *keys = reinterpret_cast<KeyT *>(keys_buf.data());
-        size_t opt_dim =
-            (n > 0 && !opt_states.empty()) ? opt_states.size() / n : 0;
-        if (n == 0)
-          continue;
-
-        auto compact_batch = [&](auto should_keep) {
-          size_t keep_idx = 0;
-          for (size_t i = 0; i < n; ++i) {
-            if (should_keep(i)) {
-              if (keep_idx != i) {
-                keys[keep_idx] = keys[i];
-                std::memcpy(embs.data() + keep_idx * dim * sizeof(ParamT),
-                            embs.data() + i * dim * sizeof(ParamT),
-                            dim * sizeof(ParamT));
-                if (!scores.empty())
-                  scores[keep_idx] = scores[i];
-                if (!opt_states.empty())
-                  std::memcpy(opt_states.data() + keep_idx * opt_dim,
-                              opt_states.data() + i * opt_dim, opt_dim);
-                if (!steps.empty())
-                  steps[keep_idx] = steps[i];
-              }
-              keep_idx++;
-            }
-          }
-          keys_buf.resize(keep_idx * sizeof(KeyT));
-          embs.resize(keep_idx * dim * sizeof(ParamT));
-          if (!scores.empty())
-            scores.resize(keep_idx);
-          if (!opt_states.empty())
-            opt_states.resize(keep_idx * opt_dim);
-          if (!steps.empty())
-            steps.resize(keep_idx);
-          n = keep_idx;
-        };
-
-        if (cpp_partitioner) {
-          if (n > cpp_mask_capacity) {
-            cpp_mask.reset(new bool[n]);
-            cpp_mask_capacity = n;
-          }
-          (*cpp_partitioner)
-              ->filter_span(std::span<const KeyT>(keys, n), target_shard_id,
-                            std::span<bool>(cpp_mask.get(), n));
-          compact_batch([&](size_t i) { return cpp_mask[i]; });
-        } else if (!filter_fn.is_none()) {
-          nb::gil_scoped_acquire acquire;
-          // Note: keys_buf is a vector of bytes, we need to create a shared_ptr
-          // of KeyT
-          auto keys_sp = std::shared_ptr<KeyT[]>(keys, [](KeyT *) {});
-          DLManagedTensor *in_dlm =
-              se::py::wrap_shared_ptr_as_tensor<KeyT>(keys_sp, n);
-          nb::object keys_arr = se::py::wrap_output_tensor(in_dlm);
-          nb::object shard_ids_obj = filter_fn(keys_arr);
-          keys_arr = nb::none();
-          auto [dlm, cap] = se::py::extract_dlpack_tensor(shard_ids_obj);
-          if (dlm->dl_tensor.ndim != 1 ||
-              dlm->dl_tensor.shape[0] != static_cast<int64_t>(n))
-            throw std::runtime_error(
-                "filter_fn returned dlpack tensor of incorrect size");
-          auto span = se::py::dlpack_to_span<uint32_t>(dlm);
-          const uint32_t *shard_ids_data = span.data();
-          if (keys_sp.use_count() > 1)
-            throw std::runtime_error(
-                "filter_fn retained a reference to the keys tensor, which "
-                "violates zero-copy memory safety.");
-          compact_batch(
-              [&](size_t i) { return shard_ids_data[i] == target_shard_id; });
-        }
-
-        if (n == 0)
-          continue;
-
-        auto vals = std::span<const ParamT>(
-            reinterpret_cast<const ParamT *>(embs.data()), n * dim);
-        thread_local std::vector<int64_t> tls_row_lengths;
-        tls_row_lengths.resize(n);
-        fill_uniform_row_lengths(tls_row_lengths, static_cast<int64_t>(dim));
-        self.get_store<ParamT, OptT>()->assign(std::span<const KeyT>(keys, n),
-                                               vals, tls_row_lengths);
-        if (has_score && !scores.empty())
-          self.get_store<ParamT, OptT>()->assign_scores(
-              std::span<const KeyT>(keys, n),
-              std::span<const uint64_t>(scores));
-        if (load_optimizer_state && !opt_states.empty()) {
-          self.get_store<ParamT, OptT>()->assign_opt_states(
-              dim, std::span<const KeyT>(keys, n),
-              std::span<const OptT>(
-                  reinterpret_cast<const OptT *>(opt_states.data()),
-                  opt_states.size() / sizeof(OptT)),
-              std::span<const uint32_t>(steps));
-        }
-      }
-    }
-  });
-}
-
-template <typename ParamT, typename OptT>
 nb::dict CheckpointOpsImpl<ParamT, OptT>::write_native_fragment(
     EmbeddingStoreWrapper &self, const std::string &uri,
     uint32_t participant_index, const std::vector<uint32_t> &dimensions,
     const std::string &embedding_dtype, const std::string &optimizer_dtype,
-    const std::string &score_policy, uint32_t protocol_version,
+    const std::string &score_policy, const std::string &key_dtype,
     const std::string &schema_digest, bool include_page_images) {
   se::NativeFragmentWriter writer;
-  writer.begin_fragment(
-      uri, participant_index, dimensions, embedding_dtype, optimizer_dtype,
-      score_policy, protocol_version, schema_digest,
-      self.get_store<ParamT, OptT>()->has_score_policy(), include_page_images);
+  writer.begin_fragment(uri, participant_index, dimensions, embedding_dtype,
+                        optimizer_dtype, score_policy, key_dtype, schema_digest,
+                        self.get_store<ParamT, OptT>()->has_score_policy(),
+                        include_page_images);
   {
     nb::gil_scoped_release release;
     self.get_store<ParamT, OptT>()->export_page_images(
@@ -378,100 +72,104 @@ nb::dict CheckpointOpsImpl<ParamT, OptT>::write_native_fragment(
 }
 
 template <typename ParamT, typename OptT>
-void CheckpointOpsImpl<ParamT, OptT>::restore_native_entries(
-    EmbeddingStoreWrapper &self, const std::string &uri, uint64_t version,
-    nb::object selected_keys, const se::LanceStorageOptions &storage_options,
-    bool load_optimizer_state) {
-  auto [dlm, cap] = se::py::extract_dlpack_tensor(selected_keys);
-  if (dlm->dl_tensor.dtype.code != kDLUInt || dlm->dl_tensor.dtype.bits != 64)
-    throw std::invalid_argument("native restore selected_keys must be uint64");
-  const auto keys = se::py::dlpack_to_span<const uint64_t>(dlm);
+template <typename Scanner>
+void CheckpointOpsImpl<ParamT, OptT>::restore_native_entries_with_scan(
+    EmbeddingStoreWrapper &self, Scanner &&scan, bool load_optimizer_state) {
   {
     nb::gil_scoped_release release;
-    se::scan_native_entries(
-        uri, version, keys,
-        [&](const se::NativeEntryBatch &batch) {
-          std::unordered_map<uint32_t, std::vector<size_t>> by_dimension;
-          for (size_t index = 0; index < batch.keys.size(); ++index)
-            by_dimension[batch.dimensions[index]].push_back(index);
-          for (const auto &[dim, indices] : by_dimension) {
-            std::vector<uint64_t> raw_keys;
-            std::vector<ParamT> values;
-            raw_keys.reserve(indices.size());
-            values.reserve(indices.size() * dim);
-            std::vector<int64_t> lengths(indices.size(), dim);
-            for (size_t index : indices) {
-              raw_keys.push_back(batch.keys[index]);
-              const auto begin = batch.embedding_offsets[index];
-              const auto end = batch.embedding_offsets[index + 1];
-              const auto *source = reinterpret_cast<const ParamT *>(
-                  batch.embedding_values.data() + begin);
-              values.insert(values.end(), source, source + dim);
-            }
-            auto assign_dimension = [&]<typename KeyT>() {
-              std::vector<KeyT> dim_keys(raw_keys.begin(), raw_keys.end());
-              self.get_store<ParamT, OptT>()->assign(
-                  std::span<const KeyT>(dim_keys),
-                  std::span<const ParamT>(values),
-                  std::span<const int64_t>(lengths));
-              if (!batch.scores.empty() &&
-                  self.get_store<ParamT, OptT>()->has_score_policy()) {
-                std::vector<uint64_t> dim_scores;
-                dim_scores.reserve(indices.size());
-                for (size_t index : indices)
-                  dim_scores.push_back(batch.scores[index]);
-                self.get_store<ParamT, OptT>()->assign_scores(
-                    std::span<const KeyT>(dim_keys),
-                    std::span<const uint64_t>(dim_scores));
-              }
-              const uint32_t optimizer_stride =
-                  batch.optimizer_strides[indices.front()];
-              if (load_optimizer_state && optimizer_stride != 0) {
-                std::vector<OptT> optimizer;
-                optimizer.reserve(indices.size() * optimizer_stride);
-                for (size_t index : indices) {
-                  const auto begin = batch.optimizer_offsets[index];
-                  const auto end = batch.optimizer_offsets[index + 1];
-                  const auto *source = reinterpret_cast<const OptT *>(
-                      batch.optimizer_values.data() + begin);
-                  optimizer.insert(optimizer.end(), source,
-                                   source + optimizer_stride);
-                }
-                std::vector<uint32_t> steps;
-                steps.reserve(indices.size());
-                for (size_t index : indices)
-                  steps.push_back(batch.steps[index]);
-                self.get_store<ParamT, OptT>()->assign_opt_states(
-                    dim, std::span<const KeyT>(dim_keys),
-                    std::span<const OptT>(optimizer),
-                    std::span<const uint32_t>(steps));
-              }
-            };
-            switch (self.key_type_enum_) {
-            case KeyDType::kInt32:
-              assign_dimension.template operator()<int32_t>();
-              break;
-            case KeyDType::kUInt32:
-              assign_dimension.template operator()<uint32_t>();
-              break;
-            case KeyDType::kInt64:
-              assign_dimension.template operator()<int64_t>();
-              break;
-            case KeyDType::kUInt64:
-              assign_dimension.template operator()<uint64_t>();
-              break;
-            }
+    scan([&](const se::NativeEntryBatch &batch) {
+      std::unordered_map<uint32_t, std::vector<size_t>> by_dimension;
+      for (size_t index = 0; index < batch.keys.size(); ++index)
+        by_dimension[batch.dimensions[index]].push_back(index);
+
+      se::dispatch_key_type(self.key_type_enum_, [&]<typename KeyT>() {
+        for (const auto &[dim, indices] : by_dimension) {
+          std::vector<KeyT> dim_keys;
+          std::vector<ParamT> values;
+          dim_keys.reserve(indices.size());
+          values.reserve(indices.size() * dim);
+          std::vector<int64_t> lengths(indices.size(), dim);
+          for (size_t index : indices) {
+            dim_keys.push_back(static_cast<KeyT>(batch.keys[index]));
+            const auto begin = batch.embedding_offsets[index];
+            const auto end = batch.embedding_offsets[index + 1];
+            const auto *source = reinterpret_cast<const ParamT *>(
+                batch.embedding_values.data() + begin);
+            values.insert(values.end(), source, source + dim);
           }
-          return true;
-        },
-        load_optimizer_state, storage_options);
+          self.get_store<ParamT, OptT>()->assign(
+              std::span<const KeyT>(dim_keys), std::span<const ParamT>(values),
+              std::span<const int64_t>(lengths));
+          if (!batch.scores.empty() &&
+              self.get_store<ParamT, OptT>()->has_score_policy()) {
+            std::vector<uint64_t> dim_scores;
+            dim_scores.reserve(indices.size());
+            for (size_t index : indices)
+              dim_scores.push_back(batch.scores[index]);
+            self.get_store<ParamT, OptT>()->assign_scores(
+                std::span<const KeyT>(dim_keys),
+                std::span<const uint64_t>(dim_scores));
+          }
+          const uint32_t optimizer_stride =
+              batch.optimizer_strides[indices.front()];
+          if (load_optimizer_state && optimizer_stride != 0) {
+            std::vector<OptT> optimizer;
+            optimizer.reserve(indices.size() * optimizer_stride);
+            for (size_t index : indices) {
+              const auto begin = batch.optimizer_offsets[index];
+              const auto end = batch.optimizer_offsets[index + 1];
+              const auto *source = reinterpret_cast<const OptT *>(
+                  batch.optimizer_values.data() + begin);
+              optimizer.insert(optimizer.end(), source,
+                               source + optimizer_stride);
+            }
+            std::vector<uint32_t> steps;
+            steps.reserve(indices.size());
+            for (size_t index : indices) steps.push_back(batch.steps[index]);
+            self.get_store<ParamT, OptT>()->assign_opt_states(
+                dim, std::span<const KeyT>(dim_keys),
+                std::span<const OptT>(optimizer),
+                std::span<const uint32_t>(steps));
+          }
+        }
+      });
+      return true;
+    });
   }
+}
+
+template <typename ParamT, typename OptT>
+void CheckpointOpsImpl<ParamT, OptT>::restore_native_partition_entries(
+    EmbeddingStoreWrapper &self, const std::string &uri, uint64_t version,
+    uint64_t partition_count, uint64_t partition_id,
+    const std::string &key_dtype, const std::string &assignment_name,
+    const std::unordered_map<std::string, std::string> &assignment_parameters,
+    const se::LanceStorageOptions &storage_options, bool load_optimizer_state,
+    std::optional<uint32_t> source_participant_index) {
+  if (partition_count == 0)
+    throw std::invalid_argument("partition_count must be > 0");
+  if (partition_id >= partition_count)
+    throw std::invalid_argument("partition_id is out of range");
+
+  auto partitioner = se::ops::PartitionerRegistry::instance().create(
+      assignment_name, static_cast<uint32_t>(partition_count),
+      assignment_parameters);
+
+  restore_native_entries_with_scan(
+      self,
+      [&](se::NativeEntryBatchVisitor visitor) {
+        se::scan_native_partition_entries(
+            uri, version, std::move(partitioner),
+            static_cast<uint32_t>(partition_id), key_dtype, std::move(visitor),
+            load_optimizer_state, storage_options, source_participant_index);
+      },
+      load_optimizer_state);
 }
 
 template <typename ParamT, typename OptT>
 void CheckpointOpsImpl<ParamT, OptT>::restore_native_page_images(
     EmbeddingStoreWrapper &self, const std::vector<std::string> &uris,
-    uint64_t version, uint32_t participant_index,
+    uint64_t version, uint32_t participant_index, const std::string &key_dtype,
     const se::LanceStorageOptions &storage_options, bool load_optimizer_state) {
   std::vector<se::PageImageImport<ParamT, OptT>> imports;
   imports.reserve(se::CheckpointStreamPolicy::kPageImportBatchPages);
@@ -479,42 +177,13 @@ void CheckpointOpsImpl<ParamT, OptT>::restore_native_page_images(
     nb::gil_scoped_release release;
     for (const auto &uri : uris) {
       se::scan_native_page_images(
-          uri, version, participant_index,
+          uri, version, participant_index, key_dtype,
           [&](se::NativePageImage &&page) {
             if (page.embedding_dtype != self.value_dtype() ||
                 (load_optimizer_state &&
                  page.optimizer_dtype != self.optimizer_dtype()))
               throw std::runtime_error(
                   "native page image dtype does not match store");
-            const auto checksum = [](const se::NativePageImage &value) {
-              uint64_t hash = 1469598103934665603ULL;
-              auto update = [&](std::span<const std::byte> bytes) {
-                for (const auto byte : bytes) {
-                  hash ^= std::to_integer<unsigned char>(byte);
-                  hash *= 1099511628211ULL;
-                }
-              };
-              update(std::as_bytes(
-                  std::span<const uint32_t>(value.slot_ordinals)));
-              update(std::as_bytes(std::span<const uint64_t>(value.keys)));
-              update(std::as_bytes(std::span<const uint64_t>(value.sequences)));
-              update(value.values);
-              update(std::as_bytes(std::span<const uint64_t>(value.scores)));
-              update(value.optimizer_values);
-              update(std::as_bytes(std::span<const uint32_t>(value.steps)));
-              std::array<char, 17> output{};
-              auto [end, error] =
-                  std::to_chars(output.data(), output.data() + 16, hash, 16);
-              if (error != std::errc{})
-                throw std::runtime_error("failed to format page checksum");
-              return std::string(output.data(), end);
-            };
-            if (checksum(page) != page.checksum)
-              throw std::runtime_error("page image checksum mismatch");
-            if (!load_optimizer_state) {
-              page.optimizer_values.clear();
-              page.steps.clear();
-            }
             se::PageImageExport<ParamT, OptT> image{
                 page.physical_page_id,
                 page.embedding_dim,
@@ -559,7 +228,7 @@ void CheckpointOpsImpl<ParamT, OptT>::restore_native_page_images(
     }
   }
 }
-#endif // SE_ENABLE_LANCE_C
+#endif  // SE_ENABLE_LANCE_C
 
 template <typename ParamT, typename OptT>
 void CheckpointOpsImpl<ParamT, OptT>::export_batches_dlpack(
@@ -567,14 +236,14 @@ void CheckpointOpsImpl<ParamT, OptT>::export_batches_dlpack(
     bool include_optimizer_state) {
   auto dispatch_key = [&]<typename Fn>(Fn &&fn) {
     switch (self.key_type_enum_) {
-    case KeyDType::kInt32:
-      return fn.template operator()<int32_t>();
-    case KeyDType::kUInt32:
-      return fn.template operator()<uint32_t>();
-    case KeyDType::kInt64:
-      return fn.template operator()<int64_t>();
-    case KeyDType::kUInt64:
-      return fn.template operator()<uint64_t>();
+      case KeyDType::kInt32:
+        return fn.template operator()<int32_t>();
+      case KeyDType::kUInt32:
+        return fn.template operator()<uint32_t>();
+      case KeyDType::kInt64:
+        return fn.template operator()<int64_t>();
+      case KeyDType::kUInt64:
+        return fn.template operator()<uint64_t>();
     }
     throw std::invalid_argument("unsupported key_dtype");
   };
@@ -642,14 +311,14 @@ void CheckpointOpsImpl<ParamT, OptT>::export_batches_arrow(
     bool include_optimizer_state) {
   auto dispatch_key = [&]<typename Fn>(Fn &&fn) {
     switch (self.key_type_enum_) {
-    case KeyDType::kInt32:
-      return fn.template operator()<int32_t>();
-    case KeyDType::kUInt32:
-      return fn.template operator()<uint32_t>();
-    case KeyDType::kInt64:
-      return fn.template operator()<int64_t>();
-    case KeyDType::kUInt64:
-      return fn.template operator()<uint64_t>();
+      case KeyDType::kInt32:
+        return fn.template operator()<int32_t>();
+      case KeyDType::kUInt32:
+        return fn.template operator()<uint32_t>();
+      case KeyDType::kInt64:
+        return fn.template operator()<int64_t>();
+      case KeyDType::kUInt64:
+        return fn.template operator()<uint64_t>();
     }
     throw std::invalid_argument("unsupported key_dtype");
   };
@@ -700,14 +369,14 @@ void CheckpointOpsImpl<ParamT, OptT>::assign_opt_state(
     size_t dimension, nb::object steps_obj) {
   auto dispatch_key = [&]<typename Fn>(Fn &&fn) {
     switch (self.key_type_enum_) {
-    case KeyDType::kInt32:
-      return fn.template operator()<int32_t>();
-    case KeyDType::kUInt32:
-      return fn.template operator()<uint32_t>();
-    case KeyDType::kInt64:
-      return fn.template operator()<int64_t>();
-    case KeyDType::kUInt64:
-      return fn.template operator()<uint64_t>();
+      case KeyDType::kInt32:
+        return fn.template operator()<int32_t>();
+      case KeyDType::kUInt32:
+        return fn.template operator()<uint32_t>();
+      case KeyDType::kInt64:
+        return fn.template operator()<int64_t>();
+      case KeyDType::kUInt64:
+        return fn.template operator()<uint64_t>();
     }
     throw std::invalid_argument("unsupported key_dtype");
   };
@@ -761,4 +430,4 @@ void CheckpointOpsImpl<ParamT, OptT>::assign_opt_state(
   });
 }
 
-} // namespace se::py::detail
+}  // namespace se::py::detail

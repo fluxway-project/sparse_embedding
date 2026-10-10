@@ -106,25 +106,46 @@ def test_embedding_table_assign():
 
 
 def test_embedding_table_32bit_keys():
-    store = sparse_embedding.EmbeddingStore(
+    int_store = sparse_embedding.EmbeddingStore(
         embedding_config=sparse_embedding.EmbeddingConfig(
-            dims=[128], thread_budget=4, value_dtype="float32"
+            dims=[128], thread_budget=4, value_dtype="float32", key_dtype="int32"
         ),
         initializer_config=sparse_embedding.Zeros(),
     )
 
     keys_int32 = np.array([1, 2, 3], dtype=np.int32)
+    vals, lens = int_store.lookup_or_insert(keys_int32, dim=128)
+    assert vals is not None
+    assert lens is not None
+
+    uint_store = sparse_embedding.EmbeddingStore(
+        embedding_config=sparse_embedding.EmbeddingConfig(
+            dims=[128], thread_budget=4, value_dtype="float32", key_dtype="uint32"
+        ),
+        initializer_config=sparse_embedding.Zeros(),
+    )
     keys_uint32 = np.array([4, 5, 6], dtype=np.uint32)
-
-    # Test int32
-    vals, lens = store.lookup_or_insert(keys_int32, dim=128)
+    vals, lens = uint_store.lookup_or_insert(keys_uint32, dim=128)
     assert vals is not None
     assert lens is not None
 
-    # Test uint32
-    vals, lens = store.lookup_or_insert(keys_uint32, dim=128)
-    assert vals is not None
-    assert lens is not None
+
+@pytest.mark.parametrize("key_dtype", ["int32", "uint32", "int64", "uint64"])
+def test_embedding_store_exposes_and_enforces_key_dtype(key_dtype):
+    store = sparse_embedding.EmbeddingStore(
+        embedding_config=sparse_embedding.EmbeddingConfig(
+            dims=[4], thread_budget=1, key_dtype=key_dtype
+        ),
+        initializer_config=sparse_embedding.Zeros(),
+    )
+    assert store.key_dtype() == key_dtype
+    keys = np.asarray([1, 2], dtype=np.dtype(key_dtype))
+    store.lookup_or_insert(keys, dim=4)
+    wrong_dtype = np.asarray(
+        [1, 2], dtype=np.int64 if key_dtype != "int64" else np.int32
+    )
+    with pytest.raises(ValueError, match="key dtype does not match store"):
+        store.lookup(wrong_dtype, dim=4)
 
 
 def test_embedding_table_reserve_api():
@@ -259,7 +280,7 @@ def test_optimizer_per_id_step():
     """Verify that optimizer tracks steps per-ID for bias correction."""
     store = sparse_embedding.EmbeddingStore(
         embedding_config=sparse_embedding.EmbeddingConfig(
-            dims=[128], thread_budget=1, value_dtype="float32"
+            dims=[128], thread_budget=1, value_dtype="float32", key_dtype="uint64"
         ),
         initializer_config=sparse_embedding.Zeros(),
         optimizer_config=sparse_embedding.Adam(

@@ -4122,6 +4122,22 @@ public:
     if (snapshot == nullptr)
       throw std::runtime_error("store snapshot is unavailable");
     size_t n = keys.size();
+    if (row_lengths.size() != n)
+      throw std::invalid_argument(
+          "gradient key and row-length counts must match");
+    size_t expected_gradient_scalars = 0;
+    for (const int64_t row_length : row_lengths) {
+      if (row_length <= 0)
+        throw std::invalid_argument("gradient row length must be positive");
+      const size_t length = static_cast<size_t>(row_length);
+      if (expected_gradient_scalars >
+          std::numeric_limits<size_t>::max() - length)
+        throw std::overflow_error("gradient scalar count overflows size_t");
+      expected_gradient_scalars += length;
+    }
+    if (flat_grads.size() != expected_gradient_scalars)
+      throw std::invalid_argument(
+          "flat gradient scalar count does not match row lengths");
     if (!snapshot->slots.empty() &&
         !snapshot->slots.front()->transient_shards.empty())
       snapshot->slots.front()->transient_shards.front()->validate_input(

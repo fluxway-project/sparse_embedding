@@ -108,7 +108,6 @@ cc_library(
         ":operation_dispatch_policy",
         ":store_page_eviction_proxy",
         "//sparse_embedding/src/arena",
-        "//sparse_embedding/src/checkpoint",
         "//sparse_embedding/src/common",
         "//sparse_embedding/src/eviction",
         "//sparse_embedding/src/execution",
@@ -194,7 +193,6 @@ cc_test(
     linkopts = ["-pthread"],
     deps = [
         ":hogwild_headers",
-        "//sparse_embedding/src/checkpoint",
         "//sparse_embedding/src/eviction",
     ],
 )

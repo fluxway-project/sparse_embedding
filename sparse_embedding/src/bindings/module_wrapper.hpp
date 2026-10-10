@@ -34,6 +34,7 @@
 #include <span>
 #include <stdexcept>
 #include <string>
+#include <string_view>
 #include <system_error>
 #include <type_traits>
 #include <utility>
@@ -46,7 +47,6 @@
 #if defined(SE_ENABLE_LANCE_C)
 #include "sparse_embedding/src/checkpoint/lance/storage_options.hpp"
 #endif
-#include "sparse_embedding/src/checkpoint/checkpoint_interface.hpp"
 #include "sparse_embedding/src/common/function.hpp"
 #include "sparse_embedding/src/common/numeric_types.hpp"
 #include "sparse_embedding/src/initializer/uniform_initializer.hpp"
@@ -71,33 +71,39 @@ inline void check_error(std::error_code ec) {
     throw std::runtime_error(ec.message());
 }
 
-template <typename Fn>
-auto dispatch_on_key(const DLManagedTensor *dlm,
-                     KeyDType /*expected_key_dtype*/, Fn &&fn) {
-  auto kdt = detect_key_dtype(dlm);
-  switch (kdt) {
-  case KeyDType::kInt32:
-    return fn(se::py::dlpack_to_span<const int32_t>(dlm));
-  case KeyDType::kUInt32:
-    return fn(se::py::dlpack_to_span<const uint32_t>(dlm));
-  case KeyDType::kInt64:
-    return fn(se::py::dlpack_to_span<const int64_t>(dlm));
-  case KeyDType::kUInt64:
-    return fn(se::py::dlpack_to_span<const uint64_t>(dlm));
+inline void validate_key_dtype(KeyDType actual, KeyDType expected) {
+  if (actual != expected) {
+    throw std::invalid_argument(
+        "key dtype does not match store key_dtype: expected " +
+        std::string(key_dtype_name(expected)) + ", got " +
+        std::string(key_dtype_name(actual)));
   }
-  throw std::invalid_argument("unsupported key_dtype");
+}
+
+template <typename Fn>
+decltype(auto) dispatch_key_span(KeyDType dtype, const void *data, size_t size,
+                                 Fn &&fn) {
+  return se::dispatch_key_type(dtype, [&]<typename KeyT>() {
+    return fn(std::span<const KeyT>(static_cast<const KeyT *>(data), size));
+  });
+}
+
+template <typename Fn>
+auto dispatch_on_key(const DLManagedTensor *dlm, KeyDType expected_key_dtype,
+                     Fn &&fn) {
+  auto kdt = detect_key_dtype(dlm);
+  validate_key_dtype(kdt, expected_key_dtype);
+  return se::dispatch_key_type(kdt, [&]<typename KeyT>() {
+    return fn(se::py::dlpack_to_span<const KeyT>(dlm));
+  });
 }
 
 template <typename Fn>
 auto dispatch_partition_key(const DLManagedTensor *dlm, Fn &&fn) {
   auto kdt = detect_key_dtype(dlm);
-  if (kdt == KeyDType::kInt32)
-    return fn(se::py::dlpack_to_span<const int32_t>(dlm));
-  if (kdt == KeyDType::kUInt32)
-    return fn(se::py::dlpack_to_span<const uint32_t>(dlm));
-  if (kdt == KeyDType::kInt64)
-    return fn(se::py::dlpack_to_span<const int64_t>(dlm));
-  return fn(se::py::dlpack_to_span<const uint64_t>(dlm));
+  return se::dispatch_key_type(kdt, [&]<typename KeyT>() {
+    return fn(se::py::dlpack_to_span<const KeyT>(dlm));
+  });
 }
 
 inline size_t get_dlm_size(const DLManagedTensor *dlm) {
@@ -156,11 +162,28 @@ struct UniformInitializerBuilder {
 
 struct PyPartitioner {
   std::shared_ptr<pro::proxy<se::ops::PartitionerFacade>> facade;
+  uint32_t num_shards{0};
+  std::string name{};
+
   // Methods defined in module.cpp
-  nb::object partition(nb::object keys);
-  nb::object async_partition(nb::object keys);
-  nb::object filter(nb::object keys, uint32_t target_shard);
-  nb::object async_filter(nb::object keys, uint32_t target_shard);
+  nb::object partition(nb::object keys,
+                       std::optional<uint32_t> partition_count = std::nullopt,
+                       std::optional<uint64_t> domain_size = std::nullopt,
+                       size_t num_threads = 0);
+  nb::object
+  async_partition(nb::object keys,
+                  std::optional<uint32_t> partition_count = std::nullopt,
+                  std::optional<uint64_t> domain_size = std::nullopt,
+                  size_t num_threads = 0);
+  nb::object filter(nb::object keys, uint32_t target_shard,
+                    std::optional<uint32_t> partition_count = std::nullopt,
+                    std::optional<uint64_t> domain_size = std::nullopt,
+                    size_t num_threads = 0);
+  nb::object
+  async_filter(nb::object keys, uint32_t target_shard,
+               std::optional<uint32_t> partition_count = std::nullopt,
+               std::optional<uint64_t> domain_size = std::nullopt,
+               size_t num_threads = 0);
 };
 
 // =============================================================================
@@ -213,30 +236,28 @@ template <typename ParamT, typename OptT> struct AsyncOpsImpl {
 
 template <typename ParamT, typename OptT> struct CheckpointOpsImpl {
 #if defined(SE_ENABLE_LANCE_C)
-  static void save_checkpoint(EmbeddingStoreWrapper &self,
-                              const std::string &uri, const std::string &mode,
-                              uint64_t min_score, bool include_optimizer_state,
-                              bool use_compression);
-  static void load_checkpoint(EmbeddingStoreWrapper &self,
-                              const std::string &uri, uint64_t version,
-                              bool clear, bool load_optimizer_state,
-                              nb::object filter_fn, uint32_t target_shard_id,
-                              size_t batch_size);
   static nb::dict write_native_fragment(
       EmbeddingStoreWrapper &self, const std::string &uri,
       uint32_t participant_index, const std::vector<uint32_t> &dimensions,
       const std::string &embedding_dtype, const std::string &optimizer_dtype,
-      const std::string &score_policy, uint32_t protocol_version,
+      const std::string &score_policy, const std::string &key_dtype,
       const std::string &schema_digest, bool include_page_images = false);
-  static void
-  restore_native_entries(EmbeddingStoreWrapper &self, const std::string &uri,
-                         uint64_t version, nb::object selected_keys,
-                         const se::LanceStorageOptions &storage_options,
-                         bool load_optimizer_state);
+  template <typename Scanner>
+  static void restore_native_entries_with_scan(EmbeddingStoreWrapper &self,
+                                               Scanner &&scan,
+                                               bool load_optimizer_state);
+  static void restore_native_partition_entries(
+      EmbeddingStoreWrapper &self, const std::string &uri, uint64_t version,
+      uint64_t partition_count, uint64_t partition_id,
+      const std::string &key_dtype, const std::string &assignment_name,
+      const std::unordered_map<std::string, std::string> &assignment_parameters,
+      const se::LanceStorageOptions &storage_options, bool load_optimizer_state,
+      std::optional<uint32_t> source_participant_index = std::nullopt);
   static void
   restore_native_page_images(EmbeddingStoreWrapper &self,
                              const std::vector<std::string> &uris,
                              uint64_t version, uint32_t participant_index,
+                             const std::string &key_dtype,
                              const se::LanceStorageOptions &storage_options,
                              bool load_optimizer_state);
 #endif
@@ -308,9 +329,6 @@ class EmbeddingStoreWrapper {
   std::vector<size_t> dims_;
   se::PageStorage storage_;
 
-  se::CheckpointWriterFactory checkpoint_writer_factory_;
-  se::CheckpointReaderFactory checkpoint_reader_factory_;
-
   template <typename ParamT, typename OptT> auto &get_store() {
     return std::get<pro::proxy<se::EmbeddingTableFacade<ParamT, OptT>>>(store_);
   }
@@ -338,6 +356,7 @@ public:
   std::vector<size_t> table_dims() const;
   std::string value_dtype() const;
   std::string optimizer_dtype() const;
+  std::string key_dtype() const;
   bool optimizer_enabled() const;
   std::string score_policy() const;
   size_t internal_shard_count();
@@ -371,31 +390,26 @@ public:
 
   // ---- Checkpoint Operations ----
 #ifdef SE_ENABLE_LANCE_C
-  void save_checkpoint(const std::string &uri, const std::string &mode,
-                       uint64_t min_score, bool include_optimizer_state,
-                       bool use_compression);
-  void load_checkpoint(const std::string &uri, uint64_t version, bool clear,
-                       bool load_optimizer_state,
-                       nb::object filter_fn = nb::none(),
-                       uint32_t target_shard_id = 0, size_t batch_size = 65536);
   nb::dict write_native_fragment(
       const std::string &uri, uint32_t participant_index,
       const std::vector<uint32_t> &dimensions,
       const std::string &embedding_dtype, const std::string &optimizer_dtype,
-      const std::string &score_policy, uint32_t protocol_version,
+      const std::string &score_policy, const std::string &key_dtype,
       const std::string &schema_digest, bool include_page_images = false);
-  void restore_native_entries(const std::string &uri, uint64_t version,
-                              nb::object selected_keys,
-                              const se::LanceStorageOptions &storage_options,
-                              bool load_optimizer_state);
+  void restore_native_partition_entries(
+      const std::string &uri, uint64_t version, uint64_t partition_count,
+      uint64_t partition_id, const std::string &key_dtype,
+      const std::string &assignment_name,
+      const std::unordered_map<std::string, std::string> &assignment_parameters,
+      const se::LanceStorageOptions &storage_options, bool load_optimizer_state,
+      std::optional<uint32_t> source_participant_index = std::nullopt);
   void
   restore_native_page_images(const std::vector<std::string> &uris,
                              uint64_t version, uint32_t participant_index,
+                             const std::string &key_dtype,
                              const se::LanceStorageOptions &storage_options,
                              bool load_optimizer_state);
 
-  void set_checkpoint_factories(se::CheckpointWriterFactory wf,
-                                se::CheckpointReaderFactory rf);
 #endif
 
   void export_batches_dlpack(nb::callable visitor, size_t batch_size = 65536,

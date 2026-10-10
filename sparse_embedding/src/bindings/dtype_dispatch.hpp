@@ -22,38 +22,27 @@
 
 #include <cstdint>
 #include <stdexcept>
-#include <string>
-#include <string_view>
 
-#include "sparse_embedding/src/common/numeric_types.hpp"
+#include "sparse_embedding/src/common/dtypes.hpp"
 
 namespace se::py::detail {
 
-enum class KeyDType : uint8_t { kInt32, kUInt32, kInt64, kUInt64 };
-enum class ValueDType : uint8_t { kFloat32, kFloat16, kBFloat16 };
+// Reuse core types from domain SSOT
+using KeyDType = se::KeyDType;
+using ValueDType = se::ValueDType;
 
-inline KeyDType parse_key_dtype(std::string_view dtype) {
-  if (dtype == "int32" || dtype == "i32")
-    return KeyDType::kInt32;
-  if (dtype == "uint32" || dtype == "u32")
-    return KeyDType::kUInt32;
-  if (dtype == "int64" || dtype == "i64")
-    return KeyDType::kInt64;
-  if (dtype == "uint64" || dtype == "u64" || dtype.empty())
-    return KeyDType::kUInt64;
-  throw std::invalid_argument("unsupported key_dtype: " + std::string(dtype));
-}
+using se::dispatch_dtype_pair;
+using se::dispatch_key_type;
+using se::dispatch_value_type;
+using se::key_dtype_name;
+using se::parse_key_dtype;
+using se::parse_value_dtype;
+using se::value_dtype_name;
 
-inline ValueDType parse_value_dtype(std::string_view dtype,
-                                    std::string_view label) {
-  if (dtype == "float32" || dtype == "f32")
-    return ValueDType::kFloat32;
-  if (dtype == "float16" || dtype == "f16")
-    return ValueDType::kFloat16;
-  if (dtype == "bfloat16" || dtype == "bf16")
-    return ValueDType::kBFloat16;
-  throw std::invalid_argument("unsupported " + std::string(label) + ": " +
-                              std::string(dtype));
+// Legacy alias for value dispatch
+template <typename Fn>
+decltype(auto) dispatch_value_dtype(ValueDType dtype, Fn &&fn) {
+  return se::dispatch_value_type(dtype, std::forward<Fn>(fn));
 }
 
 inline KeyDType detect_key_dtype(const DLManagedTensor *dlm) {
@@ -70,55 +59,16 @@ inline KeyDType detect_key_dtype(const DLManagedTensor *dlm) {
   throw std::invalid_argument("keys must be int32, uint32, int64 or uint64");
 }
 
-template <typename Fn>
-decltype(auto) dispatch_value_dtype(ValueDType dtype, Fn &&fn) {
-  switch (dtype) {
-  case ValueDType::kFloat32:
-    return fn.template operator()<float>();
-  case ValueDType::kFloat16:
-    return fn.template operator()<se::float16_t>();
-  case ValueDType::kBFloat16:
-    return fn.template operator()<se::bfloat16_t>();
-  }
-  throw std::invalid_argument("unsupported value dtype code");
-}
-
-template <typename Fn>
-decltype(auto) dispatch_dtype_pair(ValueDType param_dtype,
-                                   ValueDType optimizer_dtype, Fn &&fn) {
-  switch (param_dtype) {
-  case ValueDType::kFloat32:
-    switch (optimizer_dtype) {
-    case ValueDType::kFloat32:
-      return fn.template operator()<float, float>();
-    case ValueDType::kFloat16:
-      return fn.template operator()<float, se::float16_t>();
-    case ValueDType::kBFloat16:
-      return fn.template operator()<float, se::bfloat16_t>();
-    }
-    break;
-  case ValueDType::kFloat16:
-    switch (optimizer_dtype) {
-    case ValueDType::kFloat32:
-      return fn.template operator()<se::float16_t, float>();
-    case ValueDType::kFloat16:
-      return fn.template operator()<se::float16_t, se::float16_t>();
-    case ValueDType::kBFloat16:
-      return fn.template operator()<se::float16_t, se::bfloat16_t>();
-    }
-    break;
-  case ValueDType::kBFloat16:
-    switch (optimizer_dtype) {
-    case ValueDType::kFloat32:
-      return fn.template operator()<se::bfloat16_t, float>();
-    case ValueDType::kFloat16:
-      return fn.template operator()<se::bfloat16_t, se::float16_t>();
-    case ValueDType::kBFloat16:
-      return fn.template operator()<se::bfloat16_t, se::bfloat16_t>();
-    }
-    break;
-  }
-  throw std::invalid_argument("unsupported dtype pair");
+inline ValueDType detect_value_dtype(const DLManagedTensor *dlm) {
+  const auto code = dlm->dl_tensor.dtype.code;
+  const auto bits = dlm->dl_tensor.dtype.bits;
+  if (code == static_cast<uint8_t>(kDLFloat) && bits == 32)
+    return ValueDType::kFloat32;
+  if (code == static_cast<uint8_t>(kDLFloat) && bits == 16)
+    return ValueDType::kFloat16;
+  if (code == static_cast<uint8_t>(kDLBfloat) && bits == 16)
+    return ValueDType::kBFloat16;
+  throw std::invalid_argument("values must be float32, float16 or bfloat16");
 }
 
 } // namespace se::py::detail

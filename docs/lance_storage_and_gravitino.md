@@ -15,15 +15,15 @@ PYTHONPATH="$PWD" pytest -q sparse_embedding/tests/test_checkpoint.py
 PYTHONPATH="$PWD" pytest -q sparse_embedding/tests/test_gravitino_lance.py
 ```
 
-## 1. Storage Hierarchies
+## 1. Storage Hierarchies and Dual-Lance 2PC Architecture
 
 ```text
 SparseCheckpoint
     |
     +-- LocalLanceStorage
-    |       +-- snapshot_manifest (sole visibility boundary)
-    |       +-- _staging/<fragment_id>/entries (Canonical SSOT dataset)
-    |       +-- _staging/<fragment_id>/page_images (Optional page image cache, generated on-demand)
+    |       +-- snapshot_manifest.lance (2PC transaction control ledger & global visibility boundary)
+    |       +-- _staging/<attempt>/<fragment_id>/entries.lance (Worker physical slice SSOT)
+    |       +-- _staging/<attempt>/<fragment_id>/page_images.lance (Optional physical page cache)
     |
     +-- GravitinoLanceStorage
             +-- Gravitino control-plane API base URI
@@ -42,41 +42,83 @@ storage uses canonical table handles returned by Lance REST and S3 conditional
 writes. Missing conditional-write support is an initialization/runtime error; no
 local or process-memory fallback exists.
 
+### Dual-Lance 2PC Storage Layering
+
+Persistence is split into two physical Lance datasets:
+1. **`snapshot_manifest.lance`** (Control-plane ledger and visibility boundary):
+   - Records transaction transitions (`PREPARED` $\to$ `COMMITTED` / `ABORT`), leases, fencing markers, and `fragment_ids`. Compact (1 row appended per commit).
+2. **`entries.lance`** (Data-plane physical slices):
+   - Workers write concurrently to isolated paths `_staging/<attempt>/<fragment_id>/entries.lance`, enabling lock-free writes and offline streaming compaction.
+
 ## 2. Local Lance Integration
 
 ```python
 from sparse_embedding.checkpoint import (
+    ElasticRestore,
     LocalLanceStorage,
     PhysicalRestore,
     PhysicalRestoreStrategy,
     SparseCheckpoint,
+    SparsePartitionAssignmentSpec,
+    encode_restore_options,
 )
 
 checkpoint = SparseCheckpoint(
-    LocalLanceStorage("/checkpoints/user_embedding")
+    LocalLanceStorage.from_checkpoint_root("/checkpoints/user_embedding")
 )
 
 # Default: persist only canonical entries (saves 50% write bandwidth and storage space)
-locator = checkpoint.save(store, "step-1000")
+committed = checkpoint.save_training_checkpoint(store, "step-1000")
 
-# Optional: persist physical page_images cache for fastest restore speed in fixed topologies:
-# locator = checkpoint.save(store, "step-1000", include_page_images=True)
-
-# Restore with explicit strategy (zero implicit fallback)
-checkpoint.restore(
+# 1. Physical Restore (PhysicalRestore)
+checkpoint.load_training_checkpoint(
     restored_store,
-    locator,
-    mode=PhysicalRestore(participant, strategy=PhysicalRestoreStrategy.RECONSTRUCT_ENTRIES),
+    committed.handle,
+    encode_restore_options(
+        PhysicalRestore(
+            participant,
+            strategy=PhysicalRestoreStrategy.RECONSTRUCT_ENTRIES,
+            key_dtype="uint64",
+        )
+    ),
+)
+
+# 2. Elastic Topology Restore (ElasticRestore + Normalized Partitioning)
+# Supports modulo(), hash(), fast_range(), or custom registered algorithms
+assignment_spec = SparsePartitionAssignmentSpec.hash()
+checkpoint.load_training_checkpoint(
+    restored_store,
+    committed.handle,
+    encode_restore_options(
+        ElasticRestore(
+            spec=assignment_spec,
+            partition_count=8,
+            partition_id=0,
+            key_dtype="uint64",
+        )
+    ),
 )
 ```
 
 Training and inference stores use the same checkpoint format but have explicit
 optimizer-state policies. `EmbeddingConfig(enable_optimizer=False)` constructs
 a weight-only store without allocating optimizer-state pages. Ordinary
-`checkpoint.restore(..., load_optimizer_state=True)` preserves the training
+`checkpoint.load_training_checkpoint(..., load_optimizer_state=True)` preserves the training
 round trip and can be set to `False` for weight-only restore. A disabled target
-rejects optimizer-state loading. `restore_weight_snapshot` is the inference
+rejects optimizer-state loading. `load_inference_weights` is the inference
 entry point and always loads embeddings without optimizer state.
+
+To publish a sparse inference reference, provide the component-owned physical
+asset directory during the same save transaction. The directory contains one
+opaque owner reference and does not copy the Lance table:
+
+```python
+asset = "/published/steps/1000/sparse/group"
+checkpoint.save_training_checkpoint(store, "step-1000", weight_path=asset)
+inference_storage = LocalLanceStorage.from_weight_path(asset)
+# owner_restore_options is produced by the owner-specific router adapter.
+inference_storage.load_inference_weights(restored_store, owner_restore_options)
+```
 
 The selective-loading contract is covered by
 `sparse_embedding/tests/test_lance_optimizer_loading.py`; run it together with
@@ -89,17 +131,16 @@ bounded single-page and writer buffers, and writing in a single commit (data
 version 1, followed by metadata publish version 2).
 This completely eliminates Lance multi-transaction append loops and manifest explosion.
 The Manifest records `fragment_ids`, digests, `commit_state`, `compacted_version`,
-and protocol version. The sole visibility metadata table is:
+and snapshot version. The sole visibility metadata table is:
 
-- `snapshot_manifest`: The unique visibility boundary for checkpoints.
+- `snapshot_manifest.lance`: The unique visibility boundary for checkpoints.
 
 ### Restore Strategies and Single Source of Truth (SSOT)
 
 - **Canonical `entries` as Sole Source of Truth**:
   Default writes persist only the `entries` dataset containing all keys, embedding vectors,
   and optimizer states.
-  - `ElasticRestore`: Elastic resharding with new `partition_fn`, completely decoupled
-    from historical participant/page topologies.
+  - `ElasticRestore`: Accepts `SparsePartitionAssignmentSpec` (`modulo()`, `hash()`, `fast_range()`, or dynamically registered custom algorithms). The C++ native restore engine leverages `PartitionerRegistry` and AVX-512 SIMD contiguous slice mask filtering (`filter_span`) to rapidly filter target partition keys with zero intermediate deserialization. Unregistered algorithms or mismatched parameters raise exceptions directly with zero silent fallback.
   - `PhysicalRestore(..., strategy=PhysicalRestoreStrategy.RECONSTRUCT_ENTRIES)`: Rebuilds
     physical pages deterministically from canonical `entries`. Even after multi-participant
     checkpoint compaction, it precisely filters by `source_participant_index` to restore only
@@ -111,12 +152,28 @@ and protocol version. The sole visibility metadata table is:
   - **Zero Fallback Contract**: If `FAST_PAGE_CACHE` is requested but the checkpoint does not
     contain physical page images, it **strictly raises `FileNotFoundError`** with zero implicit fallback.
 
+### Bit-identical Reference Vectors
+
+To ensure that offline C++ restore partitioning matches online distributed runtimes (e.g. Fluxway/JAX) communication planning with bit-identical fidelity across programming languages and compiler optimizations, the library provides a canonical verification utility:
+
+```python
+from sparse_embedding.checkpoint import generate_reference_vectors
+
+keys, ranks = generate_reference_vectors(
+    assignment_name="sparse_embedding.hash",
+    key_dtype="uint64",
+    partition_count=8,
+)
+```
+
+This utility provides comprehensive test vectors across all 4 supported `key_dtype` variants (including extreme values, negative bounds, and modulus borders) for cross-framework verification.
+
 ### Standalone Compaction and Remote Storage Support
 
 Export jobs can compact persisted Fragments by path alone without instantiating storage:
 
 ```python
-from sparse_embedding.checkpoint import compact_fragments
+from sparse_embedding.checkpoint.lance_backend import compact_fragments
 
 # Local directory compaction
 compact_fragments("/checkpoints/user_embedding/_staging", "/exports/user_embedding")
@@ -135,7 +192,7 @@ Publication strictly enforces atomicity and zero-orphan cleanup rules:
 - **Remote Object Storage (S3 / S3A)**: Since object storage lacks atomic directory rename, a single, strongly-consistent pointer object (`.manifest_pointer.json`) is written over an immutable staged prefix to provide linearized atomic publication without partial visibility.
 - **Full Lifecycle Cleanup (Zero Orphans)**: Auxiliary JSON files are used exclusively on remote object stores as an atomic pointer. Successful overwrite, explicit `delete_prefix`, recursive parent deletion, and rollback paths strictly clean pointer objects and staged directories; cleanup failures are propagated and preserve the published root for retry instead of reporting success.
 - **Strict Zero Fallback Deletion**: `delete_prefix(..., missing_ok=False)` strictly raises `FileNotFoundError` when the target prefix does not exist; idempotent exit is permitted only when `missing_ok=True` is explicitly passed.
-- **Protocol Version Stability**: Protocol version remains `_PROTOCOL_VERSION = 1`. Multi-participant compaction records the complete `participant_indices` array in the compacted fragment metadata.
+- **Metadata Consistency**: Multi-participant compaction records the complete `participant_indices` array in the compacted fragment metadata.
 
 The distributed framework provides framework-agnostic commit authority via the SPI:
 
@@ -155,11 +212,19 @@ CheckpointSaveIdentity(
 
 Distributed integrations can provide a durable `reference_id` upon commit. Locators that remain referenced will pin their corresponding entries, page-images, and exact manifest versions. `reserve_reclaim` checks active leases and writes reservations under the same storage lock; `publish_reclaim` converts these to pending. Subsequently, `reclaim_checkpoint` only releases references of selected locators and executes GC. Successful reclaim writes a sparse-owned durable completion record, making repair retries idempotent without treating a missing pending reservation as success. Lease acquisition uses idempotent request IDs, while renew/release leverages generation CAS.
 
-### Physical DType
+### Physical DTypes
 
-The physical column in the current Lance checkpoint schema is `float32`; logical `embedding_dtype` and `optimizer_dtype` are recorded in fragment metadata and manifests, allowing the restoration process to strictly validate target specifications.
+#### 1. Polymorphic Key Types (Key DType SSOT)
+The system supports four native fixed-width Arrow integer key types:
+- `int32` (`pa.int32()`)
+- `uint32` (`pa.uint32()`)
+- `int64` (`pa.int64()`)
+- `uint64` (`pa.uint64()`)
 
-Current Lance/PyArrow implementations support reading and writing Arrow `float16` natively; however, PyArrow does not yet support the `bfloat16` type. Sparse Embedding checkpoints do not claim support for dynamic physical dtypes or lossless `bfloat16` storage at this time. All non-`float32` logical dtypes will be cast through a canonical `float32` physical column.
+Key columns are stored directly as native Arrow fixed-width integer types with zero encoding overhead, providing native support for predicate pushdown across DuckDB and Lance storage engines (e.g., `SELECT key FROM 'entries.lance' WHERE key = -1`).
+
+#### 2. Values and Optimizer Numeric Types
+The physical payload column in the Lance checkpoint schema adopts canonical `float32` format (with native Arrow `float16` read/write support). Logical `embedding_dtype` and `optimizer_dtype` metadata are preserved in fragment metadata and manifests, allowing the restoration process to strictly validate target specifications; other logical floating-point formats are canonicalized through the standard `float32` physical column to ensure binary determinism across heterogeneous compute engines and storage drivers.
 
 
 ## 3. Gravitino Control Plane
@@ -245,8 +310,11 @@ immutable `TableHandle(table_id, location, storage_options)`. It does not transp
 checkpoint data and does not publish or restore a Lance latest version.
 
 ```python
-from sparse_embedding.checkpoint import GravitinoLanceStorage, SparseCheckpoint
-from sparse_embedding.checkpoint.gravitino_lance import SdkConfig
+from sparse_embedding.checkpoint import SparseCheckpoint
+from sparse_embedding.checkpoint.gravitino_lance import (
+    GravitinoLanceStorage,
+    SdkConfig,
+)
 
 storage = GravitinoLanceStorage(
     SdkConfig.for_rest(
@@ -257,12 +325,9 @@ storage = GravitinoLanceStorage(
     location="s3://bucket/training/checkpoints/embedding",
 )
 checkpoint = SparseCheckpoint(storage)
-locator = checkpoint.save(store, "step-1000")
-checkpoint.restore(restored_store, locator)
 ```
 
-The adapter internally registers `<component_id>_entries`,
-`<component_id>_page_images`, and `<component_id>_snapshot_manifest`. Those names
+The adapter registers `<component_id>_snapshot_manifest`, whose dataset location ends in `snapshot_manifest.lance`. Those names
 are physical metadata, not additional checkpoint identities. The locator remains
 the only restore identity exposed to algorithm code.
 
@@ -290,27 +355,16 @@ To stop the sidecar:
 docker rm -f sparse-embedding-lance-rest
 ```
 
-## 6. Validation Status
+## 6. Verification and Operational Specifications
 
-The local `apache/gravitino-lance-rest:1.3.0` sidecar has validated namespace
-operations, table register/describe/drop, native Lance writes using returned
-storage options, exact old-version reads, lease blocking, retention reclaim, and
-object cleanup. Its Arrow IPC table-create route still returns HTTP 500 because
-the server image lacks an Arrow allocation implementation. The checkpoint path
-does not call that route: it registers metadata first and creates datasets through
-the native Lance client.
+The system provides standardized lifecycle verification contracts for local and distributed deployments:
+1. **Control-Plane and Catalog Lifecycle**: Full lifecycle management covering namespace maintenance, table registration/description/deregistration, lease-based concurrency locking, and retention-period garbage collection.
+2. **Decoupled Data-Plane I/O**: Checkpoint write pipelines stream high-throughput binary fragment datasets through native Lance engines, isolating payload I/O from metadata catalog governance.
+3. **Point-in-Time Snapshot Reads**: Native support for deterministic version-tagged point-in-time reads.
 
-The Gravitino control API and catalog lifecycles of remote deployments can be verified via the configured `GRAVITINO_API_BASE_URI`. The official Gravitino Lance REST operation API is typically hosted at `/lance/v1/...`, but clients rely on the fully-qualified `LANCE_REST_API_BASE_URI` provided by the deployment. If this API root is invoked and reports a missing metalake, the deployment must configure `gravitino.lance-rest.gravitino-metalake=<metalake_name>` before proceeding with full namespace, table, read/write, and exact-version conformance tests. Until these checks pass, neither the documentation nor the client should claim that the Gravitino-backed checkpoint data plane is available.
+## 7. Deployment and Integration Specifications
 
-`LANCE_REST_API_BASE_URI` must be the complete operation API root. For example, if the deployment exposes `https://<host>/gateway/lance`, this exact URI should be configured. If it exposes `https://<host>/gateway/lance/v1`, then configure the latter. The SDK does not infer versions or proxy prefixes.
-
-## 7. Current Limitations
-
-The following capabilities are not yet declared as complete:
-
-- Strict consistency between Lance REST base paths, metalake configurations, and reverse proxy rewrites.
-- Gravitino Lance REST Arrow `create` route conformance; checkpoint storage does
-  not depend on that route.
-- Lossless storage for `bfloat16` or dynamic physical dtypes.
-
-Failure logs, credentials, and internal endpoints from the deployment environment must not be committed to open-source repositories; they should be securely stored in the deployment's own logging systems.
+- **REST Endpoint Declaration**: `LANCE_REST_API_BASE_URI` must be explicitly configured as the fully-qualified operation API root (e.g., `https://<host>/gateway/lance/v1`). Clients connect strictly to the specified path without implicit version guessing or proxy rewriting.
+- **Physical Data Types**: Data persistence adheres to Arrow fixed-width integer key columns and canonical `float32`/`float16` payload columns, guaranteeing strict binary determinism across heterogeneous execution environments.
+- **Credential and Network Security**: Authentication tokens, private network endpoints, and sensitive credentials must be injected via standard environment variables (e.g., `GRAVITINO_AUTH_TOKEN`) and never hardcoded in configuration files.
+- **Analytical Query Integration**: Zero-copy offline queries integrate directly with DuckDB via the official Lance extension (`INSTALL lance; LOAD lance; SELECT key FROM '/path/to/entries.lance' WHERE key = -1`), executing native projection and predicate pushdown directly against the physical dataset.

@@ -145,8 +145,28 @@ def _build_native_artifacts() -> None:
         shutil.copy2(lance_src, lance_so)
         print(f"[setup.py] Copied {lance_src.name} -> {lance_so}", file=sys.stderr)
 
-    # Generate the _core.pyi type stubs using nanobind.stubgen
-    print("[setup.py] Generating type stubs (_core.pyi)...", file=sys.stderr)
+    _generate_extension_stubs(
+        extension_name="_core",
+        extension_dir=_PKG_DIR,
+        output_dir=_PKG_DIR,
+    )
+
+
+def _generate_extension_stubs(
+    extension_name: str,
+    extension_dir: Path,
+    output_dir: Path,
+) -> None:
+    """Generate .pyi stubs from compiled extension binary without importing top-level package.
+
+    Uses nanobind's import-path mechanism to inspect only the binary shared library,
+    ensuring hermetic execution in PEP 517 isolated environments without requiring
+    runtime package dependencies.
+    """
+    print(
+        f"[setup.py] Generating type stubs for native extension {extension_name!r}...",
+        file=sys.stderr,
+    )
     try:
         subprocess.run(
             [
@@ -154,25 +174,30 @@ def _build_native_artifacts() -> None:
                 "-m",
                 "nanobind.stubgen",
                 "-P",
+                "-i",
+                str(extension_dir),
                 "-m",
-                "sparse_embedding._core",
+                extension_name,
                 "-O",
-                str(_PKG_DIR),
+                str(output_dir),
             ],
-            cwd=str(_PROJECT_DIR),
+            cwd=_PROJECT_DIR,
             check=True,
             capture_output=True,
             text=True,
         )
     except subprocess.CalledProcessError as e:
         print(
-            f"[setup.py] nanobind.stubgen failed with exit code {e.returncode}",
+            f"[setup.py] nanobind.stubgen failed for {extension_name} with exit code {e.returncode}",
             file=sys.stderr,
         )
         print(f"[setup.py] stdout: {e.stdout}", file=sys.stderr)
         print(f"[setup.py] stderr: {e.stderr}", file=sys.stderr)
         raise
-    print("[setup.py] Successfully generated _core.pyi", file=sys.stderr)
+    print(
+        f"[setup.py] Successfully generated {extension_name}.pyi",
+        file=sys.stderr,
+    )
 
 
 class BazelAwareBuildPy(build_py):

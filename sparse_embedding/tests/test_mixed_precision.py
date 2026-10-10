@@ -11,7 +11,23 @@ import numpy as np
 import pytest
 
 import sparse_embedding as se
-from sparse_embedding.checkpoint import LocalLanceStorage, SparseCheckpoint
+from sparse_embedding.checkpoint import (
+    ElasticRestore,
+    SparseCheckpoint,
+    SparsePartitionAssignmentSpec,
+    encode_restore_options,
+)
+from sparse_embedding.checkpoint.lance_backend import LocalLanceStorage
+
+
+def _modulo_restore(partition_count: int, partition_id: int) -> ElasticRestore:
+    return ElasticRestore(
+        SparsePartitionAssignmentSpec.modulo(),
+        partition_count,
+        partition_id,
+        "uint64",
+    )
+
 
 # ---------------------------------------------------------------------------
 # DLPack-compatible array helpers
@@ -108,6 +124,7 @@ def test_assign_lookup_integrity(param_dtype, optimizer_dtype):
         thread_budget=1,
         value_dtype=param_dtype,
         optimizer_dtype=optimizer_dtype,
+        key_dtype="uint64",
     )
     store = se.EmbeddingStore(cfg)
 
@@ -149,6 +166,7 @@ def test_adam_optimizer_step(param_dtype, optimizer_dtype):
         thread_budget=1,
         value_dtype=param_dtype,
         optimizer_dtype=optimizer_dtype,
+        key_dtype="uint64",
     )
     store = se.EmbeddingStore(
         cfg,
@@ -165,31 +183,41 @@ def test_adam_optimizer_step(param_dtype, optimizer_dtype):
 
     out_dlp, _ = store.lookup(keys, dim=dim)
     got = _to_numpy_f32(out_dlp, (1, dim), param_dtype)
-
-    # After one Adam step on zero-initialized params with unit-ish grads,
-    # result should be approximately -lr = -0.01
     assert np.all(got != 0.0), "optimizer step should produce non-zero values"
 
-    # Verify per-ID step independence: a new ID gets a fresh step counter
     keys2 = np.array([1], dtype=np.uint64)
     store.lookup_or_insert(keys2, dim=dim)
-
-    # advance 50 steps on key 0 only
     for _ in range(50):
         store.accumulate_gradients(keys, grads)
         store.optimizer_step()
-
-    # first step on key 1
     grads2 = _make_array((1, dim), param_dtype, rng)
     store.accumulate_gradients(keys2, grads2)
     store.optimizer_step()
-
     out1_dlp, _ = store.lookup(keys2, dim=dim)
     val_key1 = _to_numpy_f32(out1_dlp, (1, dim), param_dtype)
-    # Result should be ~-lr (first step bias correction), not tiny
-    assert np.abs(val_key1).max() > 0.005, (
-        f"per-ID step seems broken: max abs = {np.abs(val_key1).max()}"
+    assert np.abs(val_key1).max() > 0.005
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("key_dtype", ["int32", "uint32", "int64", "uint64"])
+async def test_async_accumulate_preserves_key_width(key_dtype):
+    cfg = se.EmbeddingConfig(
+        dims=[2],
+        thread_budget=1,
+        value_dtype="float32",
+        optimizer_dtype="float32",
+        gradient_dtype="float32",
+        key_dtype=key_dtype,
     )
+    store = se.EmbeddingStore(
+        cfg, optimizer_config=se.Sgd(lr=1.0), initializer_config=se.Zeros()
+    )
+    keys = np.array([1, 2], dtype=np.dtype(key_dtype))
+    store.lookup_or_insert(keys, dim=2)
+    await store.async_accumulate_gradients(keys, np.ones((2, 2), dtype=np.float32))
+    store.optimizer_step()
+    out, _ = store.lookup(keys, dim=2)
+    np.testing.assert_allclose(np.from_dlpack(out), -1.0)
 
 
 # ---------------------------------------------------------------------------
@@ -199,7 +227,7 @@ def test_adam_optimizer_step(param_dtype, optimizer_dtype):
 
 @pytest.mark.parametrize("param_dtype,optimizer_dtype", ALL_COMBOS, ids=ALL_COMBO_IDS)
 def test_checkpoint_roundtrip(param_dtype, optimizer_dtype, tmp_path):
-    """save_checkpoint -> load_checkpoint should preserve embeddings and opt state."""
+    """Training checkpoint round-trip preserves embeddings and optimizer state."""
     if "bfloat16" in (param_dtype, optimizer_dtype) and not _HAS_JAX:
         pytest.skip("JAX required for bfloat16")
 
@@ -212,6 +240,7 @@ def test_checkpoint_roundtrip(param_dtype, optimizer_dtype, tmp_path):
         thread_budget=1,
         value_dtype=param_dtype,
         optimizer_dtype=optimizer_dtype,
+        key_dtype="uint64",
     )
     adam = se.Adam(lr=0.01)
 
@@ -229,11 +258,15 @@ def test_checkpoint_roundtrip(param_dtype, optimizer_dtype, tmp_path):
 
     uri = str(tmp_path / "ckpt")
     checkpoint = SparseCheckpoint(LocalLanceStorage(uri))
-    locator = checkpoint.save(store1, "mixed")
+    locator = checkpoint.save_training_checkpoint(store1, "mixed")
 
     # Load into a fresh store
     store2 = se.EmbeddingStore(cfg, optimizer_config=adam)
-    checkpoint.restore(store2, locator)
+    checkpoint.load_training_checkpoint(
+        store2,
+        locator.handle,
+        encode_restore_options(_modulo_restore(1, 0)),
+    )
 
     assert store2.total_size() == n_keys
 
@@ -290,6 +323,7 @@ def test_independent_gradient_accumulator_dtype(
         value_dtype=param_dtype,
         optimizer_dtype=optimizer_dtype,
         gradient_dtype=gradient_dtype,
+        key_dtype="uint64",
     )
     store = se.EmbeddingStore(
         cfg,
@@ -325,6 +359,7 @@ async def test_async_accumulate_accepts_configured_gradient_dtype(
         value_dtype=param_dtype,
         optimizer_dtype="float32",
         gradient_dtype=gradient_dtype,
+        key_dtype="uint64",
     )
     store = se.EmbeddingStore(
         cfg,
@@ -352,6 +387,7 @@ def test_gradient_scale_round_trip(gradient_scale):
             optimizer_dtype="float32",
             gradient_dtype="float16",
             gradient_scale=scale,
+            key_dtype="uint64",
         )
         store = se.EmbeddingStore(
             cfg,
@@ -377,6 +413,25 @@ def test_gradient_scale_rejects_invalid_values(gradient_scale):
                 optimizer_dtype="float32",
                 gradient_dtype="float16",
                 gradient_scale=gradient_scale,
+                key_dtype="uint64",
             ),
             optimizer_config=se.Sgd(lr=0.01),
         )
+
+
+def test_wider_gradient_dtype_rejects_parameter_overflow():
+    cfg = se.EmbeddingConfig(
+        dims=[1],
+        thread_budget=1,
+        value_dtype="float16",
+        optimizer_dtype="float32",
+        gradient_dtype="float32",
+        key_dtype="uint64",
+    )
+    store = se.EmbeddingStore(
+        cfg, optimizer_config=se.Sgd(lr=1.0), initializer_config=se.Zeros()
+    )
+    key = np.array([1], dtype=np.uint64)
+    store.lookup_or_insert(key, dim=1)
+    with pytest.raises((OverflowError, ValueError), match="gradient"):
+        store.accumulate_gradients(key, np.array([[100000.0]], dtype=np.float32))
