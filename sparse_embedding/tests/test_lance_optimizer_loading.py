@@ -5,14 +5,25 @@ import pytest
 
 import sparse_embedding as se
 from sparse_embedding.checkpoint import (
+    CheckpointParticipant,
     ElasticRestore,
-    LocalLanceStorage,
     PhysicalRestore,
     PhysicalRestoreStrategy,
     SparseCheckpoint,
-    SparseWeightSnapshot,
+    SparsePartitionAssignmentSpec,
+    encode_restore_options,
 )
-from sparse_embedding.checkpoint.spi import CheckpointParticipant
+from sparse_embedding.checkpoint.lance_backend import LocalLanceStorage
+from sparse_embedding.checkpoint.schema import ENTRIES_DATASET
+
+
+def _modulo_restore(partition_count: int, partition_id: int) -> ElasticRestore:
+    return ElasticRestore(
+        SparsePartitionAssignmentSpec.modulo(),
+        partition_count,
+        partition_id,
+        "uint64",
+    )
 
 
 def _config(*, optimizer_dtype="float32", enable_optimizer=True):
@@ -21,6 +32,7 @@ def _config(*, optimizer_dtype="float32", enable_optimizer=True):
         thread_budget=1,
         value_dtype="float32",
         optimizer_dtype=optimizer_dtype,
+        key_dtype="uint64",
         enable_optimizer=enable_optimizer,
     )
 
@@ -40,14 +52,6 @@ def _store_with_optimizer_state():
 def _lookup(store, keys):
     values, _ = store.lookup(np.asarray(keys, dtype=np.uint64), dim=4)
     return np.from_dlpack(values).reshape(-1, 4)
-
-
-def _snapshot(storage, source, *, include_page_images=False):
-    locator = SparseCheckpoint(storage).save(
-        source, "optimizer-loading", include_page_images=include_page_images
-    )
-    manifest = storage._resolve_manifest(locator)
-    return locator, SparseWeightSnapshot(manifest["fragment_digest"])
 
 
 def test_default_and_disabled_optimizer_metadata_and_operations():
@@ -74,16 +78,19 @@ def test_default_and_disabled_optimizer_metadata_and_operations():
 
 def test_entries_snapshot_skips_optimizer_state_for_disabled_target(tmp_path):
     source, keys, _ = _store_with_optimizer_state()
-    storage = LocalLanceStorage(tmp_path / "entries")
-    _, snapshot = _snapshot(storage, source)
+    storage = LocalLanceStorage(tmp_path / ENTRIES_DATASET)
+    locator = SparseCheckpoint(storage).save_training_checkpoint(
+        source, "optimizer-loading"
+    )
     target = se.EmbeddingStore(
         _config(optimizer_dtype="float32", enable_optimizer=False)
     )
 
-    storage.restore_weight_snapshot(
+    storage.load_component_checkpoint(
         target,
-        snapshot,
-        ElasticRestore(lambda values, count: values % count, 1, 0),
+        locator.handle,
+        encode_restore_options(_modulo_restore(1, 0)),
+        load_optimizer_state=False,
     )
 
     np.testing.assert_allclose(_lookup(target, keys), _lookup(source, keys))
@@ -94,18 +101,23 @@ def test_entries_snapshot_skips_optimizer_state_for_disabled_target(tmp_path):
 def test_page_image_snapshot_skips_optimizer_state_for_disabled_target(tmp_path):
     source, keys, _ = _store_with_optimizer_state()
     storage = LocalLanceStorage(tmp_path / "page-images")
-    _, snapshot = _snapshot(storage, source, include_page_images=True)
+    locator = SparseCheckpoint(storage).save_training_checkpoint(
+        source, "optimizer-loading", include_page_images=True
+    )
     target = se.EmbeddingStore(
         _config(optimizer_dtype="float32", enable_optimizer=False)
     )
 
-    storage.restore_weight_snapshot(
+    storage.load_component_checkpoint(
         target,
-        snapshot,
-        PhysicalRestore(
-            CheckpointParticipant(0, 1),
-            strategy=PhysicalRestoreStrategy.FAST_PAGE_CACHE,
+        locator.handle,
+        encode_restore_options(
+            PhysicalRestore(
+                CheckpointParticipant(0, 1),
+                strategy=PhysicalRestoreStrategy.FAST_PAGE_CACHE,
+            )
         ),
+        load_optimizer_state=False,
     )
 
     np.testing.assert_allclose(_lookup(target, keys), _lookup(source, keys))
@@ -115,12 +127,14 @@ def test_training_restore_default_loads_optimizer_state(tmp_path):
     source, keys, _ = _store_with_optimizer_state()
     gradients = np.asarray([[2.0, 3.0, 4.0, 5.0]], dtype=np.float32)
     storage = LocalLanceStorage(tmp_path / "training")
-    locator = SparseCheckpoint(storage).save(source, "training")
+    locator = SparseCheckpoint(storage).save_training_checkpoint(source, "training")
     target = se.EmbeddingStore(
         _config(optimizer_dtype="float16"), optimizer_config=se.Adam(lr=0.01)
     )
 
-    SparseCheckpoint(storage).restore(target, locator)
+    SparseCheckpoint(storage).load_training_checkpoint(
+        target, locator.handle, encode_restore_options(_modulo_restore(1, 0))
+    )
     source.accumulate_gradients(keys, gradients)
     source.optimizer_step()
     target.accumulate_gradients(keys, gradients)
@@ -133,14 +147,15 @@ def test_training_restore_explicit_weight_only_does_not_load_optimizer_state(tmp
     source, keys, _ = _store_with_optimizer_state()
     gradients = np.asarray([[2.0, 3.0, 4.0, 5.0]], dtype=np.float32)
     storage = LocalLanceStorage(tmp_path / "weight-only")
-    locator = SparseCheckpoint(storage).save(source, "weight-only")
+    locator = SparseCheckpoint(storage).save_training_checkpoint(source, "weight-only")
     target = se.EmbeddingStore(
         _config(optimizer_dtype="float16"), optimizer_config=se.Adam(lr=0.01)
     )
 
-    SparseCheckpoint(storage).restore(
+    SparseCheckpoint(storage).load_training_checkpoint(
         target,
-        locator,
+        locator.handle,
+        encode_restore_options(_modulo_restore(1, 0)),
         load_optimizer_state=False,
     )
     source.accumulate_gradients(keys, gradients)
@@ -154,7 +169,9 @@ def test_training_restore_explicit_weight_only_does_not_load_optimizer_state(tmp
 def test_training_weight_only_restore_accepts_disabled_or_different_optimizer(tmp_path):
     source, keys, _ = _store_with_optimizer_state()
     storage = LocalLanceStorage(tmp_path / "weight-only-targets")
-    locator = SparseCheckpoint(storage).save(source, "weight-only-targets")
+    locator = SparseCheckpoint(storage).save_training_checkpoint(
+        source, "weight-only-targets"
+    )
 
     for target in (
         se.EmbeddingStore(_config(enable_optimizer=False)),
@@ -162,15 +179,22 @@ def test_training_weight_only_restore_accepts_disabled_or_different_optimizer(tm
             _config(optimizer_dtype="float32"), optimizer_config=se.Adam(lr=0.01)
         ),
     ):
-        SparseCheckpoint(storage).restore(target, locator, load_optimizer_state=False)
+        SparseCheckpoint(storage).load_training_checkpoint(
+            target,
+            locator.handle,
+            encode_restore_options(_modulo_restore(1, 0)),
+            load_optimizer_state=False,
+        )
         np.testing.assert_allclose(_lookup(target, keys), _lookup(source, keys))
 
 
 def test_training_restore_rejects_optimizer_state_for_disabled_target(tmp_path):
     source, _, _ = _store_with_optimizer_state()
     storage = LocalLanceStorage(tmp_path / "strict")
-    locator = SparseCheckpoint(storage).save(source, "strict")
+    locator = SparseCheckpoint(storage).save_training_checkpoint(source, "strict")
     target = se.EmbeddingStore(_config(enable_optimizer=False))
 
     with pytest.raises(ValueError, match="load_optimizer_state requires"):
-        SparseCheckpoint(storage).restore(target, locator)
+        SparseCheckpoint(storage).load_training_checkpoint(
+            target, locator.handle, encode_restore_options(_modulo_restore(1, 0))
+        )

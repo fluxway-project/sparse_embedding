@@ -1,13 +1,14 @@
-"""
-BUILD file for ops
-"""
+load("@rules_cc//cc:defs.bzl", "cc_library", "cc_test")
 
 filegroup(
     name = "srcs",
-    srcs = glob([
-        "*.hpp",
-        "*.cpp",
-    ]),
+    srcs = glob(
+        [
+            "*.hpp",
+            "*.cpp",
+        ],
+        exclude = ["*_test.cpp"],
+    ),
     visibility = ["//visibility:public"],
 )
 
@@ -15,4 +16,27 @@ filegroup(
     name = "headers",
     srcs = glob(["*.hpp"]),
     visibility = ["//visibility:public"],
+)
+
+cc_library(
+    name = "ops",
+    srcs = glob(
+        ["*.cpp"],
+        exclude = ["*_test.cpp"],
+    ),
+    hdrs = glob(["*.hpp"]),
+    visibility = ["//visibility:public"],
+    deps = [
+        "//sparse_embedding/src/common",
+        "@proxy",
+        "@stdexec",
+    ],
+)
+
+cc_test(
+    name = "partitioner_registry_test",
+    srcs = ["partitioner_registry_test.cpp"],
+    deps = [
+        ":ops",
+    ],
 )

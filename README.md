@@ -12,9 +12,10 @@ High-performance Sparse Embedding Table library for large-scale recommendation s
 - **Batch Optimizer Extension**: `OptimizerExtensionFacade<ParamT, OptT>` is the single optimizer type-erasure seam. The store resolves locator rows under shard-local SeqLock write guards and dispatches one `update(OptimizerBatchView, global_step)` per key shard instead of calling a proxy for every row.
 - **C++23 Standard Concurrency**: Sender/Receiver task scheduling based on NVIDIA `stdexec` + `exec::static_thread_pool`.
 - **Epoch Memory Safety**: Batch protection for concurrent hash map read/write using `epoch::with_epoch`, avoiding ABA problems.
-- **Distributed Lance Checkpointing**: A framework-neutral prepare/write/commit protocol writes manifest-pinned `entries` and physical `page_images`, including slot layout, sequence values, payload/state, and SHA-256 validation. Exact-version restore supports physical participants or caller-owned elastic partition functions. Monotonic commit authority rejects stale coordinators without depending on a specific distributed framework.
-- **Selective Optimizer Loading**: `EmbeddingConfig(enable_optimizer=False)` creates a weight-only inference store without optimizer-state allocation. Training restores load optimizer state by default, while `restore_weight_snapshot` always performs a weight-only restore.
-- **Dynamic Partitioner OPs**: High-performance C++ Partitioners (`ModuloPartitioner`, `HashPartitioner`, `FastRangePartitioner`) supporting efficient feature routing and on-the-fly cluster resharding during checkpoint loading.
+- **Distributed Lance Checkpointing**: Two-phase commit protocol separating `snapshot_manifest.lance` (control ledger) and `entries.lance` (worker slices). Supports 4 native Arrow integer key types (`int32`, `uint32`, `int64`, `uint64`) with DuckDB pushdown and optional physical page cache.
+- **Selective Optimizer Loading**: `EmbeddingConfig(enable_optimizer=False)` creates a weight-only inference store. `load_inference_weights` restores weights only.
+- **Partitioner Registry and Routing (PartitionerRegistry)**: Built on `pro::proxy<PartitionerFacade>` supporting `modulo`, `hash`, `fast_range`, and dynamic extensions. Offline restore uses AVX-512 `filter_span`; online routing (`parallel_partitioner.hpp`) integrates with Fluxway `FunctionPartition`.
+- **Reference Vector Validation**: Canonical `generate_reference_vectors` validates bit-identical partition mappings between distributed runtimes and offline restore engines across all key types.
 - **Eviction Management**: Memory-efficient scoring policies (e.g., LFU) using thread-safe `std::atomic_ref` for concurrent state updates without locking.
 - **Page-Level Hot/Cold Swapping**: Background eviction of cold data pages through address-stable `MAP_FIXED` remapping to file-backed storage based on configurable memory watermarks.
 
@@ -183,12 +184,16 @@ ParlayHash capacity outside the hot path without globally serializing Upsert.
 
 ```
 HogwildEmbeddingStore
+├── StorageTopology (SSOT)       # Immutable topology & branchless bit-shift addressing
+├── StorageResourceTuner         # 2MB HugePage & hardware auto-tuning
 ├── parlayhash (KeyMap)          # Sharded Key→uint32_t mapping
 ├── EmbeddingArena               # Cache-line aligned embedding storage
 │   └── StablePageDirectory      # Stable-address segmented page metadata
-├── PageStorage                   # Auto-detected RAM budget + file-backed spill
+├── PageStorage                  # Auto-detected RAM budget + file-backed spill
 ├── TransientArena[thread_budget]  # Per-shard gradient accumulation (lock-free)
 ├── exec::static_thread_pool     # C++23 stdexec thread pool
+├── PartitionerRegistry (ops)    # Zero-vtable proxy partitioner registry (modulo/hash/fast_range)
+├── ParallelPartitioner          # 1.03B keys/s multi-threaded router & AVX-512 mask filter
 └── pro::proxy<OptimizerExtensionFacade<ParamT, OptT>> # Batch optimizer seam
 ```
 

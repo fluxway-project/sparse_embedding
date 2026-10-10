@@ -5,35 +5,6 @@ BUILD file for checkpoint
 load("@rules_cc//cc:defs.bzl", "cc_library")
 
 cc_library(
-    name = "checkpoint_interface",
-    hdrs = [
-        "checkpoint_interface.hpp",
-    ],
-    visibility = ["//visibility:public"],
-    deps = [
-        "@proxy",
-    ],
-)
-
-cc_library(
-    name = "checkpoint_batch_filter",
-    hdrs = ["checkpoint_batch_filter.hpp"],
-    visibility = ["//visibility:public"],
-)
-
-cc_library(
-    name = "checkpoint_registry",
-    srcs = ["checkpoint_registry.cpp"],
-    hdrs = [
-        "checkpoint_registry.hpp",
-    ],
-    visibility = ["//visibility:public"],
-    deps = [
-        ":checkpoint_interface",
-    ],
-)
-
-cc_library(
     name = "partitioned_checkpoint",
     hdrs = [
         "partitioned_checkpoint.hpp",
@@ -53,24 +24,16 @@ cc_library(
     name = "checkpoint",
     visibility = ["//visibility:public"],
     deps = [
-        ":checkpoint_batch_filter",
-        ":checkpoint_interface",
         ":checkpoint_layout_schema",
-        ":checkpoint_registry",
+        ":checkpoint_stream_policy",
         ":partitioned_checkpoint",
     ],
 )
 
-cc_test(
-    name = "checkpoint_batch_filter_test",
-    srcs = ["checkpoint_batch_filter_test.cpp"],
-    deps = [":checkpoint_batch_filter"],
-)
-
-cc_test(
-    name = "checkpoint_registry_test",
-    srcs = ["checkpoint_registry_test.cpp"],
-    deps = [":checkpoint_registry"],
+cc_library(
+    name = "checkpoint_stream_policy",
+    hdrs = ["checkpoint_stream_policy.hpp"],
+    visibility = ["//visibility:public"],
 )
 
 cc_test(
@@ -82,14 +45,11 @@ cc_test(
 cc_library(
     name = "checkpoint_lance",
     srcs = [
-        "lance/lance_checkpoint.cpp",
-        "lance/lance_checkpoint_registry.cpp",
         "lance/native_fragment_writer.cpp",
     ],
     hdrs = [
         "checkpoint_stream_policy.hpp",
         "lance/arrow/c/abi.h",
-        "lance/lance_checkpoint.hpp",
         "lance/layout_schema.hpp",
         "lance/native_fragment_writer.hpp",
         "lance/storage_options.hpp",
@@ -97,17 +57,14 @@ cc_library(
     tags = ["manual"],
     visibility = ["//visibility:public"],
     deps = [
-        ":checkpoint_interface",
-        ":checkpoint_registry",
+        ":checkpoint_layout_schema",
+        ":checkpoint_stream_policy",
+        "//sparse_embedding/src/common",
+        "//sparse_embedding/src/ops",
         "@lance_c",
+        "@proxy",
     ],
     alwayslink = True,
-)
-
-cc_test(
-    name = "lance_checkpoint_registry_test",
-    srcs = ["lance/lance_checkpoint_registry_test.cpp"],
-    deps = [":checkpoint_lance"],
 )
 
 cc_test(

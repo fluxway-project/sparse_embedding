@@ -8,6 +8,7 @@ cc_library(
     name = "common",
     hdrs = [
         "checked_numeric.hpp",
+        "dtypes.hpp",
         "embedding_error.hpp",
         "function.hpp",
         "numeric_types.hpp",

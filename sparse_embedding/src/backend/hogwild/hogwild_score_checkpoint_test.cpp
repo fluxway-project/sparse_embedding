@@ -14,7 +14,8 @@
 // =============================================================================
 
 // Tests for HogwildEmbeddingStore: score integration, assign_scores,
-// export_batch, evict_by_score, checkpoint save/load via proxy facades.
+// export_batch, evict_by_score, checkpoint save/load via export/import
+// roundtrip.
 
 #include <cassert>
 #include <cstring>
@@ -26,7 +27,6 @@
 #include <vector>
 
 #include "sparse_embedding/src/backend/hogwild/hogwild_embedding_store.hpp"
-#include "sparse_embedding/src/checkpoint/checkpoint_interface.hpp"
 #include "sparse_embedding/src/eviction/score_policy.hpp"
 
 using namespace se;

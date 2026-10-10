@@ -42,6 +42,7 @@ cc_binary(
     linkshared = True,
     deps = [
         "//sparse_embedding/src/backend/hogwild:hogwild_embedding_store",
+        "//sparse_embedding/src/bindings:checkpoint_instantiations",
         "//sparse_embedding/src/checkpoint",
         "//sparse_embedding/src/common",
         "//sparse_embedding/src/eviction",
@@ -51,6 +52,7 @@ cc_binary(
         "@dlpack",
         "@nanobind",
         "@proxy",
+        "@stdexec",
     ],
 )
 
@@ -95,6 +97,7 @@ cc_binary(
         "@dlpack",
         "@nanobind",
         "@proxy",
+        "@stdexec",
     ],
 )
 

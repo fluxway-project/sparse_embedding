@@ -94,8 +94,8 @@ public:
           for (const GradT gradient : gradients) {
             const float scaled = static_cast<float>(gradient) / scale_;
             if (!std::isfinite(scaled) ||
-                std::abs(scaled) >
-                    static_cast<float>(std::numeric_limits<StoredT>::max()))
+                std::abs(scaled) > dtype_max<StoredT>() ||
+                std::abs(scaled) > dtype_max<ParamT>())
               throw std::overflow_error(
                   "gradient scale storage exceeds configured dtype");
           }
@@ -110,6 +110,12 @@ public:
         [&](auto &arena) {
           using ArenaT = std::remove_reference_t<decltype(*arena)>;
           using StoredT = typename ArenaT::value_type;
+          if constexpr (std::is_same_v<GradT, StoredT>) {
+            if (scale_ == 1.0f) {
+              arena->accumulate_hashed(feature_id, feature_hash, gradient);
+              return;
+            }
+          }
           thread_local std::vector<StoredT> scaled;
           scaled.resize(dim_);
           for (size_t col = 0; col < dim_; ++col) {
@@ -125,6 +131,14 @@ public:
     std::visit(
         [&](auto &arena) {
           arena->with_accumulated_batch([&](const auto &raw) {
+            using ArenaT = std::remove_reference_t<decltype(*arena)>;
+            using StoredT = typename ArenaT::value_type;
+            if constexpr (std::is_same_v<StoredT, ParamT>) {
+              if (scale_ == 1.0f) {
+                std::forward<Fn>(fn)(raw);
+                return;
+              }
+            }
             GradientBatchView<ParamT> batch;
             batch.assign(raw, dim_, scale_);
             std::forward<Fn>(fn)(batch);
@@ -138,6 +152,16 @@ public:
   }
 
 private:
+  template <typename T> static constexpr float dtype_max() {
+    if constexpr (std::is_same_v<T, float>)
+      return std::numeric_limits<float>::max();
+    if constexpr (std::is_same_v<T, float16_t>)
+      return 65504.0f;
+    if constexpr (std::is_same_v<T, bfloat16_t>)
+      return 3.38953139e38f;
+    return std::numeric_limits<T>::max();
+  }
+
   static void validate_scale(float scale) {
     if (!std::isfinite(scale))
       throw std::invalid_argument("gradient_scale must be finite");

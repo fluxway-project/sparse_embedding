@@ -124,6 +124,34 @@ def test_modulo_partitioner_matches_standard_modulo_for_all_key_dtypes() -> None
     )
 
 
+def test_parallel_partitioner() -> None:
+    keys = np.arange(100_000, dtype=np.int64) - 50_000
+    partitioner = sparse_embedding.ModuloPartitioner(num_shards=16)
+    expected = np.mod(keys, np.int64(16)).astype(np.uint32)
+
+    for num_threads in (0, 1, 2, 4, 8):
+        actual = np.from_dlpack(partitioner.partition(keys, num_threads=num_threads))
+        np.testing.assert_array_equal(actual, expected)
+
+        mask = np.from_dlpack(
+            partitioner.filter(keys, target_shard=7, num_threads=num_threads)
+        )
+        np.testing.assert_array_equal(mask, expected == 7)
+
+    async def run_async_test() -> None:
+        actual_async = np.from_dlpack(
+            await partitioner.async_partition(keys, num_threads=4)
+        )
+        np.testing.assert_array_equal(actual_async, expected)
+
+        mask_async = np.from_dlpack(
+            await partitioner.async_filter(keys, target_shard=3, num_threads=4)
+        )
+        np.testing.assert_array_equal(mask_async, expected == 3)
+
+    asyncio.run(run_async_test())
+
+
 # =============================================================================
 # encode_keys / decode_keys
 # =============================================================================

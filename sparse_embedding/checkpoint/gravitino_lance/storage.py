@@ -5,10 +5,11 @@ from collections.abc import Mapping
 from .._lance_workspace import S3LanceWorkspace
 from ..catalog import TableHandle
 from ..lance_backend import _LanceCheckpointStorage
+from ..schema import SNAPSHOT_MANIFEST_DATASET
 from .config import SdkConfig
 from .rest import LanceRestCatalog, LanceRestError
 
-_DATASETS = ("snapshot_manifest",)
+_DATASETS = (("snapshot_manifest", SNAPSHOT_MANIFEST_DATASET),)
 
 
 class GravitinoLanceStorage(_LanceCheckpointStorage):
@@ -38,11 +39,11 @@ class GravitinoLanceStorage(_LanceCheckpointStorage):
         created_tables: list[tuple[str, str, str]] = []
         try:
             handles = []
-            for dataset in _DATASETS:
+            for dataset, physical_name in _DATASETS:
                 table_id = (*namespace, f"{component_id}_{dataset}")
                 handle, created = self._ensure_table(
                     table_id,
-                    f"{location.rstrip('/')}/{dataset}",
+                    f"{location.rstrip('/')}/{physical_name}",
                     provision=provision,
                 )
                 handles.append(handle)

@@ -15,6 +15,7 @@ nb::object AsyncOpsImpl<ParamT, OptT>::async_lookup(
   auto [dlm_keys, cap_keys] = se::py::extract_dlpack_tensor(keys);
   size_t n = get_dlm_size(dlm_keys);
   auto kdt = detect_key_dtype(dlm_keys);
+  validate_key_dtype(kdt, self.key_type_enum_);
   const void *keys_data =
       reinterpret_cast<const char *>(dlm_keys->dl_tensor.data) +
       dlm_keys->dl_tensor.byte_offset;
@@ -43,12 +44,7 @@ nb::object AsyncOpsImpl<ParamT, OptT>::async_lookup(
             if (ec)
               throw std::runtime_error(ec.message());
           };
-          if (kdt == KeyDType::kInt64)
-            do_lookup(std::span<const int64_t>(
-                static_cast<const int64_t *>(keys_data), n));
-          else
-            do_lookup(std::span<const uint64_t>(
-                static_cast<const uint64_t *>(keys_data), n));
+          dispatch_key_span(kdt, keys_data, n, do_lookup);
         } catch (...) {
           if (vals_dlm)
             vals_dlm->deleter(vals_dlm);
@@ -89,6 +85,7 @@ nb::object AsyncOpsImpl<ParamT, OptT>::async_assign(
     throw std::invalid_argument("values must be a 1D or 2D tensor");
   }
   auto kdt = detect_key_dtype(dlm_keys);
+  validate_key_dtype(kdt, self.key_type_enum_);
   const void *keys_data =
       reinterpret_cast<const char *>(dlm_keys->dl_tensor.data) +
       dlm_keys->dl_tensor.byte_offset;
@@ -113,11 +110,7 @@ nb::object AsyncOpsImpl<ParamT, OptT>::async_assign(
                   static_cast<const ParamT *>(values_data), n * val_dim),
               tls_row_lengths);
         };
-        if (kdt == KeyDType::kInt64)
-          return do_assign(std::span<const int64_t>(
-              static_cast<const int64_t *>(keys_data), n));
-        return do_assign(std::span<const uint64_t>(
-            static_cast<const uint64_t *>(keys_data), n));
+        return dispatch_key_span(kdt, keys_data, n, do_assign);
       },
       [](nb::object future, std::error_code ec) {
         if (!ec)
@@ -135,6 +128,7 @@ nb::object AsyncOpsImpl<ParamT, OptT>::async_lookup_or_insert(
   auto [dlm_keys, cap_keys] = se::py::extract_dlpack_tensor(keys);
   size_t n = get_dlm_size(dlm_keys);
   auto kdt = detect_key_dtype(dlm_keys);
+  validate_key_dtype(kdt, self.key_type_enum_);
   const void *keys_data =
       reinterpret_cast<const char *>(dlm_keys->dl_tensor.data) +
       dlm_keys->dl_tensor.byte_offset;
@@ -165,12 +159,7 @@ nb::object AsyncOpsImpl<ParamT, OptT>::async_lookup_or_insert(
             if (ec)
               throw std::runtime_error(ec.message());
           };
-          if (kdt == KeyDType::kInt64)
-            do_loi(std::span<const int64_t>(
-                static_cast<const int64_t *>(keys_data), n));
-          else
-            do_loi(std::span<const uint64_t>(
-                static_cast<const uint64_t *>(keys_data), n));
+          dispatch_key_span(kdt, keys_data, n, do_loi);
         } catch (...) {
           if (vals_dlm)
             vals_dlm->deleter(vals_dlm);
@@ -211,6 +200,7 @@ nb::object AsyncOpsImpl<ParamT, OptT>::async_accumulate_gradients(
     throw std::invalid_argument("grads must be a 1D or 2D tensor");
   }
   auto kdt = detect_key_dtype(dlm_keys);
+  validate_key_dtype(kdt, self.key_type_enum_);
   auto *wrapper_ptr = &self;
   return dispatch_value_dtype(self.gradient_dtype_code_,
                              [&]<typename GradT>() -> nb::object {
@@ -235,11 +225,7 @@ nb::object AsyncOpsImpl<ParamT, OptT>::async_accumulate_gradients(
                     ks, std::span<const GradT>(grads_data, n * dim),
                     tls_row_lengths);
           };
-          if (kdt == KeyDType::kInt64)
-            return do_acc(std::span<const int64_t>(
-                static_cast<const int64_t *>(keys_data), n));
-          return do_acc(std::span<const uint64_t>(
-              static_cast<const uint64_t *>(keys_data), n));
+          return dispatch_key_span(kdt, keys_data, n, do_acc);
         },
         [](nb::object future, std::error_code ec) {
           if (!ec)
@@ -278,6 +264,7 @@ nb::object AsyncOpsImpl<ParamT, OptT>::async_contains(
   auto [dlm_keys, cap_keys] = se::py::extract_dlpack_tensor(keys);
   size_t n = get_dlm_size(dlm_keys);
   auto kdt = detect_key_dtype(dlm_keys);
+  validate_key_dtype(kdt, self.key_type_enum_);
   const void *keys_data =
       reinterpret_cast<const char *>(dlm_keys->dl_tensor.data) +
       dlm_keys->dl_tensor.byte_offset;
@@ -299,12 +286,7 @@ nb::object AsyncOpsImpl<ParamT, OptT>::async_contains(
             if (ec)
               throw std::runtime_error(ec.message());
           };
-          if (kdt == KeyDType::kInt64)
-            do_contains(std::span<const int64_t>(
-                static_cast<const int64_t *>(keys_data), n));
-          else
-            do_contains(std::span<const uint64_t>(
-                static_cast<const uint64_t *>(keys_data), n));
+          dispatch_key_span(kdt, keys_data, n, do_contains);
         } catch (...) {
           if (out_dlm)
             out_dlm->deleter(out_dlm);
@@ -323,6 +305,7 @@ nb::object AsyncOpsImpl<ParamT, OptT>::async_erase(
   auto [dlm_keys, cap_keys] = se::py::extract_dlpack_tensor(keys);
   size_t n = get_dlm_size(dlm_keys);
   auto kdt = detect_key_dtype(dlm_keys);
+  validate_key_dtype(kdt, self.key_type_enum_);
   const void *keys_data =
       reinterpret_cast<const char *>(dlm_keys->dl_tensor.data) +
       dlm_keys->dl_tensor.byte_offset;
@@ -332,15 +315,10 @@ nb::object AsyncOpsImpl<ParamT, OptT>::async_erase(
       [wrapper_ptr, n, kdt, keys_data,
        keys_keeper = std::make_shared<se::py::AsyncPyObjectKeeper>(
            cap_keys)]() -> std::error_code {
-        if (kdt == KeyDType::kInt64) {
-          return wrapper_ptr->get_store<ParamT, OptT>()->erase(
-              std::span<const int64_t>(
-                  static_cast<const int64_t *>(keys_data), n));
-        } else {
-          return wrapper_ptr->get_store<ParamT, OptT>()->erase(
-              std::span<const uint64_t>(
-                  static_cast<const uint64_t *>(keys_data), n));
-        }
+        auto erase = [&](auto keys_span) {
+          return wrapper_ptr->get_store<ParamT, OptT>()->erase(keys_span);
+        };
+        return dispatch_key_span(kdt, keys_data, n, erase);
       },
       [](nb::object future, std::error_code ec) {
         if (!ec) {
@@ -381,6 +359,7 @@ nb::object AsyncOpsImpl<ParamT, OptT>::async_assign_scores(
   auto [dlm_scores, cap_scores] = se::py::extract_dlpack_tensor(scores);
   size_t n = get_dlm_size(dlm_keys);
   auto kdt = detect_key_dtype(dlm_keys);
+  validate_key_dtype(kdt, self.key_type_enum_);
   const void *keys_data =
       reinterpret_cast<const char *>(dlm_keys->dl_tensor.data) +
       dlm_keys->dl_tensor.byte_offset;
@@ -397,17 +376,11 @@ nb::object AsyncOpsImpl<ParamT, OptT>::async_assign_scores(
            cap_scores)]() -> std::error_code {
         auto scores_span = std::span<const uint64_t>(
             static_cast<const uint64_t *>(scores_data), n);
-        if (kdt == KeyDType::kInt64) {
+        auto assign_scores = [&](auto keys_span) {
           return wrapper_ptr->get_store<ParamT, OptT>()->assign_scores(
-              std::span<const int64_t>(
-                  static_cast<const int64_t *>(keys_data), n),
-              scores_span);
-        } else {
-          return wrapper_ptr->get_store<ParamT, OptT>()->assign_scores(
-              std::span<const uint64_t>(
-                  static_cast<const uint64_t *>(keys_data), n),
-              scores_span);
-        }
+              keys_span, scores_span);
+        };
+        return dispatch_key_span(kdt, keys_data, n, assign_scores);
       },
       [](nb::object future, std::error_code ec) {
         if (!ec) {

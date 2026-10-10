@@ -2,11 +2,64 @@
 
 from __future__ import annotations
 
-from collections.abc import Callable, Sequence
+import math
+from abc import ABC, abstractmethod
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from datetime import datetime
 from enum import Enum
+from types import MappingProxyType
 from typing import Any, Protocol, TypeAlias
+
+SPARSE_EMBEDDING_MODULO_ASSIGNMENT_NAME = "sparse_embedding.modulo"
+SPARSE_EMBEDDING_HASH_ASSIGNMENT_NAME = "sparse_embedding.hash"
+SPARSE_EMBEDDING_FAST_RANGE_ASSIGNMENT_NAME = "sparse_embedding.fast_range"
+_MAX_ASSIGNMENT_NAME_BYTES = 128
+_MAX_ASSIGNMENT_MAP_ITEMS = 8
+_MAX_ASSIGNMENT_ARRAY_ITEMS = 8
+_MAX_ASSIGNMENT_STRING_BYTES = 128
+_MAX_ASSIGNMENT_DEPTH = 8
+
+
+def _freeze_assignment_value(value: object, path: str, depth: int = 0) -> object:
+    if depth > _MAX_ASSIGNMENT_DEPTH:
+        raise ValueError(f"{path} exceeds assignment nesting depth limit")
+    if value is None or isinstance(value, bool):
+        return value
+    if isinstance(value, int):
+        if value < -(1 << 63) or value >= 1 << 64:
+            raise ValueError(f"{path} integer is out of range")
+        return value
+    if isinstance(value, float):
+        if not math.isfinite(value):
+            raise ValueError(f"{path} must be finite")
+        return value
+    if isinstance(value, str):
+        if not value or len(value.encode("utf-8")) > _MAX_ASSIGNMENT_STRING_BYTES:
+            raise ValueError(f"{path} has an invalid string")
+        return value
+    if isinstance(value, Mapping):
+        if len(value) > _MAX_ASSIGNMENT_MAP_ITEMS:
+            raise ValueError(f"{path} exceeds map size limit")
+        keys = tuple(value)
+        if any(not isinstance(key, str) or not key for key in keys):
+            raise TypeError(f"{path} keys must be non-empty strings")
+        if keys != tuple(sorted(keys)):
+            raise ValueError(f"{path} keys must be sorted")
+        return MappingProxyType(
+            {
+                key: _freeze_assignment_value(value[key], f"{path}.{key}", depth + 1)
+                for key in keys
+            }
+        )
+    if isinstance(value, (list, tuple)):
+        if len(value) > _MAX_ASSIGNMENT_ARRAY_ITEMS:
+            raise ValueError(f"{path} exceeds array size limit")
+        return tuple(
+            _freeze_assignment_value(item, f"{path}[{index}]", depth + 1)
+            for index, item in enumerate(value)
+        )
+    raise TypeError(f"{path} contains an unsupported value")
 
 
 class SparseCheckpointError(RuntimeError):
@@ -34,6 +87,7 @@ class UnsupportedValueType(SparseCheckpointError):
 
 
 SUPPORTED_VALUE_DTYPES = frozenset({"float16", "float32", "bfloat16"})
+SUPPORTED_KEY_DTYPES = frozenset({"int32", "uint32", "int64", "uint64"})
 
 
 @dataclass(frozen=True, slots=True)
@@ -42,7 +96,7 @@ class TableSpecification:
     embedding_dtype: str
     optimizer_dtype: str | None
     score_policy: str
-    protocol_version: int
+    key_dtype: str
 
     def __post_init__(self) -> None:
         if not self.dimensions or any(
@@ -65,8 +119,8 @@ class TableSpecification:
             )
         if not self.score_policy.strip():
             raise ValueError("score_policy must be non-empty")
-        if self.protocol_version != 1:
-            raise ValueError("unsupported checkpoint protocol version")
+        if self.key_dtype not in SUPPORTED_KEY_DTYPES:
+            raise ValueError(f"unsupported key dtype: {self.key_dtype}")
 
 
 @dataclass(frozen=True, slots=True)
@@ -171,21 +225,21 @@ class SparseCheckpointLocator:
             raise ValueError("checkpoint_version must be a positive integer")
 
 
-@dataclass(frozen=True, slots=True)
-class SparseWeightSnapshot:
-    """Immutable content identity used by inference weight sources."""
+CheckpointHandle: TypeAlias = bytes
 
-    snapshot_digest: str
+
+@dataclass(frozen=True, slots=True)
+class CommittedCheckpoint:
+    """Owner-issued opaque handle and its logical version identity."""
+
+    handle: CheckpointHandle
+    version_id: bytes
 
     def __post_init__(self) -> None:
-        if (
-            not isinstance(self.snapshot_digest, str)
-            or not self.snapshot_digest.strip()
-        ):
-            raise ValueError("snapshot_digest must be a non-empty string")
-
-
-PartitionFn: TypeAlias = Callable[[Any, int], Any]
+        if not isinstance(self.handle, bytes) or not self.handle:
+            raise ValueError("checkpoint handle must be non-empty bytes")
+        if not isinstance(self.version_id, bytes) or not self.version_id:
+            raise ValueError("checkpoint version_id must be non-empty bytes")
 
 
 class PhysicalRestoreStrategy(str, Enum):
@@ -193,40 +247,298 @@ class PhysicalRestoreStrategy(str, Enum):
     FAST_PAGE_CACHE = "fast_page_cache"
 
 
-@dataclass(frozen=True, slots=True)
-class PhysicalRestore:
-    participant: CheckpointParticipant
-    strategy: PhysicalRestoreStrategy = PhysicalRestoreStrategy.RECONSTRUCT_ENTRIES
+class PartitionSpec:
+    """Declarative partition specification serving as Single Source of Truth."""
 
-    def __post_init__(self) -> None:
-        if not isinstance(self.strategy, PhysicalRestoreStrategy):
+    __slots__ = ("_name", "_parameters")
+
+    def __init__(
+        self,
+        name: str,
+        parameters: Mapping[str, object] | None = None,
+    ) -> None:
+        if not isinstance(name, str):
+            raise TypeError("partition spec name must be a string")
+        if not name.strip():
+            raise ValueError("partition spec name must be non-empty")
+        if len(name.encode("utf-8")) > _MAX_ASSIGNMENT_NAME_BYTES:
+            raise ValueError("partition spec name is too long")
+        params = parameters if parameters is not None else {}
+        if not isinstance(params, Mapping):
+            raise TypeError("partition spec parameters must be a mapping")
+
+        frozen_parameters = _freeze_assignment_value(params, "parameters")
+        if not isinstance(frozen_parameters, Mapping):
+            raise TypeError("partition spec parameters must be a mapping")
+
+        _APPROVED_ASSIGNMENTS = {
+            SPARSE_EMBEDDING_MODULO_ASSIGNMENT_NAME,
+            SPARSE_EMBEDDING_HASH_ASSIGNMENT_NAME,
+            SPARSE_EMBEDDING_FAST_RANGE_ASSIGNMENT_NAME,
+        }
+        if name not in _APPROVED_ASSIGNMENTS:
+            try:
+                import sparse_embedding as _se
+
+                if not _se.is_partitioner_registered(name):
+                    raise ValueError(
+                        "sparse assignment is not an owner-approved executable contract"
+                    )
+            except (ImportError, AttributeError):
+                raise ValueError(
+                    "sparse assignment is not an owner-approved executable contract"
+                )
+
+        self._name = name
+        self._parameters = frozen_parameters
+
+    @property
+    def name(self) -> str:
+        return self._name
+
+    @property
+    def parameters(self) -> Mapping[str, object]:
+        return self._parameters
+
+    @property
+    def sparse_assignment_name(self) -> str:
+        return self._name
+
+    @property
+    def sparse_assignment_parameters(self) -> Mapping[str, object]:
+        return self._parameters
+
+    def __eq__(self, other: object) -> bool:
+        if isinstance(other, PartitionSpec):
+            return self._name == other._name and self._parameters == other._parameters
+        return False
+
+    def __hash__(self) -> int:
+        return hash((self._name, tuple(sorted(self._parameters.items()))))
+
+    def __repr__(self) -> str:
+        return (
+            f"PartitionSpec(name={self._name!r}, parameters={dict(self._parameters)!r})"
+        )
+
+    @classmethod
+    def modulo(cls) -> PartitionSpec:
+        return cls(SPARSE_EMBEDDING_MODULO_ASSIGNMENT_NAME, {})
+
+    @classmethod
+    def hash(cls, *, seed: int | None = None) -> PartitionSpec:
+        params: dict[str, object] = {}
+        if seed is not None:
+            params["seed"] = str(seed)
+        return cls(SPARSE_EMBEDDING_HASH_ASSIGNMENT_NAME, params)
+
+    @classmethod
+    def fast_range(cls) -> PartitionSpec:
+        return cls(SPARSE_EMBEDDING_FAST_RANGE_ASSIGNMENT_NAME, {})
+
+    @classmethod
+    def from_strategy(cls, strategy: Any) -> PartitionSpec:
+        if hasattr(strategy, "spec") and isinstance(strategy.spec, PartitionSpec):
+            return strategy.spec
+        raise TypeError(
+            f"Expected PartitionStrategy with .spec, got {type(strategy).__name__}"
+        )
+
+
+SparsePartitionAssignmentSpec: TypeAlias = PartitionSpec
+
+
+class RestorePlan(ABC):
+    """Abstract base class for typed checkpoint restore plans."""
+
+    __slots__ = ()
+
+    @property
+    @abstractmethod
+    def restore_kind(self) -> str:
+        """Identifier for restore mode ('physical' or 'elastic')."""
+        raise NotImplementedError
+
+    @abstractmethod
+    def encode(self) -> bytes:
+        """Encode this restore plan into canonical opaque bytes."""
+        raise NotImplementedError
+
+    @classmethod
+    def decode(cls, payload: bytes) -> RestorePlan:
+        """Decode canonical opaque bytes into a concrete RestorePlan."""
+        from .restore_options import _decode_restore_options
+
+        return _decode_restore_options(payload)
+
+    @classmethod
+    def physical(
+        cls,
+        participant: CheckpointParticipant,
+        strategy: PhysicalRestoreStrategy = PhysicalRestoreStrategy.RECONSTRUCT_ENTRIES,
+        key_dtype: str = "uint64",
+    ) -> PhysicalRestore:
+        return PhysicalRestore(participant, strategy, key_dtype)
+
+    @classmethod
+    def elastic(
+        cls,
+        spec: PartitionSpec,
+        partition_count: int,
+        partition_id: int,
+        key_dtype: str = "uint64",
+    ) -> ElasticRestore:
+        return ElasticRestore(spec, partition_count, partition_id, key_dtype)
+
+
+class PhysicalRestore(RestorePlan):
+    """Physical restore plan restoring 1-to-1 rank fragments."""
+
+    __slots__ = ("_participant", "_strategy", "_key_dtype")
+
+    def __init__(
+        self,
+        participant: CheckpointParticipant,
+        strategy: PhysicalRestoreStrategy = PhysicalRestoreStrategy.RECONSTRUCT_ENTRIES,
+        key_dtype: str = "uint64",
+    ) -> None:
+        if not isinstance(participant, CheckpointParticipant):
+            raise TypeError(
+                f"participant must be a CheckpointParticipant; got {type(participant).__name__}"
+            )
+        if not isinstance(strategy, PhysicalRestoreStrategy):
             raise TypeError("strategy must be a PhysicalRestoreStrategy")
+        if key_dtype not in SUPPORTED_KEY_DTYPES:
+            raise ValueError(f"unsupported key dtype: {key_dtype}")
+
+        self._participant = participant
+        self._strategy = strategy
+        self._key_dtype = key_dtype
+
+    @property
+    def restore_kind(self) -> str:
+        return "physical"
+
+    @property
+    def participant(self) -> CheckpointParticipant:
+        return self._participant
+
+    @property
+    def strategy(self) -> PhysicalRestoreStrategy:
+        return self._strategy
+
+    @property
+    def key_dtype(self) -> str:
+        return self._key_dtype
+
+    def __eq__(self, other: object) -> bool:
+        if isinstance(other, PhysicalRestore):
+            return (
+                self._participant == other._participant
+                and self._strategy == other._strategy
+                and self._key_dtype == other._key_dtype
+            )
+        return False
+
+    def __hash__(self) -> int:
+        return hash((self._participant, self._strategy, self._key_dtype))
+
+    def __repr__(self) -> str:
+        return (
+            f"PhysicalRestore(participant={self._participant!r}, "
+            f"strategy={self._strategy!r}, key_dtype={self._key_dtype!r})"
+        )
+
+    def encode(self) -> bytes:
+        from .restore_options import encode_restore_options
+
+        return encode_restore_options(self)
 
 
-@dataclass(frozen=True, slots=True)
-class ElasticRestore:
-    partition_fn: PartitionFn
-    partition_count: int
-    target_partition_id: int
+class ElasticRestore(RestorePlan):
+    """Elastic restore plan specifying partition redistribution semantics."""
 
-    def __post_init__(self) -> None:
-        if not callable(self.partition_fn):
-            raise TypeError("partition_fn must be callable")
-        if isinstance(self.partition_count, bool) or not isinstance(
-            self.partition_count, int
-        ):
+    __slots__ = ("_spec", "_partition_count", "_partition_id", "_key_dtype")
+
+    def __init__(
+        self,
+        spec: PartitionSpec,
+        partition_count: int,
+        partition_id: int,
+        key_dtype: str = "uint64",
+    ) -> None:
+        if not isinstance(spec, PartitionSpec):
+            raise TypeError(f"spec must be a PartitionSpec; got {type(spec).__name__}")
+        if key_dtype not in SUPPORTED_KEY_DTYPES:
+            raise ValueError(f"unsupported key dtype: {key_dtype}")
+        if isinstance(partition_count, bool) or not isinstance(partition_count, int):
             raise TypeError("partition_count must be an integer")
-        if self.partition_count <= 0:
+        if partition_count <= 0:
             raise ValueError("partition_count must be positive")
-        if isinstance(self.target_partition_id, bool) or not isinstance(
-            self.target_partition_id, int
-        ):
-            raise TypeError("target_partition_id must be an integer")
-        if not 0 <= self.target_partition_id < self.partition_count:
-            raise ValueError("target_partition_id is outside partition_count")
+        if isinstance(partition_id, bool) or not isinstance(partition_id, int):
+            raise TypeError("partition_id must be an integer")
+        if not 0 <= partition_id < partition_count:
+            raise ValueError("partition_id is outside partition_count")
+
+        self._spec = spec
+        self._partition_count = partition_count
+        self._partition_id = partition_id
+        self._key_dtype = key_dtype
+
+    @property
+    def restore_kind(self) -> str:
+        return "elastic"
+
+    @property
+    def spec(self) -> PartitionSpec:
+        return self._spec
+
+    @property
+    def assignment_spec(self) -> PartitionSpec:
+        return self._spec
+
+    @property
+    def key_dtype(self) -> str:
+        return self._key_dtype
+
+    @property
+    def partition_count(self) -> int:
+        return self._partition_count
+
+    @property
+    def partition_id(self) -> int:
+        return self._partition_id
+
+    def __eq__(self, other: object) -> bool:
+        if isinstance(other, ElasticRestore):
+            return (
+                self._spec == other._spec
+                and self._key_dtype == other._key_dtype
+                and self._partition_count == other._partition_count
+                and self._partition_id == other._partition_id
+            )
+        return False
+
+    def __hash__(self) -> int:
+        return hash(
+            (self._spec, self._key_dtype, self._partition_count, self._partition_id)
+        )
+
+    def __repr__(self) -> str:
+        return (
+            f"ElasticRestore(spec={self._spec!r}, "
+            f"key_dtype={self._key_dtype!r}, "
+            f"partition_count={self._partition_count}, "
+            f"partition_id={self._partition_id})"
+        )
+
+    def encode(self) -> bytes:
+        from .restore_options import encode_restore_options
+
+        return encode_restore_options(self)
 
 
-RestoreMode: TypeAlias = PhysicalRestore | ElasticRestore
+RestoreMode: TypeAlias = RestorePlan
 
 
 @dataclass(frozen=True, slots=True)
@@ -247,7 +559,6 @@ class CheckpointLeaseRequest:
 @dataclass(frozen=True, slots=True)
 class CheckpointLease:
     lease_id: str
-    locator: SparseCheckpointLocator
     lease_holder_id: str
     expires_at: datetime
     generation: int
@@ -272,21 +583,26 @@ class CheckpointLease:
 @dataclass(frozen=True, slots=True)
 class CleanupReservation:
     reservation_id: str
-    locators: tuple[SparseCheckpointLocator, ...]
+    owner_handle: CheckpointHandle
+    handles: tuple[CheckpointHandle, ...]
 
     def __post_init__(self) -> None:
         if not isinstance(self.reservation_id, str) or not self.reservation_id.strip():
             raise ValueError("reservation_id must be a non-empty string")
-        if not self.locators:
+        if not isinstance(self.owner_handle, bytes) or not self.owner_handle:
+            raise ValueError("cleanup owner handle must be non-empty bytes")
+        if not self.handles:
             raise ValueError("reclaim reservation requires locators")
-        if len(set(self.locators)) != len(self.locators):
-            raise ValueError("reclaim reservation locators must be unique")
+        if any(not isinstance(handle, bytes) or not handle for handle in self.handles):
+            raise ValueError("cleanup handles must be non-empty bytes")
+        if len(set(self.handles)) != len(self.handles):
+            raise ValueError("reclaim reservation handles must be unique")
 
 
 class CheckpointLeaseStore(Protocol):
     def acquire_checkpoint_lease(
         self,
-        locator: SparseCheckpointLocator,
+        handle: CheckpointHandle,
         request: CheckpointLeaseRequest,
     ) -> CheckpointLease: ...
 
@@ -305,7 +621,7 @@ class CheckpointCleanup(Protocol):
     def reserve_cleanup(
         self,
         reservation_id: str,
-        ordered_candidates: Sequence[SparseCheckpointLocator],
+        ordered_candidates: Sequence[CheckpointHandle],
         required_count: int,
     ) -> CleanupReservation: ...
 
@@ -316,13 +632,10 @@ class CheckpointCleanup(Protocol):
     def cleanup_checkpoint(
         self,
         reservation: CleanupReservation,
-        locator: SparseCheckpointLocator,
-        reference_id: str,
+        handle: CheckpointHandle,
     ) -> None: ...
 
-    def release_reference(
-        self, locator: SparseCheckpointLocator, reference_id: str
-    ) -> None: ...
+    def release_reference(self, handle: CheckpointHandle) -> None: ...
 
 
 class SparseCheckpointProtocol(Protocol):
@@ -343,26 +656,31 @@ class SparseCheckpointProtocol(Protocol):
         identity: CheckpointSaveIdentity,
         fragments: Sequence[CheckpointFragment],
         lease_request: CheckpointLeaseRequest | None = None,
-        reference_id: str | None = None,
-    ) -> SparseCheckpointLocator: ...
+    ) -> CommittedCheckpoint: ...
 
     def abort_checkpoint(self, identity: CheckpointSaveIdentity) -> None: ...
 
     def acknowledge_checkpoint(self, identity: CheckpointSaveIdentity) -> None: ...
 
-    def restore_checkpoint(
+    def load_component_checkpoint(
         self,
         store: Any,
-        locator: SparseCheckpointLocator,
-        mode: RestoreMode,
+        storage_locator: CheckpointHandle,
+        owner_restore_options: bytes,
+        *,
         load_optimizer_state: bool = True,
     ) -> None: ...
 
-    def restore_weight_snapshot(
+    def write_weight_reference(
+        self,
+        path: str,
+        handle: CheckpointHandle,
+    ) -> None: ...
+
+    def load_inference_weights(
         self,
         store: Any,
-        snapshot: SparseWeightSnapshot,
-        mode: RestoreMode,
+        owner_restore_options: bytes,
     ) -> None: ...
 
 
@@ -376,7 +694,7 @@ class SparseCheckpointStorage(
 
     def compact_checkpoints(self) -> None: ...
 
-    def compact_checkpoint(self, locator: SparseCheckpointLocator) -> None: ...
+    def compact_checkpoint(self, handle: CheckpointHandle) -> None: ...
 
     def compact_fragments(
         self,
@@ -386,21 +704,10 @@ class SparseCheckpointStorage(
 
     async def compact_checkpoints_async(self) -> None: ...
 
-    async def compact_checkpoint_async(
-        self, locator: SparseCheckpointLocator
-    ) -> None: ...
+    async def compact_checkpoint_async(self, handle: CheckpointHandle) -> None: ...
 
     async def compact_fragments_async(
         self,
         source_path: str,
         target_path: str | None = None,
     ) -> str: ...
-
-
-class SparseWeightSnapshotReader(Protocol):
-    def restore_weight_snapshot(
-        self,
-        store: Any,
-        snapshot: SparseWeightSnapshot,
-        mode: RestoreMode,
-    ) -> None: ...

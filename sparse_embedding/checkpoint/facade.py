@@ -3,18 +3,18 @@
 from __future__ import annotations
 
 import uuid
+from pathlib import Path
 from typing import Any
 
 from .base import (
     CheckpointCommitAuthority,
+    CheckpointHandle,
     CheckpointParticipant,
     CheckpointSaveIdentity,
-    PhysicalRestore,
-    RestoreMode,
-    SparseCheckpointLocator,
+    CommittedCheckpoint,
+    RestorePlan,
     SparseCheckpointProtocol,
     SparseCheckpointStorage,
-    SparseWeightSnapshot,
 )
 
 
@@ -26,12 +26,14 @@ class SparseCheckpoint:
     def integration_protocol(self) -> SparseCheckpointProtocol:
         return self._protocol
 
-    def save(
+    def save_training_checkpoint(
         self,
         store: Any,
         name: str,
+        *,
+        weight_path: str | Path | None = None,
         include_page_images: bool = False,
-    ) -> SparseCheckpointLocator:
+    ) -> CommittedCheckpoint:
         attempt = uuid.uuid4().hex
         identity = CheckpointSaveIdentity(
             name,
@@ -44,35 +46,47 @@ class SparseCheckpoint:
         )
         participant = CheckpointParticipant(0, 1)
         self._protocol.prepare_checkpoint(identity)
+        committed: CommittedCheckpoint | None = None
         try:
             fragment = self._protocol.write_checkpoint_fragment(
                 store, identity, participant, include_page_images=include_page_images
             )
-            locator = self._protocol.commit_checkpoint(identity, (fragment,))
+            self._protocol.finalize_checkpoint(identity)
+            committed = self._protocol.commit_checkpoint(
+                identity,
+                (fragment,),
+            )
+            if weight_path is not None:
+                self._protocol.write_weight_reference(
+                    str(weight_path), committed.handle
+                )
             self._protocol.acknowledge_checkpoint(identity)
-            return locator
+            if weight_path is None:
+                self._protocol.release_reference(committed.handle)
+            return committed
         except Exception:
             self._protocol.abort_checkpoint(identity)
             raise
 
-    def restore(
+    def load_training_checkpoint(
         self,
         store: Any,
-        locator: SparseCheckpointLocator,
-        mode: RestoreMode | None = None,
+        storage_locator: CheckpointHandle,
+        restore: RestorePlan | bytes,
         *,
         load_optimizer_state: bool = True,
     ) -> None:
-        selected_mode = mode or PhysicalRestore(CheckpointParticipant(0, 1))
-        self._protocol.restore_checkpoint(
-            store, locator, selected_mode, load_optimizer_state
+        if isinstance(restore, RestorePlan):
+            options = restore.encode()
+        elif isinstance(restore, bytes):
+            options = restore
+        else:
+            raise TypeError(
+                f"restore must be a RestorePlan instance or bytes; got {type(restore).__name__}"
+            )
+        self._protocol.load_component_checkpoint(
+            store,
+            storage_locator,
+            options,
+            load_optimizer_state=load_optimizer_state,
         )
-
-    def restore_weight_snapshot(
-        self,
-        store: Any,
-        snapshot: SparseWeightSnapshot,
-        mode: RestoreMode | None = None,
-    ) -> None:
-        selected_mode = mode or PhysicalRestore(CheckpointParticipant(0, 1))
-        self._protocol.restore_weight_snapshot(store, snapshot, selected_mode)

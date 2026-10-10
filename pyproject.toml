@@ -10,11 +10,13 @@ readme = "README.md"
 requires-python = ">=3.12"
 license = { text = "Apache-2.0" }
 dependencies = [
+    "msgpack>=1.0",
     "pyarrow>=14.0.0",
     "requests>=2.31.0",
 ]
 
 [project.optional-dependencies]
+analysis = ["duckdb>=1.5.6"]
 # Optional at runtime for lance checkpoint backend
 pylance = [
     "pylance>=0.11.0",

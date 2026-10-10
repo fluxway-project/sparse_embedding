@@ -12,6 +12,8 @@ struct CheckpointStreamPolicy {
   static constexpr std::size_t kChannelCapacity = 8;
   static constexpr std::int64_t kScanBatchRows = 4096;
   static constexpr std::size_t kPageImportBatchPages = 16;
+  static constexpr std::size_t kDuplicateValidationRunRecords = 1U << 16;
+  static constexpr std::size_t kDuplicateValidationMergeFanIn = 64;
 };
 
 } // namespace se

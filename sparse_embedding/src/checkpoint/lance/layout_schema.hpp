@@ -5,6 +5,8 @@
 
 #include <array>
 #include <cstdint>
+#include <stdexcept>
+#include <string>
 #include <string_view>
 
 #ifndef ARROW_C_DATA_INTERFACE
@@ -82,10 +84,10 @@ inline constexpr std::array<ColumnDef, 17> kPageImageColumns = {{
     {"last_updated_checkpoint_version", "L"},
 }};
 
-inline constexpr std::string_view kEntriesDataset = "entries";
-inline constexpr std::string_view kPageImagesDataset = "page_images";
+inline constexpr std::string_view kEntriesDataset = "entries.lance";
+inline constexpr std::string_view kPageImagesDataset = "page_images.lance";
 inline constexpr std::string_view kSnapshotManifestDataset =
-    "snapshot_manifest";
+    "snapshot_manifest.lance";
 
 inline void release_arrow_schema(ArrowSchema *schema) noexcept {
   if (!schema || !schema->release)
@@ -173,8 +175,23 @@ inline ArrowSchema make_columns_schema(const std::array<ColumnDef, N> &columns,
   };
 }
 
-inline ArrowSchema make_entries_schema(const char *metadata = nullptr) {
-  return make_columns_schema(kEntryColumns, metadata);
+inline const char *arrow_format_for_key_dtype(std::string_view dtype) {
+  if (dtype == "int32")
+    return "i";
+  if (dtype == "uint32")
+    return "I";
+  if (dtype == "int64")
+    return "l";
+  if (dtype == "uint64")
+    return "L";
+  throw std::invalid_argument("unsupported key dtype: " + std::string(dtype));
+}
+
+inline ArrowSchema make_entries_schema(std::string_view key_dtype = "uint64",
+                                       const char *metadata = nullptr) {
+  auto columns = kEntryColumns;
+  columns[1].arrow_format = arrow_format_for_key_dtype(key_dtype);
+  return make_columns_schema(columns, metadata);
 }
 
 inline ArrowSchema make_page_images_schema(const char *metadata = nullptr) {
@@ -184,23 +201,23 @@ inline ArrowSchema make_page_images_schema(const char *metadata = nullptr) {
 inline ArrowSchema make_manifest_schema(const char *metadata = nullptr) {
   constexpr size_t kManifestFieldCount = 22;
   auto **children = new ArrowSchema *[kManifestFieldCount];
-  children[0] = make_leaf_schema("protocol_version", "I");
-  children[1] = make_leaf_schema("checkpoint_name", "u");
-  children[2] = make_leaf_schema("checkpoint_version", "L");
-  children[3] = make_leaf_schema("parent_checkpoint_version", "L");
-  children[4] = make_leaf_schema("participant_count", "I");
-  children[5] = make_leaf_schema("checkpoint_mode", "u");
-  children[6] = make_leaf_schema("schema_digest", "u");
-  children[7] = make_leaf_schema("fragment_digest", "u");
-  children[8] = make_leaf_schema("save_attempt", "u");
-  children[9] = make_leaf_schema("authority_scope", "u");
-  children[10] = make_leaf_schema("authority_generation", "L");
-  children[11] = make_leaf_schema("commit_authority", "u");
-  children[12] = make_leaf_schema("created_at", "tsu:UTC");
-  children[13] = make_list_schema("dimensions", "item", "I");
-  children[14] = make_leaf_schema("embedding_dtype", "u");
-  children[15] = make_leaf_schema("optimizer_dtype", "u");
-  children[16] = make_leaf_schema("score_policy", "u");
+  children[0] = make_leaf_schema("checkpoint_name", "u");
+  children[1] = make_leaf_schema("checkpoint_version", "L");
+  children[2] = make_leaf_schema("parent_checkpoint_version", "L");
+  children[3] = make_leaf_schema("participant_count", "I");
+  children[4] = make_leaf_schema("checkpoint_mode", "u");
+  children[5] = make_leaf_schema("schema_digest", "u");
+  children[6] = make_leaf_schema("fragment_digest", "u");
+  children[7] = make_leaf_schema("save_attempt", "u");
+  children[8] = make_leaf_schema("authority_scope", "u");
+  children[9] = make_leaf_schema("authority_generation", "L");
+  children[10] = make_leaf_schema("commit_authority", "u");
+  children[11] = make_leaf_schema("created_at", "tsu:UTC");
+  children[12] = make_list_schema("dimensions", "item", "I");
+  children[13] = make_leaf_schema("embedding_dtype", "u");
+  children[14] = make_leaf_schema("optimizer_dtype", "u");
+  children[15] = make_leaf_schema("score_policy", "u");
+  children[16] = make_leaf_schema("key_dtype", "u");
   children[17] = make_leaf_schema("reference_id", "u");
   children[18] = make_list_schema("fragment_ids", "item", "u");
   children[19] = make_leaf_schema("compacted_version", "L");

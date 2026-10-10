@@ -1,0 +1,223 @@
+{
+  "schema_version": 1,
+  "sparse_assignment_name": "sparse_embedding.modulo",
+  "sparse_assignment_parameters": {},
+  "vectors": [
+    {
+      "key_dtype": "int32",
+      "logical_key": -2147483648,
+      "partition_count": 3,
+      "partition_id": 1
+    },
+    {
+      "key_dtype": "int32",
+      "logical_key": -1,
+      "partition_count": 3,
+      "partition_id": 2
+    },
+    {
+      "key_dtype": "int32",
+      "logical_key": 0,
+      "partition_count": 3,
+      "partition_id": 0
+    },
+    {
+      "key_dtype": "int32",
+      "logical_key": 1,
+      "partition_count": 3,
+      "partition_id": 1
+    },
+    {
+      "key_dtype": "int32",
+      "logical_key": 2147483647,
+      "partition_count": 3,
+      "partition_id": 1
+    },
+    {
+      "key_dtype": "int32",
+      "logical_key": -2147483648,
+      "partition_count": 7,
+      "partition_id": 5
+    },
+    {
+      "key_dtype": "int32",
+      "logical_key": -1,
+      "partition_count": 7,
+      "partition_id": 6
+    },
+    {
+      "key_dtype": "int32",
+      "logical_key": 0,
+      "partition_count": 7,
+      "partition_id": 0
+    },
+    {
+      "key_dtype": "int32",
+      "logical_key": 1,
+      "partition_count": 7,
+      "partition_id": 1
+    },
+    {
+      "key_dtype": "int32",
+      "logical_key": 2147483647,
+      "partition_count": 7,
+      "partition_id": 1
+    },
+    {
+      "key_dtype": "uint32",
+      "logical_key": 0,
+      "partition_count": 3,
+      "partition_id": 0
+    },
+    {
+      "key_dtype": "uint32",
+      "logical_key": 1,
+      "partition_count": 3,
+      "partition_id": 1
+    },
+    {
+      "key_dtype": "uint32",
+      "logical_key": 2147483648,
+      "partition_count": 3,
+      "partition_id": 2
+    },
+    {
+      "key_dtype": "uint32",
+      "logical_key": 4294967295,
+      "partition_count": 3,
+      "partition_id": 0
+    },
+    {
+      "key_dtype": "uint32",
+      "logical_key": 0,
+      "partition_count": 7,
+      "partition_id": 0
+    },
+    {
+      "key_dtype": "uint32",
+      "logical_key": 1,
+      "partition_count": 7,
+      "partition_id": 1
+    },
+    {
+      "key_dtype": "uint32",
+      "logical_key": 2147483648,
+      "partition_count": 7,
+      "partition_id": 2
+    },
+    {
+      "key_dtype": "uint32",
+      "logical_key": 4294967295,
+      "partition_count": 7,
+      "partition_id": 3
+    },
+    {
+      "key_dtype": "int64",
+      "logical_key": -9223372036854775808,
+      "partition_count": 3,
+      "partition_id": 1
+    },
+    {
+      "key_dtype": "int64",
+      "logical_key": -1,
+      "partition_count": 3,
+      "partition_id": 2
+    },
+    {
+      "key_dtype": "int64",
+      "logical_key": 0,
+      "partition_count": 3,
+      "partition_id": 0
+    },
+    {
+      "key_dtype": "int64",
+      "logical_key": 1,
+      "partition_count": 3,
+      "partition_id": 1
+    },
+    {
+      "key_dtype": "int64",
+      "logical_key": 9223372036854775807,
+      "partition_count": 3,
+      "partition_id": 1
+    },
+    {
+      "key_dtype": "int64",
+      "logical_key": -9223372036854775808,
+      "partition_count": 7,
+      "partition_id": 6
+    },
+    {
+      "key_dtype": "int64",
+      "logical_key": -1,
+      "partition_count": 7,
+      "partition_id": 6
+    },
+    {
+      "key_dtype": "int64",
+      "logical_key": 0,
+      "partition_count": 7,
+      "partition_id": 0
+    },
+    {
+      "key_dtype": "int64",
+      "logical_key": 1,
+      "partition_count": 7,
+      "partition_id": 1
+    },
+    {
+      "key_dtype": "int64",
+      "logical_key": 9223372036854775807,
+      "partition_count": 7,
+      "partition_id": 0
+    },
+    {
+      "key_dtype": "uint64",
+      "logical_key": 0,
+      "partition_count": 3,
+      "partition_id": 0
+    },
+    {
+      "key_dtype": "uint64",
+      "logical_key": 1,
+      "partition_count": 3,
+      "partition_id": 1
+    },
+    {
+      "key_dtype": "uint64",
+      "logical_key": 9223372036854775808,
+      "partition_count": 3,
+      "partition_id": 2
+    },
+    {
+      "key_dtype": "uint64",
+      "logical_key": 18446744073709551615,
+      "partition_count": 3,
+      "partition_id": 0
+    },
+    {
+      "key_dtype": "uint64",
+      "logical_key": 0,
+      "partition_count": 7,
+      "partition_id": 0
+    },
+    {
+      "key_dtype": "uint64",
+      "logical_key": 1,
+      "partition_count": 7,
+      "partition_id": 1
+    },
+    {
+      "key_dtype": "uint64",
+      "logical_key": 9223372036854775808,
+      "partition_count": 7,
+      "partition_id": 1
+    },
+    {
+      "key_dtype": "uint64",
+      "logical_key": 18446744073709551615,
+      "partition_count": 7,
+      "partition_id": 1
+    }
+  ]
+}

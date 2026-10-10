@@ -10,13 +10,11 @@
 
 ## C++ API 契约
 
-`PageStorage` 与 `PageEvictionProxy` 是仅有的 storage `pro::proxy` facade。新代码通过 `create_page_storage(StorageOptions)` 创建存储，并按值传递 facade。复制或移动 facade 是浅操作，共享底层存储生命周期。`StoragePage` 是单次分配的 move-only RAII owner。
+`PageStorage` 与 `PageEvictionProxy` 是仅有的 storage `pro::proxy` facade。存储通过 `create_page_storage(StorageOptions)` 创建，并按值传递 facade。复制或移动 facade 是浅操作，共享底层存储生命周期。`StoragePage` 是单次分配的 move-only RAII owner。
 
-`set_page_eviction_proxy()` 返回 `PageEvictionRegistration`。每个 registration 必须且只能清理一次；空 token、未知 token 和已清理 token 都会抛异常，不会静默 fallback。proxy 接口只暴露 score evaluation 与 evaluator registration，不再暴露生命周期锁；Hogwild 的具体 adapter 会在注销 evaluator 时等待正在运行的 callback 退出。active proxy 的 identity 或 lifetime 发生切换时 proxy generation 会递增，因此旧 active-proxy generation 评估出的候选不能执行 swap-out。
+`set_page_eviction_proxy()` 返回 `PageEvictionRegistration`。每个 registration 必须且只能清理一次；空 token、未知 token 和已清理 token 都会抛异常，不进行静默 fallback。proxy 接口只暴露 score evaluation 与 evaluator registration，不暴露生命周期锁；Hogwild 的具体 adapter 会在注销 evaluator 时等待正在运行的 callback 退出。active proxy 的 identity 或 lifetime 发生切换时 proxy generation 会递增，因此前代 proxy generation 评估出的候选不能执行 swap-out。
 
-旧虚基类存储层级与 `PageStorage::create()` 不属于当前契约。
-
-运行时替换只保留在 `PageStorage` 与 `PageEvictionProxy` facade。
+运行时多态封装集中在 `PageStorage` 与 `PageEvictionProxy` facade。
 `SwapScheduler`、`SpillAllocator` 与 `PageRegistry` 是普通私有类，不是 facade：
 scheduler 管理 wake、stop、join 与异常传播；spill allocator 管理 fd、目录、容量和
 extent free-list；registry 管理 page identity、地址索引、淘汰快照和 evaluator 记录。
@@ -170,7 +168,7 @@ telemetry partition；task 数提供足够的独立随机访存工作来隐藏�
 
 每个 embedding 维度包含多个 key shard。查询不获取 shard mutex。insert、erase、reserve、locator rotation 与 checkpoint import 只在受影响 shard 的 writer mutex 下重建并原子发布不可变目录状态；compaction publication 不重建 `MapBundle`，而是直接对 locator 执行 packed seqlock/CAS 发布。不存在全局 Upsert mutex，因此一个 shard 扩容时，其他 shard 仍可并行。
 
-扩表策略集中定义在 store 与 `FlatKeyDirectory` 内。每个 shard 只按自己的实际目标 key 数扩容；`reserve(keys_count, dim)` 将总预算精确分摊到 shard，`reserve_per_shard(counts, dim)` 则直接接受调用方已知的每 shard 预算，不再把所有 shard 向上取相同二次幂。目录 bucket 数按 2.5 倍探测预算并向 16 对齐；只有较小容量仍低于旧 4 倍二次幂上限时才使用二次幂，因此大表不会因 per-shard rounding 快速膨胀。扩容倍率为 `<64K` 时 2x、`64K–1M` 时 1.5x、`>=1M` 时 1.25x，并且每次都至少覆盖本次 required capacity。
+扩表策略集中定义在 store 与 `FlatKeyDirectory` 内。每个 shard 只按自己的实际目标 key 数扩容；`reserve(keys_count, dim)` 将总预算精确分摊到 shard，`reserve_per_shard(counts, dim)` 则直接接受调用方已知的每 shard 预算，避免无条件对齐二次幂。目录 bucket 数按 2.5 倍探测预算并向 16 对齐；只有较小容量在 4 倍二次幂预算更优时才采用二次幂，避免大表因 per-shard rounding 产生内存膨胀。扩容倍率为 `<64K` 时 2x、`64K–1M` 时 1.5x、`>=1M` 时 1.25x，并且每次都至少覆盖本次 required capacity。
 
 扩容只发生在 writer/control plane：writer 在受影响 shard 的 mutex 下 clone 当前 `MapBundle`，把 key→locator slot 复制到新目录后 atomic exchange；旧 bundle 通过 epoch retirement 回收，locator slot 与 arena index 地址不因目录扩容改变。已知容量的生产 workload 应在计时前调用 `reserve(keys_count, dim)` 或 `reserve_per_shard(counts, dim)`，将目录复制和 arena/optimizer reserve 移出热路径。运行期若插入超出预算，系统按上述精确增长策略扩容；容量上溢、bucket/slot 上限或 storage 分配失败直接抛出明确异常，不使用 fallback。
 
@@ -250,6 +248,41 @@ compaction 目的地按 shard 批量执行 ticket-CAS 预留；普通 compaction
 
 `MapBundle`、`StoreSnapshot`、locator slot、arena index、`StoragePage` 和 sealed page image 共用 epoch retirement。reader 在 invocation gate 与 epoch 中取得快照；clear、import 和析构先关闭 invocation gate，再等待活动调用退出，最后释放 payload。旧物理页只有在 source page 无 live entry 且最后一个 epoch reader 退出后才析构，`retired_bytes` 随回收归零。PageStorage 的 swap/spill mutex 和条件变量只存在于后台换页控制面，不进入 lookup、optimizer 或 relocation 热路径。
 
+## Partitioner 架构与注册中心
+
+### 1. 注册中心与 Facade (`PartitionerRegistry`)
+
+分片器基于 `pro::proxy<PartitionerFacade>` 统一接入：
+
+```cpp
+using PartitionerProxy = pro::proxy<PartitionerFacade>;
+using PartitionerFactory = std::function<PartitionerProxy(
+    uint32_t num_partitions,
+    const std::unordered_map<std::string, std::string> &parameters)>;
+```
+
+集中式注册中心 `se::ops::PartitionerRegistry` 管理算法工厂：
+- `sparse_embedding.modulo`：规范化整数取模，负数映射至 $[0, \text{num\_partitions})$。
+- `sparse_embedding.hash`：MurmurHash3 雪崩哈希，支持可选 `seed` 参数。
+- `sparse_embedding.fast_range`：Lemire FastRange 无除法范围分片。
+- 扩展：通过 `register_factory(name, factory)` 注册；未注册或参数错误直接抛出 `std::invalid_argument`。
+
+### 2. 向量化切片过滤 (`filter_span`)
+
+在连续 Arrow 键切片上调用 AVX-512 `filter_span` 内核，批量生成 `uint8_t` 掩码并提取匹配行索引，供离线恢复过滤。
+
+### 3. 并行调度与弹性分片策略
+
+- **调度内核 (`parallel_partitioner.hpp`)**：基于 `stdexec` 多线程分块调度，输出 DLPack Capsule。
+- **Python 弹性策略 (`PartitionStrategy`)**：
+  - 解耦声明与拓扑：`ModuloPartition`、`HashPartition`、`FastRangePartition` 声明算法与参数，不绑定固定卡数。
+  - 晚绑定契约：实现 `__call__(values, *, partition_count, ...)`，对接 Fluxway `FunctionPartition(target=...)`。
+  - 特化缓存与绑定：按 `partition_count` 惰性缓存特化 C++ 内核；热循环可通过 `bind(partition_count)` 预取。
+  - 严格拓扑校验：传入的 `partition_count` 与底层配置不符时抛出 `ValueError`。
+  - 单一事实来源：`.spec` 导出 `SparsePartitionAssignmentSpec`，与 Checkpoint 规范统一。
+  - 纯函数接口：`se.partition(keys, partition_count=...)` 与 `se.filter_partition(...)`。
+- **职责边界**：Partitioner 仅负责计算目标卡号（`ranks`）。通信拓扑排布（`sort_indices`, `send_counts`）由 Fluxway `TransportPlanner` 统一派生。
+
 ## 框架无关的 Lance checkpoint 协议
 
 分布式集成使用 `SparseCheckpointProtocol`，提供一个
@@ -260,18 +293,46 @@ generation 和 authority identity，不包含任何特定编排框架的类型�
 `LocalLanceStorage` 与 `GravitinoLanceStorage` 复用唯一的 Lance checkpoint 事务引擎。
 该引擎以规范的物化 `(dim, key)` entry 状态作为唯一事实来源 (SSOT)，物理 page image
 作为可选的高速物理导入缓存 (仅在 `include_page_images=True` 时生成)。写入采用有界生产者-消费者
-管道 (`BoundedChannel`) 进行单事务流式落盘，$O(N_{live})$ 紧凑索引元数据 + 有界单页/写入器缓冲，且版本号恒为 1。两个
+管道 (`BoundedChannel`) 进行单事务流式落盘，$O(N_{live})$ 紧凑索引元数据 + 有界单页/写入器缓冲。两个
 storage adapter 只提供 dataset 定位、staging prefix、持久小记录和 commit lock。
 manifest 是唯一可见性边界，并固定 entries 的精确 Lance version。跨 participant 重复 key、
 participant 覆盖不完整、schema 不一致和过期提交权都会显式失败。
 
-恢复选择精确的 `SparseCheckpointLocator`。`PhysicalRestore` 支持显式策略：
-`PhysicalRestoreStrategy.RECONSTRUCT_ENTRIES` (默认) 从规范 entries 确定性重建原生物理页布局，
-即使经过 Checkpoint Compaction 跨拓扑合流，也能按 `source_participant_index` 精准还原目标分区参数；
-`PhysicalRestoreStrategy.FAST_PAGE_CACHE` 则直接导入物理页缓存，若缓存缺失则严格抛出 `FileNotFoundError`，
-零隐式 fallback。`ElasticRestore` 接收调用方稳定的 `partition_fn(keys, partition_count)` 和目标 partition；
-实现先只扫描 key 与 row state，再读取分配给当前 partition 的 payload 列。Sparse Embedding 内部不提供拓扑或路由
-fallback。
+### 双 Lance 2PC 存储分层
+
+落盘存储分为控制面与数据面两个物理 Lance 数据集：
+1. **`snapshot_manifest.lance`**（控制面账本与可见性边界）：
+   - 记录事务状态（`PREPARED` $\to$ `COMMITTED` / `ABORT`）、Lease 租约、Fence 标记与 `fragment_ids`。单次提交追加 1 行，隔离数据 I/O。
+2. **`entries.lance`**（数据面物理切片）：
+   - 各 Worker 并发写入专属路径 `_staging/<attempt>/<fragment_id>/entries.lance`，多节点写隔离且支持离线流式 Compaction。
+
+### Arrow 原生键类型与下推支持
+
+全链路使用 `key_dtype` 作为单一类型事实来源，支持 4 种原生定长整型：`int32`、`uint32`、`int64`、`uint64`。物理表直接存储对等原生整型列，支持 Lance/DuckDB 零转换谓词下推（如 `WHERE key = -1`）。
+
+### 恢复策略与单事实来源
+
+恢复面向 `SparseCheckpointLocator`：
+- **`PhysicalRestore`**：
+  - `PhysicalRestoreStrategy.RECONSTRUCT_ENTRIES` (默认)：从规范 entries 重建物理页，跨拓扑合流后按 `source_participant_index` 还原。
+  - `PhysicalRestoreStrategy.FAST_PAGE_CACHE`：直接导入物理页缓存，缓存缺失抛出 `FileNotFoundError`。
+- **`ElasticRestore`**：
+  - 接收恢复选项与 `SparsePartitionAssignmentSpec`（`modulo()`、`hash()`、`fast_range()` 及自定义注册算法）。
+  - C++ 恢复引擎结合 `PartitionerRegistry` 与 AVX-512 `filter_span` 过滤当前逻辑分区。
+
+### 参考向量一致性校验 (Reference Vectors)
+
+为保障在线路由与离线恢复的一致性，提供跨仓参考向量生成工具：
+```python
+from sparse_embedding.checkpoint import generate_reference_vectors
+
+sample_keys, expected_ranks = generate_reference_vectors(
+    assignment_name="sparse_embedding.modulo",
+    key_dtype="uint64",
+    partition_count=4,
+)
+```
+任何自定义分片算法在跨框架接入前，均可通过该工具进行严格回归对齐。
 
 Compaction 流式合并利用分布式 Participant 天然互斥性消灭去重哈希集开销；Native scanner、channel
 与 page import 统一使用 `checkpoint_stream_policy.hpp` 中的 `CheckpointStreamPolicy`，因此驻留内存受固定 batch/channel 容量约束。
@@ -279,11 +340,7 @@ Compaction 流式合并利用分布式 Participant 天然互斥性消灭去重�
 - Local 使用 POSIX `rename(2)` 原子发布，零额外 JSON 辅助文件；
 - S3/S3A 远端使用不可变 Staged 前缀写入 + 单对象强一致性 Pointer (`.manifest_pointer.json`) 进行线性化原子发布；
 - 成功覆盖更新、显式 `delete_prefix`、递归父目录删除与回滚路径都会严格级联清理指针和 staged 目录；清理失败直接抛出并保留已发布 root 供重试；
-- 存储前缀删除 `delete_prefix(..., missing_ok=False)` 默认严格抛出 `FileNotFoundError`，杜绝吞异常 fallback；
-- 协议版本保持 `_PROTOCOL_VERSION = 1`。
-
-原生 `ModuloPartitioner` 遵循 Python/NumPy 的语言无关规范化求余约定：即使 key 为负数，
-owner 也始终位于 `[0, partition_count)`；用户自定义的 `partition_fn` 负责自身的路由语义。
+- 存储前缀删除 `delete_prefix(..., missing_ok=False)` 默认严格抛出 `FileNotFoundError`，杜绝吞异常 fallback。
 
 thermal tier、热度、coaccess 和 residency 等调度态不进入 checkpoint，恢复后重新观测。
 

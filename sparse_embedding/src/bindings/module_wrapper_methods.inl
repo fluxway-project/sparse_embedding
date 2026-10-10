@@ -42,6 +42,10 @@ inline std::string EmbeddingStoreWrapper::optimizer_dtype() const {
   throw std::invalid_argument("unsupported optimizer dtype");
 }
 
+inline std::string EmbeddingStoreWrapper::key_dtype() const {
+  return std::string(key_dtype_name(key_type_enum_));
+}
+
 inline bool EmbeddingStoreWrapper::optimizer_enabled() const {
   return optimizer_enabled_;
 }

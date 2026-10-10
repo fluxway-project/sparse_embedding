@@ -25,6 +25,7 @@
 #include <vector>
 
 #include "sparse_embedding/src/common/function.hpp"
+#include "sparse_embedding/src/common/numeric_types.hpp"
 
 namespace se {
 

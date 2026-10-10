@@ -18,12 +18,13 @@
 #ifndef SPARSE_EMBEDDING_PARTITIONER_HPP_
 #define SPARSE_EMBEDDING_PARTITIONER_HPP_
 
+#include <proxy/proxy.h>
+
 #include <cstdint>
 #include <span>
 #include <stdexcept>
-#include <type_traits>
 
-#include <proxy/proxy.h>
+#include "sparse_embedding/src/common/dtypes.hpp"
 
 #if defined(__AVX512F__) && defined(__AVX512DQ__)
 #include <immintrin.h>
@@ -57,10 +58,12 @@ struct PartitionerFacade
       ::add_convention<filter_span_dispatch,
                        void(std::span<const uint64_t>, uint32_t,
                             std::span<bool>)> //
-      ::add_convention<filter_span_dispatch, void(std::span<const int64_t>,
-                                                  uint32_t, std::span<bool>)> //
-      ::add_convention<filter_span_dispatch, void(std::span<const uint32_t>,
-                                                  uint32_t, std::span<bool>)> //
+      ::add_convention<filter_span_dispatch,
+                       void(std::span<const int64_t>, uint32_t,
+                            std::span<bool>)> //
+      ::add_convention<filter_span_dispatch,
+                       void(std::span<const uint32_t>, uint32_t,
+                            std::span<bool>)> //
       ::add_convention<filter_span_dispatch,
                        void(std::span<const int32_t>, uint32_t,
                             std::span<bool>)> //
@@ -71,16 +74,7 @@ class ModuloPartitioner {
   bool is_power_of_two_;
 
   template <typename KeyT> uint32_t normalized_modulo(KeyT key) const {
-    if constexpr (std::is_signed_v<KeyT>) {
-      using ArithmeticT = std::int64_t;
-      const ArithmeticT divisor = static_cast<ArithmeticT>(num_shards_);
-      const ArithmeticT remainder = static_cast<ArithmeticT>(key) % divisor;
-      return static_cast<uint32_t>((remainder + divisor) % divisor);
-    } else {
-      using ArithmeticT = std::uint64_t;
-      const ArithmeticT divisor = static_cast<ArithmeticT>(num_shards_);
-      return static_cast<uint32_t>(static_cast<ArithmeticT>(key) % divisor);
-    }
+    return static_cast<uint32_t>(modulo_partition(key, num_shards_));
   }
 
   template <typename KeyT> uint32_t shard_for(KeyT key) const {

@@ -17,6 +17,7 @@
 #include <nanobind/nanobind.h>
 #include <nanobind/stl/optional.h>
 #include <nanobind/stl/string.h>
+#include <nanobind/stl/string_view.h>
 #include <nanobind/stl/unordered_map.h>
 #include <nanobind/stl/variant.h>
 #include <nanobind/stl/vector.h>
@@ -36,11 +37,12 @@
 #include "sparse_embedding/src/bindings/module_wrapper.hpp"
 #include "sparse_embedding/src/bindings/module_wrapper_methods.inl"
 #include "sparse_embedding/src/checkpoint/lance/layout_schema.hpp"
+#include "sparse_embedding/src/ops/parallel_partitioner.hpp"
 #include "sparse_embedding/src/ops/partitioner.hpp"
+#include "sparse_embedding/src/ops/partitioner_registry.hpp"
 #include "sparse_embedding/src/ops/tensor_ops.hpp"
 #ifdef SE_ENABLE_LANCE_C
 #include "sparse_embedding/src/bindings/module_checkpoint_methods.inl"
-#include "sparse_embedding/src/checkpoint/checkpoint_registry.hpp"
 #include "sparse_embedding/src/checkpoint/lance/native_fragment_writer.hpp"
 #endif
 
@@ -189,7 +191,17 @@ EmbeddingStoreWrapper::EmbeddingStoreWrapper(
 
 namespace se::py::detail {
 
-nb::object PyPartitioner::partition(nb::object keys) {
+nb::object PyPartitioner::partition(nb::object keys,
+                                    std::optional<uint32_t> partition_count,
+                                    std::optional<uint64_t> domain_size,
+                                    size_t num_threads) {
+  (void)domain_size;
+  if (partition_count.has_value() && *partition_count != num_shards) {
+    throw std::invalid_argument(
+        "partition_count (" + std::to_string(*partition_count) +
+        ") does not match partitioner configured num_shards (" +
+        std::to_string(num_shards) + ")");
+  }
   auto [dlm_keys, cap_keys] = se::py::extract_dlpack_tensor(keys);
   size_t n = dlm_keys->dl_tensor.shape[0];
 
@@ -197,13 +209,26 @@ nb::object PyPartitioner::partition(nb::object keys) {
       std::span<const int64_t>({static_cast<int64_t>(n)}));
   auto out_span = se::py::dlpack_to_span<uint32_t>(out_dlm);
 
-  dispatch_partition_key(dlm_keys, [&](auto keys_span) {
-    (*facade)->partition_span(keys_span, out_span);
-  });
+  {
+    nb::gil_scoped_release release;
+    dispatch_partition_key(dlm_keys, [&](auto keys_span) {
+      se::ops::parallel_partition(se::ops::global_partition_pool(), *facade,
+                                  keys_span, out_span, num_threads);
+    });
+  }
   return se::py::wrap_output_tensor(out_dlm);
 }
 
-nb::object PyPartitioner::async_partition(nb::object keys) {
+nb::object PyPartitioner::async_partition(
+    nb::object keys, std::optional<uint32_t> partition_count,
+    std::optional<uint64_t> domain_size, size_t num_threads) {
+  (void)domain_size;
+  if (partition_count.has_value() && *partition_count != num_shards) {
+    throw std::invalid_argument(
+        "partition_count (" + std::to_string(*partition_count) +
+        ") does not match partitioner configured num_shards (" +
+        std::to_string(num_shards) + ")");
+  }
   auto [dlm_keys, cap_keys] = se::py::extract_dlpack_tensor(keys);
   size_t n = dlm_keys->dl_tensor.shape[0];
   auto kdt = detect_key_dtype(dlm_keys);
@@ -211,22 +236,21 @@ nb::object PyPartitioner::async_partition(nb::object keys) {
       reinterpret_cast<const char *>(dlm_keys->dl_tensor.data) +
       dlm_keys->dl_tensor.byte_offset;
 
-  static exec::static_thread_pool pool(
-      std::max(1u, std::thread::hardware_concurrency()));
   auto facade_copy = facade;
 
   return se::py::async_dispatch(
-      pool,
-      [facade_copy, n, kdt, keys_data,
+      se::ops::global_partition_pool(),
+      [facade_copy, n, kdt, keys_data, num_threads,
        keys_keeper = std::make_shared<se::py::AsyncPyObjectKeeper>(
            cap_keys)]() -> DLManagedTensor * {
         DLManagedTensor *out_dlm = se::py::create_output_tensor<uint32_t>(
             std::span<const int64_t>({static_cast<int64_t>(n)}));
         uint32_t *out_ptr =
             reinterpret_cast<uint32_t *>(out_dlm->dl_tensor.data);
+        auto out_span = std::span<uint32_t>(out_ptr, n);
 
         auto do_partition = [&](auto ks) {
-          (*facade_copy)->partition_span(ks, std::span<uint32_t>(out_ptr, n));
+          se::ops::invoke_partition_span(*facade_copy, ks, out_span);
         };
         if (kdt == KeyDType::kInt32)
           do_partition(std::span<const int32_t>(
@@ -248,7 +272,23 @@ nb::object PyPartitioner::async_partition(nb::object keys) {
       });
 }
 
-nb::object PyPartitioner::filter(nb::object keys, uint32_t target_shard) {
+nb::object PyPartitioner::filter(nb::object keys, uint32_t target_shard,
+                                 std::optional<uint32_t> partition_count,
+                                 std::optional<uint64_t> domain_size,
+                                 size_t num_threads) {
+  (void)domain_size;
+  if (partition_count.has_value() && *partition_count != num_shards) {
+    throw std::invalid_argument(
+        "partition_count (" + std::to_string(*partition_count) +
+        ") does not match partitioner configured num_shards (" +
+        std::to_string(num_shards) + ")");
+  }
+  if (target_shard >= num_shards) {
+    throw std::invalid_argument("target_shard (" +
+                                std::to_string(target_shard) +
+                                ") out of range for partitioner with " +
+                                std::to_string(num_shards) + " shards");
+  }
   auto [dlm_keys, cap_keys] = se::py::extract_dlpack_tensor(keys);
   size_t n = dlm_keys->dl_tensor.shape[0];
 
@@ -256,13 +296,33 @@ nb::object PyPartitioner::filter(nb::object keys, uint32_t target_shard) {
       std::span<const int64_t>({static_cast<int64_t>(n)}));
   auto out_span = se::py::dlpack_to_span<bool>(out_dlm);
 
-  dispatch_partition_key(dlm_keys, [&](auto keys_span) {
-    (*facade)->filter_span(keys_span, target_shard, out_span);
-  });
+  {
+    nb::gil_scoped_release release;
+    dispatch_partition_key(dlm_keys, [&](auto keys_span) {
+      se::ops::parallel_filter(se::ops::global_partition_pool(), *facade,
+                               keys_span, target_shard, out_span, num_threads);
+    });
+  }
   return se::py::wrap_output_tensor(out_dlm);
 }
 
-nb::object PyPartitioner::async_filter(nb::object keys, uint32_t target_shard) {
+nb::object PyPartitioner::async_filter(nb::object keys, uint32_t target_shard,
+                                       std::optional<uint32_t> partition_count,
+                                       std::optional<uint64_t> domain_size,
+                                       size_t num_threads) {
+  (void)domain_size;
+  if (partition_count.has_value() && *partition_count != num_shards) {
+    throw std::invalid_argument(
+        "partition_count (" + std::to_string(*partition_count) +
+        ") does not match partitioner configured num_shards (" +
+        std::to_string(num_shards) + ")");
+  }
+  if (target_shard >= num_shards) {
+    throw std::invalid_argument("target_shard (" +
+                                std::to_string(target_shard) +
+                                ") out of range for partitioner with " +
+                                std::to_string(num_shards) + " shards");
+  }
   auto [dlm_keys, cap_keys] = se::py::extract_dlpack_tensor(keys);
   size_t n = dlm_keys->dl_tensor.shape[0];
   auto kdt = detect_key_dtype(dlm_keys);
@@ -270,22 +330,20 @@ nb::object PyPartitioner::async_filter(nb::object keys, uint32_t target_shard) {
       reinterpret_cast<const char *>(dlm_keys->dl_tensor.data) +
       dlm_keys->dl_tensor.byte_offset;
 
-  static exec::static_thread_pool pool(
-      std::max(1u, std::thread::hardware_concurrency()));
   auto facade_copy = facade;
 
   return se::py::async_dispatch(
-      pool,
-      [facade_copy, n, target_shard, kdt, keys_data,
+      se::ops::global_partition_pool(),
+      [facade_copy, n, target_shard, kdt, keys_data, num_threads,
        keys_keeper = std::make_shared<se::py::AsyncPyObjectKeeper>(
            cap_keys)]() -> DLManagedTensor * {
         DLManagedTensor *out_dlm = se::py::create_output_tensor<bool>(
             std::span<const int64_t>({static_cast<int64_t>(n)}));
         bool *out_ptr = reinterpret_cast<bool *>(out_dlm->dl_tensor.data);
+        auto out_span = std::span<bool>(out_ptr, n);
 
         auto do_filter = [&](auto ks) {
-          (*facade_copy)
-              ->filter_span(ks, target_shard, std::span<bool>(out_ptr, n));
+          se::ops::invoke_filter_span(*facade_copy, ks, target_shard, out_span);
         };
         if (kdt == KeyDType::kInt32)
           do_filter(std::span<const int32_t>(
@@ -623,26 +681,37 @@ NB_MODULE(_core, m) {
            nb::arg("pages"))
       .def("value_dtype", &EmbeddingStoreWrapper::value_dtype)
       .def("optimizer_dtype", &EmbeddingStoreWrapper::optimizer_dtype)
+      .def("key_dtype", &EmbeddingStoreWrapper::key_dtype)
       .def("optimizer_enabled", &EmbeddingStoreWrapper::optimizer_enabled)
       .def("score_policy", &EmbeddingStoreWrapper::score_policy)
 
       ;
 
   auto checkpoint = m.def_submodule("checkpoint");
+  checkpoint.attr("ENTRIES_DATASET") =
+      std::string(se::lance_layout::kEntriesDataset);
+  checkpoint.attr("PAGE_IMAGES_DATASET") =
+      std::string(se::lance_layout::kPageImagesDataset);
+  checkpoint.attr("SNAPSHOT_MANIFEST_DATASET") =
+      std::string(se::lance_layout::kSnapshotManifestDataset);
 
   // ---- Universal checkpoint functionality (available unconditionally for
   // Python pylance) ----
-  checkpoint.def("lance_entries_schema_capsule", []() {
-    auto *s = new ArrowSchema(se::lance_layout::make_entries_schema());
-    return nb::capsule(s, "arrow_schema", [](void *p) noexcept {
-      auto *schema = static_cast<ArrowSchema *>(p);
-      if (schema) {
-        if (schema->release)
-          schema->release(schema);
-        delete schema;
-      }
-    });
-  });
+  checkpoint.def(
+      "lance_entries_schema_capsule",
+      [](const std::string &key_dtype) {
+        auto *s =
+            new ArrowSchema(se::lance_layout::make_entries_schema(key_dtype));
+        return nb::capsule(s, "arrow_schema", [](void *p) noexcept {
+          auto *schema = static_cast<ArrowSchema *>(p);
+          if (schema) {
+            if (schema->release)
+              schema->release(schema);
+            delete schema;
+          }
+        });
+      },
+      nb::arg("key_dtype") = "uint64");
 
   checkpoint.def("lance_page_images_schema_capsule", []() {
     auto *s = new ArrowSchema(se::lance_layout::make_page_images_schema());
@@ -700,76 +769,61 @@ NB_MODULE(_core, m) {
   // ---- Native C++ acceleration extensions (available when SE_ENABLE_LANCE_C
   // is defined) ----
   checkpoint.def(
-      "save_checkpoint",
-      [](EmbeddingStoreWrapper &self, const std::string &uri,
-         const std::string &mode, uint64_t min_score,
-         bool include_optimizer_state, bool use_compression) {
-        self.save_checkpoint(uri, mode, min_score, include_optimizer_state,
-                             use_compression);
-      },
-      nb::arg("store"), nb::arg("uri"), nb::arg("mode") = "full",
-      nb::arg("min_score") = 0, nb::arg("include_optimizer_state") = false,
-      nb::arg("use_compression") = false);
-  checkpoint.def(
-      "load_checkpoint",
-      [](EmbeddingStoreWrapper &self, const std::string &uri, uint64_t version,
-         bool clear, bool load_optimizer_state, nb::object filter_fn,
-         uint32_t target_shard_id, size_t batch_size) {
-        self.load_checkpoint(uri, version, clear, load_optimizer_state,
-                             filter_fn, target_shard_id, batch_size);
-      },
-      nb::arg("store"), nb::arg("uri"), nb::arg("version") = 0,
-      nb::arg("clear") = true, nb::arg("load_optimizer_state") = false,
-      nb::arg("filter_fn") = nb::none(), nb::arg("target_shard_id") = 0,
-      nb::arg("batch_size") = 65536);
-  checkpoint.def(
       "write_native_fragment",
       [](EmbeddingStoreWrapper &self, const std::string &uri,
          uint32_t participant_index, const std::vector<uint32_t> &dimensions,
          const std::string &embedding_dtype, const std::string &optimizer_dtype,
-         const std::string &score_policy, uint32_t protocol_version,
+         const std::string &score_policy, const std::string &key_dtype,
          const std::string &schema_digest, bool include_page_images) {
         return self.write_native_fragment(uri, participant_index, dimensions,
                                           embedding_dtype, optimizer_dtype,
-                                          score_policy, protocol_version,
+                                          score_policy, key_dtype,
                                           schema_digest, include_page_images);
       },
       nb::arg("store"), nb::arg("uri"), nb::arg("participant_index"),
       nb::arg("dimensions"), nb::arg("embedding_dtype"),
-      nb::arg("optimizer_dtype"), nb::arg("score_policy"),
-      nb::arg("protocol_version"), nb::arg("schema_digest"),
-      nb::arg("include_page_images") = false);
+      nb::arg("optimizer_dtype"), nb::arg("score_policy"), nb::arg("key_dtype"),
+      nb::arg("schema_digest"), nb::arg("include_page_images") = false);
   checkpoint.def(
-      "set_checkpoint_factories",
-      [](EmbeddingStoreWrapper &self, const std::string &backend) {
-        auto factories = se::make_checkpoint_factories(backend);
-        self.set_checkpoint_factories(std::move(factories.writer),
-                                      std::move(factories.reader));
-      },
-      nb::arg("store"), nb::arg("backend"));
-  checkpoint.def(
-      "restore_native_entries",
+      "restore_native_partition_entries",
       [](EmbeddingStoreWrapper &self, const std::string &uri, uint64_t version,
-         nb::object selected_keys, const nb::dict &storage_options,
-         bool load_optimizer_state) {
-        self.restore_native_entries(uri, version, selected_keys,
-                                    checkpoint_storage_options(storage_options),
-                                    load_optimizer_state);
+         uint64_t partition_count, uint64_t partition_id,
+         const std::string &key_dtype,
+         std::optional<uint32_t> source_participant_index,
+         const nb::dict &storage_options, bool load_optimizer_state,
+         const std::string &assignment_name,
+         const nb::dict &assignment_parameters) {
+        std::unordered_map<std::string, std::string> params;
+        for (auto [k, v] : assignment_parameters) {
+          params[nb::cast<std::string>(nb::str(k))] =
+              nb::cast<std::string>(nb::str(v));
+        }
+        self.restore_native_partition_entries(
+            uri, version, partition_count, partition_id, key_dtype,
+            assignment_name, params,
+            checkpoint_storage_options(storage_options), load_optimizer_state,
+            source_participant_index);
       },
       nb::arg("store"), nb::arg("uri"), nb::arg("version"),
-      nb::arg("selected_keys"), nb::arg("storage_options") = nb::dict(),
-      nb::arg("load_optimizer_state") = true);
+      nb::arg("partition_count"), nb::arg("partition_id"), nb::arg("key_dtype"),
+      nb::arg("source_participant_index") = nb::none(),
+      nb::arg("storage_options") = nb::dict(),
+      nb::arg("load_optimizer_state") = true,
+      nb::arg("assignment_name") = std::string(se::ops::kModuloPartitionerName),
+      nb::arg("assignment_parameters") = nb::dict());
   checkpoint.def(
       "restore_native_page_images",
       [](EmbeddingStoreWrapper &self, const std::vector<std::string> &uris,
          uint64_t version, uint32_t participant_index,
-         const nb::dict &storage_options, bool load_optimizer_state) {
+         const std::string &key_dtype, const nb::dict &storage_options,
+         bool load_optimizer_state) {
         self.restore_native_page_images(
-            uris, version, participant_index,
+            uris, version, participant_index, key_dtype,
             checkpoint_storage_options(storage_options), load_optimizer_state);
       },
       nb::arg("store"), nb::arg("uris"), nb::arg("version"),
-      nb::arg("participant_index"), nb::arg("storage_options") = nb::dict(),
+      nb::arg("participant_index"), nb::arg("key_dtype"),
+      nb::arg("storage_options") = nb::dict(),
       nb::arg("load_optimizer_state") = true);
   checkpoint.def(
       "active_entry_keys",
@@ -929,44 +983,88 @@ NB_MODULE(_core, m) {
         [](bool enable) { nb::set_leak_warnings(enable); });
 
   nb::class_<PyPartitioner>(m, "Partitioner")
-      .def("partition", &PyPartitioner::partition, nb::arg("keys"))
+      .def_prop_ro("num_shards",
+                   [](const PyPartitioner &p) { return p.num_shards; })
+      .def_prop_ro("name", [](const PyPartitioner &p) { return p.name; })
+      .def("partition", &PyPartitioner::partition, nb::arg("keys"),
+           nb::arg("partition_count") = nb::none(),
+           nb::arg("domain_size") = nb::none(), nb::arg("num_threads") = 0)
+      .def("__call__", &PyPartitioner::partition, nb::arg("keys"),
+           nb::arg("partition_count") = nb::none(),
+           nb::arg("domain_size") = nb::none(), nb::arg("num_threads") = 0)
       .def("async_partition", &PyPartitioner::async_partition, nb::arg("keys"),
-           nb::sig("def async_partition(self, keys: object) -> "
+           nb::arg("partition_count") = nb::none(),
+           nb::arg("domain_size") = nb::none(), nb::arg("num_threads") = 0,
+           nb::sig("def async_partition(self, keys: object, partition_count: "
+                   "typing.Optional[int] = None, domain_size: "
+                   "typing.Optional[int] = None, num_threads: int = 0) -> "
                    "typing.Awaitable[typing.Any]"))
       .def("filter", &PyPartitioner::filter, nb::arg("keys"),
-           nb::arg("target_shard"))
+           nb::arg("target_shard"), nb::arg("partition_count") = nb::none(),
+           nb::arg("domain_size") = nb::none(), nb::arg("num_threads") = 0)
       .def("async_filter", &PyPartitioner::async_filter, nb::arg("keys"),
-           nb::arg("target_shard"),
-           nb::sig("def async_filter(self, keys: object, target_shard: int) -> "
+           nb::arg("target_shard"), nb::arg("partition_count") = nb::none(),
+           nb::arg("domain_size") = nb::none(), nb::arg("num_threads") = 0,
+           nb::sig("def async_filter(self, keys: object, target_shard: int, "
+                   "partition_count: typing.Optional[int] = None, domain_size: "
+                   "typing.Optional[int] = None, num_threads: int = 0) -> "
                    "typing.Awaitable[typing.Any]"));
+
+  m.def(
+      "create_partitioner",
+      [](const std::string &name, uint32_t num_shards,
+         const nb::dict &parameters) -> PyPartitioner {
+        std::unordered_map<std::string, std::string> params;
+        for (auto [k, v] : parameters) {
+          params[nb::cast<std::string>(nb::str(k))] =
+              nb::cast<std::string>(nb::str(v));
+        }
+        auto proxy = se::ops::PartitionerRegistry::instance().create(
+            name, num_shards, params);
+        return PyPartitioner{
+            std::make_shared<decltype(proxy)>(std::move(proxy)), num_shards,
+            name};
+      },
+      nb::arg("name"), nb::arg("num_shards"),
+      nb::arg("parameters") = nb::dict());
+
+  m.def(
+      "is_partitioner_registered",
+      [](const std::string &name) -> bool {
+        return se::ops::PartitionerRegistry::instance().is_registered(name);
+      },
+      nb::arg("name"));
 
   m.def(
       "ModuloPartitioner",
       [](uint32_t num_shards) -> PyPartitioner {
-        auto proxy = pro::make_proxy<se::ops::PartitionerFacade,
-                                     se::ops::ModuloPartitioner>(num_shards);
+        auto proxy = se::ops::PartitionerRegistry::instance().create(
+            se::ops::kModuloPartitionerName, num_shards);
         return PyPartitioner{
-            std::make_shared<decltype(proxy)>(std::move(proxy))};
+            std::make_shared<decltype(proxy)>(std::move(proxy)), num_shards,
+            std::string(se::ops::kModuloPartitionerName)};
       },
       nb::arg("num_shards"));
 
   m.def(
       "HashPartitioner",
       [](uint32_t num_shards) -> PyPartitioner {
-        auto proxy = pro::make_proxy<se::ops::PartitionerFacade,
-                                     se::ops::HashPartitioner>(num_shards);
+        auto proxy = se::ops::PartitionerRegistry::instance().create(
+            se::ops::kHashPartitionerName, num_shards);
         return PyPartitioner{
-            std::make_shared<decltype(proxy)>(std::move(proxy))};
+            std::make_shared<decltype(proxy)>(std::move(proxy)), num_shards,
+            std::string(se::ops::kHashPartitionerName)};
       },
       nb::arg("num_shards"));
 
   m.def(
       "FastRangePartitioner",
       [](uint32_t num_shards) -> PyPartitioner {
-        auto proxy = pro::make_proxy<se::ops::PartitionerFacade,
-                                     se::ops::FastRangePartitioner>(num_shards);
+        auto proxy = se::ops::PartitionerRegistry::instance().create(
+            se::ops::kFastRangePartitionerName, num_shards);
         return PyPartitioner{
-            std::make_shared<decltype(proxy)>(std::move(proxy))};
+            std::make_shared<decltype(proxy)>(std::move(proxy)), num_shards,
+            std::string(se::ops::kFastRangePartitionerName)};
       },
       nb::arg("num_shards"));
 

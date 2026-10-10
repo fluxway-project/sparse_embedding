@@ -32,23 +32,27 @@ int main() {
   }
 
   std::set<std::string_view> manifest_names;
-  constexpr std::array<std::string_view, 22> manifest_columns = {
-      "protocol_version",     "checkpoint_name",
-      "checkpoint_version",   "parent_checkpoint_version",
-      "participant_count",    "checkpoint_mode",
-      "schema_digest",        "fragment_digest",
-      "save_attempt",         "authority_scope",
-      "authority_generation", "commit_authority",
-      "created_at",           "dimensions",
-      "embedding_dtype",      "optimizer_dtype",
-      "score_policy",         "reference_id",
-      "fragment_ids",         "compacted_version",
-      "commit_state",         "storage_mode"};
-  manifest_names.insert(manifest_columns.begin(), manifest_columns.end());
+  auto manifest_schema = se::lance_layout::make_manifest_schema();
+  for (int64_t index = 0; index < manifest_schema.n_children; ++index) {
+    if (!manifest_names.insert(manifest_schema.children[index]->name).second)
+      throw std::runtime_error("duplicate Lance manifest column");
+  }
+  manifest_schema.release(&manifest_schema);
   for (std::string_view required :
-       {"protocol_version", "fragment_ids", "compacted_version", "commit_state",
-        "storage_mode", "schema_digest", "dimensions"}) {
+       {"fragment_ids", "compacted_version", "commit_state", "storage_mode",
+        "schema_digest", "dimensions", "key_dtype"}) {
     if (!manifest_names.contains(required))
       throw std::runtime_error("Lance snapshot manifest schema is incomplete");
+  }
+
+  for (const auto &[dtype, fmt] : {std::pair{"int32", "i"},
+                                   {"uint32", "I"},
+                                   {"int64", "l"},
+                                   {"uint64", "L"}}) {
+    auto schema = se::lance_layout::make_entries_schema(dtype);
+    if (std::string_view(schema.children[1]->format) != fmt)
+      throw std::runtime_error("entry key format mismatch");
+    if (schema.release)
+      schema.release(&schema);
   }
 }
