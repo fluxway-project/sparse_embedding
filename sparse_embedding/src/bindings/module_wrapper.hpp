@@ -210,6 +210,8 @@ template <typename ParamT, typename OptT> struct SyncOpsImpl {
                                    nb::object grads);
   static void optimizer_step(EmbeddingStoreWrapper &self);
   static void erase(EmbeddingStoreWrapper &self, nb::object keys);
+  static void erase_dimension(EmbeddingStoreWrapper &self, nb::object keys,
+                              int64_t dimension);
   static void clear(EmbeddingStoreWrapper &self);
   static void assign_scores(EmbeddingStoreWrapper &self, nb::object keys,
                             nb::object scores);
@@ -241,14 +243,15 @@ template <typename ParamT, typename OptT> struct CheckpointOpsImpl {
       uint32_t participant_index, const std::vector<uint32_t> &dimensions,
       const std::string &embedding_dtype, const std::string &optimizer_dtype,
       const std::string &score_policy, const std::string &key_dtype,
-      const std::string &schema_digest, bool include_page_images = false);
+      const std::string &schema_digest, bool include_page_images = false,
+      bool incremental_mode = false, const std::string &expected_baseline = "");
   template <typename Scanner>
   static void restore_native_entries_with_scan(EmbeddingStoreWrapper &self,
                                                Scanner &&scan,
                                                bool load_optimizer_state);
   static void restore_native_partition_entries(
-      EmbeddingStoreWrapper &self, const std::string &uri, uint64_t version,
-      uint64_t partition_count, uint64_t partition_id,
+      EmbeddingStoreWrapper &self, const std::vector<std::string> &uris,
+      uint64_t version, uint64_t partition_count, uint64_t partition_id,
       const std::string &key_dtype, const std::string &assignment_name,
       const std::unordered_map<std::string, std::string> &assignment_parameters,
       const se::LanceStorageOptions &storage_options, bool load_optimizer_state,
@@ -270,6 +273,13 @@ template <typename ParamT, typename OptT> struct CheckpointOpsImpl {
   static void assign_opt_state(EmbeddingStoreWrapper &self, nb::object keys_obj,
                                nb::object opt_states_obj, size_t dimension,
                                nb::object steps_obj);
+  static nb::list checkpoint_mutations(EmbeddingStoreWrapper &self);
+  static std::string checkpoint_baseline(EmbeddingStoreWrapper &self);
+  static uint64_t checkpoint_mutation_watermark(EmbeddingStoreWrapper &self);
+  static void acknowledge_checkpoint_mutations(
+      EmbeddingStoreWrapper &self, uint64_t watermark,
+      const std::string &baseline, uint64_t capture_id,
+      const std::string &journal_identity);
 };
 
 #define SE_DECLARE_TYPED_BINDING_INSTANCES(PARAM_T, OPT_T)                     \
@@ -370,6 +380,7 @@ public:
   void accumulate_gradients(nb::object keys, nb::object grads);
   void optimizer_step();
   void erase(nb::object keys);
+  void erase_dimension(nb::object keys, int64_t dimension);
   void clear();
   void assign_scores(nb::object keys, nb::object scores);
   size_t compact_page(size_t dim, uint64_t page_id);
@@ -395,11 +406,12 @@ public:
       const std::vector<uint32_t> &dimensions,
       const std::string &embedding_dtype, const std::string &optimizer_dtype,
       const std::string &score_policy, const std::string &key_dtype,
-      const std::string &schema_digest, bool include_page_images = false);
+      const std::string &schema_digest, bool include_page_images = false,
+      bool incremental_mode = false, const std::string &expected_baseline = "");
   void restore_native_partition_entries(
-      const std::string &uri, uint64_t version, uint64_t partition_count,
-      uint64_t partition_id, const std::string &key_dtype,
-      const std::string &assignment_name,
+      const std::vector<std::string> &uris, uint64_t version,
+      uint64_t partition_count, uint64_t partition_id,
+      const std::string &key_dtype, const std::string &assignment_name,
       const std::unordered_map<std::string, std::string> &assignment_parameters,
       const se::LanceStorageOptions &storage_options, bool load_optimizer_state,
       std::optional<uint32_t> source_participant_index = std::nullopt);
@@ -418,6 +430,16 @@ public:
                             bool include_optimizer_state = false);
   void assign_opt_state(nb::object keys_obj, nb::object opt_states_obj,
                         size_t dimension, nb::object steps_obj);
+  nb::list checkpoint_mutations();
+  std::string checkpoint_baseline();
+  uint64_t checkpoint_mutation_watermark();
+  size_t entries_per_page();
+  void cancel_checkpoint_capture(uint64_t capture_id,
+                                 const std::string &journal_identity);
+  void acknowledge_checkpoint_mutations(uint64_t watermark,
+                                        const std::string &baseline,
+                                        uint64_t capture_id,
+                                        const std::string &journal_identity);
 };
 
 } // namespace se::py::detail

@@ -626,6 +626,8 @@ NB_MODULE(_core, m) {
            nb::arg("values"))
       .def("contains", &EmbeddingStoreWrapper::contains, nb::arg("keys"))
       .def("erase", &EmbeddingStoreWrapper::erase, nb::arg("keys"))
+      .def("erase_dimension", &EmbeddingStoreWrapper::erase_dimension,
+           nb::arg("keys"), nb::arg("dimension"))
       .def("clear", &EmbeddingStoreWrapper::clear)
       .def("assign_scores", &EmbeddingStoreWrapper::assign_scores,
            nb::arg("keys"), nb::arg("scores"))
@@ -679,6 +681,18 @@ NB_MODULE(_core, m) {
       .def("export_page_images", &EmbeddingStoreWrapper::export_page_images)
       .def("import_page_images", &EmbeddingStoreWrapper::import_page_images,
            nb::arg("pages"))
+      .def("checkpoint_mutations", &EmbeddingStoreWrapper::checkpoint_mutations)
+      .def("checkpoint_baseline", &EmbeddingStoreWrapper::checkpoint_baseline)
+      .def("checkpoint_mutation_watermark",
+           &EmbeddingStoreWrapper::checkpoint_mutation_watermark)
+      .def("cancel_checkpoint_capture",
+           &EmbeddingStoreWrapper::cancel_checkpoint_capture,
+           nb::arg("capture_id"), nb::arg("journal_identity"))
+      .def_prop_ro("entries_per_page", &EmbeddingStoreWrapper::entries_per_page)
+      .def("acknowledge_checkpoint_mutations",
+           &EmbeddingStoreWrapper::acknowledge_checkpoint_mutations,
+           nb::arg("watermark"), nb::arg("baseline"), nb::arg("capture_id"),
+           nb::arg("journal_identity"))
       .def("value_dtype", &EmbeddingStoreWrapper::value_dtype)
       .def("optimizer_dtype", &EmbeddingStoreWrapper::optimizer_dtype)
       .def("key_dtype", &EmbeddingStoreWrapper::key_dtype)
@@ -774,20 +788,22 @@ NB_MODULE(_core, m) {
          uint32_t participant_index, const std::vector<uint32_t> &dimensions,
          const std::string &embedding_dtype, const std::string &optimizer_dtype,
          const std::string &score_policy, const std::string &key_dtype,
-         const std::string &schema_digest, bool include_page_images) {
-        return self.write_native_fragment(uri, participant_index, dimensions,
-                                          embedding_dtype, optimizer_dtype,
-                                          score_policy, key_dtype,
-                                          schema_digest, include_page_images);
+         const std::string &schema_digest, bool include_page_images,
+         bool incremental_mode, const std::string &expected_baseline) {
+        return self.write_native_fragment(
+            uri, participant_index, dimensions, embedding_dtype,
+            optimizer_dtype, score_policy, key_dtype, schema_digest,
+            include_page_images, incremental_mode, expected_baseline);
       },
       nb::arg("store"), nb::arg("uri"), nb::arg("participant_index"),
       nb::arg("dimensions"), nb::arg("embedding_dtype"),
       nb::arg("optimizer_dtype"), nb::arg("score_policy"), nb::arg("key_dtype"),
-      nb::arg("schema_digest"), nb::arg("include_page_images") = false);
+      nb::arg("schema_digest"), nb::arg("include_page_images") = false,
+      nb::arg("incremental_mode") = false, nb::arg("expected_baseline") = "");
   checkpoint.def(
       "restore_native_partition_entries",
-      [](EmbeddingStoreWrapper &self, const std::string &uri, uint64_t version,
-         uint64_t partition_count, uint64_t partition_id,
+      [](EmbeddingStoreWrapper &self, const std::vector<std::string> &uris,
+         uint64_t version, uint64_t partition_count, uint64_t partition_id,
          const std::string &key_dtype,
          std::optional<uint32_t> source_participant_index,
          const nb::dict &storage_options, bool load_optimizer_state,
@@ -799,12 +815,12 @@ NB_MODULE(_core, m) {
               nb::cast<std::string>(nb::str(v));
         }
         self.restore_native_partition_entries(
-            uri, version, partition_count, partition_id, key_dtype,
+            uris, version, partition_count, partition_id, key_dtype,
             assignment_name, params,
             checkpoint_storage_options(storage_options), load_optimizer_state,
             source_participant_index);
       },
-      nb::arg("store"), nb::arg("uri"), nb::arg("version"),
+      nb::arg("store"), nb::arg("uris"), nb::arg("version"),
       nb::arg("partition_count"), nb::arg("partition_id"), nb::arg("key_dtype"),
       nb::arg("source_participant_index") = nb::none(),
       nb::arg("storage_options") = nb::dict(),
@@ -861,6 +877,50 @@ NB_MODULE(_core, m) {
       },
       nb::arg("uris"), nb::arg("version"),
       nb::arg("storage_options") = nb::dict());
+  checkpoint.def(
+      "validate_native_checkpoint_chain",
+      [](const std::vector<std::vector<std::string>> &source_uris,
+         const std::vector<std::vector<uint64_t>> &participant_watermarks,
+         const std::vector<uint32_t> &dimensions, const std::string &key_dtype,
+         const nb::dict &storage_options) {
+        const auto options = checkpoint_storage_options(storage_options);
+        nb::gil_scoped_release release;
+        se::validate_native_checkpoint_chain(source_uris,
+                                             participant_watermarks, dimensions,
+                                             key_dtype, options);
+      },
+      nb::arg("source_uris"), nb::arg("participant_watermarks"),
+      nb::arg("dimensions"), nb::arg("key_dtype"), nb::arg("storage_options"));
+  checkpoint.def(
+      "compact_native_checkpoint",
+      [](const std::string &target_uri,
+         const std::vector<std::string> &source_uris,
+         uint32_t participant_index, const std::vector<uint32_t> &dimensions,
+         const std::string &embedding_dtype, const std::string &optimizer_dtype,
+         const std::string &score_policy, const std::string &key_dtype,
+         const std::string &schema_digest, bool include_page_images,
+         uint32_t entries_per_page, const nb::dict &storage_options) {
+        const auto options = checkpoint_storage_options(storage_options);
+        se::NativeFragmentArtifact artifact;
+        {
+          nb::gil_scoped_release release;
+          artifact = se::compact_native_checkpoint(
+              target_uri, source_uris, participant_index, dimensions,
+              embedding_dtype, optimizer_dtype, score_policy, key_dtype,
+              schema_digest, include_page_images, entries_per_page, options);
+        }
+        nb::dict result;
+        result["entry_count"] = artifact.entry_count;
+        result["page_count"] = artifact.page_count;
+        result["content_digest"] = artifact.content_digest;
+        return result;
+      },
+      nb::arg("target_uri"), nb::arg("source_uris"),
+      nb::arg("participant_index"), nb::arg("dimensions"),
+      nb::arg("embedding_dtype"), nb::arg("optimizer_dtype"),
+      nb::arg("score_policy"), nb::arg("key_dtype"), nb::arg("schema_digest"),
+      nb::arg("include_page_images"), nb::arg("entries_per_page"),
+      nb::arg("storage_options"));
   checkpoint.def(
       "compact_native_lance_sources",
       [](const std::string &target_uri,

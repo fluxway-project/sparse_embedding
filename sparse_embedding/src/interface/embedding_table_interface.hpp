@@ -29,6 +29,19 @@
 
 namespace se {
 
+struct CheckpointCaptureCut {
+  uint64_t mutation_watermark;
+  uint64_t capture_id;
+  std::string journal_identity;
+};
+
+struct CheckpointMutation {
+  uint32_t dimension;
+  uint64_t key;
+  uint64_t mutation_sequence;
+  bool deleted;
+};
+
 template <typename ParamT, typename OptT> struct PageImageExport {
   uint64_t physical_page_id;
   uint32_t embedding_dim;
@@ -69,6 +82,7 @@ PRO_DEF_MEM_DISPATCH(MemCapacity, capacity);
 PRO_DEF_MEM_DISPATCH(MemReserve, reserve);
 PRO_DEF_MEM_DISPATCH(MemReservePerShard, reserve_per_shard);
 PRO_DEF_MEM_DISPATCH(MemInternalShardCount, internal_shard_count);
+PRO_DEF_MEM_DISPATCH(MemEntriesPerPage, entries_per_page);
 
 // --- Core read/write ---------------------------------------------------------
 PRO_DEF_MEM_DISPATCH(MemLookup, lookup);
@@ -76,6 +90,7 @@ PRO_DEF_MEM_DISPATCH(MemLookupOrInsert, lookup_or_insert);
 PRO_DEF_MEM_DISPATCH(MemAssign, assign);
 PRO_DEF_MEM_DISPATCH(MemContains, contains);
 PRO_DEF_MEM_DISPATCH(MemErase, erase);
+PRO_DEF_MEM_DISPATCH(MemEraseDimension, erase_dimension);
 PRO_DEF_MEM_DISPATCH(MemClear, clear);
 
 // --- Score / eviction (optional) ---------------------------------------------
@@ -93,6 +108,14 @@ PRO_DEF_MEM_DISPATCH(MemPromoteHotKeys, promote_hot_keys);
 PRO_DEF_MEM_DISPATCH(MemPromotedHotPageSize, promoted_hot_page_size);
 PRO_DEF_MEM_DISPATCH(MemExportPageImages, export_page_images);
 PRO_DEF_MEM_DISPATCH(MemImportPageImages, import_page_images);
+PRO_DEF_MEM_DISPATCH(MemCaptureCheckpoint, capture_checkpoint);
+PRO_DEF_MEM_DISPATCH(MemCheckpointMutations, checkpoint_mutations);
+PRO_DEF_MEM_DISPATCH(MemCancelCheckpointCapture, cancel_checkpoint_capture);
+PRO_DEF_MEM_DISPATCH(MemCheckpointBaseline, checkpoint_baseline);
+PRO_DEF_MEM_DISPATCH(MemCheckpointMutationWatermark,
+                     checkpoint_mutation_watermark);
+PRO_DEF_MEM_DISPATCH(MemAcknowledgeCheckpointMutations,
+                     acknowledge_checkpoint_mutations);
 
 // --- Training: Forward -------------------------------------------------------
 PRO_DEF_MEM_DISPATCH(MemForwardLookup, forward_lookup);
@@ -152,6 +175,8 @@ using WeakMemOptimizerStep = pro::weak_dispatch<MemOptimizerStep>;
   std::error_code(std::span<const key_t> keys, std::span<uint8_t> out_exists)
 
 #define SE_ERASE_FACADE_SIG(key_t) std::error_code(std::span<const key_t> keys)
+#define SE_ERASE_DIMENSION_FACADE_SIG(key_t)                                   \
+  std::error_code(std::size_t dimension, std::span<const key_t> keys)
 
 #define SE_ASSIGN_SCORES_FACADE_SIG(key_t)                                     \
   std::error_code(std::span<const key_t> keys, std::span<const uint64_t> scores)
@@ -272,6 +297,11 @@ struct EmbeddingTableFacade : pro //
   ::add_convention<WeakMemErase,
                    SE_ERASE_FACADE_SIG(int32_t), SE_ERASE_FACADE_SIG(uint32_t),
                    SE_ERASE_FACADE_SIG(int64_t), SE_ERASE_FACADE_SIG(uint64_t)> //
+  ::add_convention<pro::weak_dispatch<MemEraseDimension>,
+                   SE_ERASE_DIMENSION_FACADE_SIG(int32_t),
+                   SE_ERASE_DIMENSION_FACADE_SIG(uint32_t),
+                   SE_ERASE_DIMENSION_FACADE_SIG(int64_t),
+                   SE_ERASE_DIMENSION_FACADE_SIG(uint64_t)> //
   ::add_convention<WeakMemClear,
                    std::error_code()> //
 
@@ -295,6 +325,20 @@ struct EmbeddingTableFacade : pro //
                    SE_PROMOTED_HOT_PAGE_SIZE_FACADE_SIG> //
   ::add_convention<WeakMemExportPageImages, SE_EXPORT_PAGE_IMAGES_FACADE_SIG> //
   ::add_convention<WeakMemImportPageImages, SE_IMPORT_PAGE_IMAGES_FACADE_SIG> //
+  ::add_convention<MemEntriesPerPage, size_t() const> //
+  ::add_convention<pro::weak_dispatch<MemCaptureCheckpoint>,
+                   CheckpointCaptureCut(bool, std::string, bool,
+                            se::Function<void(std::span<const CheckpointMutation>, uint64_t)>,
+                            se::Function<bool(size_t, PageImageExport<ParamT, OptT> &&)>)> //
+  ::add_convention<pro::weak_dispatch<MemCheckpointMutations>,
+                   std::vector<CheckpointMutation>() const> //
+  ::add_convention<pro::weak_dispatch<MemCancelCheckpointCapture>, void(uint64_t, std::string)> \
+  ::add_convention<pro::weak_dispatch<MemCheckpointBaseline>,
+                   std::string() const> //
+  ::add_convention<pro::weak_dispatch<MemCheckpointMutationWatermark>,
+                   uint64_t() const> //
+  ::add_convention<pro::weak_dispatch<MemAcknowledgeCheckpointMutations>,
+                   void(uint64_t, std::string, uint64_t, std::string)> //
 
   // --- Training: Forward ----------------------------------------------------
   ::add_convention<WeakMemForwardLookup,
@@ -344,6 +388,7 @@ struct EmbeddingTableFacade : pro //
 #undef SE_ASSIGN_FACADE_SIG
 #undef SE_CONTAINS_FACADE_SIG
 #undef SE_ERASE_FACADE_SIG
+#undef SE_ERASE_DIMENSION_FACADE_SIG
 #undef SE_ASSIGN_SCORES_FACADE_SIG
 #undef SE_FORWARD_LOOKUP_FACADE_SIG
 #undef SE_ACCUMULATE_GRADIENTS_FACADE_SIG

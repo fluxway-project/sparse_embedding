@@ -7,6 +7,7 @@ from pathlib import Path
 import lance
 import msgpack
 import numpy as np
+import pyarrow as pa
 import pytest
 
 import sparse_embedding as se
@@ -28,6 +29,7 @@ from sparse_embedding.checkpoint.base import (
     CheckpointLeaseRequest,
     CheckpointParticipant,
     CheckpointSaveIdentity,
+    CheckpointSaveMode,
     InvalidCheckpointFragment,
     StorageBudgetExceeded,
 )
@@ -102,6 +104,97 @@ def test_user_facade_roundtrip(tmp_path):
         encode_restore_options(PhysicalRestore(CheckpointParticipant(0, 1))),
     )
     np.testing.assert_allclose(lookup(restored, (1, 2)), 3)
+
+
+def test_incremental_checkpoint_restores_parent_and_delta(tmp_path):
+    storage = LocalLanceStorage(tmp_path / "checkpoint")
+    checkpoint = SparseCheckpoint(storage)
+    source = populated_store((1,), 1)
+    parent = checkpoint.save_training_checkpoint(source, "incremental")
+    source.assign(
+        np.asarray([2], dtype=np.uint64), np.full((1, 4), 2, dtype=np.float32)
+    )
+    child = checkpoint.save_training_checkpoint(
+        source,
+        "incremental",
+        mode=CheckpointSaveMode.INCREMENTAL,
+        parent_handle=parent.handle,
+    )
+    restored_parent = se.EmbeddingStore(config())
+    checkpoint.load_training_checkpoint(
+        restored_parent,
+        parent.handle,
+        encode_restore_options(modulo_restore(1, 0)),
+    )
+    restored_child = se.EmbeddingStore(config())
+    checkpoint.load_training_checkpoint(
+        restored_child,
+        child.handle,
+        encode_restore_options(modulo_restore(1, 0)),
+    )
+    assert restored_parent.total_size() == 1
+    assert restored_child.total_size() == 2
+    np.testing.assert_allclose(lookup(restored_child, (2,)), 2)
+
+
+def test_incremental_tombstone_is_dimension_scoped(tmp_path):
+    storage = LocalLanceStorage(tmp_path / "checkpoint")
+    checkpoint = SparseCheckpoint(storage)
+    source = populated_store((7,), 1, dims=(2, 4))
+    parent = checkpoint.save_training_checkpoint(source, "tombstone")
+    source.erase_dimension(np.asarray([7], dtype=np.uint64), dimension=2)
+    child = checkpoint.save_training_checkpoint(
+        source,
+        "tombstone",
+        mode=CheckpointSaveMode.INCREMENTAL,
+        parent_handle=parent.handle,
+    )
+    restored = se.EmbeddingStore(config((2, 4)))
+    checkpoint.load_training_checkpoint(
+        restored,
+        child.handle,
+        encode_restore_options(modulo_restore(1, 0)),
+    )
+    assert restored.total_size() == 1
+    np.testing.assert_allclose(lookup(restored, (7,), dim=4), 1)
+
+
+def test_incremental_requires_store_parent_baseline(tmp_path):
+    storage = LocalLanceStorage(tmp_path / "checkpoint")
+    checkpoint = SparseCheckpoint(storage)
+    source = populated_store((1,), 1)
+    parent = checkpoint.save_training_checkpoint(source, "baseline")
+    restarted = se.EmbeddingStore(config())
+    with pytest.raises(RuntimeError, match="store baseline"):
+        checkpoint.save_training_checkpoint(
+            restarted,
+            "baseline",
+            mode=CheckpointSaveMode.INCREMENTAL,
+            parent_handle=parent.handle,
+        )
+
+
+def test_empty_incremental_checkpoint_has_no_entry_payload(tmp_path):
+    storage = LocalLanceStorage(tmp_path / "checkpoint")
+    checkpoint = SparseCheckpoint(storage)
+    source = populated_store((1,), 1)
+    parent = checkpoint.save_training_checkpoint(source, "empty-delta")
+    child = checkpoint.save_training_checkpoint(
+        source,
+        "empty-delta",
+        mode=CheckpointSaveMode.INCREMENTAL,
+        parent_handle=parent.handle,
+    )
+    manifest = storage.resolve_checkpoint_manifest(child.handle)
+    root = storage._manifest_fragment_roots(manifest)[0]
+    assert storage._metadata_for_root(root)["entry_count"] == 0
+    assert not (tmp_path / "checkpoint" / root / ENTRIES_DATASET).exists()
+    assert not (tmp_path / "checkpoint" / root / PAGE_IMAGES_DATASET).exists()
+    restored = se.EmbeddingStore(config())
+    checkpoint.load_training_checkpoint(
+        restored, child.handle, PhysicalRestore(CheckpointParticipant(0, 1))
+    )
+    np.testing.assert_allclose(lookup(restored, (1,)), 1)
 
 
 def test_checkpoint_publication_uses_opaque_handle_and_owner_version(tmp_path):
@@ -456,13 +549,14 @@ def test_physical_restore_preserves_source_participant_after_compaction(tmp_path
             )
         )
     locator = storage.commit_checkpoint(identity, fragments)
-    storage.compact_checkpoint(handle(locator))
+    storage.acknowledge_checkpoint(identity)
+    compacted = storage.compact_checkpoint(handle(locator))
 
     for participant_index in range(2):
         restored = se.EmbeddingStore(config())
         storage.load_component_checkpoint(
             restored,
-            handle(locator),
+            compacted,
             encode_restore_options(
                 PhysicalRestore(CheckpointParticipant(participant_index, 2))
             ),
@@ -985,17 +1079,48 @@ def test_commit_rejects_post_merge_storage_budget(tmp_path):
     assert not (root / PAGE_IMAGES_DATASET).exists()
 
 
-def test_compact_checkpoint_locator_is_explicit_and_idempotent(tmp_path):
+def test_compact_checkpoint_publishes_new_full_version(tmp_path):
     storage = LocalLanceStorage(tmp_path / "checkpoint")
     checkpoint = SparseCheckpoint(storage)
-    locator = checkpoint.save_training_checkpoint(
-        populated_store((1,), 1), "compact-me"
+    source = checkpoint.save_training_checkpoint(populated_store((1,), 1), "compact-me")
+    compacted_handle = storage.compact_checkpoint(handle(source))
+    source_manifest = storage._resolve_manifest(
+        _decode_checkpoint_handle(handle(source))[1]
     )
-    storage.compact_checkpoint(handle(locator))
-    storage.compact_checkpoint(handle(locator))
-    manifest = storage._resolve_manifest(_decode_checkpoint_handle(handle(locator))[1])
-    assert manifest["compacted_version"] == 1
-    assert len(manifest["fragment_ids"]) == 1
+    compacted_manifest = storage._resolve_manifest(
+        _decode_checkpoint_handle(compacted_handle)[1]
+    )
+    assert source_manifest["compacted_version"] == 0
+    assert compacted_manifest["checkpoint_version"] == 2
+    assert compacted_manifest["checkpoint_mode"] == "full"
+
+
+def test_compact_checkpoint_can_materialize_page_images(tmp_path):
+    storage = LocalLanceStorage(tmp_path / "checkpoint")
+    checkpoint = SparseCheckpoint(storage)
+    source = checkpoint.save_training_checkpoint(
+        populated_store((1, 2), 3), "compact-pages"
+    )
+    compacted = storage.compact_checkpoint(handle(source), include_page_images=True)
+    manifest = storage._resolve_manifest(_decode_checkpoint_handle(compacted)[1])
+    roots = storage._manifest_fragment_roots(manifest)
+    assert manifest["checkpoint_mode"] == "full"
+    assert manifest["compacted_version"] == 0
+    assert all(
+        storage._workspace.exists(f"{root}/{PAGE_IMAGES_DATASET}") for root in roots
+    )
+    restored = se.EmbeddingStore(config())
+    storage.load_component_checkpoint(
+        restored,
+        compacted,
+        encode_restore_options(
+            PhysicalRestore(
+                CheckpointParticipant(0, 1),
+                strategy=PhysicalRestoreStrategy.FAST_PAGE_CACHE,
+            )
+        ),
+    )
+    np.testing.assert_allclose(lookup(restored, (1, 2)), 3)
 
 
 def test_inference_storage_requires_a_published_weight_path(tmp_path):
@@ -1321,3 +1446,731 @@ def test_sparse_checkpoint_load_with_typed_restore_plan(tmp_path):
             committed.handle,
             "unsupported_restore_type",  # type: ignore
         )
+
+
+@pytest.mark.parametrize("include_page_images", [False, True])
+def test_incremental_commit_context_survives_coordinator_restart(
+    tmp_path, include_page_images
+):
+    root = tmp_path / "checkpoint"
+    writer = LocalLanceStorage(root)
+    checkpoint = SparseCheckpoint(writer)
+    source = populated_store((1, 2), 1)
+    parent = checkpoint.save_training_checkpoint(source, "restart-delta")
+    source.assign(
+        np.asarray([2], dtype=np.uint64), np.full((1, 4), 9, dtype=np.float32)
+    )
+    identity = CheckpointSaveIdentity("restart-delta", "delta", authority(1))
+    writer.prepare_checkpoint(identity)
+    fragment = writer.write_checkpoint_fragment(
+        source,
+        identity,
+        CheckpointParticipant(0, 1),
+        mode=CheckpointSaveMode.INCREMENTAL,
+        parent_manifest=writer.resolve_checkpoint_manifest(parent.handle),
+        include_page_images=include_page_images,
+    )
+    committer = LocalLanceStorage(root)
+    child = committer.commit_checkpoint(identity, [fragment])
+    manifest = committer.resolve_checkpoint_manifest(child.handle)
+    assert manifest["checkpoint_mode"] == "incremental"
+    assert manifest["participant_watermarks"] == [
+        fragment.save_context.mutation_watermark
+    ]
+    assert fragment.entry_count == 1
+    restored = se.EmbeddingStore(config())
+    strategy = (
+        PhysicalRestoreStrategy.FAST_PAGE_CACHE
+        if include_page_images
+        else PhysicalRestoreStrategy.RECONSTRUCT_ENTRIES
+    )
+    SparseCheckpoint(committer).load_training_checkpoint(
+        restored,
+        child.handle,
+        PhysicalRestore(CheckpointParticipant(0, 1), strategy=strategy),
+    )
+    np.testing.assert_allclose(lookup(restored, (1,)), 1)
+    np.testing.assert_allclose(lookup(restored, (2,)), 9)
+
+
+@pytest.mark.parametrize("equal_watermarks", [False, True])
+def test_participant_local_sequences_and_unequal_watermarks(tmp_path, equal_watermarks):
+    root = tmp_path / "checkpoint"
+    storage = LocalLanceStorage(root)
+    stores = [
+        populated_store((1,), 1),
+        populated_store((2,) if equal_watermarks else (2, 3), 2),
+    ]
+    first_identity = CheckpointSaveIdentity("participants", "full", authority())
+    storage.prepare_checkpoint(first_identity)
+    fragments = [
+        storage.write_checkpoint_fragment(
+            store, first_identity, CheckpointParticipant(index, 2)
+        )
+        for index, store in enumerate(stores)
+    ]
+    parent = storage.commit_checkpoint(first_identity, fragments)
+    storage.acknowledge_checkpoint(first_identity)
+    for index, store in enumerate(stores):
+        storage.acknowledge_store_mutations(
+            store, parent.handle, participant_index=index
+        )
+    stores[0].assign(
+        np.asarray([1], dtype=np.uint64), np.full((1, 4), 7, dtype=np.float32)
+    )
+    stores[1].assign(
+        np.asarray([2], dtype=np.uint64), np.full((1, 4), 8, dtype=np.float32)
+    )
+    second_identity = CheckpointSaveIdentity("participants", "delta", authority(1))
+    storage.prepare_checkpoint(second_identity)
+    fragments = [
+        storage.write_checkpoint_fragment(
+            store,
+            second_identity,
+            CheckpointParticipant(index, 2),
+            mode=CheckpointSaveMode.INCREMENTAL,
+            parent_manifest=storage.resolve_checkpoint_manifest(parent.handle),
+        )
+        for index, store in enumerate(stores)
+    ]
+    child = LocalLanceStorage(root).commit_checkpoint(second_identity, fragments)
+    assert storage.resolve_checkpoint_manifest(child.handle)[
+        "participant_watermarks"
+    ] == [fragment.save_context.mutation_watermark for fragment in fragments]
+    restored = se.EmbeddingStore(config())
+    SparseCheckpoint(storage).load_training_checkpoint(
+        restored, child.handle, modulo_restore(1, 0)
+    )
+    np.testing.assert_allclose(lookup(restored, (1,)), 7)
+    np.testing.assert_allclose(lookup(restored, (2,)), 8)
+    if equal_watermarks:
+        assert (
+            fragments[0].save_context.mutation_watermark
+            == fragments[1].save_context.mutation_watermark
+        )
+    else:
+        np.testing.assert_allclose(lookup(restored, (3,)), 2)
+
+
+def test_parent_protection_survives_prepared_commit_retry(tmp_path, monkeypatch):
+    root = tmp_path / "checkpoint"
+    storage = LocalLanceStorage(root)
+    source = populated_store((1,), 1)
+    parent = SparseCheckpoint(storage).save_training_checkpoint(source, "retry-parent")
+    source.assign(
+        np.asarray([1], dtype=np.uint64), np.full((1, 4), 2, dtype=np.float32)
+    )
+    identity = CheckpointSaveIdentity("retry-parent", "delta", authority(1))
+    storage.prepare_checkpoint(identity)
+    fragment = storage.write_checkpoint_fragment(
+        source,
+        identity,
+        CheckpointParticipant(0, 1),
+        mode=CheckpointSaveMode.INCREMENTAL,
+        parent_manifest=storage.resolve_checkpoint_manifest(parent.handle),
+    )
+    original = storage._create_parent_chain_reference
+
+    def fault(manifest):
+        original(manifest)
+        raise RuntimeError("injected parent protection fault")
+
+    monkeypatch.setattr(storage, "_create_parent_chain_reference", fault)
+    with pytest.raises(RuntimeError, match="injected parent"):
+        storage.commit_checkpoint(identity, [fragment])
+    restarted = LocalLanceStorage(root)
+    child = restarted.commit_checkpoint(identity, ())
+    restarted.acknowledge_checkpoint(identity)
+    restarted.release_reference(child.handle)
+    restarted.reclaim()
+    restored = se.EmbeddingStore(config())
+    SparseCheckpoint(restarted).load_training_checkpoint(
+        restored, child.handle, modulo_restore(1, 0)
+    )
+    np.testing.assert_allclose(lookup(restored, (1,)), 2)
+    assert (
+        restarted.resolve_checkpoint_manifest(parent.handle)["checkpoint_version"] == 1
+    )
+
+
+def test_optimizer_tracks_only_updated_keys(tmp_path):
+    source = se.EmbeddingStore(config(), optimizer_config=se.Adam(lr=0.01))
+    source.assign(
+        np.asarray([1, 2], dtype=np.uint64), np.ones((2, 4), dtype=np.float32)
+    )
+    storage = LocalLanceStorage(tmp_path / "checkpoint")
+    checkpoint = SparseCheckpoint(storage)
+    parent = checkpoint.save_training_checkpoint(source, "optimizer-dirty")
+    source.optimizer_step()
+    assert source.checkpoint_mutations() == []
+    source.accumulate_gradients(
+        np.asarray([2], dtype=np.uint64), np.ones((1, 4), dtype=np.float32)
+    )
+    source.optimizer_step()
+    assert [row["key"] for row in source.checkpoint_mutations()] == [2]
+    child = checkpoint.save_training_checkpoint(
+        source,
+        "optimizer-dirty",
+        mode=CheckpointSaveMode.INCREMENTAL,
+        parent_handle=parent.handle,
+    )
+    root = storage._manifest_fragment_roots(
+        storage.resolve_checkpoint_manifest(child.handle)
+    )[0]
+    assert storage._metadata_for_root(root)["entry_count"] == 1
+
+
+def test_lookup_score_survives_incremental_restore(tmp_path):
+    source = se.EmbeddingStore(config(), score_policy="lfu")
+    source.assign(
+        np.asarray([1, 2], dtype=np.uint64), np.ones((2, 4), dtype=np.float32)
+    )
+    storage = LocalLanceStorage(tmp_path / "checkpoint")
+    checkpoint = SparseCheckpoint(storage)
+    parent = checkpoint.save_training_checkpoint(source, "score-dirty")
+    lookup(source, (1,))
+    assert [row["key"] for row in source.checkpoint_mutations()] == [1]
+    child = checkpoint.save_training_checkpoint(
+        source,
+        "score-dirty",
+        mode=CheckpointSaveMode.INCREMENTAL,
+        parent_handle=parent.handle,
+    )
+    restored = se.EmbeddingStore(config(), score_policy="lfu")
+    checkpoint.load_training_checkpoint(
+        restored, child.handle, PhysicalRestore(CheckpointParticipant(0, 1))
+    )
+    assert restored.total_size() == 2
+    image = restored.export_page_images()[0]
+    assert dict(zip(image["keys"], image["scores"], strict=True)) == {1: 1, 2: 0}
+
+
+def test_mutation_after_capture_survives_acknowledgement(tmp_path, monkeypatch):
+    source = populated_store((1,), 1)
+    storage = LocalLanceStorage(tmp_path / "checkpoint")
+    checkpoint = SparseCheckpoint(storage)
+    parent = checkpoint.save_training_checkpoint(source, "later-mutation")
+    source.assign(
+        np.asarray([1], dtype=np.uint64), np.full((1, 4), 2, dtype=np.float32)
+    )
+    original = storage.commit_checkpoint
+
+    def publish(identity, fragments, lease_request=None):
+        source.assign(
+            np.asarray([1], dtype=np.uint64), np.full((1, 4), 3, dtype=np.float32)
+        )
+        return original(identity, fragments, lease_request)
+
+    monkeypatch.setattr(storage, "commit_checkpoint", publish)
+    child = checkpoint.save_training_checkpoint(
+        source,
+        "later-mutation",
+        mode=CheckpointSaveMode.INCREMENTAL,
+        parent_handle=parent.handle,
+    )
+    assert len(source.checkpoint_mutations()) == 1
+    restored = se.EmbeddingStore(config())
+    checkpoint.load_training_checkpoint(
+        restored, child.handle, PhysicalRestore(CheckpointParticipant(0, 1))
+    )
+    np.testing.assert_allclose(lookup(restored, (1,)), 2)
+    np.testing.assert_allclose(lookup(source, (1,)), 3)
+
+
+def test_stale_acknowledgement_cannot_roll_back_baseline(tmp_path):
+    storage = LocalLanceStorage(tmp_path / "checkpoint")
+    store = populated_store((1,), 1)
+    first_identity = CheckpointSaveIdentity("first-cut", "first", authority())
+    storage.prepare_checkpoint(first_identity)
+    first_fragment = storage.write_checkpoint_fragment(
+        store, first_identity, CheckpointParticipant(0, 1)
+    )
+    first = storage.commit_checkpoint(first_identity, [first_fragment])
+    storage.acknowledge_checkpoint(first_identity)
+    store.assign(np.asarray([1], dtype=np.uint64), np.full((1, 4), 2, dtype=np.float32))
+    second_identity = CheckpointSaveIdentity("second-cut", "second", authority(1))
+    storage.prepare_checkpoint(second_identity)
+    second_fragment = storage.write_checkpoint_fragment(
+        store, second_identity, CheckpointParticipant(0, 1)
+    )
+    second = storage.commit_checkpoint(second_identity, [second_fragment])
+    storage.acknowledge_store_mutations(store, second.handle)
+    baseline = store.checkpoint_baseline()
+    with pytest.raises(ValueError, match="stale"):
+        storage.acknowledge_store_mutations(store, first.handle)
+    assert store.checkpoint_baseline() == baseline
+
+
+def test_compact_pages_respect_explicit_geometry(tmp_path):
+    tuning = se.StorageTuningOptions(
+        entries_per_page=4096, max_pages=64, calibrate_page_geometry=False
+    )
+    cfg = se.EmbeddingConfig(
+        dims=[4], thread_budget=1, key_dtype="uint64", storage_tuning=tuning
+    )
+    source = se.EmbeddingStore(cfg, optimizer_config=se.Adam(lr=0.01))
+    keys = np.arange(5000, dtype=np.uint64)
+    source.assign(keys, np.ones((5000, 4), dtype=np.float32))
+    gradients = np.arange(5000 * 4, dtype=np.float32).reshape(5000, 4) / 20000
+    source.accumulate_gradients(keys, gradients)
+    source.optimizer_step()
+    storage = LocalLanceStorage(tmp_path / "checkpoint")
+    checkpoint = SparseCheckpoint(storage)
+    parent = checkpoint.save_training_checkpoint(source, "geometry")
+    compacted = storage.compact_checkpoint(parent.handle, include_page_images=True)
+    restored = se.EmbeddingStore(cfg, optimizer_config=se.Adam(lr=0.01))
+    checkpoint.load_training_checkpoint(
+        restored,
+        compacted,
+        PhysicalRestore(
+            CheckpointParticipant(0, 1),
+            strategy=PhysicalRestoreStrategy.FAST_PAGE_CACHE,
+        ),
+    )
+    assert restored.total_size() == 5000
+    np.testing.assert_allclose(lookup(restored, keys), lookup(source, keys))
+    assert sorted(len(image["keys"]) for image in restored.export_page_images()) == [
+        904,
+        4096,
+    ]
+    for store in (source, restored):
+        store.accumulate_gradients(keys, gradients)
+        store.optimizer_step()
+    np.testing.assert_allclose(lookup(restored, keys), lookup(source, keys))
+    incompatible = se.EmbeddingStore(
+        se.EmbeddingConfig(
+            dims=[4],
+            thread_budget=1,
+            key_dtype="uint64",
+            storage_tuning=se.StorageTuningOptions(
+                entries_per_page=8192, max_pages=64, calibrate_page_geometry=False
+            ),
+        )
+    )
+    with pytest.raises(ValueError, match="geometry"):
+        checkpoint.load_training_checkpoint(
+            incompatible,
+            compacted,
+            PhysicalRestore(
+                CheckpointParticipant(0, 1),
+                strategy=PhysicalRestoreStrategy.FAST_PAGE_CACHE,
+            ),
+        )
+    assert incompatible.total_size() == 0
+
+
+@pytest.mark.parametrize("include_page_images", [False, True])
+def test_native_compact_rejects_optimizer_stride_change_after_page_flush(
+    tmp_path, include_page_images
+):
+    source = se.EmbeddingStore(config(), optimizer_config=se.Adam(lr=0.01))
+    keys = np.arange(4097, dtype=np.uint64)
+    source.assign(keys, np.ones((len(keys), 4), dtype=np.float32))
+    storage = LocalLanceStorage(tmp_path / "checkpoint")
+    saved = SparseCheckpoint(storage).save_training_checkpoint(source, "stride-check")
+    manifest = storage.resolve_checkpoint_manifest(saved.handle)
+    root = storage._manifest_fragment_roots(manifest)[0]
+    table = lance.dataset(
+        storage._workspace.uri(f"{root}/{ENTRIES_DATASET}")
+    ).to_table()
+    first_uri = str(tmp_path / "first" / ENTRIES_DATASET)
+    second_uri = str(tmp_path / "second" / ENTRIES_DATASET)
+    lance.write_dataset(table.slice(0, 4096), first_uri)
+    last = table.slice(4096, 1).to_pylist()[0]
+    last["optimizer_state_stride"] //= 2
+    last["optimizer_state_values"] = last["optimizer_state_values"][
+        : len(last["optimizer_state_values"]) // 2
+    ]
+    lance.write_dataset(pa.Table.from_pylist([last], schema=table.schema), second_uri)
+    specification = storage._manifest_specification(manifest)
+    with pytest.raises(RuntimeError, match="optimizer strides differ"):
+        lance_backend._checkpoint_native.compact_native_checkpoint(
+            str(tmp_path / "target"),
+            [first_uri, second_uri],
+            0,
+            list(specification.dimensions),
+            specification.embedding_dtype,
+            specification.optimizer_dtype,
+            specification.score_policy,
+            specification.key_dtype,
+            lance_backend._schema_digest(specification),
+            include_page_images,
+            4096,
+            {},
+        )
+
+
+@pytest.mark.parametrize("failure_boundary", ["payload", "manifest", "post_manifest"])
+def test_reclaim_recovery_releases_parent_chain_reference(
+    tmp_path, monkeypatch, failure_boundary
+):
+    storage = LocalLanceStorage(tmp_path / "checkpoint")
+    source = populated_store((1,), 1)
+    checkpoint = SparseCheckpoint(storage)
+    parent = checkpoint.save_training_checkpoint(source, "reclaim-chain")
+    source.assign(
+        np.asarray([1], dtype=np.uint64), np.full((1, 4), 2, dtype=np.float32)
+    )
+    child = checkpoint.save_training_checkpoint(
+        source,
+        "reclaim-chain",
+        mode=CheckpointSaveMode.INCREMENTAL,
+        parent_handle=parent.handle,
+    )
+    lease = storage.acquire_checkpoint_lease(
+        child.handle, CheckpointLeaseRequest("fault-test", 60, "retain-child")
+    )
+    checkpoint.save_training_checkpoint(source, "reclaim-chain")
+    child_manifest = storage.resolve_checkpoint_manifest(child.handle)
+    child_root = storage._manifest_fragment_roots(child_manifest)[0]
+    if failure_boundary == "payload":
+        original = storage._workspace.delete_prefix
+
+        def fault(root, **kwargs):
+            original(root, **kwargs)
+            if root == child_root:
+                raise RuntimeError("injected reclaim payload fault")
+
+        monkeypatch.setattr(storage._workspace, "delete_prefix", fault)
+    elif failure_boundary == "manifest":
+        original = storage._delete_parent_chain_reference
+
+        def fault(manifest):
+            original(manifest)
+            if manifest["checkpoint_version"] == child_manifest["checkpoint_version"]:
+                raise RuntimeError("injected reclaim manifest fault")
+
+        monkeypatch.setattr(storage, "_delete_parent_chain_reference", fault)
+    else:
+        dataset_type = type(
+            lance.dataset(str(tmp_path / "checkpoint" / SNAPSHOT_MANIFEST_DATASET))
+        )
+        original = dataset_type.delete
+
+        def fault(dataset, predicate, *args, **kwargs):
+            result = original(dataset, predicate, *args, **kwargs)
+            if (
+                f"checkpoint_version = {child_manifest['checkpoint_version']}"
+                in predicate
+            ):
+                raise RuntimeError("injected post-manifest reclaim fault")
+            return result
+
+        monkeypatch.setattr(dataset_type, "delete", fault)
+    storage.release_checkpoint_lease(lease)
+    with pytest.raises(RuntimeError):
+        storage.reclaim()
+    monkeypatch.undo()
+    restarted = LocalLanceStorage(tmp_path / "checkpoint")
+    restarted.reclaim()
+    restarted.reclaim()
+    with pytest.raises(LookupError):
+        restarted.resolve_checkpoint_manifest(parent.handle)
+    with pytest.raises(LookupError):
+        restarted.resolve_checkpoint_manifest(child.handle)
+
+
+@pytest.mark.parametrize("capture_target", [False, True])
+def test_acknowledgement_rejects_other_journal_incarnation(tmp_path, capture_target):
+    storage = LocalLanceStorage(tmp_path / "checkpoint")
+    source = populated_store((1,), 1)
+    parent = SparseCheckpoint(storage).save_training_checkpoint(source, "incarnation")
+    target = populated_store((1,), 1)
+    if capture_target:
+        identity = CheckpointSaveIdentity("other", "other", authority(1))
+        storage.prepare_checkpoint(identity)
+        storage.write_checkpoint_fragment(target, identity, CheckpointParticipant(0, 1))
+        storage.abort_checkpoint(identity)
+    with pytest.raises(ValueError, match="incarnation"):
+        storage.acknowledge_store_mutations(target, parent.handle)
+    assert target.checkpoint_baseline() == ""
+    assert target.checkpoint_mutations()
+
+
+def test_page_restore_requires_new_full_baseline(tmp_path):
+    storage = LocalLanceStorage(tmp_path / "checkpoint")
+    checkpoint = SparseCheckpoint(storage)
+    store = populated_store((1,), 1)
+    parent = checkpoint.save_training_checkpoint(
+        store, "physical-lineage", include_page_images=True
+    )
+    store.clear()
+    checkpoint.load_training_checkpoint(
+        store,
+        parent.handle,
+        PhysicalRestore(
+            CheckpointParticipant(0, 1),
+            strategy=PhysicalRestoreStrategy.FAST_PAGE_CACHE,
+        ),
+    )
+    assert store.checkpoint_baseline() == ""
+    np.testing.assert_allclose(lookup(store, (1,)), 1)
+    with pytest.raises(RuntimeError, match="baseline"):
+        checkpoint.save_training_checkpoint(
+            store,
+            "physical-lineage",
+            mode=CheckpointSaveMode.INCREMENTAL,
+            parent_handle=parent.handle,
+        )
+    fresh = checkpoint.save_training_checkpoint(store, "physical-lineage")
+    child = checkpoint.save_training_checkpoint(
+        store,
+        "physical-lineage",
+        mode=CheckpointSaveMode.INCREMENTAL,
+        parent_handle=fresh.handle,
+    )
+    restored = se.EmbeddingStore(config())
+    checkpoint.load_training_checkpoint(restored, child.handle, modulo_restore(1, 0))
+    np.testing.assert_allclose(lookup(restored, (1,)), 1)
+
+
+@pytest.mark.parametrize("include_page_images", [False, True])
+def test_empty_full_delta_and_compact_without_payload(tmp_path, include_page_images):
+    storage = LocalLanceStorage(tmp_path / "checkpoint")
+    checkpoint = SparseCheckpoint(storage)
+    store = se.EmbeddingStore(config())
+    parent = checkpoint.save_training_checkpoint(
+        store, "empty-chain", include_page_images=include_page_images
+    )
+    child = checkpoint.save_training_checkpoint(
+        store,
+        "empty-chain",
+        mode=CheckpointSaveMode.INCREMENTAL,
+        parent_handle=parent.handle,
+        include_page_images=include_page_images,
+    )
+    compacted = storage.compact_checkpoint(
+        child.handle, include_page_images=include_page_images
+    )
+    for saved in (parent.handle, child.handle, compacted):
+        manifest = storage.resolve_checkpoint_manifest(saved)
+        root = storage._manifest_fragment_roots(manifest)[0]
+        assert not storage._workspace.exists(f"{root}/{ENTRIES_DATASET}")
+        assert not storage._workspace.exists(f"{root}/{PAGE_IMAGES_DATASET}")
+        target = se.EmbeddingStore(config())
+        checkpoint.load_training_checkpoint(
+            target,
+            saved,
+            PhysicalRestore(
+                CheckpointParticipant(0, 1),
+                strategy=PhysicalRestoreStrategy.FAST_PAGE_CACHE
+                if include_page_images
+                else PhysicalRestoreStrategy.RECONSTRUCT_ENTRIES,
+            ),
+        )
+        assert target.total_size() == 0
+
+
+@pytest.mark.parametrize("include_page_images", [False, True])
+def test_compact_preserves_delta_tombstones_optimizer_and_scores(
+    tmp_path, include_page_images
+):
+    cfg = config()
+    source = se.EmbeddingStore(
+        cfg, optimizer_config=se.Adam(lr=0.01), score_policy="lfu"
+    )
+    source.assign(
+        np.asarray([1, 2], dtype=np.uint64), np.ones((2, 4), dtype=np.float32)
+    )
+    storage = LocalLanceStorage(tmp_path / "checkpoint")
+    checkpoint = SparseCheckpoint(storage)
+    parent = checkpoint.save_training_checkpoint(source, "merge-state")
+    source.erase_dimension(np.asarray([2], dtype=np.uint64), dimension=4)
+    source.assign(
+        np.asarray([3], dtype=np.uint64), np.full((1, 4), 3, dtype=np.float32)
+    )
+    source.accumulate_gradients(
+        np.asarray([1], dtype=np.uint64), np.ones((1, 4), dtype=np.float32)
+    )
+    source.optimizer_step()
+    lookup(source, (1,))
+    child = checkpoint.save_training_checkpoint(
+        source,
+        "merge-state",
+        mode=CheckpointSaveMode.INCREMENTAL,
+        parent_handle=parent.handle,
+    )
+    compacted = storage.compact_checkpoint(
+        child.handle, include_page_images=include_page_images
+    )
+    original = se.EmbeddingStore(
+        cfg, optimizer_config=se.Adam(lr=0.01), score_policy="lfu"
+    )
+    merged = se.EmbeddingStore(
+        cfg, optimizer_config=se.Adam(lr=0.01), score_policy="lfu"
+    )
+    checkpoint.load_training_checkpoint(original, child.handle, modulo_restore(1, 0))
+    checkpoint.load_training_checkpoint(
+        merged,
+        compacted,
+        PhysicalRestore(
+            CheckpointParticipant(0, 1),
+            strategy=PhysicalRestoreStrategy.FAST_PAGE_CACHE
+            if include_page_images
+            else PhysicalRestoreStrategy.RECONSTRUCT_ENTRIES,
+        ),
+    )
+    assert original.total_size() == merged.total_size() == 2
+
+    def scores(store):
+        return {
+            int(key): int(score)
+            for image in store.export_page_images()
+            for key, score in zip(image["keys"], image["scores"], strict=True)
+        }
+
+    assert scores(original) == scores(merged)
+    np.testing.assert_allclose(lookup(original, (1, 3)), lookup(merged, (1, 3)))
+    for target in (original, merged):
+        target.accumulate_gradients(
+            np.asarray([1], dtype=np.uint64), np.ones((1, 4), dtype=np.float32)
+        )
+        target.optimizer_step()
+    np.testing.assert_allclose(lookup(original, (1, 3)), lookup(merged, (1, 3)))
+
+
+@pytest.mark.parametrize("failure_boundary", ["write", "commit"])
+def test_compact_failure_preserves_source_chain(
+    tmp_path, monkeypatch, failure_boundary
+):
+    storage = LocalLanceStorage(tmp_path / "checkpoint")
+    checkpoint = SparseCheckpoint(storage)
+    source = populated_store((1,), 1)
+    parent = checkpoint.save_training_checkpoint(source, "compact-fault")
+    source.assign(
+        np.asarray([1], dtype=np.uint64), np.full((1, 4), 2, dtype=np.float32)
+    )
+    child = checkpoint.save_training_checkpoint(
+        source,
+        "compact-fault",
+        mode=CheckpointSaveMode.INCREMENTAL,
+        parent_handle=parent.handle,
+    )
+
+    def fault(*args, **kwargs):
+        raise RuntimeError("injected compact fault")
+
+    if failure_boundary == "write":
+        monkeypatch.setattr(
+            lance_backend._checkpoint_native, "compact_native_checkpoint", fault
+        )
+    else:
+        monkeypatch.setattr(storage, "commit_checkpoint", fault)
+    with pytest.raises(RuntimeError, match="injected compact"):
+        storage.compact_checkpoint(child.handle, include_page_images=True)
+    for saved, value in ((parent.handle, 1), (child.handle, 2)):
+        target = se.EmbeddingStore(config())
+        checkpoint.load_training_checkpoint(target, saved, modulo_restore(1, 0))
+        np.testing.assert_allclose(lookup(target, (1,)), value)
+
+
+@pytest.mark.parametrize("operation", ["clear", "reserve"])
+def test_structural_publication_preserves_incremental_baseline(tmp_path, operation):
+    storage = LocalLanceStorage(tmp_path / "checkpoint")
+    checkpoint = SparseCheckpoint(storage)
+    store = populated_store((1,), 1)
+    parent = checkpoint.save_training_checkpoint(store, "structural")
+    if operation == "clear":
+        store.clear()
+    else:
+        store.reserve(128, dim=4)
+        store.assign(
+            np.asarray([1], dtype=np.uint64), np.full((1, 4), 2, dtype=np.float32)
+        )
+    child = checkpoint.save_training_checkpoint(
+        store,
+        "structural",
+        mode=CheckpointSaveMode.INCREMENTAL,
+        parent_handle=parent.handle,
+    )
+    restored = se.EmbeddingStore(config())
+    checkpoint.load_training_checkpoint(restored, child.handle, modulo_restore(1, 0))
+    assert restored.total_size() == (0 if operation == "clear" else 1)
+    if operation == "reserve":
+        np.testing.assert_allclose(lookup(restored, (1,)), 2)
+
+
+def test_acknowledgement_idempotence_validates_watermark(tmp_path):
+    storage = LocalLanceStorage(tmp_path / "checkpoint")
+    source = populated_store((1,), 1)
+    saved = SparseCheckpoint(storage).save_training_checkpoint(source, "strict-cut")
+    manifest = storage.resolve_checkpoint_manifest(saved.handle)
+    import json
+
+    descriptor = json.loads(manifest["fragment_descriptors"][0])
+    storage.acknowledge_store_mutations(source, saved.handle)
+    with pytest.raises(ValueError, match="stale"):
+        source.acknowledge_checkpoint_mutations(
+            descriptor["mutation_watermark"] + 1,
+            source.checkpoint_baseline(),
+            descriptor["capture_id"],
+            descriptor["journal_identity"],
+        )
+
+
+def test_cancelled_capture_keeps_dirty_generation(tmp_path):
+    storage = LocalLanceStorage(tmp_path / "checkpoint")
+    source = populated_store((1,), 1)
+    identity = CheckpointSaveIdentity("cancelled", "attempt", authority())
+    storage.prepare_checkpoint(identity)
+    fragment = storage.write_checkpoint_fragment(
+        source, identity, CheckpointParticipant(0, 1)
+    )
+    source.cancel_checkpoint_capture(
+        fragment.save_context.capture_id, fragment.save_context.journal_identity
+    )
+    source.cancel_checkpoint_capture(
+        fragment.save_context.capture_id, fragment.save_context.journal_identity
+    )
+    assert source.checkpoint_mutations()
+    committed = storage.commit_checkpoint(identity, [fragment])
+    with pytest.raises(ValueError, match="stale"):
+        storage.acknowledge_store_mutations(source, committed.handle)
+    assert source.checkpoint_baseline() == ""
+
+
+def test_restore_allocates_only_surviving_keys(tmp_path):
+    source = populated_store(range(20000), 1)
+    storage = LocalLanceStorage(tmp_path / "checkpoint")
+    checkpoint = SparseCheckpoint(storage)
+    parent = checkpoint.save_training_checkpoint(source, "capacity")
+    source.erase_dimension(np.arange(19999, dtype=np.uint64), dimension=4)
+    child = checkpoint.save_training_checkpoint(
+        source,
+        "capacity",
+        mode=CheckpointSaveMode.INCREMENTAL,
+        parent_handle=parent.handle,
+    )
+    tuning = se.StorageTuningOptions(
+        entries_per_page=4096, max_pages=2, calibrate_page_geometry=False
+    )
+    target = se.EmbeddingStore(
+        se.EmbeddingConfig(
+            dims=[4], thread_budget=1, key_dtype="uint64", storage_tuning=tuning
+        )
+    )
+    checkpoint.load_training_checkpoint(target, child.handle, modulo_restore(1, 0))
+    assert target.total_size() == 1
+    np.testing.assert_allclose(lookup(target, (19999,)), 1)
+
+
+def test_native_restore_uses_one_explicit_lance_version(tmp_path):
+    storage = LocalLanceStorage(tmp_path / "checkpoint")
+    checkpoint = SparseCheckpoint(storage)
+    saved = checkpoint.save_training_checkpoint(
+        populated_store((1,), 1), "scan-version"
+    )
+    root = storage._manifest_fragment_roots(
+        storage.resolve_checkpoint_manifest(saved.handle)
+    )[0]
+    uri = storage._workspace.uri(f"{root}/{ENTRIES_DATASET}")
+    dataset = lance.dataset(uri)
+    version = dataset.version
+    dataset.delete("key = 1")
+    assert dataset.count_rows() == 0
+    target = se.EmbeddingStore(config())
+    lance_backend._checkpoint_native.restore_native_partition_entries(
+        target, [uri], version, 1, 0, "uint64"
+    )
+    assert target.total_size() == 1
+    np.testing.assert_allclose(lookup(target, (1,)), 1)

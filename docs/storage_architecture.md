@@ -1,527 +1,250 @@
-# Storage Architecture and API
+# Storage Architecture and API Contracts
 
-[中文](storage_architecture_zh.md)
+[中文](storage_architecture_zh.md) | [Performance and Reliability Report](performance_and_reliability_report.md) | [Lance Storage and Gravitino Integration](lance_storage_and_gravitino.md)
 
-[Performance and Reliability Report](performance_and_reliability_report.md)
+This document provides a comprehensive technical overview of the Sparse Embedding storage engine, detailing its core architecture, concurrency and memory model, tiered storage topology, eviction scheduling, and distributed interface contracts.
 
-[Lance Storage and Gravitino Validation](lance_storage_and_gravitino.md)
+---
 
-This document describes the storage, concurrency, and core mechanism contracts. The implementation is the source of truth for constants; the names
-below make those policy points searchable.
+## 1. Overview and Design Philosophy
 
-## C++ API Contract
+The Sparse Embedding storage engine is designed for modern deep recommendation engines, search ranking systems, and large language model sparse retrieval workflows, efficiently managing massive sparse tables scaling to hundreds of millions or billions of parameters.
 
-`PageStorage` and `PageEvictionProxy` are the only storage `pro::proxy`
-facades. New code creates storage with `create_page_storage(StorageOptions)`
-and passes the facade by value. Copying or moving the facade is shallow and
-shares the underlying storage lifetime. `StoragePage` is move-only RAII
-ownership for one allocation.
+To handle high-throughput irregular memory access, extreme parameter skew, and massive memory capacity requirements, the engine is built on the following core design principles:
 
-`set_page_eviction_proxy()` returns a `PageEvictionRegistration`. A
-registration must be cleared exactly once. Empty, unknown, and already-cleared
-tokens throw; there is no silent fallback. The proxy interface exposes only
-score evaluation and evaluator registration. It does not expose lifecycle
-locks; the concrete Hogwild adapter waits for active evaluator callbacks during
-unregistration. The proxy generation changes when the active proxy identity or
-lifetime transitions, so a candidate scored by an older active-proxy generation
-cannot be swapped out.
+- **Lock-Free Read Hot Paths**: Forward lookup pipelines completely bypass global locks and shard mutexes. Slot lookups utilize optimistic SeqLocks, eliminating locks and atomic counter write overhead on the read path.
+- **Branchless Single-Cycle Addressing**: Physical page tables use flat, compact pointer directories. Addressing is resolved in a single step using bitwise shifts and masks, eliminating virtual functions and multi-level pointer indirection.
+- **Hardware-Aware Auto-Tuning**: Probes physical system memory (`/proc/meminfo`) and NUMA topology, running adaptive micro-benchmarks at startup to select optimal page sizes.
+- **Tiered Storage and Seamless Spill-to-Disk**: Supports pure in-memory operation (`MemoryOnly`) as well as adaptive disk spilling (`AutoStorage`), transparently remapping anonymous memory pages to file-backed pages via `MAP_FIXED` when memory pressure reaches high watermarks.
+- **Defensive Engineering and Fail-Fast Contracts**: Rejects implicit fallbacks that could cause silent corruption or data loss. Invalid parameters, exhausted capacities, and operational errors strictly raise explicit exceptions.
 
-Runtime polymorphism remains confined to the `PageStorage` and
-`PageEvictionProxy` facades. `SwapScheduler`, `SpillAllocator`, and
-`PageRegistry` are private concrete classes rather than facades: the scheduler
-owns wake, stop, join, and exception propagation; the spill allocator owns the
-file descriptor, directory, capacity, and extent free-list; the registry owns
-page identity, address indexing, eviction snapshots, and evaluator records.
-Their locks are independent, and none of these cold-path modules adds a virtual
-or type-erased call to memory allocation or lookup.
+---
 
-## Checkpoint Identity
+## 2. System Architecture
 
-Embedding and optimizer checkpoint rows are identified by `(dimension, key)`.
-`key` alone is not unique because one store can contain the same `uint64` key
-in multiple dimension tables. Checkpoint loaders must call
-`assign_opt_state(keys, optimizer_states, dimension, steps)` with the physical
-dimension from the persisted row group.
+The Sparse Embedding engine is structured into five distinct layers:
 
-The store selects that dimension once, validates the optimizer-state width and
-step count, and then resolves every key only inside the selected table. An
-unknown dimension, missing optimizer, malformed state width, mismatched step
-count, or key absent from that dimension raises immediately. No loader may
-search other dimensions as a fallback.
-
-The embedding and optimizer templates use the following canonical shapes:
-
-```cpp
-using Store = se::HogwildEmbeddingStore<KeyT, ParamT, OptT, ScorePolicy>;
-using Optimizer = se::OptimizerExtension<ParamT, OptT>;
-using OptimizerFactory = se::Function<Optimizer(size_t)>;
-
-auto optimizer =
-    pro::make_proxy<se::OptimizerExtensionFacade<ParamT, OptT>,
-                    OptimizerImpl>();
-auto optimizer_factory = pro::make_proxy<
-    se::FunctionFacade<Optimizer(size_t)>>(
-    [](size_t) -> Optimizer {
-      return pro::make_proxy<
-          se::OptimizerExtensionFacade<ParamT, OptT>, OptimizerImpl>();
-    });
+```text
+┌─────────────────────────────────────────────────────────────┐
+│                      Python API Layer                       │
+│       EmbeddingStore / EmbeddingConfig / Partitioner        │
+└──────────────────────────────┬──────────────────────────────┘
+                               │
+┌──────────────────────────────▼──────────────────────────────┐
+│             Concurrent Hash Routing & Locator Layer         │
+│  ParlayHash Shards ──► MapBundle (RCU) ──► SegmentedLocator │
+└──────────────────────────────┬──────────────────────────────┘
+                               │
+┌──────────────────────────────▼──────────────────────────────┐
+│                 Physical Page Management Layer              │
+│  StablePageDirectory ──► StoragePage (RAM / Spill SSD)      │
+└──────────────────────────────┬──────────────────────────────┘
+                               │
+┌──────────────────────────────▼──────────────────────────────┐
+│             Eviction & Adaptive Locality Scheduling         │
+│  Eviction Thread ──► Boltzmann Policy ──► Coaccess Sketch   │
+└──────────────────────────────┬──────────────────────────────┘
+                               │
+┌──────────────────────────────▼──────────────────────────────┐
+│            Distributed Partitioning & Persistence           │
+│  PartitionerRegistry (SIMD)  │  Dual-Lance 2PC Checkpoint   │
+└─────────────────────────────────────────────────────────────┘
 ```
 
-`OptimizerExtensionFacade<ParamT, OptT>` is the only optimizer extension seam.
-Its required operation is `update(const OptimizerBatchView<ParamT>&,
-uint64_t)`. Optional state, checkpoint, and lifecycle operations remain on the
-same facade. The store resolves keys and arena indices first, then invokes one
-batch update per key shard. Every parameter span is consumed while the
-corresponding locator `PackedWriteGuardBatch` is held; no raw `ParamT*` is
-retained for deferred work.
+---
 
-`std::variant` is reserved for cold optimizer and learning-rate configuration;
-it is not a long-lived per-row runtime representation.
+## 3. Concurrency Model and Lock-Free Queries
 
-### Optimizer Execution Invariants
+### 3.1 Hash Routing and Immutable MapBundle (RCU Publication)
 
-Optimizer allocation is an explicit construction policy. Setting
-`EmbeddingConfig(enable_optimizer=False)` creates a weight-only store and
-skips optimizer-state reserve/allocation. Such a store is suitable for
-inference and rejects a training restore that requests optimizer state.
+The core query resolution path follows: `Key Hash -> Shard ID -> slot_id -> SegmentedLocatorTable -> arena_index`.
 
-The training path accumulates gradients in `TransientArena` and then executes
-one batch update per execution shard. It obeys the following invariants:
+- **Read/Write Decoupling**: Each shard manages an immutable `MapBundle`. Readers acquire-load the current `MapBundle` pointer without taking shared mutexes.
+- **Copy-on-Write and Atomic Publication**: Structural mutations (insert, erase, reserve, slot rotation) clone the active bundle under the affected shard's writer mutex, applying changes and publishing the new bundle via a single atomic exchange. Individual shards grow independently without blocking concurrent operations on other shards.
+- **Zero Secondary Lookups**: Hot/cold tiers and physical pages do not participate in routing decisions. Each lookup requires exactly one directory lookup and one locator read, eliminating secondary hash probes.
 
-| Invariant | Contract |
-|---|---|
-| Locator lifetime | Key resolution, parameter-span construction, and optimizer mutation occur inside one `PackedWriteGuardBatch`. |
-| Proxy frequency | The optimizer extension proxy is entered once per resolved shard batch, never once per row. |
-| Deferred pointers | No raw `ParamT*` or parameter span escapes the locator write callback. |
-| Failure policy | Invalid dimensions, payload widths, duplicate locator slots, and missing optimizer state throw immediately. |
+### 3.2 Locator Slots and Optimistic SeqLocks
 
-Batch dispatch is the production seam. Static dispatch and type-erased dispatch
-implement the same batch contract; neither changes locator lifetime or permits
-parameter spans to escape the write guard.
+Slot allocation is managed by `SegmentedLocatorTable`, structured in fixed 32 KiB segments with 8-byte aligned slots storing `{sequence, arena_index}`:
 
-## Python Configuration
+- **Optimistic Reading and In-Place Updates**: Readers and in-place weight updaters (e.g., `optimizer_step`, `assign`) use optimistic `try_read` to load the sequence and `arena_index`, passing compiler barriers to access physical memory in-place before validating sequence consistency. Hot paths are entirely lock-free with zero atomic writes.
+- **Relocation Awareness and ABA Defense**: When background compaction migrates physical pages and mutates `arena_index`, it flips the sequence from even to odd via CAS, copies payloads, and atomically publishes the new even sequence and address. Concurrent readers detect the version change and retry automatically. As sequences approach wraparound, keys are rotated to fresh slots while permanently retiring old slots.
+
+### 3.3 Flat Two-Level Page Directory (`StablePageDirectory`)
+
+Physical page management employs a compact two-level pointer directory `StablePageDirectory<T>` (managing data pages, state pages, owners, and locks) resident in CPU L1 cache:
+
+$$\text{page\_id} = \text{index} \gg \text{entries\_shift}, \quad \text{slot\_offset} = \text{index} \ \& \ \text{slot\_mask}$$
+
+Addressing is resolved directly through single-cycle branchless bitwise operations, eliminating heap pointer indirection.
+
+### 3.4 Four-Stage Software Pipelined Prefetching
+
+Because sparse feature lookups exhibit irregular and non-contiguous memory access patterns, hardware stream prefetchers cannot anticipate cachelines. The engine implements a four-stage software pipelined prefetch architecture across forward and backward hot paths:
+
+1. **Stage 1 (Input Features)**: Prefetches batch `keys[i + distance]`, row lengths, and offsets into L1/L2 cache ahead of current compute.
+2. **Stage 2 (Output Destination Buffer)**: Issues write-intent prefetching for destination memory (`out_flat_values + offset`).
+3. **Stage 3 (Directory Hash Buckets)**: Computes future key hashes and prefetches directory hash buckets into CPU cache prior to probing.
+4. **Stage 4 (Locator Slots & Optimizer State)**: Prefetches 8-byte aligned `LocatorSlot` entries and optimizer first/second moment vectors, hiding LLC cache miss latency.
+
+---
+
+## 4. Tiered Storage and Hardware Auto-Tuning
+
+### 4.1 Hardware Probing and Dynamic Tuning
+
+The storage layer includes dedicated auto-tuning modules:
+
+- **Resource Probing (`SystemResourceProbe`)**: Parses high-precision `MemAvailable` from `/proc/meminfo` and detects NUMA topology and physical core counts via `libnuma`.
+- **Startup Calibration (`StorageResourceTuner`)**: Evaluates candidate page sizes `{4096, 8192, 16384}` across embedding dimensions and workload types at startup, selecting the median duration winner. Explicit `entries_per_page` bypasses calibration.
+- **Dynamic Max Pages (`max_pages`)**: Automatically calculates page count limits based on a 75% available RAM budget, aligned to NUMA cohorts.
+
+### 4.2 Storage Modes and Disk Spilling (Spill-to-Disk)
+
+- **`MemoryOnly`**: Pure memory mode. Raises an exception when memory limits are exceeded.
+- **`AutoStorage`**: Spills cold pages to disk automatically. Background threads monitor resident memory watermarks (High and Low):
+  - When memory reaches the high watermark, the eviction thread wakes up and writes cold pages to the spill directory;
+  - Utilizes `mmap(MAP_FIXED)` to transparently remap virtual memory addresses from anonymous physical RAM to file-backed disk pages;
+  - Once memory drains to the low watermark, the eviction thread returns to sleep.
+
+---
+
+## 5. Eviction Scheduling and Adaptive Locality
+
+### 5.1 Score-Threshold Eviction (`evict_by_score`)
+
+- Collects live entries with scores at or below `max_score` using bounded per-worker heaps. Temporary memory overhead scales with the eviction budget rather than the total table size.
+- Deletions are re-validated under the affected shard's writer mutex without acquiring global table locks.
+
+### 5.2 Boltzmann Utility Model and Co-Access Clustering
+
+To maximize cache hits, the engine implements adaptive utility estimation:
+
+- **Adaptive Boltzmann Policy (`AdaptiveBoltzmannPolicy`)**:
+  $$\text{weight}_i = \frac{\exp(-(\text{utility}_i - \min(\text{utility})) / T)}{\sum_j \exp(-(\text{utility}_j - \min(\text{utility})) / T)}$$
+  Page utility combines decayed access frequency, co-access density, and residency duration. Higher utility monotonically decreases the probability of eviction.
+- **Co-Access Sketch (`CoaccessSketch`)**: Forward lookups non-blockingly sample co-occurring feature keys to update co-access counters. High-frequency co-accessed features are clustered into contiguous physical pages during compaction, improving CPU cacheline locality.
+
+---
+
+## 6. Lifecycle Management and Epoch Backpressure
+
+All resources potentially visible to concurrent readers (including `MapBundle`, `StoreSnapshot`, locator slots, and physical pages) are managed within the epoch-backed `RetirementPressure` domain:
+
+- **Three-Tier Backpressure Control**:
+  1. **Normal Phase** (below `backpressure_fraction = 0.15`): Full-speed execution.
+  2. **Backpressure Phase** (between 0.15 and 0.25): Writers and compactor threads execute brief CPU pauses to pace mutations.
+  3. **Circuit Phase** (at or above `circuit_fraction = 0.25`): Rejects control-plane mutations that create new retirement records by raising exceptions, preventing memory blowup.
+- **Safe Reclamation**: Once all concurrent readers exit the corresponding epoch, retired memory and metadata are freed, draining `retired_bytes` to zero.
+
+---
+
+## 7. Distributed Partitioner Subsystem
+
+### 7.1 Partitioner Registry (`PartitionerRegistry`)
+
+The C++ core provides a centralized registry for algorithm factories:
+- `sparse_embedding.modulo`: Normalized integer modulo (supports negative key normalization).
+- `sparse_embedding.hash`: MurmurHash3 avalanche hash with optional seed.
+- `sparse_embedding.fast_range`: Lemire FastRange division-free range partitioner.
+- Custom algorithms can be dynamically registered via `register_factory`.
+
+### 7.2 Vectorized Slice Filtering (`filter_span`)
+
+Executes native AVX-512 SIMD kernels over contiguous Arrow key slices to produce bitmasks and matching row indices, accelerating offline checkpoint restore and communication planning.
+
+### 7.3 Python Elastic Strategy (`PartitionStrategy`)
+
+Decouples algorithm declaration from physical cluster topology:
+
+```python
+import numpy as np
+import sparse_embedding as se
+
+keys = np.array([10, 20, 30, 40], dtype=np.uint64)
+
+# 1. Declarative partition strategy (late-binding topology)
+strategy = se.HashPartition(seed=42)
+
+# 2. Compute partition ranks given target worker count
+ranks = strategy(keys, partition_count=4)
+
+# 3. Vectorized filtering for a specific shard
+filtered_keys = strategy.filter(keys, target_shard=0, partition_count=4)
+
+# 4. Functional convenience API
+ranks_func = se.partition(keys, partition_count=4, algorithm="sparse_embedding.hash")
+```
+
+---
+
+## 8. Checkpoint Subsystem Integration Contracts
+
+The storage engine coordinates with the persistence subsystem under the following contracts:
+
+- **`(dimension, key)` Identity Tuple**: Embedding and optimizer state rows are uniquely identified by `(dimension, key)`, allowing distinct dimension tables to hold identical key values.
+- **Training vs. Inference State Isolation**:
+  - Training instances allocate and manage optimizer state pages (e.g., Adam first/second moments).
+  - Inference instances configure `EmbeddingConfig(enable_optimizer=False)` to create weight-only stores, skipping optimizer allocation.
+- **Two-Phase Commit and Lance Lakehouse Persistence**: Underlying storage persists state via `snapshot_manifest.lance` (control-plane ledger) and `entries.lance` (data-plane physical slices).
+
+> For detailed checkpoint architecture, Two-Phase Commit protocols, incremental restoration, and Gravitino integration, refer to [Lance Storage and Gravitino Integration](lance_storage_and_gravitino.md).
+
+---
+
+## 9. Python Configuration Guide
 
 ```python
 import sparse_embedding as se
 
+# 1. Configure tiered storage (AutoStorage spills cold pages to NVMe/SSD)
 storage = se.AutoStorage(
-    memory_limit_bytes=5 << 20,
-    spill_directory="/path/to/local-spill-device",
-    max_spill_bytes=1 << 40,
-    high_watermark=0.8,
-    low_watermark=0.6,
+    memory_limit_bytes=4 << 30,          # Resident memory limit: 4 GiB
+    spill_directory="/mnt/nvme/spill",    # Spill storage directory
+    max_spill_bytes=100 << 30,           # Max disk spill capacity: 100 GiB
+    high_watermark=0.8,                  # Trigger background swap-out at 80%
+    low_watermark=0.6,                   # Sleep swap-out thread at 60%
 )
+
+# 2. Configure EmbeddingStore parameters
 config = se.EmbeddingConfig(
-    dims=[128],
-    thread_budget=8,
-    storage=storage,
+    dims=[128],                          # Embedding vector dimension
+    thread_budget=8,                     # Internal thread budget
+    storage=storage,                     # Storage backend
+    key_dtype="uint64",                  # Key dtype (int32/uint32/int64/uint64)
+    value_dtype="float32",               # Value dtype
     storage_tuning=se.StorageTuningOptions(
-        target_capacity_keys=10_000_000,
-        memory_budget_bytes=4 << 30,
-        entries_per_page=4096,
+        target_capacity_keys=10_000_000, # Expected key capacity
+        memory_budget_bytes=4 << 30,     # Memory tuning budget
+        entries_per_page=4096,           # Entries per page (4096/8192/16384)
     ),
 )
+
+# 3. Instantiate store
 store = se.EmbeddingStore(config, score_policy="lfu")
 ```
 
-`MemoryOnly()` disables disk-backed pages and raises when the memory budget is
-exhausted. `AutoStorage(memory_limit_bytes=0, spill_directory=..., max_spill_bytes=...)`
-uses the specified spill device for trainable pages.
-Invalid storage limits, alignments, watermarks, capacities, or registration
-tokens raise instead of selecting a fallback policy.
-
-## Universal Storage Topology and Hardware Auto-Tuning
-
-The storage architecture defines an immutable Single Source of Truth (SSOT) in the independent `se::storage` namespace:
-
-1. **Hardware Resource Probing (`SystemResourceProbe`)**:
-   Directly parses `MemAvailable` from `/proc/meminfo` (raising exceptions on parse errors with zero fallbacks) and queries NUMA topology and physical CPU core counts via `libnuma`.
-2. **Mathematical Resource Auto-Tuning (`StorageResourceTuner`)**:
-   - **Measured Page-Size Calibration**: At startup, `StorageResourceTuner` evaluates the small candidate set `{4096, 8192, 16384}` using the requested embedding dimension, worker budget, workload (`forward_lookup`, `lookup_insert`, `compaction`, or `training`), and NUMA mode. It selects the median-duration winner and caches the result by the complete request shape. Explicit `entries_per_page` disables calibration. `calibration_samples` defaults to three and is bounded to seven.
-   - **Dynamic Max Pages (`max_pages`)**: Automatically derives total page allocation limits based on a 75% available RAM budget and precise per-entry overheads, aligning to NUMA cohort counts.
-3. **Immutable Topology Contract (`StorageTopology`)**:
-   Enforces power-of-two invariants and precalculates branchless shift amounts and masks (`entries_shift_`, `slot_mask_`, `shard_mask_`). Hotpath page coordinate lookups replace division and modulo with single-cycle bitwise shifts:
-   $$\text{page\_id} = \text{index} \gg \text{entries\_shift}, \quad \text{slot\_offset} = \text{index} \ \& \ \text{slot\_mask}$$
-
-## Runtime Architecture and Concurrency
-
-### Lookup and Storage
-
-The authoritative lookup path is `ParlayHash key -> slot_id ->
-SegmentedLocatorTable -> arena_index`. Shard selection depends only on the key
-hash; hot/cold tier and physical page do not participate in lookup routing. A
-lookup performs one directory lookup and one locator read, avoiding a
-HotMap-to-ColdMap fallback lookup.
-
-Each shard publishes an immutable `MapBundle*`. A map value is a nonzero
-`slot_id`, never an arena index. Readers acquire-load the current bundle and
-do not take a shard shared mutex. Structural writers (insert, erase, reserve,
-locator rotation, and checkpoint import) hold that shard's writer mutex, clone
-the published bundle, apply directory changes, then publish the replacement with
-one atomic exchange. Lookup, optimizer, and ordinary compaction relocation do
-not take that mutex; they use locator packed seqlock/CAS. The retired bundle is
-returned through the shared epoch-retirement pressure domain.
-
-`SegmentedLocatorTable` owns fixed 32 KiB segments of 4,096 eight-byte locator
-slots. A slot stores `{sequence, arena_index}` and is eight-byte aligned. Slot
-IDs, locator slots, arena indices, pages, and store snapshots are reusable only
-after an epoch-safe retirement. If a locator sequence approaches wraparound, the
-directory rotates that key to a fresh slot and permanently retires the old slot
-rather than risking ABA.
-
-Physical page directories in `PageTable` employ a two-level L1 cache-resident pointer directory `StablePageDirectory<T>` (managing `data`, `states`, `owner`, and `locks`), completely eliminating heap-allocated `std::unique_ptr<OwnerRecord[]>*` hops. Page pointers are published atomically upon page allocation, and hotpath indexing resolves in a single flat step:
-$$\text{owner} = \text{pages\_}\to\text{owner.load}(\text{index} \gg \text{entries\_shift})[\text{index} \ \& \ \text{slot\_mask}]$$
-
-Payload access follows the Linux x86_64 GCC/Clang pure optimistic SeqLock contract.
-Operations that mutate `arena_index` mappings (such as compaction relocation) CAS an even sequence
-to odd, migrate the physical page payload, then release-publish an even new sequence and destination address.
-Readers and in-place weight updaters (`optimizer_step`, `assign_existing`) use pure optimistic `try_read`
-to load the sequence and arena index with acquire semantics, pass a compiler barrier, directly read or modify
-the destination memory in-place, pass a second compiler barrier, and validate sequence consistency.
-Readers and updaters are entirely lock-free with zero atomic writes on the read path, automatically detecting
-version mutations and retrying if a compaction relocation occurs concurrently.
-
-Store lifetime is protected by an atomic `StoreSnapshot*` and an invocation
-gate. Forward, lookup, mutation, export, and metadata calls register once at
-entry, acquire-load the snapshot, and leave through the gate. `clear`, reserve,
-page-image import, and other reconfiguration work publish a new snapshot under
-a private control-plane mutex after waiting for active invocations. Destruction
-stops telemetry, closes the invocation gate, unregisters page-eviction
-callbacks, retires the snapshot, and only then destroys slot state.
-
-Lookup dispatch separates three quantities. The logical memory-work width
-decides whether a batch benefits from parallel execution and defines telemetry
-partitions. The task count provides enough independent random-memory work to
-hide latency. The execution width is then limited by the number of active
-lookup invocations so nested dispatch does not assign the full pool to every
-concurrent caller. For an 8,192-key, dimension-128 batch on a 128-worker
-topology, these quantities are 16 logical partitions, up to 128 tasks, and one
-execution worker for an invocation that enters when 128 invocations are active.
-The share is fixed when each invocation enters; earlier invocations are not
-retroactively resized. Explicit `memory_parallelism` remains the upper bound
-for both task decomposition and execution.
-
-### Software Pipelined Prefetching
-
-Sparse embedding operations suffer primarily from memory latency bottlenecks due to irregular and non-contiguous memory access patterns (random key hashing, segmented locator lookup, physical page payload indexing, and optimizer moment state retrieval). Hardware stream prefetchers cannot predict these access patterns. The engine implements a multi-stage software pipelined prefetching architecture across both retrieval (Forward/Lookup) and training (Accumulate/Optimizer Step) hot paths:
-
-1. **SIMD & Prefetch Primitives (`simd/prefetch.hpp`)**:
-   Provides portable intrinsic wrappers for CPU cache line prefetching (`prefetch_l1`, `prefetch_l2`, `__builtin_prefetch`) with configurable locality hints and read/write intent flags.
-
-2. **Hierarchical Forward/Lookup Pipeline (`HogwildEmbeddingStore::forward`)**:
-   Under a configurable pipeline distance (`forward_prefetch_distance`, default 8–16), the forward loop prefetches future items ahead of current compute:
-   - **Stage 1 (Feature Inputs)**: Prefetches future batch keys (`keys[i + distance]`), row lengths, and offsets into L1/L2 cache.
-   - **Stage 2 (Output Destination Buffer)**: Issues write-intent prefetching for destination memory (`out_flat_values + offset`).
-   - **Stage 3 (Directory Hash Buckets)**: Computes future key hashes and executes `prefetch_entry_cacheline(prefetch_key, prefetch_hash)` -> `FlatKeyDirectory::prefetch_bucket_cacheline(hash)`, bringing directory slot hash buckets into CPU cache prior to probing.
-   - **Stage 4 (Locator Slots)**: `SegmentedLocatorTable::prefetch_slot_cacheline(slot_id)` pre-stages the 8-byte aligned `LocatorSlot` `{sequence, arena_index}`.
-
-3. **Optimizer State Page Prefetching (`OptimizerExtensionFacade` & `AdamOptimizer`)**:
-   - `OptimizerExtensionFacade` keeps `prefetch_state(uint32_t idx)` as an optional operation on the optimizer extension seam.
-   - Optimizer kernels prefetch each row's state immediately before its SIMD update; proxy dispatch still occurs once per resolved batch rather than once per row.
-   - In `OptimizerState::prefetch_state_cacheline(index)`, the storage page pointer is loaded and `__builtin_prefetch(ptr, 1, 3)` is executed with write-intent (`rw=1`, `locality=3`), explicitly targeting CPU cacheline prefetching without confusing with storage I/O page faults.
-   - `AdamOptimizer` prefetches the first moment ($m$), second moment ($v$), and per-slot `step_state` cache lines before its SIMD update to reduce avoidable state-load latency.
-
-4. **Transient Arena Accumulation Pipeline**:
-   - In `TransientArena::for_each_accumulated`, iterating accumulated gradients prefetches future `feature_ids_` and `feature_hashes_` 8 steps ahead.
-
-### ParlayHash Concurrency
-
-Each embedding dimension owns multiple key shards. Lookup never takes a shard
-mutex. Insert, erase, reserve, locator rotation, checkpoint import, and
-compaction publication takes no writer mutex: insert, erase, reserve, locator
-rotation, and checkpoint import rebuild and atomically publish immutable
-directory state under only the affected shard writer mutex, while compaction
-publishes a locator update through packed seqlock/CAS. There is no global
-Upsert mutex, so unrelated shards continue in parallel while one shard grows.
-
-Expansion policy is centralized in the store and `FlatKeyDirectory`. Each shard
-grows only to its own required key budget. `reserve(keys_count, dim)` distributes
-the total budget exactly across shards, while `reserve_per_shard(counts, dim)`
-accepts caller-provided per-shard budgets and avoids equal power-of-two rounding.
-Directory bucket counts use a 2.5x probe budget rounded to 16 buckets; a
-power-of-two bucket count is selected only when the smaller 4x power-of-two bound is
-more compact. Large tables therefore do not pay a per-shard power-of-two memory spike.
-Growth steps are 2x below 64K keys, 1.5x from 64K to 1M, and 1.25x at or above
-1M, with every step covering the required capacity.
-
-Expansion runs only in the writer/control plane. Affected-shard writers clone
-the current `MapBundle`, copy key-to-locator mappings into the new directory,
-and publish it with one atomic exchange. Epoch retirement reclaims the old
-bundle; locator-slot and arena-index addresses do not change during directory
-growth. Known production workloads should call `reserve(keys_count, dim)` or
-`reserve_per_shard(counts, dim)` before timing so directory cloning and
-arena/optimizer reservation stay off the hot path. If runtime inserts exceed the
-budget, the same precise growth policy is applied. Capacity overflow, bucket or
-slot limits, and storage allocation failures throw explicit errors; no fallback
-capacity path is used.
-
-## Eviction Mechanism and Background Threads
-
-### Score-Threshold Eviction
-
-`evict_by_score(max_score, max_evict_count, ...)` selects the globally coldest
-live entries whose current score is at most `max_score`. Candidate collection
-uses a bounded per-worker heap, so memory remains proportional to the eviction
-budget rather than the complete table. 
-
-Final deletion revalidates the directory entry, locator slot, score, and live
-bit while holding only the affected shard writer mutex. It does not use a store
-lifecycle shared lock or a global exclusive scan lock.
-
-The live bitmap is cleared before index retirement. Page heat evaluation skips
-non-live slots, preventing deleted entries from distorting page heat.
-This is entry-level garbage collection. It controls arena growth but does not
-release a partially occupied storage page.
-
-The output spans represent one physical dimension. If a store has candidates
-from multiple dimensions, the operation throws before copying any value; callers
-must evict each dimension separately.
-
-### Background Eviction Thread
-
-Eviction is event-driven. The background thread waits on a condition variable
-until resident evictable memory reaches the high watermark, then continues
-until it reaches the low watermark. It does not use periodic polling or a
-probability gate.
-
-The storage maintains an incremental index of anonymous evictable pages, so a
-background swap selection pass does not scan the complete page registry.
-
-- `kExactEvictionPageThreshold = 1024`: score every candidate.
-- `kSampledEvictionPageCount = 256`: above the threshold, score at most 256
-  unique candidates per pass.
-- `kMaxEvictionNoProgressAttempts = 8`: terminate repeated invalidation rather
-  than spin indefinitely.
-
-Selection snapshots page identity and proxy generation while holding the
-storage mutex, releases that mutex for score evaluation, and validates both
-again before `MAP_FIXED` remapping. Data-page evaluators aggregate entry
-scores. Score metadata pages use a constant cold score so selection does not
-scan the same score array twice.
-
-The storage layer does not receive a store lifecycle lock through its facade.
-When a score-enabled store unregisters its proxy, the concrete proxy removes
-page evaluators and waits for active evaluator callbacks to exit before the
-store frees slot state.
-
-### Retirement Pressure and Sink
-
-All objects that may remain visible to old readers are retired through the same
-epoch-backed `RetirementPressure` domain. The domain accounts retired bundle,
-snapshot, page, arena-index, locator-slot, and page-image bytes. The default
-configuration uses `backpressure_fraction = 0.15`,
-`circuit_fraction = 0.25`, and `epoch_stall_timeout = 30s`; construction
-rejects invalid fractions, and Auto storage requires the circuit threshold to
-be below the spill high watermark.
-
-Below backpressure the store runs normally. Between backpressure and circuit,
-each writer or compactor performs at most one CPU pause per call. At circuit
-pressure, control-plane mutations that would create new retirement throw
-unless already admitted. Existing keys continue to read and update normally.
-Missing lookup-or-insert and assign operations fail explicitly without growing
-the directory. New insertion resumes after pressure falls below the
-backpressure threshold.
-
-### Adaptive Placement Signals
-
-`AdaptiveBoltzmannPolicy` combines decayed heat, co-access density, and
-residency age into a page utility. Temperature adapts to memory pressure and
-utility dispersion. The utility loop accepts caller-owned structure-of-arrays
-spans and has no policy-side allocation.
-
-`CoaccessSketch` records bounded co-access telemetry. Forward lookup samples at
-most 16 keys into stack storage and attempts one bounded ring publication per
-sampled table. A single store-owned consumer performs page-heat and co-access
-counter mutations in batches. Publication never blocks or expands the ring;
-full rings increment `dropped_batches` and discard the sample without affecting
-embedding values. Forward lookup rotates one sampled logical partition per
-invocation and weights its observations by the logical partition count.
-Telemetry partitioning is therefore independent of task decomposition and
-concurrency limiting. Store destruction stops and joins the consumer before
-destroying any slot referenced by queued events.
-
-Release-only optimizer locator revalidation failures use the same ring. The
-producer increments a relaxed counter and publishes a fixed-size diagnostic
-event; it never formats a string or performs iostream I/O. The consumer invokes
-the configured `noexcept` diagnostic sink, whose default implementation writes
-one line to `std::clog`. Diagnostic events are bounded and may be dropped when
-the ring is full; `dropped_diagnostic_events` exposes that loss separately.
-
-The adaptive policy uses the Boltzmann distribution
-`weight_i = exp(-(utility_i - min_utility) / temperature) / sum_j exp(...)`.
-Higher utility monotonically lowers eviction probability. The minimum-utility
-shift preserves the normalized distribution while keeping exponents non-positive.
-Temperature adapts to memory pressure and utility dispersion within configured
-bounds. The candidate loop uses approximate_exp, which is a bounded base-2
-polynomial approximation to exp; tests bound relative error below 0.001 and
-verify finite weights normalized to one. Co-access density enters utility, so
-frequently co-used keys receive lower eviction probability and can be clustered
-by full-page relocation. Expected locality benefit is validated by target
-workload benchmarks.
-
-`compact_adaptive_pages()` applies the selected physical-page budget through
-the same full-page relocation transaction as explicit compaction. A source page
-first transitions `Available -> Draining`; every live key revalidates its
-locator, owner, and sequence. The destination payload, score, and Adam state
-are copied before the locator packed seqlock publishes the new index. Ordinary
-relocation takes no global compaction mutex, shard writer mutex, or blocking OS
-primitive; conflicts result in bounded retry or an explicit retry failure. Only
-after the source live bitmap is empty are its data and score pages epoch-retired,
-then transitioned `Retired -> Available`. Draining and retired source slots are
-never reused as destinations. The directory remains the sole lookup authority,
-so page movement never introduces a second HotMap/ColdMap search.
-
-Score-enabled stores also expose `promote_hot_keys(dim, page_id, maximum_keys,
-minimum_score)`. This operation selects a deterministic top-K from one source
-page, relocates only those keys through the authoritative shard directory, and
-publishes an immutable Hot Page snapshot. The source page remains allocated and
-continues to serve unselected cold keys; it is marked draining so its slots are
-never reused as relocation destinations. Callers can inspect the published
-snapshot count with `promoted_hot_page_size(dim)`.
-
-`seal_adaptive_pages()` produces immutable, 64-byte-aligned page snapshots for
-checkpoint/layout control work. A sealed page is not a lookup index and does
-not change routing. Selector and planner APIs additionally accept reusable
-scratch objects, so a scheduler can retain vector capacities across control
-cycles rather than allocating temporary selection buffers each time.
-
-Compaction destinations are reserved with per-shard ticket-CAS batches. Ordinary
-compaction groups migration order by shard for contiguous cache-friendly
-publication; co-access compaction keeps its stable co-access-cluster ordering
-before reservation so hot keys remain colocated. Reservation, payload copy, and
-publication stay in the control-plane invocation and never enter lookup or
-optimizer hot paths.
-
-### Lifetime and non-blocking boundaries
-
-`MapBundle`, `StoreSnapshot`, locator slots, arena indices, `StoragePage`, and
-sealed page images share one epoch-retirement domain. Readers hold the
-invocation gate and an epoch while loading snapshots. Clear, import, and
-destruction close the gate, wait for active invocations to leave, and only then
-release payloads. A source page is destroyed only after it has no live entries
-and the last epoch reader has exited; `retired_bytes` consequently drains to
-zero. PageStorage swap/spill mutexes and its condition variable are background
-control-plane mechanisms and never enter lookup, optimizer, or relocation hot
-paths.
-
-## Partitioner Architecture and Registry
-
-Sparse Embedding provides a native C++ partitioner subsystem for high-throughput feature routing and offline checkpoint restore partitioning.
-
-### 1. Registry and Facade (`PartitionerRegistry`)
-
-Partitioners are accessed via `pro::proxy<PartitionerFacade>`:
-
-```cpp
-using PartitionerProxy = pro::proxy<PartitionerFacade>;
-using PartitionerFactory = std::function<PartitionerProxy(
-    uint32_t num_partitions,
-    const std::unordered_map<std::string, std::string> &parameters)>;
-```
-
-The centralized registry `se::ops::PartitionerRegistry` manages algorithm factories:
-- `sparse_embedding.modulo`: Normalized integer modulo mapping negative keys to $[0, \text{num\_partitions})$.
-- `sparse_embedding.hash`: MurmurHash3 avalanche hash with optional `seed`.
-- `sparse_embedding.fast_range`: Lemire FastRange division-free range partitioner.
-- Extension: Register via `register_factory(name, factory)`; unregistered names or malformed parameters throw `std::invalid_argument`.
-
-### 2. Vectorized Slice Filtering (`filter_span`)
-
-The AVX-512 `filter_span` kernel evaluates contiguous Arrow key slices in batch, producing compact `uint8_t` byte masks and matching row indices for offline restore.
-
-### 3. Parallel Dispatcher and Elastic Strategies
-
-- **Dispatcher Kernel (`parallel_partitioner.hpp`)**: Chunked execution based on `stdexec` multithreading, outputting DLPack Capsules.
-- **Python Elastic Strategy (`PartitionStrategy`)**:
-  - Decoupled Declaration and Topology: `ModuloPartition`, `HashPartition`, `FastRangePartition` declare algorithm and parameters without fixed shard counts.
-  - Late-Binding Contract: Implements `__call__(values, *, partition_count, ...)`, matching Fluxway `FunctionPartition(target=...)`.
-  - Specialization Cache and Pre-binding: Lazily caches specialized C++ kernels per `partition_count`; hot loops can pre-fetch via `bind(partition_count)`.
-  - Strict Invariant Defense: Throws `ValueError` if supplied `partition_count` mismatches bound topology.
-  - Single Source of Truth: `.spec` exports `SparsePartitionAssignmentSpec` aligned with Checkpoint metadata.
-  - Functional APIs: Top-level `se.partition(keys, partition_count=...)` and `se.filter_partition(...)`.
-- **Integration Boundary**: Partitioners compute target partition IDs (`ranks`). Cluster routing layout (`sort_indices`, `send_counts`) is derived by Fluxway `TransportPlanner`.
-
-## Framework-neutral Lance Checkpoint Protocol
-
-Distributed integrations use `SparseCheckpointProtocol` and supply a
-`CheckpointSaveIdentity`, one `CheckpointParticipant` per writer, and one final
-commit call containing all fragments. `CheckpointCommitAuthority` carries an
-opaque scope, monotonic generation, and authority identity.
-
-`LocalLanceStorage` and `GravitinoLanceStorage` share one Lance checkpoint
-transaction engine. Materialized `(dim, key)` entry states serve as the SSOT,
-with physical page images as an optional import cache. Writing uses a bounded channel
-(`BoundedChannel`) streaming pipeline. Storage adapters only provide dataset locations,
-staging prefixes, durable records, and commit locking. The manifest is the visibility boundary.
-
-### Dual-Lance 2PC Storage Layering
-
-Persistence is split into two physical Lance datasets:
-1. **`snapshot_manifest.lance`** (Control-plane ledger and visibility boundary):
-   - Records transaction transitions (`PREPARED` $\to$ `COMMITTED` / `ABORT`), leases, fencing markers, and `fragment_ids`. Compact (1 row appended per commit).
-2. **`entries.lance`** (Data-plane physical slices):
-   - Workers write concurrently to isolated paths `_staging/<attempt>/<fragment_id>/entries.lance`, enabling lock-free writes and offline streaming compaction.
-
-### Native Arrow Key Types and Pushdown
-
-The system standardizes on `key_dtype` as the type SSOT across 4 native fixed-width integer types: `int32`, `uint32`, `int64`, `uint64`. Tables store native integer columns, enabling direct Lance/DuckDB predicate pushdown (e.g. `WHERE key = -1`).
-
-### Restore Strategies
-
-Restore targets `SparseCheckpointLocator`:
-- **`PhysicalRestore`**:
-  - `PhysicalRestoreStrategy.RECONSTRUCT_ENTRIES` (default): Reconstructs native page layouts from canonical entries, filtering by `source_participant_index` after compaction.
-  - `PhysicalRestoreStrategy.FAST_PAGE_CACHE`: Directly imports physical page cache; missing cache raises `FileNotFoundError`.
-- **`ElasticRestore`**:
-  - Encodes `SparsePartitionAssignmentSpec` (`modulo()`, `hash()`, `fast_range()`, or registered custom algorithms).
-  - The C++ restore engine applies `PartitionerRegistry` and AVX-512 `filter_span` to filter the target logical partition.
-
-### Reference Vector Consistency Validation
-
-To guarantee bit-identical partitioning across online routing and offline restore:
-```python
-from sparse_embedding.checkpoint import generate_reference_vectors
-
-sample_keys, expected_ranks = generate_reference_vectors(
-    assignment_name="sparse_embedding.modulo",
-    key_dtype="uint64",
-    partition_count=4,
-)
-```
-
-Compaction streaming merge leverages participant topological disjointness to eliminate in-memory deduplication hash sets. Native scanners, channels, and page imports use the single C++ `CheckpointStreamPolicy` in `checkpoint_stream_policy.hpp`, so resident compaction memory is bounded by fixed batch/channel capacities. For directory and object publication:
-- Local workspaces use POSIX atomic `rename(2)` with zero auxiliary JSON files.
-- Remote S3/S3A workspaces use immutable staged prefixes and single-object strongly consistent pointers (`.manifest_pointer.json`) for atomic linearization without partial exposure.
-- Successful overwrites, explicit `delete_prefix`, recursive parent deletion, and rollback paths strictly clean pointer files and staged datasets; cleanup failures propagate while preserving the published root for retry.
-- Workspace prefix deletion `delete_prefix(..., missing_ok=False)` strictly raises `FileNotFoundError` by default with zero silent fallbacks.
-
-Thermal tier, heat, coaccess, and residency scheduling metadata are intentionally
-not checkpointed. They are re-observed after restore.
-
-## Telemetry
-
-`EmbeddingStore.storage_stats()` returns cumulative counters and current byte
-usage:
-
-| Field | Meaning |
-|---|---|
-| `memory_bytes` | Current resident bytes accounted to storage |
-| `spill_bytes` | Current live file-backed bytes |
-| `memory_limit_bytes` | Effective resident-memory limit |
-| `spill_limit_bytes` | Effective spill limit |
-| `spill_count` | Disk-backed page allocations, including reused extents |
-| `swap_out_count` | Background anonymous-to-file remaps |
-| `eviction_selection_count` | Completed selection passes |
-| `eviction_evaluated_pages` | Candidate pages scored across all passes |
-| `eviction_selection_ns` | Cumulative selection time in nanoseconds |
-| `eviction_candidate_invalidated_count` | Candidates rejected during final validation |
-| `retired_bytes` | Epoch-retired bytes not yet reclaimed |
-| `retirement_pressure_state` | Current pressure state: normal, backpressure, or circuit |
-| `retirement_backpressure_count` | Writer calls that yielded for retirement pressure |
-| `oldest_unreclaimed_age_ns` | Age of the oldest unreclaimed retirement record |
-| `epoch_stall_count` | Count of epoch-stall events that emitted a CRITICAL JSON log |
-| `spill_directory` | Selected or configured spill directory |
-
-`spill_count` and `swap_out_count` are intentionally different. Direct
-file-backed allocation increments the former; background eviction increments
-the latter.
+---
+
+## 10. Telemetry Reference and Diagnostics
+
+Call `store.storage_stats()` to inspect cumulative runtime counters and memory usage:
+
+| Metric Name | Type | Description and Operational Guidance |
+|---|---|---|
+| `memory_bytes` | bytes | Resident physical memory currently accounted to storage |
+| `spill_bytes` | bytes | Active file-backed disk memory in bytes |
+| `memory_limit_bytes` | bytes | Configured resident memory limit |
+| `spill_limit_bytes` | bytes | Configured disk spill limit |
+| `spill_count` | counter | Disk-backed page allocations (including reused extents) |
+| `swap_out_count` | counter | Background anonymous-to-file remapping count |
+| `eviction_selection_count` | counter | Completed background eviction selection passes |
+| `eviction_evaluated_pages` | counter | Cumulative pages evaluated during eviction passes |
+| `eviction_selection_ns` | nanoseconds | Cumulative time spent in eviction candidate selection |
+| `eviction_candidate_invalidated_count` | counter | Candidates invalidated during final verification (normal concurrency) |
+| `retired_bytes` | bytes | Bytes retired into epoch domains awaiting reclamation |
+| `retirement_pressure_state` | state | Current epoch pressure: `normal`, `backpressure`, or `circuit` |
+| `retirement_backpressure_count` | counter | Writer calls that executed CPU pause due to epoch pressure |
+| `oldest_unreclaimed_age_ns` | nanoseconds | Age of the oldest unreclaimed retirement record |
+| `epoch_stall_count` | counter | Critical epoch stalls that generated diagnostic logs |
+| `spill_directory` | string | Active disk spill directory path |

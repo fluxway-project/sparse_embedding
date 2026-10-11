@@ -1,5 +1,7 @@
 #include "sparse_embedding/src/checkpoint/lance/native_fragment_writer.hpp"
+#include "sparse_embedding/src/interface/embedding_table_interface.hpp"
 
+#include <ankerl/unordered_dense.h>
 #include <lance/lance.h>
 
 #include <algorithm>
@@ -12,6 +14,7 @@
 #include <filesystem>
 #include <fstream>
 #include <limits>
+#include <map>
 #include <memory>
 #include <mutex>
 #include <optional>
@@ -21,11 +24,13 @@
 #include <thread>
 #include <tuple>
 #include <type_traits>
+#include <unordered_map>
 
 #include "sparse_embedding/src/checkpoint/checkpoint_stream_policy.hpp"
 #include "sparse_embedding/src/checkpoint/lance/layout_schema.hpp"
 #include "sparse_embedding/src/common/dtypes.hpp"
 #include "sparse_embedding/src/ops/partitioner_registry.hpp"
+#include "sparse_embedding/src/storage/topology/storage_topology.hpp"
 
 namespace se {
 namespace {
@@ -331,6 +336,7 @@ inline EntryScanIndices resolve_entry_scan_indices(const ArrowSchema &schema) {
 }
 
 struct PageImageScanIndices {
+  size_t entries_per_page = 0;
   size_t source_participant_index = 0;
   size_t embedding_dim = 0;
   size_t physical_page_id = 0;
@@ -352,6 +358,7 @@ struct PageImageScanIndices {
 inline PageImageScanIndices
 resolve_page_image_scan_indices(const ArrowSchema &schema) {
   return {
+      .entries_per_page = find_column_index(schema, "entries_per_page"),
       .source_participant_index =
           find_column_index(schema, "source_participant_index"),
       .embedding_dim = find_column_index(schema, "embedding_dim"),
@@ -829,6 +836,22 @@ struct PipelinedWriterState {
   std::vector<char> schema_metadata;
   NativeFragmentArtifact artifact;
   uint64_t content_hash = 1469598103934665603ULL;
+  struct MutationKey {
+    uint32_t dimension;
+    uint64_t key;
+    bool operator==(const MutationKey &) const = default;
+  };
+  struct MutationKeyHash {
+    size_t operator()(const MutationKey &value) const noexcept {
+      size_t hash = std::hash<uint64_t>{}(value.key);
+      hash ^= std::hash<uint32_t>{}(value.dimension) +
+              static_cast<size_t>(0x9e3779b9) + (hash << 6) + (hash >> 2);
+      return hash;
+    }
+  };
+  std::unordered_map<MutationKey, uint64_t, MutationKeyHash>
+      incremental_sequences;
+  bool incremental_filter_enabled = false;
 
   BoundedChannel<std::optional<ArrowArray>> entries_channel{
       CheckpointStreamPolicy::kChannelCapacity};
@@ -881,12 +904,83 @@ NativeFragmentWriter::NativeFragmentWriter(NativeFragmentWriter &&) noexcept =
 NativeFragmentWriter &
 NativeFragmentWriter::operator=(NativeFragmentWriter &&) noexcept = default;
 
+void NativeFragmentWriter::set_incremental_mutations(
+    std::span<const CheckpointMutation> mutations) {
+  if (!state_)
+    throw std::runtime_error(
+        "incremental mutations require an active fragment");
+  state_->incremental_sequences.clear();
+  state_->incremental_filter_enabled = true;
+  for (const auto &mutation : mutations) {
+    if (mutation.deleted) {
+      write_tombstone(mutation.dimension, mutation.key,
+                      mutation.mutation_sequence);
+    } else if (!state_->incremental_sequences
+                    .emplace(
+                        PipelinedWriterState::MutationKey{mutation.dimension,
+                                                          mutation.key},
+                        mutation.mutation_sequence)
+                    .second) {
+      throw std::invalid_argument("duplicate checkpoint mutation identity");
+    }
+  }
+}
+
+void NativeFragmentWriter::write_tombstone(uint32_t dimension, uint64_t key,
+                                           uint64_t mutation_sequence) {
+  if (!state_)
+    throw std::runtime_error("tombstone write requires an active fragment");
+  std::vector<ArrowArray *> children;
+  children.reserve(16);
+  children.push_back(numeric_column(std::span<const uint32_t>(&dimension, 1)));
+  const auto kdt = parse_key_dtype(state_->key_dtype);
+  se::dispatch_key_type(kdt, [&]<typename KeyT>() {
+    const KeyT typed_key = static_cast<KeyT>(key);
+    children.push_back(numeric_column(std::span<const KeyT>(&typed_key, 1)));
+  });
+  children.push_back(make_strided_binary_column({}, 0, 1));
+  children.push_back(
+      make_repeated_binary_column(string_bytes(state_->embedding_dtype), 1));
+  children.push_back(make_strided_binary_column({}, 0, 1));
+  children.push_back(
+      make_repeated_binary_column(string_bytes(state_->optimizer_dtype), 1));
+  const uint32_t optimizer_stride = 0;
+  children.push_back(
+      numeric_column(std::span<const uint32_t>(&optimizer_stride, 1)));
+  const uint32_t step = 0;
+  children.push_back(numeric_column(std::span<const uint32_t>(&step, 1)));
+  const uint64_t zero = 0;
+  children.push_back(numeric_column(std::span<const uint64_t>(&zero, 1)));
+  children.push_back(numeric_column(std::span<const uint64_t>(&zero, 1)));
+  children.push_back(numeric_column(std::span<const uint64_t>(&zero, 1)));
+  const uint32_t slot = 0;
+  children.push_back(numeric_column(std::span<const uint32_t>(&slot, 1)));
+  children.push_back(make_repeated_binary_column(string_bytes("deleted"), 1));
+  children.push_back(numeric_column(std::span<const uint64_t>(&zero, 1)));
+  children.push_back(
+      numeric_column(std::span<const uint32_t>(&state_->participant_index, 1)));
+  children.push_back(
+      numeric_column(std::span<const uint64_t>(&mutation_sequence, 1)));
+  start_entries();
+  state_->entries_channel.push(make_struct_array(std::move(children), 1));
+  ++state_->artifact.entry_count;
+  state_->content_hash =
+      fnv1a(std::as_bytes(std::span<const uint32_t>(&dimension, 1)),
+            state_->content_hash);
+  state_->content_hash = fnv1a(
+      std::as_bytes(std::span<const uint64_t>(&key, 1)), state_->content_hash);
+  state_->content_hash =
+      fnv1a(std::as_bytes(std::span<const uint64_t>(&mutation_sequence, 1)),
+            state_->content_hash);
+}
+
 void NativeFragmentWriter::begin_fragment(
     std::string_view staging_uri, uint32_t participant_index,
     std::span<const uint32_t> dimensions, std::string_view embedding_dtype,
     std::string_view optimizer_dtype, std::string_view score_policy,
     std::string_view key_dtype, std::string_view schema_digest, bool has_score,
-    bool include_page_images) {
+    bool include_page_images, uint32_t entries_per_page) {
+  const storage::PageGeometry geometry(entries_per_page);
   state_ = std::make_unique<PipelinedWriterState>();
   state_->root = std::string(staging_uri);
   state_->entries_uri =
@@ -899,6 +993,8 @@ void NativeFragmentWriter::begin_fragment(
   state_->participant_index = participant_index;
   state_->has_score = has_score;
   state_->include_page_images = include_page_images;
+  state_->artifact.entries_per_page =
+      static_cast<uint32_t>(geometry.entries_per_page());
   state_->artifact.locator = state_->root;
   state_->artifact.schema_digest = std::string(schema_digest);
 
@@ -915,7 +1011,11 @@ void NativeFragmentWriter::begin_fragment(
       {"sparse_embedding.key_dtype", std::string(key_dtype)},
   }};
   state_->schema_metadata = make_arrow_metadata(metadata);
+}
 
+void NativeFragmentWriter::start_entries() {
+  if (state_->entries_worker.joinable())
+    return;
   state_->entries_worker = std::thread([state = state_.get()]() {
     try {
       ArrowSchema schema = se::lance_layout::make_entries_schema(
@@ -942,8 +1042,14 @@ void NativeFragmentWriter::begin_fragment(
       state->entries_channel.set_error(state->entries_error);
     }
   });
+}
 
-  if (state_->include_page_images) {
+void NativeFragmentWriter::start_pages() {
+  if (state_->pages_worker.joinable())
+    return;
+  if (!state_->include_page_images)
+    throw std::logic_error("page writer is disabled");
+  {
     state_->pages_channel =
         std::make_unique<BoundedChannel<std::optional<ArrowArray>>>(
             CheckpointStreamPolicy::kChannelCapacity);
@@ -1007,65 +1113,118 @@ void NativeFragmentWriter::write_page_image(
   std::string page_digest =
       checksum(slot_bytes, key_bytes, sequence_bytes, value_bytes, score_bytes,
                optimizer_bytes, step_bytes);
+  std::vector<uint32_t> selected_slots;
+  std::vector<uint64_t> selected_keys;
+  std::vector<uint64_t> selected_sequences;
+  std::vector<uint64_t> selected_scores;
+  std::vector<uint32_t> selected_steps;
+  std::vector<std::byte> selected_values;
+  std::vector<std::byte> selected_optimizer;
+  if (state_->incremental_filter_enabled) {
+    const size_t value_stride = embedding_row_bytes;
+    const size_t optimizer_stride_bytes = optimizer_stride * optimizer_itemsize;
+    for (size_t index = 0; index < keys.size(); ++index) {
+      if (!state_->incremental_sequences.contains(
+              PipelinedWriterState::MutationKey{
+                  static_cast<uint32_t>(embedding_dim), keys[index]}))
+        continue;
+      selected_slots.push_back(slots[index]);
+      selected_keys.push_back(keys[index]);
+      selected_sequences.push_back(sequences[index]);
+      if (!scores.empty())
+        selected_scores.push_back(scores[index]);
+      if (!steps.empty())
+        selected_steps.push_back(steps[index]);
+      selected_values.insert(selected_values.end(),
+                             values.begin() + index * value_stride,
+                             values.begin() + (index + 1) * value_stride);
+      if (optimizer_stride_bytes != 0)
+        selected_optimizer.insert(
+            selected_optimizer.end(),
+            optimizer.begin() + index * optimizer_stride_bytes,
+            optimizer.begin() + (index + 1) * optimizer_stride_bytes);
+    }
+    slots = std::span<const uint32_t>(selected_slots);
+    keys = std::span<const uint64_t>(selected_keys);
+    sequences = std::span<const uint64_t>(selected_sequences);
+    scores = std::span<const uint64_t>(selected_scores);
+    steps = std::span<const uint32_t>(selected_steps);
+    values = std::span<const std::byte>(selected_values);
+    optimizer = std::span<const std::byte>(selected_optimizer);
+  }
+
   const size_t optimizer_stride_bytes = optimizer_stride * optimizer_itemsize;
   if (optimizer_stride_bytes != 0 &&
       optimizer.size() != keys.size() * optimizer_stride_bytes)
     throw std::invalid_argument(
         "native Lance optimizer payload shape mismatch");
 
-  const size_t count = keys.size();
-  std::vector<ArrowArray *> children;
-  children.reserve(15);
-  children.push_back(numeric_column(
-      std::vector<uint32_t>(count, static_cast<uint32_t>(embedding_dim))));
+  if (!keys.empty()) {
+    const size_t count = keys.size();
+    std::vector<ArrowArray *> children;
+    children.reserve(15);
+    children.push_back(numeric_column(
+        std::vector<uint32_t>(count, static_cast<uint32_t>(embedding_dim))));
 
-  const auto kdt = parse_key_dtype(state_->key_dtype);
-  se::dispatch_key_type(kdt, [&]<typename KeyT>() {
-    std::vector<KeyT> typed_keys;
-    typed_keys.reserve(count);
-    for (uint64_t k : keys) {
-      typed_keys.push_back(static_cast<KeyT>(k));
-    }
-    children.push_back(numeric_column(typed_keys));
-  });
-  children.push_back(
-      make_strided_binary_column(values, embedding_row_bytes, count));
-  const auto embedding_dtype_bytes = string_bytes(state_->embedding_dtype);
-  children.push_back(make_repeated_binary_column(embedding_dtype_bytes, count));
-  children.push_back(
-      make_strided_binary_column(optimizer, optimizer_stride_bytes, count));
-  const auto optimizer_dtype_bytes = string_bytes(state_->optimizer_dtype);
-  children.push_back(make_repeated_binary_column(optimizer_dtype_bytes, count));
-  const uint32_t opt_stride_val =
-      optimizer_stride_bytes == 0 || state_->optimizer_dtype.empty()
-          ? 0
-          : static_cast<uint32_t>(optimizer_stride_bytes /
-                                  dtype_itemsize(state_->optimizer_dtype));
-  std::vector<uint32_t> opt_strides(count, opt_stride_val);
-  children.push_back(numeric_column(opt_strides));
-  std::vector<uint32_t> default_steps(count, 0);
-  children.push_back(numeric_column(
-      steps.empty() ? std::span<const uint32_t>{default_steps} : steps));
-  std::vector<uint64_t> default_scores(count, 0ULL);
-  children.push_back(numeric_column(
-      scores.empty() ? std::span<const uint64_t>{default_scores} : scores));
-  children.push_back(numeric_column(sequences));
-  std::vector<uint64_t> page_ids(count, physical_page_id);
-  children.push_back(numeric_column(page_ids));
-  children.push_back(numeric_column(slots));
-  const auto active_row_state = string_bytes("active");
-  children.push_back(make_repeated_binary_column(active_row_state, count));
-  std::vector<uint64_t> last_ckpts(count, 0ULL);
-  children.push_back(numeric_column(last_ckpts));
-  std::vector<uint32_t> part_indices(count, state_->participant_index);
-  children.push_back(numeric_column(part_indices));
+    const auto kdt = parse_key_dtype(state_->key_dtype);
+    se::dispatch_key_type(kdt, [&]<typename KeyT>() {
+      std::vector<KeyT> typed_keys;
+      typed_keys.reserve(count);
+      for (uint64_t k : keys) {
+        typed_keys.push_back(static_cast<KeyT>(k));
+      }
+      children.push_back(numeric_column(typed_keys));
+    });
+    children.push_back(
+        make_strided_binary_column(values, embedding_row_bytes, count));
+    const auto embedding_dtype_bytes = string_bytes(state_->embedding_dtype);
+    children.push_back(
+        make_repeated_binary_column(embedding_dtype_bytes, count));
+    children.push_back(
+        make_strided_binary_column(optimizer, optimizer_stride_bytes, count));
+    const auto optimizer_dtype_bytes = string_bytes(state_->optimizer_dtype);
+    children.push_back(
+        make_repeated_binary_column(optimizer_dtype_bytes, count));
+    const uint32_t opt_stride_val =
+        optimizer_stride_bytes == 0 || state_->optimizer_dtype.empty()
+            ? 0
+            : static_cast<uint32_t>(optimizer_stride_bytes /
+                                    dtype_itemsize(state_->optimizer_dtype));
+    std::vector<uint32_t> opt_strides(count, opt_stride_val);
+    children.push_back(numeric_column(opt_strides));
+    std::vector<uint32_t> default_steps(count, 0);
+    children.push_back(numeric_column(
+        steps.empty() ? std::span<const uint32_t>{default_steps} : steps));
+    std::vector<uint64_t> default_scores(count, 0ULL);
+    children.push_back(numeric_column(
+        scores.empty() ? std::span<const uint64_t>{default_scores} : scores));
+    children.push_back(numeric_column(sequences));
+    std::vector<uint64_t> page_ids(count, physical_page_id);
+    children.push_back(numeric_column(page_ids));
+    children.push_back(numeric_column(slots));
+    const auto active_row_state = string_bytes("active");
+    children.push_back(make_repeated_binary_column(active_row_state, count));
+    std::vector<uint64_t> last_ckpts(count, 0ULL);
+    children.push_back(numeric_column(last_ckpts));
+    std::vector<uint32_t> part_indices(count, state_->participant_index);
+    children.push_back(numeric_column(part_indices));
+    std::vector<uint64_t> mutation_sequences(count, 0ULL);
+    if (state_->incremental_filter_enabled)
+      for (size_t index = 0; index < count; ++index)
+        mutation_sequences[index] =
+            state_->incremental_sequences.at(PipelinedWriterState::MutationKey{
+                static_cast<uint32_t>(embedding_dim), keys[index]});
+    children.push_back(numeric_column(mutation_sequences));
 
-  auto entries_array = make_struct_array(std::move(children), count);
-  state_->artifact.entry_count += count;
-  state_->entries_channel.push(std::move(entries_array));
+    auto entries_array = make_struct_array(std::move(children), count);
+    state_->artifact.entry_count += count;
+    start_entries();
+    state_->entries_channel.push(std::move(entries_array));
+  }
 
   if (state_->include_page_images) {
-    const size_t p_count = keys.empty() ? 0 : 1;
+    start_pages();
+    const size_t p_count = 1;
     std::vector<ArrowArray *> p_children;
     std::vector<uint32_t> part_col(p_count, state_->participant_index);
     p_children.push_back(numeric_column(part_col));
@@ -1101,12 +1260,11 @@ void NativeFragmentWriter::write_page_image(
     std::vector<uint64_t> zeros_col(p_count, 0ULL);
     p_children.push_back(numeric_column(zeros_col));
 
+    p_children.push_back(numeric_column(
+        std::vector<uint32_t>(p_count, state_->artifact.entries_per_page)));
     auto page_array = make_struct_array(std::move(p_children), p_count);
-    if (!slots.empty() || !keys.empty() || !values.empty())
-      state_->artifact.page_count += 1;
-    state_->pages_channel->push(std::move(page_array));
-  } else if (!slots.empty() || !keys.empty() || !values.empty()) {
     state_->artifact.page_count += 1;
+    state_->pages_channel->push(std::move(page_array));
   }
 
   state_->content_hash = fnv1a(slot_bytes, state_->content_hash);
@@ -1129,17 +1287,10 @@ NativeFragmentArtifact NativeFragmentWriter::finalize() {
   if (!state_)
     throw std::runtime_error("finalize called without active fragment");
 
-  if (state_->artifact.entry_count == 0) {
-    auto schema = se::lance_layout::make_entries_schema(
-        state_->key_dtype, state_->schema_metadata.empty()
-                               ? nullptr
-                               : state_->schema_metadata.data());
-    state_->entries_channel.push(make_empty_array(schema));
-    if (schema.release)
-      schema.release(&schema);
+  if (state_->entries_worker.joinable()) {
+    state_->entries_channel.push(std::nullopt);
+    state_->entries_channel.close();
   }
-  state_->entries_channel.push(std::nullopt);
-  state_->entries_channel.close();
   if (state_->entries_worker.joinable())
     state_->entries_worker.join();
   if (state_->entries_error)
@@ -1152,15 +1303,7 @@ NativeFragmentArtifact NativeFragmentWriter::finalize() {
     state_->entries_dataset = nullptr;
   }
 
-  if (state_->include_page_images) {
-    if (state_->artifact.page_count == 0) {
-      auto schema = se::lance_layout::make_page_images_schema(
-          state_->schema_metadata.empty() ? nullptr
-                                          : state_->schema_metadata.data());
-      state_->pages_channel->push(make_empty_array(schema));
-      if (schema.release)
-        schema.release(&schema);
-    }
+  if (state_->pages_worker.joinable()) {
     state_->pages_channel->push(std::nullopt);
     state_->pages_channel->close();
     if (state_->pages_worker.joinable())
@@ -1266,7 +1409,9 @@ compact_native_lance_sources(std::string_view target_uri,
     }
     const bool is_entries = dim_index.has_value() && key_index.has_value() &&
                             state_index.has_value();
-    if (!is_entries && schema.get()->n_children != 17)
+    if (!is_entries &&
+        schema.get()->n_children !=
+            static_cast<int64_t>(lance_layout::kPageImageColumns.size()))
       throw std::runtime_error(
           "native Lance compaction source schema is unsupported");
 
@@ -1801,12 +1946,320 @@ void validate_native_active_entry_keys(
   validator.finish();
 }
 
+void validate_native_checkpoint_chain(
+    std::span<const std::vector<std::string>> source_uris,
+    std::span<const std::vector<uint64_t>> participant_watermarks,
+    std::span<const uint32_t> dimensions, std::string_view key_dtype,
+    const LanceStorageOptions &storage_options) {
+  if (source_uris.empty() ||
+      source_uris.size() != participant_watermarks.size() ||
+      source_uris.front().empty())
+    throw std::invalid_argument(
+        "checkpoint chain participant cuts are invalid");
+  const size_t participant_count = source_uris.front().size();
+  std::vector<uint64_t> previous_watermarks(participant_count, 0);
+  ankerl::unordered_dense::map<std::pair<uint32_t, uint64_t>, uint32_t>
+      ownership;
+  const char *const columns[] = {"dim",
+                                 "key",
+                                 "row_state",
+                                 "mutation_sequence",
+                                 "source_participant_index",
+                                 nullptr};
+  for (size_t checkpoint = 0; checkpoint < source_uris.size(); ++checkpoint) {
+    if (source_uris[checkpoint].size() != participant_count ||
+        participant_watermarks[checkpoint].size() != participant_count)
+      throw std::runtime_error("checkpoint chain participant topology changed");
+    ankerl::unordered_dense::set<std::pair<uint32_t, uint64_t>> identities;
+    ankerl::unordered_dense::set<std::pair<uint32_t, uint64_t>> sequences;
+    for (uint32_t participant = 0; participant < participant_count;
+         ++participant) {
+      const uint64_t watermark =
+          participant_watermarks[checkpoint][participant];
+      if (watermark < previous_watermarks[participant])
+        throw std::runtime_error(
+            "checkpoint participant watermark is retrograde");
+      const auto &uri = source_uris[checkpoint][participant];
+      if (uri.empty())
+        continue;
+      scan_dataset(
+          uri, 0,
+          [&](const ArrowSchema &schema, ArrowArrayStream &stream) {
+            require_schema_key_dtype(schema, key_dtype);
+            const auto dim_col = find_column_index(schema, "dim");
+            const auto key_col = find_column_index(schema, "key");
+            const auto state_col = find_column_index(schema, "row_state");
+            const auto mutation_col =
+                find_column_index(schema, "mutation_sequence");
+            const auto participant_col =
+                find_column_index(schema, "source_participant_index");
+            for (;;) {
+              ArrowArray array{};
+              if (stream.get_next(&stream, &array) != 0)
+                throw std::runtime_error(
+                    "checkpoint chain validation scan failed");
+              if (!array.release)
+                break;
+              try {
+                for (int64_t row = 0; row < array.length; ++row) {
+                  const uint32_t dim =
+                      fixed_value<uint32_t>(array.children[dim_col], row);
+                  const uint64_t key = read_polymorphic_key(
+                      array.children[key_col], schema.children[key_col], row);
+                  const auto identity = std::pair{dim, key};
+                  const uint64_t sequence =
+                      fixed_value<uint64_t>(array.children[mutation_col], row);
+                  const auto state =
+                      binary_string(array.children[state_col], row);
+                  if (std::find(dimensions.begin(), dimensions.end(), dim) ==
+                          dimensions.end() ||
+                      fixed_value<uint32_t>(array.children[participant_col],
+                                            row) != participant)
+                    throw std::runtime_error("checkpoint entry dimension or "
+                                             "participant identity mismatch");
+                  if (!identities.insert(identity).second)
+                    throw std::invalid_argument("duplicate active checkpoint "
+                                                "key or tombstone identity");
+                  auto [owner, inserted] =
+                      ownership.try_emplace(identity, participant);
+                  if (owner->second != participant)
+                    throw std::runtime_error("checkpoint key ownership changed "
+                                             "across incremental chain");
+                  if (state != "active" && state != "deleted")
+                    throw std::runtime_error("checkpoint row state is invalid");
+                  if (checkpoint == 0) {
+                    if (sequence != 0 || state != "active")
+                      throw std::runtime_error(
+                          "FULL checkpoint entry is invalid");
+                  } else if (!(previous_watermarks[participant] < sequence &&
+                               sequence <= watermark)) {
+                    throw std::runtime_error("checkpoint mutation sequence is "
+                                             "outside its participant cut");
+                  }
+                  if (sequence != 0 &&
+                      !sequences.emplace(participant, sequence).second)
+                    throw std::runtime_error("checkpoint participant mutation "
+                                             "sequence is duplicated");
+                }
+              } catch (...) {
+                array.release(&array);
+                throw;
+              }
+              array.release(&array);
+            }
+          },
+          storage_options, columns);
+    }
+    previous_watermarks = participant_watermarks[checkpoint];
+  }
+}
+
+struct CheckpointWinner {
+  size_t source;
+  uint64_t sequence;
+  bool deleted;
+};
+using CheckpointWinners =
+    ankerl::unordered_dense::map<std::pair<uint32_t, uint64_t>,
+                                 CheckpointWinner>;
+
+CheckpointWinners select_checkpoint_winners(
+    std::span<const std::string> source_uris, uint64_t version,
+    std::optional<uint32_t> participant_index, std::string_view key_dtype,
+    const LanceStorageOptions &storage_options) {
+  CheckpointWinners winners;
+  const char *const columns[] = {"dim",
+                                 "key",
+                                 "row_state",
+                                 "mutation_sequence",
+                                 "source_participant_index",
+                                 nullptr};
+  for (size_t source = 0; source < source_uris.size(); ++source) {
+    scan_dataset(
+        source_uris[source], version,
+        [&](const ArrowSchema &schema, ArrowArrayStream &stream) {
+          require_schema_key_dtype(schema, key_dtype);
+          const size_t dim_col = find_column_index(schema, "dim");
+          const size_t key_col = find_column_index(schema, "key");
+          const size_t state_col = find_column_index(schema, "row_state");
+          const size_t participant_col =
+              find_column_index(schema, "source_participant_index");
+          const size_t mutation =
+              find_column_index(schema, "mutation_sequence");
+          for (;;) {
+            ArrowArray array{};
+            if (stream.get_next(&stream, &array) != 0)
+              throw std::runtime_error(
+                  "checkpoint compact identity scan failed");
+            if (!array.release)
+              break;
+            try {
+              for (int64_t row = 0; row < array.length; ++row) {
+                if (participant_index &&
+                    fixed_value<uint32_t>(array.children[participant_col],
+                                          row) != *participant_index)
+                  throw std::runtime_error(
+                      "checkpoint compact participant mismatch");
+                const auto identity = std::pair{
+                    fixed_value<uint32_t>(array.children[dim_col], row),
+                    read_polymorphic_key(array.children[key_col],
+                                         schema.children[key_col], row)};
+                const uint64_t sequence =
+                    fixed_value<uint64_t>(array.children[mutation], row);
+                const auto state =
+                    binary_string(array.children[state_col], row);
+                if (state != "active" && state != "deleted")
+                  throw std::runtime_error(
+                      "checkpoint compact row state is invalid");
+                const auto previous = winners.find(identity);
+                if (previous != winners.end() &&
+                    (previous->second.source == source ||
+                     sequence <= previous->second.sequence))
+                  throw std::runtime_error(
+                      "checkpoint compact mutation sequence is duplicate or "
+                      "retrograde");
+                winners.insert_or_assign(
+                    identity,
+                    CheckpointWinner{source, sequence, state == "deleted"});
+              }
+            } catch (...) {
+              array.release(&array);
+              throw;
+            }
+            array.release(&array);
+          }
+        },
+        storage_options, columns);
+  }
+  return winners;
+}
+
+NativeFragmentArtifact compact_native_checkpoint(
+    std::string_view target_uri, std::span<const std::string> source_uris,
+    uint32_t participant_index, std::span<const uint32_t> dimensions,
+    std::string_view embedding_dtype, std::string_view optimizer_dtype,
+    std::string_view score_policy, std::string_view key_dtype,
+    std::string_view schema_digest, bool include_page_images,
+    uint32_t entries_per_page, const LanceStorageOptions &storage_options) {
+  const auto winners = select_checkpoint_winners(
+      source_uris, 0, participant_index, key_dtype, storage_options);
+  const bool has_score = score_policy != "none";
+  NativeFragmentWriter writer;
+  writer.begin_fragment(target_uri, participant_index, dimensions,
+                        embedding_dtype, optimizer_dtype, score_policy,
+                        key_dtype, schema_digest, has_score,
+                        include_page_images, entries_per_page);
+  std::unordered_map<uint32_t, uint64_t> next_page;
+  struct PageBatch {
+    std::vector<uint64_t> keys, sequences, scores;
+    std::vector<uint32_t> slots, steps;
+    std::vector<std::byte> values, optimizer;
+    std::optional<uint32_t> optimizer_stride;
+  };
+  std::map<uint32_t, PageBatch> pages;
+  auto flush_page = [&](uint32_t dim, PageBatch &page) {
+    if (page.keys.empty())
+      return;
+    const size_t row_bytes = dim * dtype_itemsize(embedding_dtype);
+    writer.write_page_image(
+        dim, next_page[dim]++,
+        static_cast<uint32_t>(
+            storage::PageGeometry::aligned_slot_stride(row_bytes)),
+        row_bytes, page.slots, page.keys, page.sequences, page.values,
+        page.scores, page.optimizer, *page.optimizer_stride,
+        optimizer_dtype.empty() ? 0 : dtype_itemsize(optimizer_dtype),
+        page.steps);
+    page.keys.clear();
+    page.sequences.clear();
+    page.scores.clear();
+    page.slots.clear();
+    page.steps.clear();
+    page.values.clear();
+    page.optimizer.clear();
+  };
+  for (size_t source = 0; source < source_uris.size(); ++source) {
+    scan_dataset(
+        source_uris[source], 0,
+        [&](const ArrowSchema &schema, ArrowArrayStream &stream) {
+          const auto col = resolve_entry_scan_indices(schema);
+          const auto sequence_col = find_column_index(schema, "sequence");
+          for (;;) {
+            ArrowArray array{};
+            if (stream.get_next(&stream, &array) != 0)
+              throw std::runtime_error(
+                  "checkpoint compact payload scan failed");
+            if (!array.release)
+              break;
+            try {
+              for (int64_t row = 0; row < array.length; ++row) {
+                const uint32_t dim =
+                    fixed_value<uint32_t>(array.children[col.dim], row);
+                const uint64_t key = read_polymorphic_key(
+                    array.children[col.key], schema.children[col.key], row);
+                const auto &winner = winners.at({dim, key});
+                if (winner.source != source || winner.deleted)
+                  continue;
+                if (std::find(dimensions.begin(), dimensions.end(), dim) ==
+                    dimensions.end())
+                  throw std::runtime_error(
+                      "checkpoint compact dimension is invalid");
+                const auto values =
+                    binary_value(array.children[col.embedding_values], row);
+                const auto optimizer = binary_value(
+                    array.children[col.optimizer_state_values], row);
+                const uint32_t stride = fixed_value<uint32_t>(
+                    array.children[col.optimizer_state_stride], row);
+                if (values.size() != dim * dtype_itemsize(embedding_dtype) ||
+                    optimizer.size() !=
+                        stride * (optimizer_dtype.empty()
+                                      ? 0
+                                      : dtype_itemsize(optimizer_dtype)))
+                  throw std::runtime_error(
+                      "checkpoint compact payload shape mismatch");
+                auto &page = pages[dim];
+                if (page.optimizer_stride.has_value() &&
+                    *page.optimizer_stride != stride)
+                  throw std::runtime_error(
+                      "checkpoint compact optimizer strides differ");
+                page.optimizer_stride = stride;
+                page.slots.push_back(static_cast<uint32_t>(page.keys.size()));
+                page.keys.push_back(key);
+                page.sequences.push_back(
+                    fixed_value<uint64_t>(array.children[sequence_col], row));
+                page.values.insert(page.values.end(), values.begin(),
+                                   values.end());
+                if (has_score)
+                  page.scores.push_back(
+                      fixed_value<uint64_t>(array.children[col.score], row));
+                page.optimizer.insert(page.optimizer.end(), optimizer.begin(),
+                                      optimizer.end());
+                if (stride)
+                  page.steps.push_back(
+                      fixed_value<uint32_t>(array.children[col.step], row));
+                if (page.keys.size() == entries_per_page)
+                  flush_page(dim, page);
+              }
+            } catch (...) {
+              array.release(&array);
+              throw;
+            }
+            array.release(&array);
+          }
+        },
+        storage_options);
+  }
+  for (auto &[dim, page] : pages)
+    flush_page(dim, page);
+  return writer.finalize();
+}
+
 void scan_native_partition_entries(
     std::string_view uri, uint64_t version,
-    pro::proxy<se::ops::PartitionerFacade> partitioner, uint32_t partition_id,
+    pro::proxy<se::ops::PartitionerFacade> &partitioner, uint32_t partition_id,
     std::string_view key_dtype, NativeEntryBatchVisitor visitor,
     bool load_optimizer_state, const LanceStorageOptions &storage_options,
-    std::optional<uint32_t> source_participant_index) {
+    std::optional<uint32_t> source_participant_index,
+    const std::function<bool(uint32_t, uint64_t)> &select_entry) {
   if (!partitioner.has_value())
     throw std::invalid_argument("native Lance partitioner is null");
   if (!visitor)
@@ -1895,6 +2348,10 @@ void scan_native_partition_entries(
               continue;
             const uint64_t key = read_polymorphic_key(
                 batch_array.children[col.key], schema.children[col.key], row);
+            const uint32_t dimension =
+                fixed_value<uint32_t>(batch_array.children[col.dim], row);
+            if (select_entry && !select_entry(dimension, key))
+              continue;
             batch.dimensions.push_back(
                 fixed_value<uint32_t>(batch_array.children[col.dim], row));
             batch.keys.push_back(key);
@@ -1944,10 +2401,30 @@ void scan_native_partition_entries(
         "native Lance logical partition is outside logical partition count");
   auto partitioner = se::ops::PartitionerRegistry::instance().create(
       se::ops::kModuloPartitionerName, static_cast<uint32_t>(partition_count));
-  scan_native_partition_entries(uri, version, std::move(partitioner),
+  scan_native_partition_entries(uri, version, partitioner,
                                 static_cast<uint32_t>(partition_id), key_dtype,
                                 std::move(visitor), load_optimizer_state,
                                 storage_options, source_participant_index);
+}
+
+void scan_native_checkpoint_entries(
+    std::span<const std::string> uris, uint64_t version,
+    pro::proxy<se::ops::PartitionerFacade> partitioner, uint32_t partition_id,
+    std::string_view key_dtype, NativeEntryBatchVisitor visitor,
+    bool load_optimizer_state, const LanceStorageOptions &storage_options,
+    std::optional<uint32_t> source_participant_index) {
+  const auto winners = select_checkpoint_winners(
+      uris, version, source_participant_index, key_dtype, storage_options);
+  for (size_t source = 0; source < uris.size(); ++source) {
+    scan_native_partition_entries(
+        uris[source], version, partitioner, partition_id, key_dtype, visitor,
+        load_optimizer_state, storage_options, source_participant_index,
+        [&](uint32_t dim, uint64_t key) {
+          const auto winner = winners.find({dim, key});
+          return winner != winners.end() && winner->second.source == source &&
+                 !winner->second.deleted;
+        });
+  }
 }
 
 void scan_native_page_images(std::string_view uri, uint64_t version,
@@ -1979,6 +2456,8 @@ void scan_native_page_images(std::string_view uri, uint64_t version,
                     kActiveRowState)
               continue;
             NativePageImage page;
+            page.entries_per_page = fixed_value<uint32_t>(
+                batch_array.children[col.entries_per_page], row);
             page.embedding_dim = fixed_value<uint32_t>(
                 batch_array.children[col.embedding_dim], row);
             page.physical_page_id = fixed_value<uint64_t>(

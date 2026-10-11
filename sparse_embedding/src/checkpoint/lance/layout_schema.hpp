@@ -46,7 +46,7 @@ struct ColumnDef {
   const char *arrow_format;
 };
 
-inline constexpr std::array<ColumnDef, 15> kEntryColumns = {{
+inline constexpr std::array<ColumnDef, 16> kEntryColumns = {{
     {"dim", "I"},
     {"key", "L"},
     {"embedding_values", "z"},
@@ -62,9 +62,10 @@ inline constexpr std::array<ColumnDef, 15> kEntryColumns = {{
     {"row_state", "u"},
     {"last_updated_checkpoint_version", "L"},
     {"source_participant_index", "I"},
+    {"mutation_sequence", "L"},
 }};
 
-inline constexpr std::array<ColumnDef, 17> kPageImageColumns = {{
+inline constexpr std::array<ColumnDef, 18> kPageImageColumns = {{
     {"source_participant_index", "I"},
     {"embedding_dim", "I"},
     {"physical_page_id", "L"},
@@ -82,6 +83,7 @@ inline constexpr std::array<ColumnDef, 17> kPageImageColumns = {{
     {"checksum", "u"},
     {"row_state", "u"},
     {"last_updated_checkpoint_version", "L"},
+    {"entries_per_page", "I"},
 }};
 
 inline constexpr std::string_view kEntriesDataset = "entries.lance";
@@ -199,7 +201,7 @@ inline ArrowSchema make_page_images_schema(const char *metadata = nullptr) {
 }
 
 inline ArrowSchema make_manifest_schema(const char *metadata = nullptr) {
-  constexpr size_t kManifestFieldCount = 22;
+  constexpr size_t kManifestFieldCount = 29;
   auto **children = new ArrowSchema *[kManifestFieldCount];
   children[0] = make_leaf_schema("checkpoint_name", "u");
   children[1] = make_leaf_schema("checkpoint_version", "L");
@@ -223,6 +225,13 @@ inline ArrowSchema make_manifest_schema(const char *metadata = nullptr) {
   children[19] = make_leaf_schema("compacted_version", "L");
   children[20] = make_leaf_schema("commit_state", "u");
   children[21] = make_leaf_schema("storage_mode", "u");
+  children[22] = make_leaf_schema("format_version", "I");
+  children[23] = make_leaf_schema("parent_checkpoint_name", "u");
+  children[24] = make_leaf_schema("parent_reference_id", "u");
+  children[25] = make_list_schema("participant_watermarks", "item", "L");
+  children[26] = make_list_schema("fragment_descriptors", "item", "u");
+  children[27] = make_leaf_schema("include_page_images", "b");
+  children[28] = make_list_schema("participant_page_capacities", "item", "I");
 
   return ArrowSchema{
       .format = "+s",

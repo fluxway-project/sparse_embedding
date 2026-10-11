@@ -48,8 +48,9 @@ nb::tuple SyncOpsImpl<ParamT, OptT>::lookup(EmbeddingStoreWrapper &self,
 }
 
 template <typename ParamT, typename OptT>
-nb::tuple SyncOpsImpl<ParamT, OptT>::lookup_or_insert(
-    EmbeddingStoreWrapper &self, nb::object keys, int64_t dim) {
+nb::tuple
+SyncOpsImpl<ParamT, OptT>::lookup_or_insert(EmbeddingStoreWrapper &self,
+                                            nb::object keys, int64_t dim) {
   auto [dlm_keys, cap_keys] = se::py::extract_dlpack_tensor(keys);
   size_t n = get_dlm_size(dlm_keys);
   DLManagedTensor *vals_dlm = nullptr;
@@ -71,8 +72,8 @@ nb::tuple SyncOpsImpl<ParamT, OptT>::lookup_or_insert(
       vals_dlm = se::py::create_output_tensor<ParamT>(vals_shape);
       auto vals_span = std::span<ParamT>(
           static_cast<ParamT *>(vals_dlm->dl_tensor.data), total);
-      ec = self.get_store<ParamT, OptT>()->lookup_or_insert(
-          ks, vals_span, {lens_out, n});
+      ec = self.get_store<ParamT, OptT>()->lookup_or_insert(ks, vals_span,
+                                                            {lens_out, n});
     });
   }
 
@@ -101,8 +102,7 @@ void SyncOpsImpl<ParamT, OptT>::assign(EmbeddingStoreWrapper &self,
       int64_t dim = 0;
       if (dlm_values->dl_tensor.ndim == 2) {
         if (dlm_values->dl_tensor.shape[0] != static_cast<int64_t>(n)) {
-          throw std::invalid_argument(
-              "values shape[0] must match keys length");
+          throw std::invalid_argument("values shape[0] must match keys length");
         }
         dim = dlm_values->dl_tensor.shape[1];
       } else if (dlm_values->dl_tensor.ndim == 1) {
@@ -116,11 +116,11 @@ void SyncOpsImpl<ParamT, OptT>::assign(EmbeddingStoreWrapper &self,
       } else {
         throw std::invalid_argument("values must be a 1D or 2D tensor");
       }
-      auto& tls_row_lengths = get_tls_row_lengths();
+      auto &tls_row_lengths = get_tls_row_lengths();
       tls_row_lengths.resize(n);
       fill_uniform_row_lengths(tls_row_lengths, dim);
-      ec = self.get_store<ParamT, OptT>()->assign(ks, val_span,
-                                                   tls_row_lengths);
+      ec =
+          self.get_store<ParamT, OptT>()->assign(ks, val_span, tls_row_lengths);
     });
   }
   check_error(ec);
@@ -140,8 +140,8 @@ nb::object SyncOpsImpl<ParamT, OptT>::contains(EmbeddingStoreWrapper &self,
   {
     nb::gil_scoped_release release;
     dispatch_on_key(dlm_keys, self.key_type_enum_, [&](auto ks) {
-      ec = self.get_store<ParamT, OptT>()->contains(
-          ks, std::span<uint8_t>(out, n));
+      ec = self.get_store<ParamT, OptT>()->contains(ks,
+                                                    std::span<uint8_t>(out, n));
     });
   }
 
@@ -179,7 +179,7 @@ void SyncOpsImpl<ParamT, OptT>::accumulate_gradients(
     dispatch_value_dtype(self.gradient_dtype_code_, [&]<typename GradT>() {
       auto grads_span = se::py::dlpack_to_span<const GradT>(dlm_grads);
       dispatch_on_key(dlm_keys, self.key_type_enum_, [&](auto ks) {
-        auto& tls_row_lengths = get_tls_row_lengths();
+        auto &tls_row_lengths = get_tls_row_lengths();
         tls_row_lengths.resize(n);
         fill_uniform_row_lengths(tls_row_lengths, dim);
         ec = self.get_store<ParamT, OptT>()->accumulate_gradients(
@@ -207,6 +207,24 @@ void SyncOpsImpl<ParamT, OptT>::erase(EmbeddingStoreWrapper &self,
     nb::gil_scoped_release release;
     dispatch_on_key(dlm_keys, self.key_type_enum_, [&](auto ks) {
       ec = self.get_store<ParamT, OptT>()->erase(ks);
+    });
+  }
+  check_error(ec);
+}
+
+template <typename ParamT, typename OptT>
+void SyncOpsImpl<ParamT, OptT>::erase_dimension(EmbeddingStoreWrapper &self,
+                                                nb::object keys,
+                                                int64_t dimension) {
+  if (dimension < 0)
+    throw std::invalid_argument("erase dimension must be non-negative");
+  auto [dlm_keys, cap_keys] = se::py::extract_dlpack_tensor(keys);
+  std::error_code ec;
+  {
+    nb::gil_scoped_release release;
+    dispatch_on_key(dlm_keys, self.key_type_enum_, [&](auto ks) {
+      ec = self.get_store<ParamT, OptT>()->erase_dimension(
+          static_cast<size_t>(dimension), ks);
     });
   }
   check_error(ec);

@@ -11,6 +11,7 @@ from .base import (
     CheckpointHandle,
     CheckpointParticipant,
     CheckpointSaveIdentity,
+    CheckpointSaveMode,
     CommittedCheckpoint,
     RestorePlan,
     SparseCheckpointProtocol,
@@ -33,7 +34,20 @@ class SparseCheckpoint:
         *,
         weight_path: str | Path | None = None,
         include_page_images: bool = False,
+        mode: CheckpointSaveMode = CheckpointSaveMode.FULL,
+        parent_handle: CheckpointHandle | None = None,
     ) -> CommittedCheckpoint:
+        if not isinstance(mode, CheckpointSaveMode):
+            raise TypeError("mode must be a CheckpointSaveMode")
+        if mode is CheckpointSaveMode.FULL and parent_handle is not None:
+            raise ValueError("full checkpoint must not specify parent_handle")
+        if mode is CheckpointSaveMode.INCREMENTAL and parent_handle is None:
+            raise ValueError("incremental checkpoint requires parent_handle")
+        parent_manifest = (
+            self._protocol.resolve_checkpoint_manifest(parent_handle)
+            if parent_handle is not None
+            else None
+        )
         attempt = uuid.uuid4().hex
         identity = CheckpointSaveIdentity(
             name,
@@ -47,15 +61,22 @@ class SparseCheckpoint:
         participant = CheckpointParticipant(0, 1)
         self._protocol.prepare_checkpoint(identity)
         committed: CommittedCheckpoint | None = None
+        fragment = None
         try:
             fragment = self._protocol.write_checkpoint_fragment(
-                store, identity, participant, include_page_images=include_page_images
+                store,
+                identity,
+                participant,
+                include_page_images=include_page_images,
+                mode=mode,
+                parent_manifest=parent_manifest,
             )
             self._protocol.finalize_checkpoint(identity)
             committed = self._protocol.commit_checkpoint(
                 identity,
                 (fragment,),
             )
+            self._protocol.acknowledge_store_mutations(store, committed.handle)
             if weight_path is not None:
                 self._protocol.write_weight_reference(
                     str(weight_path), committed.handle
@@ -65,6 +86,11 @@ class SparseCheckpoint:
                 self._protocol.release_reference(committed.handle)
             return committed
         except Exception:
+            if fragment is not None:
+                store.cancel_checkpoint_capture(
+                    fragment.save_context.capture_id,
+                    fragment.save_context.journal_identity,
+                )
             self._protocol.abort_checkpoint(identity)
             raise
 

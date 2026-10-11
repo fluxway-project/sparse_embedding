@@ -177,6 +177,13 @@ inline void EmbeddingStoreWrapper::erase(nb::object keys) {
       [&]<typename P, typename O>() { SyncOpsImpl<P, O>::erase(*this, keys); });
 }
 
+inline void EmbeddingStoreWrapper::erase_dimension(nb::object keys,
+                                                   int64_t dimension) {
+  dispatch_types([&]<typename P, typename O>() {
+    SyncOpsImpl<P, O>::erase_dimension(*this, keys, dimension);
+  });
+}
+
 inline void EmbeddingStoreWrapper::clear() {
   dispatch_types(
       [&]<typename P, typename O>() { SyncOpsImpl<P, O>::clear(*this); });
@@ -238,7 +245,8 @@ inline nb::list EmbeddingStoreWrapper::export_page_images() {
               std::vector<float> optimizer_states;
               optimizer_states.reserve(image.optimizer_states.size());
               for (O value : image.optimizer_states)
-                optimizer_states.push_back(static_cast<float>(static_cast<float>(value)));
+                optimizer_states.push_back(
+                    static_cast<float>(static_cast<float>(value)));
               page["values"] = std::move(values);
               page["optimizer_states"] = std::move(optimizer_states);
               result.append(std::move(page));
@@ -268,14 +276,12 @@ inline void EmbeddingStoreWrapper::import_page_images(nb::list pages) {
       const auto values = nb::cast<std::vector<float>>(page["values"]);
       image.values.reserve(values.size());
       for (float value : values)
-        image.values.push_back(
-            static_cast<P>(value));
+        image.values.push_back(static_cast<P>(value));
       const auto optimizer_states =
           nb::cast<std::vector<float>>(page["optimizer_states"]);
       image.optimizer_states.reserve(optimizer_states.size());
       for (float value : optimizer_states)
-        image.optimizer_states.push_back(
-            static_cast<O>(value));
+        image.optimizer_states.push_back(static_cast<O>(value));
       imports.push_back(
           {nb::cast<size_t>(page["embedding_dim"]), std::move(image)});
     }
@@ -375,6 +381,46 @@ inline void EmbeddingStoreWrapper::assign_opt_state(nb::object keys_obj,
   dispatch_types([&]<typename P, typename O>() {
     CheckpointOpsImpl<P, O>::assign_opt_state(*this, keys_obj, opt_states_obj,
                                               dimension, steps_obj);
+  });
+}
+
+inline nb::list EmbeddingStoreWrapper::checkpoint_mutations() {
+  return dispatch_types([&]<typename P, typename O>() {
+    return CheckpointOpsImpl<P, O>::checkpoint_mutations(*this);
+  });
+}
+
+inline std::string EmbeddingStoreWrapper::checkpoint_baseline() {
+  return dispatch_types([&]<typename P, typename O>() {
+    return CheckpointOpsImpl<P, O>::checkpoint_baseline(*this);
+  });
+}
+
+inline uint64_t EmbeddingStoreWrapper::checkpoint_mutation_watermark() {
+  return dispatch_types([&]<typename P, typename O>() {
+    return CheckpointOpsImpl<P, O>::checkpoint_mutation_watermark(*this);
+  });
+}
+
+inline void EmbeddingStoreWrapper::cancel_checkpoint_capture(
+    uint64_t capture_id, const std::string &journal_identity) {
+  dispatch_types([&]<typename P, typename O>() {
+    get_store<P, O>()->cancel_checkpoint_capture(capture_id, journal_identity);
+  });
+}
+
+inline size_t EmbeddingStoreWrapper::entries_per_page() {
+  return dispatch_types([&]<typename P, typename O>() {
+    return get_store<P, O>()->entries_per_page();
+  });
+}
+
+inline void EmbeddingStoreWrapper::acknowledge_checkpoint_mutations(
+    uint64_t watermark, const std::string &baseline, uint64_t capture_id,
+    const std::string &journal_identity) {
+  dispatch_types([&]<typename P, typename O>() {
+    CheckpointOpsImpl<P, O>::acknowledge_checkpoint_mutations(
+        *this, watermark, baseline, capture_id, journal_identity);
   });
 }
 

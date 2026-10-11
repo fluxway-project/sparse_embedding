@@ -27,6 +27,15 @@ struct StorageTuningOptions {
 };
 
 struct PageGeometry {
+  static constexpr size_t kSlotAlignment = 64;
+
+  static size_t aligned_slot_stride(size_t row_bytes) {
+    if (row_bytes == 0 ||
+        row_bytes > std::numeric_limits<size_t>::max() - (kSlotAlignment - 1))
+      throw std::overflow_error("page slot stride is out of range");
+    return (row_bytes + kSlotAlignment - 1) & ~(kSlotAlignment - 1);
+  }
+
   explicit PageGeometry(size_t entries_per_page)
       : entries_per_page_(validate(entries_per_page)),
         entries_shift_(

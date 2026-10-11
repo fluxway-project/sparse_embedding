@@ -26,28 +26,38 @@ nb::dict CheckpointOpsImpl<ParamT, OptT>::write_native_fragment(
     uint32_t participant_index, const std::vector<uint32_t> &dimensions,
     const std::string &embedding_dtype, const std::string &optimizer_dtype,
     const std::string &score_policy, const std::string &key_dtype,
-    const std::string &schema_digest, bool include_page_images) {
+    const std::string &schema_digest, bool include_page_images,
+    bool incremental_mode, const std::string &expected_baseline) {
   se::NativeFragmentWriter writer;
-  writer.begin_fragment(uri, participant_index, dimensions, embedding_dtype,
-                        optimizer_dtype, score_policy, key_dtype, schema_digest,
-                        self.get_store<ParamT, OptT>()->has_score_policy(),
-                        include_page_images);
+  writer.begin_fragment(
+      uri, participant_index, dimensions, embedding_dtype, optimizer_dtype,
+      score_policy, key_dtype, schema_digest,
+      self.get_store<ParamT, OptT>()->has_score_policy(), include_page_images,
+      static_cast<uint32_t>(
+          self.get_store<ParamT, OptT>()->entries_per_page()));
+  se::CheckpointCaptureCut cut;
   {
     nb::gil_scoped_release release;
-    self.get_store<ParamT, OptT>()->export_page_images(
+    cut = self.get_store<ParamT, OptT>()->capture_checkpoint(
+        incremental_mode, expected_baseline, include_page_images,
+        pro::make_proxy<se::FunctionFacade<void(
+            std::span<const se::CheckpointMutation>, uint64_t)>>(
+            [&](std::span<const se::CheckpointMutation> mutations, uint64_t) {
+              if (!incremental_mode)
+                return;
+              writer.set_incremental_mutations(mutations);
+            }),
         pro::make_proxy<se::FunctionFacade<bool(
             size_t, se::PageImageExport<ParamT, OptT> &&)>>(
             [&](size_t dim, se::PageImageExport<ParamT, OptT> &&image) {
-              const auto values = std::as_bytes(std::span<const ParamT>(
-                  image.values.data(), image.values.size()));
-              const auto optimizer = std::as_bytes(
-                  std::span<const OptT>(image.optimizer_states.data(),
-                                        image.optimizer_states.size()));
               writer.write_page_image(
                   dim, image.physical_page_id, image.page_slot_stride_bytes,
                   sizeof(ParamT) * dim, image.slot_ordinals, image.keys,
-                  image.seq_counts, values, image.scores, optimizer,
-                  image.keys.empty()
+                  image.seq_counts,
+                  std::as_bytes(std::span<const ParamT>(image.values)),
+                  image.scores,
+                  std::as_bytes(std::span<const OptT>(image.optimizer_states)),
+                  image.optimizer_states.empty()
                       ? 0
                       : image.optimizer_states.size() / image.keys.size(),
                   sizeof(OptT), image.steps);
@@ -57,9 +67,19 @@ nb::dict CheckpointOpsImpl<ParamT, OptT>::write_native_fragment(
   se::NativeFragmentArtifact artifact;
   {
     nb::gil_scoped_release release;
-    artifact = writer.finalize();
+    try {
+      artifact = writer.finalize();
+    } catch (...) {
+      self.get_store<ParamT, OptT>()->cancel_checkpoint_capture(
+          cut.capture_id, cut.journal_identity);
+      throw;
+    }
   }
   nb::dict result;
+  result["entries_per_page"] = artifact.entries_per_page;
+  result["capture_id"] = cut.capture_id;
+  result["journal_identity"] = cut.journal_identity;
+  result["mutation_watermark"] = cut.mutation_watermark;
   result["locator"] = artifact.locator;
   result["entries_version"] = artifact.entries_version;
   result["page_images_version"] = artifact.page_images_version;
@@ -92,7 +112,6 @@ void CheckpointOpsImpl<ParamT, OptT>::restore_native_entries_with_scan(
           for (size_t index : indices) {
             dim_keys.push_back(static_cast<KeyT>(batch.keys[index]));
             const auto begin = batch.embedding_offsets[index];
-            const auto end = batch.embedding_offsets[index + 1];
             const auto *source = reinterpret_cast<const ParamT *>(
                 batch.embedding_values.data() + begin);
             values.insert(values.end(), source, source + dim);
@@ -117,7 +136,6 @@ void CheckpointOpsImpl<ParamT, OptT>::restore_native_entries_with_scan(
             optimizer.reserve(indices.size() * optimizer_stride);
             for (size_t index : indices) {
               const auto begin = batch.optimizer_offsets[index];
-              const auto end = batch.optimizer_offsets[index + 1];
               const auto *source = reinterpret_cast<const OptT *>(
                   batch.optimizer_values.data() + begin);
               optimizer.insert(optimizer.end(), source,
@@ -125,7 +143,8 @@ void CheckpointOpsImpl<ParamT, OptT>::restore_native_entries_with_scan(
             }
             std::vector<uint32_t> steps;
             steps.reserve(indices.size());
-            for (size_t index : indices) steps.push_back(batch.steps[index]);
+            for (size_t index : indices)
+              steps.push_back(batch.steps[index]);
             self.get_store<ParamT, OptT>()->assign_opt_states(
                 dim, std::span<const KeyT>(dim_keys),
                 std::span<const OptT>(optimizer),
@@ -140,8 +159,8 @@ void CheckpointOpsImpl<ParamT, OptT>::restore_native_entries_with_scan(
 
 template <typename ParamT, typename OptT>
 void CheckpointOpsImpl<ParamT, OptT>::restore_native_partition_entries(
-    EmbeddingStoreWrapper &self, const std::string &uri, uint64_t version,
-    uint64_t partition_count, uint64_t partition_id,
+    EmbeddingStoreWrapper &self, const std::vector<std::string> &uris,
+    uint64_t version, uint64_t partition_count, uint64_t partition_id,
     const std::string &key_dtype, const std::string &assignment_name,
     const std::unordered_map<std::string, std::string> &assignment_parameters,
     const se::LanceStorageOptions &storage_options, bool load_optimizer_state,
@@ -158,8 +177,8 @@ void CheckpointOpsImpl<ParamT, OptT>::restore_native_partition_entries(
   restore_native_entries_with_scan(
       self,
       [&](se::NativeEntryBatchVisitor visitor) {
-        se::scan_native_partition_entries(
-            uri, version, std::move(partitioner),
+        se::scan_native_checkpoint_entries(
+            uris, version, std::move(partitioner),
             static_cast<uint32_t>(partition_id), key_dtype, std::move(visitor),
             load_optimizer_state, storage_options, source_participant_index);
       },
@@ -179,6 +198,27 @@ void CheckpointOpsImpl<ParamT, OptT>::restore_native_page_images(
       se::scan_native_page_images(
           uri, version, participant_index, key_dtype,
           [&](se::NativePageImage &&page) {
+            if (page.entries_per_page !=
+                self.get_store<ParamT, OptT>()->entries_per_page())
+              throw std::invalid_argument(
+                  "page-image geometry does not match store topology");
+            if (page.embedding_dtype != self.value_dtype() ||
+                (load_optimizer_state &&
+                 page.optimizer_dtype != self.optimizer_dtype()))
+              throw std::invalid_argument(
+                  "page-image dtype does not match store");
+            return true;
+          },
+          load_optimizer_state, storage_options);
+    }
+    for (const auto &uri : uris) {
+      se::scan_native_page_images(
+          uri, version, participant_index, key_dtype,
+          [&](se::NativePageImage &&page) {
+            if (page.entries_per_page !=
+                self.get_store<ParamT, OptT>()->entries_per_page())
+              throw std::invalid_argument(
+                  "page-image geometry does not match store topology");
             if (page.embedding_dtype != self.value_dtype() ||
                 (load_optimizer_state &&
                  page.optimizer_dtype != self.optimizer_dtype()))
@@ -228,7 +268,7 @@ void CheckpointOpsImpl<ParamT, OptT>::restore_native_page_images(
     }
   }
 }
-#endif  // SE_ENABLE_LANCE_C
+#endif // SE_ENABLE_LANCE_C
 
 template <typename ParamT, typename OptT>
 void CheckpointOpsImpl<ParamT, OptT>::export_batches_dlpack(
@@ -236,14 +276,14 @@ void CheckpointOpsImpl<ParamT, OptT>::export_batches_dlpack(
     bool include_optimizer_state) {
   auto dispatch_key = [&]<typename Fn>(Fn &&fn) {
     switch (self.key_type_enum_) {
-      case KeyDType::kInt32:
-        return fn.template operator()<int32_t>();
-      case KeyDType::kUInt32:
-        return fn.template operator()<uint32_t>();
-      case KeyDType::kInt64:
-        return fn.template operator()<int64_t>();
-      case KeyDType::kUInt64:
-        return fn.template operator()<uint64_t>();
+    case KeyDType::kInt32:
+      return fn.template operator()<int32_t>();
+    case KeyDType::kUInt32:
+      return fn.template operator()<uint32_t>();
+    case KeyDType::kInt64:
+      return fn.template operator()<int64_t>();
+    case KeyDType::kUInt64:
+      return fn.template operator()<uint64_t>();
     }
     throw std::invalid_argument("unsupported key_dtype");
   };
@@ -311,14 +351,14 @@ void CheckpointOpsImpl<ParamT, OptT>::export_batches_arrow(
     bool include_optimizer_state) {
   auto dispatch_key = [&]<typename Fn>(Fn &&fn) {
     switch (self.key_type_enum_) {
-      case KeyDType::kInt32:
-        return fn.template operator()<int32_t>();
-      case KeyDType::kUInt32:
-        return fn.template operator()<uint32_t>();
-      case KeyDType::kInt64:
-        return fn.template operator()<int64_t>();
-      case KeyDType::kUInt64:
-        return fn.template operator()<uint64_t>();
+    case KeyDType::kInt32:
+      return fn.template operator()<int32_t>();
+    case KeyDType::kUInt32:
+      return fn.template operator()<uint32_t>();
+    case KeyDType::kInt64:
+      return fn.template operator()<int64_t>();
+    case KeyDType::kUInt64:
+      return fn.template operator()<uint64_t>();
     }
     throw std::invalid_argument("unsupported key_dtype");
   };
@@ -369,14 +409,14 @@ void CheckpointOpsImpl<ParamT, OptT>::assign_opt_state(
     size_t dimension, nb::object steps_obj) {
   auto dispatch_key = [&]<typename Fn>(Fn &&fn) {
     switch (self.key_type_enum_) {
-      case KeyDType::kInt32:
-        return fn.template operator()<int32_t>();
-      case KeyDType::kUInt32:
-        return fn.template operator()<uint32_t>();
-      case KeyDType::kInt64:
-        return fn.template operator()<int64_t>();
-      case KeyDType::kUInt64:
-        return fn.template operator()<uint64_t>();
+    case KeyDType::kInt32:
+      return fn.template operator()<int32_t>();
+    case KeyDType::kUInt32:
+      return fn.template operator()<uint32_t>();
+    case KeyDType::kInt64:
+      return fn.template operator()<int64_t>();
+    case KeyDType::kUInt64:
+      return fn.template operator()<uint64_t>();
     }
     throw std::invalid_argument("unsupported key_dtype");
   };
@@ -430,4 +470,41 @@ void CheckpointOpsImpl<ParamT, OptT>::assign_opt_state(
   });
 }
 
-}  // namespace se::py::detail
+template <typename ParamT, typename OptT>
+nb::list CheckpointOpsImpl<ParamT, OptT>::checkpoint_mutations(
+    EmbeddingStoreWrapper &self) {
+  nb::list result;
+  for (const auto &mutation :
+       self.get_store<ParamT, OptT>()->checkpoint_mutations()) {
+    nb::dict row;
+    row["dimension"] = mutation.dimension;
+    row["key"] = mutation.key;
+    row["mutation_sequence"] = mutation.mutation_sequence;
+    row["deleted"] = mutation.deleted;
+    result.append(std::move(row));
+  }
+  return result;
+}
+
+template <typename ParamT, typename OptT>
+std::string CheckpointOpsImpl<ParamT, OptT>::checkpoint_baseline(
+    EmbeddingStoreWrapper &self) {
+  return self.get_store<ParamT, OptT>()->checkpoint_baseline();
+}
+
+template <typename ParamT, typename OptT>
+uint64_t CheckpointOpsImpl<ParamT, OptT>::checkpoint_mutation_watermark(
+    EmbeddingStoreWrapper &self) {
+  return self.get_store<ParamT, OptT>()->checkpoint_mutation_watermark();
+}
+
+template <typename ParamT, typename OptT>
+void CheckpointOpsImpl<ParamT, OptT>::acknowledge_checkpoint_mutations(
+    EmbeddingStoreWrapper &self, uint64_t watermark,
+    const std::string &baseline, uint64_t capture_id,
+    const std::string &journal_identity) {
+  self.get_store<ParamT, OptT>()->acknowledge_checkpoint_mutations(
+      watermark, baseline, capture_id, journal_identity);
+}
+
+} // namespace se::py::detail
