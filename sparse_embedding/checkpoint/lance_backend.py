@@ -31,7 +31,9 @@ from .base import (
     CheckpointLease,
     CheckpointLeaseRequest,
     CheckpointParticipant,
+    CheckpointSaveContext,
     CheckpointSaveIdentity,
+    CheckpointSaveMode,
     CleanupReservation,
     CommittedCheckpoint,
     ElasticRestore,
@@ -240,37 +242,6 @@ async def compact_fragments_async(
     )
 
 
-def _native_page_checksum(row: dict[str, Any]) -> str:
-    hash_value = 1469598103934665603
-    for key in (
-        "slot_ordinals",
-        "keys",
-        "sequences",
-        "embedding_values",
-        "scores",
-        "optimizer_state_values",
-        "steps",
-    ):
-        value = row[key]
-        if not isinstance(value, (bytes, bytearray, memoryview)):
-            value = np.ascontiguousarray(value).tobytes()
-        for byte in bytes(value):
-            hash_value ^= byte
-            hash_value = (hash_value * 1099511628211) & ((1 << 64) - 1)
-    return f"{hash_value:x}"
-
-
-def _decode_value_bytes(payload: bytes, dtype: str) -> np.ndarray:
-    if dtype == "float32":
-        return np.frombuffer(payload, dtype=np.float32)
-    if dtype == "float16":
-        return np.frombuffer(payload, dtype=np.float16).astype(np.float32)
-    if dtype == "bfloat16":
-        bits = np.frombuffer(payload, dtype=np.uint16).astype(np.uint32) << 16
-        return bits.view(np.float32)
-    raise ValueError(f"unsupported payload dtype: {dtype}")
-
-
 class _LanceCheckpointStorage:
     """Shared sparse checkpoint transaction engine over a Lance workspace."""
 
@@ -289,7 +260,6 @@ class _LanceCheckpointStorage:
     def prepare_checkpoint(self, identity: CheckpointSaveIdentity) -> None:
         self._ensure_tables()
         with self._commit_lock():
-            self._reconcile_compaction_retirements()
             self._reconcile_staging()
             self._check_storage_budget()
             attempt = self._attempt_prefix(identity)
@@ -304,7 +274,13 @@ class _LanceCheckpointStorage:
         identity: CheckpointSaveIdentity,
         participant: CheckpointParticipant,
         include_page_images: bool = False,
+        mode: CheckpointSaveMode = CheckpointSaveMode.FULL,
+        parent_manifest: Mapping[str, Any] | None = None,
     ) -> CheckpointFragment:
+        if not isinstance(mode, CheckpointSaveMode):
+            raise TypeError("mode must be a CheckpointSaveMode")
+        if mode is CheckpointSaveMode.INCREMENTAL and parent_manifest is None:
+            raise ValueError("incremental fragment requires a parent manifest")
         self._require_authority(identity)
         attempt = self._attempt_prefix(identity)
         if not self._workspace.exists(attempt):
@@ -314,6 +290,21 @@ class _LanceCheckpointStorage:
         if self._workspace.exists(fragment_root):
             raise CheckpointConflictError("checkpoint fragment already exists")
         specification = self._store_specification(store)
+        if mode is CheckpointSaveMode.FULL and parent_manifest is not None:
+            raise ValueError("FULL fragment cannot specify a parent")
+        if (
+            parent_manifest is not None
+            and int(parent_manifest["participant_count"])
+            != participant.participant_count
+        ):
+            raise ValueError(
+                "incremental checkpoint requires stable participant topology"
+            )
+        baseline = (
+            self._checkpoint_baseline(parent_manifest, participant.participant_index)
+            if parent_manifest is not None
+            else ""
+        )
         self._workspace.create_prefix(fragment_root)
         artifact = _checkpoint_native.write_native_fragment(
             store,
@@ -326,10 +317,16 @@ class _LanceCheckpointStorage:
             specification.key_dtype,
             _schema_digest(specification),
             include_page_images,
+            mode is CheckpointSaveMode.INCREMENTAL,
+            baseline,
         )
         if not isinstance(artifact, dict):
             raise TypeError("native fragment writer returned a non-mapping artifact")
         required = {
+            "capture_id",
+            "journal_identity",
+            "entries_per_page",
+            "mutation_watermark",
             "locator",
             "entries_version",
             "page_images_version",
@@ -342,15 +339,20 @@ class _LanceCheckpointStorage:
         if set(artifact) != required:
             raise ValueError("native fragment artifact fields are invalid")
         content_digest = str(artifact["content_digest"])
-        self._publish_fragment_metadata(
-            fragment_root,
-            fragment_id,
-            participant.participant_index,
-            participant.participant_count,
-            int(artifact["entry_count"]),
-            int(artifact["page_count"]),
-            str(artifact["schema_digest"]),
-            content_digest,
+        context = CheckpointSaveContext(
+            mode,
+            SparseCheckpointLocator(
+                str(parent_manifest["checkpoint_name"]),
+                int(parent_manifest["checkpoint_version"]),
+            )
+            if parent_manifest is not None
+            else None,
+            str(parent_manifest["reference_id"]) if parent_manifest is not None else "",
+            int(artifact["mutation_watermark"]),
+            include_page_images,
+            int(artifact["entries_per_page"]),
+            int(artifact["capture_id"]),
+            str(artifact["journal_identity"]),
         )
         fragment = CheckpointFragment(
             fragment_id=fragment_id,
@@ -361,8 +363,17 @@ class _LanceCheckpointStorage:
             page_count=int(artifact["page_count"]),
             schema_digest=str(artifact["schema_digest"]),
             content_digest=content_digest,
+            specification=specification,
+            save_context=context,
         )
-        self._require_authority(identity)
+        try:
+            self._publish_save_descriptor(fragment_root, fragment)
+            self._require_authority(identity)
+        except BaseException:
+            store.cancel_checkpoint_capture(
+                context.capture_id, context.journal_identity
+            )
+            raise
         return fragment
 
     def commit_checkpoint(
@@ -396,6 +407,51 @@ class _LanceCheckpointStorage:
         if str(manifest["reference_id"]) != reference_id:
             raise ValueError("checkpoint handle reference identity does not match")
         return locator, reference_id
+
+    def resolve_checkpoint_manifest(
+        self, handle: CheckpointHandle
+    ) -> Mapping[str, Any]:
+        locator, _ = self._resolve_handle(handle)
+        manifest = self._resolve_manifest(locator)
+        if int(manifest["format_version"]) != 2:
+            raise RuntimeError("checkpoint manifest format version is unsupported")
+        return dict(manifest)
+
+    def acknowledge_store_mutations(
+        self, store: Any, handle: CheckpointHandle, participant_index: int = 0
+    ) -> None:
+        manifest = self.resolve_checkpoint_manifest(handle)
+        if (
+            isinstance(participant_index, bool)
+            or not isinstance(participant_index, int)
+            or not 0 <= participant_index < int(manifest["participant_count"])
+        ):
+            raise ValueError("checkpoint participant index is outside saved topology")
+        watermark = int(manifest["participant_watermarks"][participant_index])
+        if not hasattr(store, "acknowledge_checkpoint_mutations"):
+            raise RuntimeError(
+                "store does not expose checkpoint mutation acknowledgement"
+            )
+        descriptor = json.loads(manifest["fragment_descriptors"][participant_index])
+        store.acknowledge_checkpoint_mutations(
+            watermark,
+            self._checkpoint_baseline(manifest, participant_index),
+            descriptor["capture_id"],
+            descriptor["journal_identity"],
+        )
+
+    @staticmethod
+    def _checkpoint_baseline(
+        manifest: Mapping[str, Any], participant_index: int
+    ) -> str:
+        return ":".join(
+            (
+                str(manifest["checkpoint_name"]),
+                str(int(manifest["checkpoint_version"])),
+                str(manifest["reference_id"]),
+                str(participant_index),
+            )
+        )
 
     def _validate_handle_storage_uri(self, storage_uri: str) -> None:
         expected_uri = self._workspace.uri("")
@@ -460,31 +516,54 @@ class _LanceCheckpointStorage:
         self._reconcile_staging()
         validated, specification = self._validate_fragments(identity, fragments)
         manifest_rows = self._manifest_rows()
-        previous = max(
-            (int(row["checkpoint_version"]) for row in manifest_rows), default=0
-        )
-        checkpoint_version = previous + 1
-        fragment_ids = tuple(fragment.fragment_id for fragment in validated)
-        fragment_roots = tuple(
-            f"{self._attempt_prefix(identity)}/{fragment.fragment_id}"
-            for fragment in validated
-        )
-        for root in fragment_roots:
-            if not self._workspace.exists(f"{root}/{ENTRIES_DATASET}"):
-                raise InvalidCheckpointFragment(
-                    "checkpoint fragment payload is missing"
+        context = validated[0].save_context
+        parent = None
+        if context.mode is CheckpointSaveMode.INCREMENTAL:
+            if context.parent is None:
+                raise RuntimeError("incremental checkpoint is missing its parent")
+            parent_version = context.parent.checkpoint_version
+            parent = self._manifest_for_version(
+                context.parent.checkpoint_name, parent_version
+            )
+            if context.parent.checkpoint_name != identity.checkpoint_name:
+                raise ValueError(
+                    "incremental parent belongs to another checkpoint lineage"
                 )
+            if (
+                parent["commit_state"] != _COMMITTED
+                or parent["reference_id"] != context.parent_reference_id
+            ):
+                raise RuntimeError("incremental parent identity is not committed")
+            if parent["schema_digest"] != _schema_digest(specification):
+                raise RuntimeError("incremental parent schema mismatch")
+            if int(parent["participant_count"]) != len(validated):
+                raise RuntimeError("incremental participant topology changed")
+            for fragment in validated:
+                if fragment.save_context.mutation_watermark < int(
+                    parent["participant_watermarks"][
+                        fragment.participant.participant_index
+                    ]
+                ):
+                    raise RuntimeError(
+                        "incremental participant watermark is retrograde"
+                    )
+        else:
+            parent_version = 0
+        checkpoint_version = (
+            max((int(row["checkpoint_version"]) for row in manifest_rows), default=0)
+            + 1
+        )
+        fragment_ids = tuple(fragment.fragment_id for fragment in validated)
         self._check_storage_budget()
         self._workspace.assert_commit_lock()
-        fragment_digest = self._fragment_digest_for_metadata(
-            fragment_ids, fragment_roots
-        )
+        descriptors = [self._fragment_descriptor(fragment) for fragment in validated]
+        fragment_digest = _canonical_digest(descriptors)
         manifest = {
             "checkpoint_name": identity.checkpoint_name,
             "checkpoint_version": checkpoint_version,
-            "parent_checkpoint_version": previous,
+            "parent_checkpoint_version": parent_version,
             "participant_count": validated[0].participant.participant_count,
-            "checkpoint_mode": "full",
+            "checkpoint_mode": context.mode.value,
             "schema_digest": _schema_digest(specification),
             "fragment_digest": fragment_digest,
             "save_attempt": identity.save_attempt,
@@ -502,6 +581,21 @@ class _LanceCheckpointStorage:
             "compacted_version": 0,
             "commit_state": _PREPARED,
             "storage_mode": _FRAGMENT_STORAGE_MODE,
+            "format_version": 2,
+            "parent_checkpoint_name": parent["checkpoint_name"]
+            if parent is not None
+            else "",
+            "parent_reference_id": parent["reference_id"] if parent is not None else "",
+            "participant_watermarks": [
+                fragment.save_context.mutation_watermark for fragment in validated
+            ],
+            "fragment_descriptors": [
+                json.dumps(descriptor, sort_keys=True) for descriptor in descriptors
+            ],
+            "include_page_images": context.include_page_images,
+            "participant_page_capacities": [
+                fragment.save_context.entries_per_page for fragment in validated
+            ],
         }
         manifest_before = self._workspace.dataset(SNAPSHOT_MANIFEST_DATASET).version
         locator = SparseCheckpointLocator(identity.checkpoint_name, checkpoint_version)
@@ -526,6 +620,8 @@ class _LanceCheckpointStorage:
                 lease = self._acquire_checkpoint_lease_locked(locator, lease_request)
             if reference_id:
                 self._create_reference_tags(locator, reference_id, manifest)
+            if parent is not None:
+                self._create_parent_chain_reference(manifest)
             self._workspace.assert_commit_lock()
             updated = self._workspace.dataset(SNAPSHOT_MANIFEST_DATASET).update(
                 {"commit_state": f"'{_COMMITTED}'"},
@@ -547,8 +643,6 @@ class _LanceCheckpointStorage:
         except BaseException:
             if lease is not None:
                 self._delete_lease_tag(lease, locator)
-            if reference_id:
-                self._delete_reference_tags(locator, reference_id)
             raise
         self._workspace.assert_commit_lock()
         self._clear_authority(identity)
@@ -569,6 +663,13 @@ class _LanceCheckpointStorage:
                         raise RuntimeError(
                             "checkpoint manifest commit state is corrupt"
                         )
+                    self._delete_parent_chain_reference(row)
+                    self._delete_reference_tags(
+                        SparseCheckpointLocator(
+                            identity.checkpoint_name, int(row["checkpoint_version"])
+                        ),
+                        str(row["reference_id"]),
+                    )
                     version = int(row["checkpoint_version"])
                     self._workspace.dataset(SNAPSHOT_MANIFEST_DATASET).delete(
                         f"checkpoint_name = '{self._sql_literal(identity.checkpoint_name)}' "
@@ -708,19 +809,15 @@ class _LanceCheckpointStorage:
         self._ensure_tables()
         with self._commit_lock():
             self._reconcile_reclaiming()
-            self._reconcile_compaction_retirements()
             self._reclaim_unlocked(older_than)
 
-    def compact_checkpoints(self) -> None:
-        self._ensure_tables()
-        with self._commit_lock():
-            rows = [
-                row
-                for row in self._manifest_rows()
-                if row["commit_state"] == _COMMITTED
-                and int(row["compacted_version"]) == 0
-            ]
-        self._compact_checkpoint_rows(rows)
+    def compact_checkpoints(
+        self, handles: Sequence[CheckpointHandle], *, include_page_images: bool = False
+    ) -> tuple[CheckpointHandle, ...]:
+        return tuple(
+            self.compact_checkpoint(handle, include_page_images=include_page_images)
+            for handle in handles
+        )
 
     def compact_fragments(
         self,
@@ -843,127 +940,107 @@ class _LanceCheckpointStorage:
             raise ValueError("fragment source path contains unrelated child prefixes")
         return roots
 
-    def compact_checkpoint(self, handle: CheckpointHandle) -> None:
+    def compact_checkpoint(
+        self, handle: CheckpointHandle, *, include_page_images: bool = False
+    ) -> CheckpointHandle:
         locator, _ = self._resolve_handle(handle)
+        reference_id = f"compact-read:{uuid.uuid4().hex}"
         with self._commit_lock():
-            row = self._resolve_manifest(locator)
-            if int(row["compacted_version"]) != 0:
-                return
-        self._compact_checkpoint_rows((row,))
-
-    def _compact_checkpoint_rows(self, rows: Sequence[dict[str, Any]]) -> None:
-        for row in rows:
-            self._validate_manifest_fragments(row)
-            version = int(row["checkpoint_version"])
-            source_roots = self._manifest_fragment_roots(row)
-            compact_root = (
-                f"_compacted/{self._token(row['checkpoint_name'])}/v{version}/"
-                f"{uuid.uuid4().hex}"
-            )
+            source = self._resolve_manifest(locator)
+            chain = self._manifest_chain(source)
+            self._create_reference_tags(locator, reference_id, source)
+        attempt = uuid.uuid4().hex
+        identity = CheckpointSaveIdentity(
+            str(source["checkpoint_name"]),
+            attempt,
+            CheckpointCommitAuthority(f"compact:{attempt}", 0, attempt),
+        )
+        try:
+            for manifest in chain:
+                self._validate_manifest_fragments(manifest)
+            self._validate_chain_entries(chain)
+            self.prepare_checkpoint(identity)
+            specification = self._manifest_specification(source)
+            participant_count = int(source["participant_count"])
+            fragments: list[CheckpointFragment] = []
+            for participant_index in range(participant_count):
+                participant = CheckpointParticipant(
+                    participant_index, participant_count
+                )
+                fragment_id = self._fragment_id(identity, participant)
+                root = f"{self._attempt_prefix(identity)}/{fragment_id}"
+                self._workspace.create_prefix(root)
+                sources = [
+                    self._workspace.uri(
+                        f"{self._manifest_fragment_roots(manifest)[participant_index]}/{ENTRIES_DATASET}"
+                    )
+                    for manifest in chain
+                    if self._workspace.exists(
+                        f"{self._manifest_fragment_roots(manifest)[participant_index]}/{ENTRIES_DATASET}"
+                    )
+                ]
+                artifact = _checkpoint_native.compact_native_checkpoint(
+                    self._workspace.uri(root),
+                    sources,
+                    participant_index,
+                    list(specification.dimensions),
+                    specification.embedding_dtype,
+                    specification.optimizer_dtype or "",
+                    specification.score_policy,
+                    specification.key_dtype,
+                    _schema_digest(specification),
+                    include_page_images,
+                    int(source["participant_page_capacities"][participant_index]),
+                    dict(self._workspace.storage_options()),
+                )
+                fragment = CheckpointFragment(
+                    fragment_id,
+                    identity.checkpoint_name,
+                    attempt,
+                    participant,
+                    int(artifact["entry_count"]),
+                    int(artifact["page_count"]),
+                    _schema_digest(specification),
+                    str(artifact["content_digest"]),
+                    specification,
+                    CheckpointSaveContext(
+                        CheckpointSaveMode.FULL,
+                        None,
+                        "",
+                        0,
+                        include_page_images,
+                        int(source["participant_page_capacities"][participant_index]),
+                        0,
+                        "",
+                    ),
+                )
+                self._publish_save_descriptor(root, fragment)
+                fragments.append(fragment)
+            committed = self.commit_checkpoint(identity, fragments)
+            self.acknowledge_checkpoint(identity)
+            return committed.handle
+        except BaseException:
+            self.abort_checkpoint(identity)
+            raise
+        finally:
             with self._commit_lock():
-                current = self._manifest_for_version(row["checkpoint_name"], version)
-                if current["compacted_version"] != 0:
-                    continue
-                self._validate_manifest_fragments(current)
-                source_roots = self._manifest_fragment_roots(current)
-                protections = self._compaction_tags(current, source_roots, compact_root)
-                tags = self._workspace.dataset(SNAPSHOT_MANIFEST_DATASET).tags
-                if any(tag in tags.list() for tag in protections):
-                    raise CheckpointConflictError(
-                        "checkpoint compaction intent already exists"
-                    )
-                for protection in protections:
-                    tags.create(
-                        protection,
-                        self._workspace.dataset(SNAPSHOT_MANIFEST_DATASET).version,
-                    )
-                expected_digest = str(current["fragment_digest"])
-            published = False
-            try:
-                self._workspace.create_prefix(compact_root)
-                compaction_artifact = self._compact_fragment_native(
-                    compact_root, source_roots
-                )
-                self._register_compacted_fragment_metadata(
-                    compact_root,
-                    current,
-                    source_roots,
-                    compaction_artifact,
-                )
-                compact_digest = self._fragment_digest_for_metadata(
-                    (compact_root,), (compact_root,)
-                )
-                with self._commit_lock():
-                    latest = self._manifest_for_version(row["checkpoint_name"], version)
-                    if (
-                        latest["commit_state"] != _COMMITTED
-                        or int(latest["compacted_version"]) != 0
-                        or str(latest["fragment_digest"]) != expected_digest
-                    ):
-                        raise CheckpointConflictError(
-                            "checkpoint changed during compaction"
-                        )
-                    manifest_dataset = self._workspace.dataset(
-                        SNAPSHOT_MANIFEST_DATASET
-                    )
-                    updated = manifest_dataset.update(
-                        {
-                            "fragment_ids": self._sql_list_literal([compact_root]),
-                            "fragment_digest": f"'{compact_digest}'",
-                            "compacted_version": str(version),
-                        },
-                        where=(
-                            f"checkpoint_name = '{self._sql_literal(row['checkpoint_name'])}' "
-                            f"AND checkpoint_version = {version} "
-                            f"AND commit_state = '{_COMMITTED}' "
-                            f"AND compacted_version = 0 "
-                            f"AND fragment_digest = '{self._sql_literal(expected_digest)}'"
-                        ),
-                    )
-                    if updated["num_rows_updated"] != 1:
-                        raise CheckpointConflictError(
-                            "checkpoint compaction publication was lost"
-                        )
-                    published = True
-                try:
-                    for root in source_roots:
-                        self._workspace.delete_prefix(root)
-                except BaseException as error:
-                    raise RuntimeError(
-                        "compaction retired fragment deletion was partial"
-                    ) from error
-                with self._commit_lock():
-                    tags = self._workspace.dataset(SNAPSHOT_MANIFEST_DATASET).tags
-                    for protection in protections:
-                        if protection in tags.list():
-                            tags.delete(protection)
-            except BaseException:
-                if not published:
-                    cleanup_error: BaseException | None = None
-                    try:
-                        if self._workspace.exists(compact_root):
-                            self._workspace.delete_prefix(compact_root)
-                    except BaseException as error:
-                        cleanup_error = error
-                    if cleanup_error is None:
-                        with self._commit_lock():
-                            tags = self._workspace.dataset(
-                                SNAPSHOT_MANIFEST_DATASET
-                            ).tags
-                            for protection in protections:
-                                if protection in tags.list():
-                                    tags.delete(protection)
-                    else:
-                        raise RuntimeError(
-                            "unpublished compaction cleanup failed"
-                        ) from cleanup_error
-                raise
+                self._delete_reference_tags(locator, reference_id)
 
-    async def compact_checkpoints_async(self) -> None:
-        await asyncio.to_thread(self.compact_checkpoints)
+    async def compact_checkpoints_async(
+        self, handles: Sequence[CheckpointHandle], *, include_page_images: bool = False
+    ) -> tuple[CheckpointHandle, ...]:
+        return await asyncio.to_thread(
+            self.compact_checkpoints, handles, include_page_images=include_page_images
+        )
 
-    async def compact_checkpoint_async(self, handle: CheckpointHandle) -> None:
-        await asyncio.to_thread(self.compact_checkpoint, handle)
+    async def compact_checkpoint_async(
+        self, handle: CheckpointHandle, *, include_page_images: bool = False
+    ) -> CheckpointHandle:
+        return await asyncio.to_thread(
+            self.compact_checkpoint,
+            handle,
+            include_page_images=include_page_images,
+        )
 
     def _reclaim_unlocked(self, older_than: timedelta) -> None:
         self._reclaim_unlocked_for(older_than, frozenset())
@@ -991,6 +1068,15 @@ class _LanceCheckpointStorage:
                 if tag.startswith("sereference.")
             )
         }
+        protected.update(
+            SparseCheckpointLocator(
+                str(row["parent_checkpoint_name"]),
+                int(row["parent_checkpoint_version"]),
+            )
+            for row in rows
+            if row["commit_state"] == _PREPARED
+            and row["checkpoint_mode"] == CheckpointSaveMode.INCREMENTAL.value
+        )
         for row in rows:
             locator = SparseCheckpointLocator(
                 row["checkpoint_name"], int(row["checkpoint_version"])
@@ -1005,7 +1091,6 @@ class _LanceCheckpointStorage:
                     and self._locator_has_reservation(locator)
                 )
                 or self._locator_has_pending_intent(locator)
-                or self._locator_has_compaction(locator)
             ):
                 continue
             latest_version = max(
@@ -1041,6 +1126,7 @@ class _LanceCheckpointStorage:
                 raise RuntimeError(
                     "checkpoint fragment reclaim was partially completed"
                 ) from error
+            self._delete_parent_chain_reference(row)
             manifest_dataset.delete(
                 f"checkpoint_name = '{self._sql_literal(locator.checkpoint_name)}' "
                 f"AND checkpoint_version = {locator.checkpoint_version}"
@@ -1063,23 +1149,32 @@ class _LanceCheckpointStorage:
                     locator.checkpoint_name, locator.checkpoint_version
                 )
             except LookupError:
-                raise RuntimeError("checkpoint reclaim marker has no manifest")
+                prior = self._workspace.dataset(
+                    SNAPSHOT_MANIFEST_DATASET, version=tags.get_version(tag)
+                )
+                matches = [
+                    row
+                    for row in prior.to_table().to_pylist()
+                    if row["checkpoint_name"] == locator.checkpoint_name
+                    and int(row["checkpoint_version"]) == locator.checkpoint_version
+                ]
+                if len(matches) != 1:
+                    raise RuntimeError(
+                        "checkpoint reclaim marker has no durable manifest"
+                    )
+                manifest = matches[0]
             if manifest["commit_state"] != _COMMITTED:
                 raise RuntimeError(
                     "checkpoint reclaim marker manifest is not committed"
                 )
             roots = self._manifest_fragment_roots(manifest)
-            states = tuple(self._workspace.exists(root) for root in roots)
-            if any(states) and not all(states):
-                raise RuntimeError(
-                    "checkpoint reclaim found partially deleted fragments"
-                )
             try:
                 for root in roots:
                     if self._workspace.exists(root):
                         self._workspace.delete_prefix(root)
             except BaseException as error:
                 raise RuntimeError("checkpoint reclaim recovery was partial") from error
+            self._delete_parent_chain_reference(manifest)
             self._workspace.dataset(SNAPSHOT_MANIFEST_DATASET).delete(
                 f"checkpoint_name = '{self._sql_literal(locator.checkpoint_name)}' "
                 f"AND checkpoint_version = {locator.checkpoint_version}"
@@ -1099,75 +1194,6 @@ class _LanceCheckpointStorage:
             )
         except (ValueError, UnicodeDecodeError) as error:
             raise RuntimeError("checkpoint reclaim marker is corrupt") from error
-
-    def _reconcile_compaction_retirements(self) -> None:
-        tags = self._workspace.dataset(SNAPSHOT_MANIFEST_DATASET).tags
-        for tag in tuple(tags.list()):
-            if not tag.startswith("secompact."):
-                continue
-            parts = tag.split(".")
-            if len(parts) != 4:
-                raise RuntimeError("checkpoint compaction marker is corrupt")
-            locator = self._compaction_marker_locator(tag)
-            try:
-                target_root = self._decode(parts[3])
-            except (TypeError, ValueError, UnicodeDecodeError) as error:
-                raise RuntimeError("checkpoint compaction marker is corrupt") from error
-            if not target_root.startswith("_compacted/"):
-                raise RuntimeError("checkpoint compaction marker target is corrupt")
-            if self._workspace_path(target_root) != target_root:
-                raise RuntimeError("checkpoint compaction marker target is corrupt")
-            try:
-                manifest = self._manifest_for_version(
-                    locator.checkpoint_name, locator.checkpoint_version
-                )
-            except LookupError:
-                raise RuntimeError("checkpoint compaction marker has no manifest")
-            if manifest["commit_state"] != _COMMITTED:
-                raise RuntimeError(
-                    "checkpoint compaction marker manifest is not committed"
-                )
-            current_roots = self._manifest_fragment_roots(manifest)
-            if target_root not in current_roots:
-                if self._workspace.exists(target_root):
-                    self._workspace.delete_prefix(target_root)
-                if tag in tags.list():
-                    tags.delete(tag)
-                continue
-            if not self._workspace.exists(target_root):
-                raise RuntimeError(
-                    "checkpoint compaction marker target fragment is missing"
-                )
-            self._validate_manifest_fragments(manifest)
-            source_roots = self._participant_fragment_roots(manifest)
-            states = tuple(self._workspace.exists(root) for root in source_roots)
-            if any(states) and not all(states):
-                raise RuntimeError(
-                    "checkpoint compaction found partially retired fragments"
-                )
-            try:
-                for root in source_roots:
-                    if self._workspace.exists(root):
-                        self._workspace.delete_prefix(root)
-            except BaseException as error:
-                raise RuntimeError(
-                    "checkpoint compaction recovery was partial"
-                ) from error
-            if tag in tags.list():
-                tags.delete(tag)
-
-    @staticmethod
-    def _compaction_marker_locator(tag: str) -> SparseCheckpointLocator:
-        parts = tag.split(".")
-        if len(parts) != 4 or not parts[1].isdecimal():
-            raise RuntimeError("checkpoint compaction marker is corrupt")
-        try:
-            return SparseCheckpointLocator(
-                urlsafe_b64decode(parts[2] + "=" * (-len(parts[2]) % 4)).decode(),
-                int(parts[1]),
-            )
-        except (ValueError, UnicodeDecodeError) as error:
-            raise RuntimeError("checkpoint compaction marker is corrupt") from error
 
     def reserve_cleanup(
         self,
@@ -1466,16 +1492,19 @@ class _LanceCheckpointStorage:
             raise LookupError("checkpoint manifest is not committed")
         if manifest["storage_mode"] != _FRAGMENT_STORAGE_MODE:
             raise RuntimeError("checkpoint storage mode is unsupported")
-        self._validate_manifest_fragments(manifest)
+        chain = self._manifest_chain(manifest)
+        for chain_manifest in chain:
+            self._validate_manifest_fragments(chain_manifest)
+        self._validate_chain_entries(chain)
         if store.total_size() != 0:
             raise RuntimeError("restore requires an empty target store")
         if isinstance(mode, PhysicalRestore):
             if mode.participant.participant_index >= int(manifest["participant_count"]):
                 raise ValueError("restore participant is outside saved topology")
-            self._restore_physical(store, manifest, mode, load_optimizer_state)
+            self._restore_physical(store, chain, mode, load_optimizer_state)
             return
         if isinstance(mode, ElasticRestore):
-            self._restore_elastic(store, manifest, mode, load_optimizer_state)
+            self._restore_elastic(store, chain, mode, load_optimizer_state)
             return
         raise TypeError("unsupported restore mode")
 
@@ -1592,33 +1621,12 @@ class _LanceCheckpointStorage:
         referenced = {
             root.split("/", 2)[1]
             for row in self._manifest_rows()
-            if row["commit_state"] == _COMMITTED
+            if row["commit_state"] in {_PREPARED, _COMMITTED}
             for root in self._manifest_fragment_roots(row)
             if root.startswith("_staging/") and len(root.split("/", 2)) >= 2
         }
-        retirement_attempts: set[str] = set()
-        for tag in tags:
-            if not tag.startswith("secompact."):
-                continue
-            parts = tag.split(".")
-            if len(parts) != 4:
-                raise RuntimeError("checkpoint compaction marker is corrupt")
-            try:
-                locator = SparseCheckpointLocator(self._decode(parts[2]), int(parts[1]))
-                manifest = self._manifest_for_version(
-                    locator.checkpoint_name, locator.checkpoint_version
-                )
-            except (TypeError, ValueError, UnicodeDecodeError, LookupError) as error:
-                raise RuntimeError("checkpoint compaction marker is corrupt") from error
-            for root in self._participant_fragment_roots(manifest):
-                if root.startswith("_staging/") and len(root.split("/", 2)) >= 2:
-                    retirement_attempts.add(root.split("/", 2)[1])
         for attempt in self._workspace.child_prefixes("_staging"):
-            if (
-                attempt not in active
-                and attempt not in referenced
-                and attempt not in retirement_attempts
-            ):
+            if attempt not in active and attempt not in referenced:
                 self._workspace.delete_prefix(f"_staging/{attempt}", missing_ok=True)
 
     def _create_lease_tags(
@@ -1643,6 +1651,38 @@ class _LanceCheckpointStorage:
         tags = self._workspace.dataset(SNAPSHOT_MANIFEST_DATASET).tags
         if tag not in tags.list():
             tags.create(tag, self._workspace.dataset(SNAPSHOT_MANIFEST_DATASET).version)
+
+    def _create_parent_chain_reference(self, manifest: Mapping[str, Any]) -> None:
+        if manifest["checkpoint_mode"] == CheckpointSaveMode.FULL.value:
+            return
+        parent_name = str(manifest["parent_checkpoint_name"])
+        parent_version = int(manifest["parent_checkpoint_version"])
+        parent_reference = str(manifest["parent_reference_id"])
+        if not parent_name or parent_version <= 0 or not parent_reference:
+            raise RuntimeError("incremental parent identity is incomplete")
+        parent = self._manifest_for_version(parent_name, parent_version)
+        if str(parent["reference_id"]) != parent_reference:
+            raise RuntimeError("checkpoint parent reference identity mismatch")
+        child_locator = SparseCheckpointLocator(
+            str(manifest["checkpoint_name"]), int(manifest["checkpoint_version"])
+        )
+        self._create_reference_tags(
+            SparseCheckpointLocator(parent_name, parent_version),
+            f"chain:{child_locator.checkpoint_name}:{child_locator.checkpoint_version}",
+            parent,
+        )
+
+    def _delete_parent_chain_reference(self, manifest: Mapping[str, Any]) -> None:
+        if str(manifest["checkpoint_mode"]) != CheckpointSaveMode.INCREMENTAL.value:
+            return
+        parent_name = str(manifest["parent_checkpoint_name"])
+        parent_version = int(manifest["parent_checkpoint_version"])
+        if not parent_name or parent_version <= 0:
+            raise RuntimeError("incremental parent identity is incomplete")
+        self._delete_reference_tags(
+            SparseCheckpointLocator(parent_name, parent_version),
+            f"chain:{manifest['checkpoint_name']}:{manifest['checkpoint_version']}",
+        )
 
     def _delete_reference_tags(
         self, locator: SparseCheckpointLocator, reference_id: str
@@ -1962,80 +2002,154 @@ class _LanceCheckpointStorage:
             self._is_reservation_tag(tag) and tag.endswith(suffix) for tag in tags
         )
 
+    def _publish_save_descriptor(self, root: str, fragment: CheckpointFragment) -> None:
+        self._publish_fragment_metadata(
+            root,
+            fragment.fragment_id,
+            fragment.participant.participant_index,
+            fragment.participant.participant_count,
+            fragment.entry_count,
+            fragment.page_count,
+            fragment.schema_digest,
+            fragment.content_digest,
+        )
+        descriptor = self._fragment_descriptor(fragment)
+        for name in (ENTRIES_DATASET, PAGE_IMAGES_DATASET):
+            if self._workspace.exists(f"{root}/{name}"):
+                self._workspace.dataset(f"{root}/{name}").update_schema_metadata(
+                    {
+                        "sparse_embedding.save_descriptor": json.dumps(
+                            descriptor, sort_keys=True
+                        )
+                    },
+                    replace=False,
+                )
+
+    @staticmethod
+    def _fragment_descriptor(fragment: CheckpointFragment) -> dict[str, Any]:
+        specification = fragment.specification
+        context = fragment.save_context
+        return {
+            "fragment_id": fragment.fragment_id,
+            "participant_indices": [fragment.participant.participant_index],
+            "participant_count": fragment.participant.participant_count,
+            "entry_count": fragment.entry_count,
+            "page_count": fragment.page_count,
+            "schema_digest": fragment.schema_digest,
+            "content_digest": fragment.content_digest,
+            "dimensions": list(specification.dimensions),
+            "embedding_dtype": specification.embedding_dtype,
+            "optimizer_dtype": specification.optimizer_dtype or "",
+            "score_policy": specification.score_policy,
+            "key_dtype": specification.key_dtype,
+            "mode": context.mode.value,
+            "parent_checkpoint_name": context.parent.checkpoint_name
+            if context.parent
+            else "",
+            "parent_checkpoint_version": context.parent.checkpoint_version
+            if context.parent
+            else 0,
+            "parent_reference_id": context.parent_reference_id,
+            "mutation_watermark": context.mutation_watermark,
+            "include_page_images": context.include_page_images,
+            "entries_per_page": context.entries_per_page,
+            "capture_id": context.capture_id,
+            "journal_identity": context.journal_identity,
+        }
+
+    def _validate_fragment_payload(
+        self, root: str, descriptor: Mapping[str, Any]
+    ) -> None:
+        specification = self._manifest_specification(dict(descriptor))
+        for name, count, schema in (
+            (
+                ENTRIES_DATASET,
+                int(descriptor["entry_count"]),
+                entry_schema(specification.key_dtype),
+            ),
+            (PAGE_IMAGES_DATASET, int(descriptor["page_count"]), PAGE_IMAGE_SCHEMA),
+        ):
+            exists = self._workspace.exists(f"{root}/{name}")
+            if exists != (count > 0):
+                raise InvalidCheckpointFragment(
+                    "fragment payload presence does not match its descriptor"
+                )
+            if not exists:
+                continue
+            dataset = self._workspace.dataset(f"{root}/{name}")
+            if (
+                dataset.count_rows() != count
+                or dataset.schema.remove_metadata() != schema.remove_metadata()
+            ):
+                raise InvalidCheckpointFragment(
+                    "fragment payload schema or row count mismatch"
+                )
+            if self._decode_specification(dataset.schema.metadata) != specification:
+                raise InvalidCheckpointFragment(
+                    "fragment payload specification mismatch"
+                )
+            stored = dataset.schema_metadata
+            if "sparse_embedding.save_descriptor" not in stored:
+                raise InvalidCheckpointFragment("fragment save context is missing")
+            if json.loads(stored["sparse_embedding.save_descriptor"]) != descriptor:
+                raise InvalidCheckpointFragment(
+                    "fragment save context does not match its descriptor"
+                )
+
     def _validate_fragments(
-        self,
-        identity: CheckpointSaveIdentity,
-        fragments: Sequence[CheckpointFragment],
+        self, identity: CheckpointSaveIdentity, fragments: Sequence[CheckpointFragment]
     ) -> tuple[list[CheckpointFragment], TableSpecification]:
-        result = list(fragments)
+        result = sorted(fragments, key=lambda item: item.participant.participant_index)
         if not result:
-            raise InvalidCheckpointFragment("checkpoint requires fragments")
+            raise InvalidCheckpointFragment(
+                "checkpoint requires participant descriptors"
+            )
         expected_count = result[0].participant.participant_count
-        expected_indices = set(range(expected_count))
-        actual_indices = {item.participant.participant_index for item in result}
-        if len(actual_indices) != len(result) or actual_indices != expected_indices:
+        if [item.participant.participant_index for item in result] != list(
+            range(expected_count)
+        ):
             raise InvalidCheckpointFragment("checkpoint fragment coverage is invalid")
-        specification = self._fragment_specification(identity, result[0])
+        specification = result[0].specification
+        context = result[0].save_context
         for item in result:
             if (
                 item.checkpoint_name != identity.checkpoint_name
                 or item.save_attempt != identity.save_attempt
             ):
                 raise InvalidCheckpointFragment("checkpoint fragment identity mismatch")
-            if item.participant.participant_count != expected_count:
-                raise InvalidCheckpointFragment("checkpoint participant count mismatch")
-            if self._fragment_specification(identity, item) != specification:
-                raise InvalidCheckpointFragment(
-                    "checkpoint fragment specification mismatch"
-                )
-            if item.schema_digest != _schema_digest(specification):
-                raise InvalidCheckpointFragment("checkpoint fragment schema mismatch")
-            if item.fragment_id != self._fragment_id(identity, item.participant):
-                raise InvalidCheckpointFragment(
-                    "checkpoint fragment identifier mismatch"
-                )
-            root = f"{self._attempt_prefix(identity)}/{item.fragment_id}"
-            metadata = self._metadata_for_root(root)
-            if metadata["fragment_id"] != item.fragment_id:
-                raise RuntimeError("checkpoint fragment metadata identifier mismatch")
-            if metadata["schema_digest"] != item.schema_digest:
-                raise RuntimeError("checkpoint fragment metadata schema mismatch")
-            if metadata["key_dtype"] != specification.key_dtype:
-                raise InvalidCheckpointFragment(
-                    "checkpoint fragment key encoding mismatch"
-                )
-            if tuple(int(index) for index in metadata["participant_indices"]) != (
-                item.participant.participant_index,
-            ):
-                raise RuntimeError("checkpoint fragment metadata participant mismatch")
             if (
-                int(metadata["entry_count"])
-                != self._workspace.dataset(f"{root}/{ENTRIES_DATASET}").count_rows()
+                item.participant.participant_count != expected_count
+                or item.specification != specification
             ):
-                raise RuntimeError("checkpoint fragment entry count mismatch")
-            if self._workspace.exists(f"{root}/{PAGE_IMAGES_DATASET}") and (
-                int(metadata["page_count"])
-                != self._workspace.dataset(f"{root}/{PAGE_IMAGES_DATASET}").count_rows()
-            ):
-                raise RuntimeError("checkpoint fragment page count mismatch")
-            if (
-                metadata["fragment_id"] != item.fragment_id
-                or int(metadata["participant_count"]) != expected_count
-                or int(metadata["entry_count"]) != item.entry_count
-                or int(metadata["page_count"]) != item.page_count
-                or metadata["schema_digest"] != item.schema_digest
-                or metadata["content_digest"] != item.content_digest
-                or metadata["key_dtype"] != specification.key_dtype
-            ):
-                raise InvalidCheckpointFragment("checkpoint fragment metadata mismatch")
-            if not self._workspace.exists(f"{root}/{ENTRIES_DATASET}"):
                 raise InvalidCheckpointFragment(
-                    "checkpoint fragment payload is missing"
+                    "checkpoint participant topology or specification mismatch"
                 )
-        return (
-            sorted(result, key=lambda item: item.participant.participant_index),
-            specification,
-        )
+            candidate = item.save_context
+            if (
+                candidate.mode,
+                candidate.parent,
+                candidate.parent_reference_id,
+                candidate.include_page_images,
+            ) != (
+                context.mode,
+                context.parent,
+                context.parent_reference_id,
+                context.include_page_images,
+            ):
+                raise InvalidCheckpointFragment(
+                    "checkpoint participant save contexts differ"
+                )
+            if item.schema_digest != _schema_digest(
+                specification
+            ) or item.fragment_id != self._fragment_id(identity, item.participant):
+                raise InvalidCheckpointFragment(
+                    "checkpoint fragment schema or identifier mismatch"
+                )
+            self._validate_fragment_payload(
+                f"{self._attempt_prefix(identity)}/{item.fragment_id}",
+                self._fragment_descriptor(item),
+            )
+        return result, specification
 
     def _manifest_rows(self) -> list[dict[str, Any]]:
         return self._workspace.dataset(SNAPSHOT_MANIFEST_DATASET).to_table().to_pylist()
@@ -2066,6 +2180,68 @@ class _LanceCheckpointStorage:
             raise LookupError("checkpoint manifest is not committed")
         return matches[0]
 
+    def _manifest_chain(self, manifest: dict[str, Any]) -> tuple[dict[str, Any], ...]:
+        chain: list[dict[str, Any]] = []
+        seen: set[tuple[str, int]] = set()
+        current = manifest
+        while True:
+            identity = (
+                str(current["checkpoint_name"]),
+                int(current["checkpoint_version"]),
+            )
+            if identity in seen:
+                raise RuntimeError("checkpoint parent chain contains a cycle")
+            seen.add(identity)
+            if int(current["format_version"]) != 2:
+                raise RuntimeError("checkpoint manifest format version is unsupported")
+            if current["schema_digest"] != manifest["schema_digest"]:
+                raise RuntimeError("checkpoint parent chain schema mismatch")
+            chain.append(current)
+            mode = str(current["checkpoint_mode"])
+            if mode == CheckpointSaveMode.FULL.value:
+                if int(current["parent_checkpoint_version"]) != 0:
+                    raise RuntimeError("FULL checkpoint cannot have a parent")
+                break
+            if mode != CheckpointSaveMode.INCREMENTAL.value:
+                raise RuntimeError("checkpoint mode is unsupported")
+            parent_name = str(current["parent_checkpoint_name"])
+            parent_version = int(current["parent_checkpoint_version"])
+            parent_reference = str(current["parent_reference_id"])
+            if not parent_name or parent_version <= 0 or not parent_reference:
+                raise RuntimeError(
+                    "incremental checkpoint has incomplete parent identity"
+                )
+            parent = self._manifest_for_version(parent_name, parent_version)
+            if parent_name != str(manifest["checkpoint_name"]):
+                raise RuntimeError("checkpoint parent belongs to another lineage")
+            if str(parent["reference_id"]) != parent_reference:
+                raise RuntimeError("checkpoint parent reference identity mismatch")
+            if parent_version >= identity[1]:
+                raise RuntimeError("checkpoint parent version does not precede child")
+            current = parent
+        chain.reverse()
+        return tuple(chain)
+
+    def _validate_chain_entries(self, chain: Sequence[dict[str, Any]]) -> None:
+        try:
+            _checkpoint_native.validate_native_checkpoint_chain(
+                [
+                    [
+                        self._workspace.uri(f"{root}/{ENTRIES_DATASET}")
+                        if self._workspace.exists(f"{root}/{ENTRIES_DATASET}")
+                        else ""
+                        for root in self._manifest_fragment_roots(manifest)
+                    ]
+                    for manifest in chain
+                ],
+                [manifest["participant_watermarks"] for manifest in chain],
+                list(chain[-1]["dimensions"]),
+                str(chain[-1]["key_dtype"]),
+                dict(self._workspace.storage_options()),
+            )
+        except ValueError as error:
+            raise InvalidCheckpointFragment(str(error)) from error
+
     def _manifest_fragment_roots(self, manifest: dict[str, Any]) -> tuple[str, ...]:
         fragment_ids = tuple(str(item) for item in manifest["fragment_ids"])
         if not fragment_ids:
@@ -2091,22 +2267,6 @@ class _LanceCheckpointStorage:
             for fragment_id in fragment_ids
         )
 
-    def _participant_fragment_roots(self, manifest: dict[str, Any]) -> tuple[str, ...]:
-        identity = CheckpointSaveIdentity(
-            manifest["checkpoint_name"],
-            manifest["save_attempt"],
-            CheckpointCommitAuthority(
-                manifest["authority_scope"],
-                int(manifest["authority_generation"]),
-                manifest["commit_authority"],
-            ),
-        )
-        return tuple(
-            f"{self._attempt_prefix(identity)}/"
-            f"{self._fragment_id(identity, CheckpointParticipant(index, int(manifest['participant_count'])))}"
-            for index in range(int(manifest["participant_count"]))
-        )
-
     def _intent_tags_for_attempt(
         self, identity: CheckpointSaveIdentity
     ) -> tuple[str, ...]:
@@ -2119,106 +2279,68 @@ class _LanceCheckpointStorage:
 
     def _validate_manifest_fragments(self, manifest: dict[str, Any]) -> None:
         roots = self._manifest_fragment_roots(manifest)
-        fragment_ids = tuple(str(item) for item in manifest["fragment_ids"])
-        if len(fragment_ids) != len(set(fragment_ids)):
-            raise RuntimeError("checkpoint manifest contains duplicate fragments")
-        expected_digest = self._fragment_digest_for_metadata(fragment_ids, roots)
-        if expected_digest != str(manifest["fragment_digest"]):
-            raise RuntimeError("checkpoint manifest fragment digest mismatch")
-        all_participants: set[int] = set()
-        for fragment_id, root in zip(fragment_ids, roots, strict=True):
-            entries = f"{root}/{ENTRIES_DATASET}"
-            if not self._workspace.exists(entries):
-                raise LookupError("checkpoint manifest references a missing fragment")
-            dataset = self._workspace.dataset(entries)
-            if (
-                dataset.schema.remove_metadata()
-                != entry_schema(manifest["key_dtype"]).remove_metadata()
-            ):
-                raise RuntimeError("checkpoint fragment schema mismatch")
-            metadata = dataset.schema.metadata or {}
-            specification = self._decode_specification(metadata)
-            if specification.key_dtype != manifest["key_dtype"]:
-                raise RuntimeError("checkpoint fragment key encoding mismatch")
-            if _schema_digest(specification) != str(manifest["schema_digest"]):
-                raise RuntimeError("checkpoint fragment schema digest mismatch")
-            if self._workspace.exists(f"{root}/{PAGE_IMAGES_DATASET}"):
-                pages_ds = self._workspace.dataset(f"{root}/{PAGE_IMAGES_DATASET}")
-                if (
-                    pages_ds.schema.remove_metadata()
-                    != PAGE_IMAGE_SCHEMA.remove_metadata()
-                ):
-                    raise RuntimeError("checkpoint fragment schema mismatch")
-            metadata = self._metadata_for_root(root)
-            if metadata["fragment_id"] != fragment_id:
-                raise RuntimeError("checkpoint fragment metadata identifier mismatch")
-            if metadata["schema_digest"] != str(manifest["schema_digest"]):
-                raise RuntimeError("checkpoint fragment metadata schema mismatch")
-            if metadata["key_dtype"] != manifest["key_dtype"]:
-                raise RuntimeError("checkpoint fragment key encoding mismatch")
-            if (
-                int(metadata["entry_count"])
-                != self._workspace.dataset(f"{root}/{ENTRIES_DATASET}").count_rows()
-            ):
-                raise RuntimeError("checkpoint fragment entry count mismatch")
-            if self._workspace.exists(f"{root}/{PAGE_IMAGES_DATASET}") and (
-                int(metadata["page_count"])
-                != self._workspace.dataset(f"{root}/{PAGE_IMAGES_DATASET}").count_rows()
-            ):
-                raise RuntimeError("checkpoint fragment page count mismatch")
-            participants = {int(index) for index in metadata["participant_indices"]}
-            expected_participants = set(range(int(manifest["participant_count"])))
-            if not participants.issubset(expected_participants):
-                raise RuntimeError(
-                    "checkpoint fragment participant is outside topology"
-                )
-            all_participants.update(participants)
-        expected_participants = set(range(int(manifest["participant_count"])))
-        if len(fragment_ids) > 1 and len(fragment_ids) != int(
+        descriptors = [json.loads(value) for value in manifest["fragment_descriptors"]]
+        if len(descriptors) != len(roots) or len(roots) != int(
             manifest["participant_count"]
         ):
             raise RuntimeError("checkpoint manifest participant coverage is incomplete")
-        if len(fragment_ids) > 1:
-            participant_sets = [
-                tuple(
-                    sorted(
-                        int(index)
-                        for index in self._metadata_for_root(root)[
-                            "participant_indices"
-                        ]
-                    )
-                )
-                for root in roots
-            ]
-            if any(len(indices) != 1 for indices in participant_sets) or len(
-                {indices[0] for indices in participant_sets}
-            ) != len(participant_sets):
-                raise RuntimeError(
-                    "checkpoint manifest fragment participant routing is ambiguous"
-                )
-        if all_participants != expected_participants:
-            raise RuntimeError("checkpoint manifest participant coverage is incomplete")
-        for root in roots:
-            metadata = self._metadata_for_root(root)
-            if int(metadata["participant_count"]) != int(manifest["participant_count"]):
-                raise RuntimeError("checkpoint fragment participant count mismatch")
-
-    def _fragment_digest_for_metadata(
-        self, fragment_ids: Sequence[str], roots: Sequence[str]
-    ) -> str:
-        if not roots or len(fragment_ids) != len(roots):
-            raise RuntimeError("fragment metadata and root counts differ")
-        return _canonical_digest(
-            [
-                {
-                    "fragment_id": fragment_id,
-                    "content_digest": self._metadata_for_root(root)["content_digest"],
-                }
-                for fragment_id, root in zip(fragment_ids, roots, strict=True)
-            ]
-        )
+        if _canonical_digest(descriptors) != manifest["fragment_digest"]:
+            raise RuntimeError("checkpoint manifest fragment digest mismatch")
+        for index, (root, descriptor) in enumerate(
+            zip(roots, descriptors, strict=True)
+        ):
+            if descriptor["fragment_id"] != manifest["fragment_ids"][
+                index
+            ] or descriptor["participant_indices"] != [index]:
+                raise RuntimeError("checkpoint manifest participant routing is invalid")
+            if descriptor["participant_count"] != int(manifest["participant_count"]):
+                raise RuntimeError("checkpoint participant topology mismatch")
+            if descriptor["schema_digest"] != manifest[
+                "schema_digest"
+            ] or self._manifest_specification(
+                descriptor
+            ) != self._manifest_specification(manifest):
+                raise RuntimeError("checkpoint fragment specification mismatch")
+            if (
+                descriptor["mode"],
+                descriptor["parent_checkpoint_name"],
+                descriptor["parent_checkpoint_version"],
+                descriptor["parent_reference_id"],
+                descriptor["mutation_watermark"],
+                descriptor["include_page_images"],
+            ) != (
+                manifest["checkpoint_mode"],
+                manifest["parent_checkpoint_name"],
+                manifest["parent_checkpoint_version"],
+                manifest["parent_reference_id"],
+                manifest["participant_watermarks"][index],
+                manifest["include_page_images"],
+            ):
+                raise RuntimeError("checkpoint manifest save context mismatch")
+            if (
+                descriptor["entries_per_page"]
+                != manifest["participant_page_capacities"][index]
+            ):
+                raise RuntimeError("checkpoint participant Page geometry mismatch")
+            self._validate_fragment_payload(root, descriptor)
 
     def _metadata_for_root(self, root: str) -> dict[str, Any]:
+        if not self._workspace.exists(f"{root}/{ENTRIES_DATASET}"):
+            matches = [
+                json.loads(value)
+                for manifest in self._manifest_rows()
+                for candidate, value in zip(
+                    self._manifest_fragment_roots(manifest),
+                    manifest["fragment_descriptors"],
+                    strict=True,
+                )
+                if candidate == root
+            ]
+            if len(matches) != 1:
+                raise LookupError(
+                    "empty fragment has no unambiguous manifest descriptor"
+                )
+            return matches[0]
         entries = self._workspace.dataset(f"{root}/{ENTRIES_DATASET}")
         entry_metadata = entries.schema_metadata
         required = {
@@ -2347,21 +2469,6 @@ class _LanceCheckpointStorage:
         )
         return {"artifact": artifact, "metadata": metadata}
 
-    def _register_compacted_fragment_metadata(
-        self,
-        compact_root: str,
-        manifest: dict[str, Any],
-        source_roots: Sequence[str],
-        compaction_artifact: dict[str, Any],
-    ) -> None:
-        self._publish_compacted_fragment_metadata(
-            compact_root,
-            source_roots,
-            compaction_artifact,
-            expected_participant_count=int(manifest["participant_count"]),
-            fragment_id=compact_root,
-        )
-
     def _build_compacted_fragment_metadata(
         self,
         compact_root: str,
@@ -2487,15 +2594,6 @@ class _LanceCheckpointStorage:
         return value.replace("'", "''")
 
     @classmethod
-    def _sql_list_literal(cls, values: Sequence[str]) -> str:
-        if not values:
-            raise ValueError("SQL list literal requires at least one value")
-        return (
-            "["
-            + ",".join("'" + cls._sql_literal(value) + "'" for value in values)
-            + "]"
-        )
-
     def _intent_tag(
         self, identity: CheckpointSaveIdentity, locator: SparseCheckpointLocator
     ) -> str:
@@ -2503,19 +2601,6 @@ class _LanceCheckpointStorage:
 
     def _committed_tag(self, locator: SparseCheckpointLocator) -> str:
         return f"secommitted.{locator.checkpoint_version}.{self._encode(locator.checkpoint_name)}"
-
-    def _compaction_tags(
-        self,
-        manifest: dict[str, Any],
-        source_roots: Sequence[str],
-        compact_root: str,
-    ) -> tuple[str, ...]:
-        return (
-            "secompact."
-            f"{manifest['checkpoint_version']}."
-            f"{self._encode(str(manifest['checkpoint_name']))}."
-            f"{self._encode(compact_root)}",
-        )
 
     def _reclaim_pending_tag(self, locator: SparseCheckpointLocator) -> str:
         return f"sereclaiming.{locator.checkpoint_version}.{self._encode(locator.checkpoint_name)}"
@@ -2527,21 +2612,6 @@ class _LanceCheckpointStorage:
             and row["commit_state"] == _PREPARED
             for row in self._manifest_rows()
         )
-
-    def _locator_has_compaction(self, locator: SparseCheckpointLocator) -> bool:
-        for tag in self._workspace.dataset(SNAPSHOT_MANIFEST_DATASET).tags.list():
-            if not tag.startswith("secompact."):
-                continue
-            parts = tag.split(".")
-            if len(parts) != 4:
-                raise RuntimeError("checkpoint compaction marker is corrupt")
-            try:
-                marker_locator = self._compaction_marker_locator(tag)
-            except (TypeError, ValueError, UnicodeDecodeError, RuntimeError) as error:
-                raise RuntimeError("checkpoint compaction marker is corrupt") from error
-            if marker_locator == locator:
-                return True
-        return False
 
     def _delete_intent_tag(
         self, identity: CheckpointSaveIdentity, version: int
@@ -2576,12 +2646,25 @@ class _LanceCheckpointStorage:
         if not matches:
             return None
         row = matches[0]
+        if (
+            row["authority_scope"],
+            int(row["authority_generation"]),
+            row["commit_authority"],
+        ) != (
+            identity.commit_authority.scope,
+            identity.commit_authority.generation,
+            identity.commit_authority.authority_id,
+        ):
+            raise CheckpointConflictError(
+                "recovered checkpoint commit authority does not match"
+            )
         locator = SparseCheckpointLocator(
             identity.checkpoint_name, int(row["checkpoint_version"])
         )
         if row["storage_mode"] != _FRAGMENT_STORAGE_MODE:
             raise RuntimeError("checkpoint manifest storage mode is corrupt")
         if row["commit_state"] == _COMMITTED:
+            self._create_parent_chain_reference(row)
             self._validate_manifest_fragments(row)
             if (reference_id or "") != (row["reference_id"] or ""):
                 raise CheckpointConflictError(
@@ -2628,6 +2711,7 @@ class _LanceCheckpointStorage:
             )
         self._require_authority(identity)
         self._validate_manifest_fragments(row)
+        self._create_parent_chain_reference(row)
         if reference_id != (row["reference_id"] or ""):
             raise CheckpointConflictError(
                 "prepared checkpoint reference does not match"
@@ -2666,11 +2750,10 @@ class _LanceCheckpointStorage:
     def _restore_elastic(
         self,
         store: Any,
-        manifest: dict[str, Any],
+        chain: Sequence[dict[str, Any]],
         mode: ElasticRestore,
         load_optimizer_state: bool,
     ) -> None:
-        roots = self._manifest_fragment_roots(manifest)
         if not hasattr(_checkpoint_native, "restore_native_partition_entries"):
             raise RuntimeError(
                 "native checkpoint restore requires a Lance-enabled _core extension"
@@ -2679,53 +2762,51 @@ class _LanceCheckpointStorage:
             raise RuntimeError(
                 "native checkpoint duplicate validation requires a Lance-enabled _core extension"
             )
-        try:
-            _checkpoint_native.validate_active_entry_keys(
-                [self._workspace.uri(f"{root}/{ENTRIES_DATASET}") for root in roots],
-                0,
-                dict(self._workspace.storage_options()),
-            )
-        except ValueError as error:
-            if "duplicate active key" not in str(error):
-                raise
-            raise InvalidCheckpointFragment(
-                "duplicate active checkpoint key"
-            ) from error
         assignment_name = mode.spec.name
         assignment_parameters = {
             str(k): str(v) for k, v in mode.spec.parameters.items()
         }
-        for root in roots:
-            _checkpoint_native.restore_native_partition_entries(
-                store,
-                self._workspace.uri(f"{root}/{ENTRIES_DATASET}"),
-                0,
-                mode.partition_count,
-                mode.partition_id,
-                mode.key_dtype,
-                None,
-                dict(self._workspace.storage_options()),
-                load_optimizer_state,
-                assignment_name,
-                assignment_parameters,
-            )
+        sources = [
+            self._workspace.uri(f"{root}/{ENTRIES_DATASET}")
+            for manifest in chain
+            for root in self._manifest_fragment_roots(manifest)
+            if self._workspace.exists(f"{root}/{ENTRIES_DATASET}")
+        ]
+        _checkpoint_native.restore_native_partition_entries(
+            store,
+            sources,
+            0,
+            mode.partition_count,
+            mode.partition_id,
+            mode.key_dtype,
+            None,
+            dict(self._workspace.storage_options()),
+            load_optimizer_state,
+            assignment_name,
+            assignment_parameters,
+        )
 
     def _restore_physical(
         self,
         store: Any,
-        manifest: dict[str, Any],
+        chain: Sequence[dict[str, Any]],
         mode: PhysicalRestore,
         load_optimizer_state: bool,
     ) -> None:
+        manifest = chain[-1]
         if mode.participant.participant_count != int(manifest["participant_count"]):
             raise ValueError("physical restore requires the saved participant topology")
         roots = self._manifest_fragment_roots(manifest)
 
         if mode.strategy == PhysicalRestoreStrategy.FAST_PAGE_CACHE:
-            has_page_cache = all(
-                self._workspace.exists(f"{root}/{PAGE_IMAGES_DATASET}")
-                for root in roots
-            )
+            if (
+                store.entries_per_page
+                != manifest["participant_page_capacities"][
+                    mode.participant.participant_index
+                ]
+            ):
+                raise ValueError("page-image geometry does not match store topology")
+            has_page_cache = bool(manifest["include_page_images"])
             if not has_page_cache:
                 raise FileNotFoundError(
                     "checkpoint does not contain page_images cache for physical restore; "
@@ -2740,6 +2821,7 @@ class _LanceCheckpointStorage:
                 [
                     self._workspace.uri(f"{root}/{PAGE_IMAGES_DATASET}")
                     for root in roots
+                    if self._workspace.exists(f"{root}/{PAGE_IMAGES_DATASET}")
                 ],
                 0,
                 mode.participant.participant_index,
@@ -2754,23 +2836,19 @@ class _LanceCheckpointStorage:
                 f"unsupported physical restore strategy: {mode.strategy!r}"
             )
 
-        target_root = None
-        for root in roots:
-            meta = self._metadata_for_root(root)
-            if mode.participant.participant_index in meta["participant_indices"]:
-                target_root = root
-                break
-        if target_root is None:
-            raise RuntimeError(
-                f"no fragment root covers participant {mode.participant.participant_index}"
-            )
-        if not hasattr(_checkpoint_native, "restore_native_partition_entries"):
-            raise RuntimeError(
-                "native checkpoint restore requires a Lance-enabled _core extension"
-            )
+        sources = [
+            self._workspace.uri(f"{root}/{ENTRIES_DATASET}")
+            for chain_manifest in chain
+            for root in [
+                self._manifest_fragment_roots(chain_manifest)[
+                    mode.participant.participant_index
+                ]
+            ]
+            if self._workspace.exists(f"{root}/{ENTRIES_DATASET}")
+        ]
         _checkpoint_native.restore_native_partition_entries(
             store,
-            self._workspace.uri(f"{target_root}/{ENTRIES_DATASET}"),
+            sources,
             0,
             1,
             0,
@@ -2826,16 +2904,6 @@ class _LanceCheckpointStorage:
             raise InvalidCheckpointFragment(
                 "checkpoint fragment specification is invalid"
             ) from error
-
-    def _fragment_specification(
-        self, identity: CheckpointSaveIdentity, fragment: CheckpointFragment
-    ) -> TableSpecification:
-        path = (
-            f"{self._attempt_prefix(identity)}/{fragment.fragment_id}/{ENTRIES_DATASET}"
-        )
-        if not self._workspace.exists(path):
-            raise InvalidCheckpointFragment("checkpoint fragment is missing")
-        return self._decode_specification(self._workspace.dataset(path).schema.metadata)
 
     @staticmethod
     def _manifest_specification(manifest: dict[str, Any]) -> TableSpecification:

@@ -60,9 +60,12 @@ cc_library(
         ":checkpoint_layout_schema",
         ":checkpoint_stream_policy",
         "//sparse_embedding/src/common",
+        "//sparse_embedding/src/interface",
         "//sparse_embedding/src/ops",
+        "//sparse_embedding/src/storage/topology:storage_topology",
         "@lance_c",
         "@proxy",
+        "@unordered_dense",
     ],
     alwayslink = True,
 )

@@ -18,8 +18,11 @@
 // roundtrip.
 
 #include <cassert>
+#include <chrono>
 #include <cstring>
+#include <future>
 #include <iostream>
+#include <latch>
 #include <span>
 #include <stdexcept>
 #include <string_view>
@@ -300,6 +303,18 @@ static void test_evict_by_score() {
 
   CHECK_EQ(store.size(), 5u);
 
+  const auto cut = store.capture_checkpoint(
+      false, "", false,
+      pro::make_proxy<se::FunctionFacade<void(
+          std::span<const se::CheckpointMutation>, uint64_t)>>(
+          [](std::span<const se::CheckpointMutation>, uint64_t) {}),
+      pro::make_proxy<se::FunctionFacade<bool(
+          size_t, se::PageImageExport<float, float> &&)>>(
+          [](size_t, se::PageImageExport<float, float> &&) { return true; }));
+  store.acknowledge_checkpoint_mutations(cut.mutation_watermark,
+                                         "eviction-base", cut.capture_id,
+                                         cut.journal_identity);
+
   // Evict entries with score <= 1, max 3
   std::vector<uint64_t> evicted_keys(3);
   std::vector<float> evicted_vals(3 * kDim);
@@ -309,6 +324,10 @@ static void test_evict_by_score() {
   CHECK(!ec);
   CHECK(evicted_count == 3u);
   CHECK(store.size() == 2u);
+  const auto mutations = store.checkpoint_mutations();
+  CHECK(mutations.size() == evicted_count);
+  for (const auto &mutation : mutations)
+    CHECK(mutation.deleted);
   for (size_t row = 0; row < evicted_count; ++row) {
     CHECK(std::ranges::all_of(
         std::span<const float>(evicted_vals.data() + row * kDim, kDim),
@@ -324,6 +343,155 @@ static void test_evict_by_score() {
   std::cout << "  [OK] evict_by_score evicts cold entries, spares hot key\n";
 }
 
+static void test_capture_serializes_mutations() {
+  auto store = make_store<ManualScorePolicy>(4, 2);
+  std::vector<uint64_t> keys{1};
+  std::vector<float> values(4, 1);
+  std::vector<int64_t> lengths{4};
+  store.assign<uint64_t>(keys, values, lengths);
+  std::latch exporting(1), resume_export(1), writing(1);
+  std::vector<float> captured_values;
+  auto capture = std::async(std::launch::async, [&] {
+    return store.capture_checkpoint(
+        false, "", false,
+        pro::make_proxy<se::FunctionFacade<void(
+            std::span<const se::CheckpointMutation>, uint64_t)>>(
+            [](std::span<const se::CheckpointMutation>, uint64_t) {}),
+        pro::make_proxy<se::FunctionFacade<bool(
+            size_t, se::PageImageExport<float, float> &&)>>(
+            [&](size_t, se::PageImageExport<float, float> &&image) {
+              captured_values = std::move(image.values);
+              exporting.count_down();
+              resume_export.wait();
+              return true;
+            }));
+  });
+  exporting.wait();
+  auto mutation = std::async(std::launch::async, [&] {
+    writing.count_down();
+    std::vector<float> updated(4, 2);
+    store.assign<uint64_t>(keys, updated, lengths);
+  });
+  writing.wait();
+  CHECK(mutation.wait_for(std::chrono::milliseconds(50)) ==
+        std::future_status::timeout);
+  resume_export.count_down();
+  const auto cut = capture.get();
+  mutation.get();
+  CHECK(std::ranges::all_of(captured_values,
+                            [](float value) { return value == 1; }));
+  store.acknowledge_checkpoint_mutations(cut.mutation_watermark,
+                                         "serialized-cut", cut.capture_id,
+                                         cut.journal_identity);
+  const auto dirty = store.checkpoint_mutations();
+  CHECK(dirty.size() == 1);
+  CHECK(dirty.front().mutation_sequence > cut.mutation_watermark);
+}
+
+struct BlockingCheckpointInitializer {
+  std::latch *started;
+  std::latch *resume;
+  void initialize(std::span<float> values, uint64_t) {
+    started->count_down();
+    resume->wait();
+    std::ranges::fill(values, 7);
+  }
+};
+
+static void test_capture_drains_inflight_insert() {
+  std::latch initializing(1), resume_insert(1), capturing(1);
+  HogwildEmbeddingStore<uint64_t, float, float, ManualScorePolicy> store(
+      {4},
+      pro::make_proxy<InitializerFacade<float>>(
+          BlockingCheckpointInitializer{&initializing, &resume_insert}),
+      nullptr, ManualScorePolicy{}, HogwildStoreOptions{.thread_budget = 2});
+  std::vector<uint64_t> keys{1};
+  std::vector<float> output(4);
+  std::vector<int64_t> lengths{4};
+  auto insert = std::async(std::launch::async, [&] {
+    store.lookup_or_insert<uint64_t>(keys, output, lengths);
+  });
+  initializing.wait();
+  std::vector<float> captured_values;
+  auto capture = std::async(std::launch::async, [&] {
+    capturing.count_down();
+    return store.capture_checkpoint(
+        false, "", false,
+        pro::make_proxy<se::FunctionFacade<void(
+            std::span<const se::CheckpointMutation>, uint64_t)>>(
+            [](std::span<const se::CheckpointMutation>, uint64_t) {}),
+        pro::make_proxy<se::FunctionFacade<bool(
+            size_t, se::PageImageExport<float, float> &&)>>(
+            [&](size_t, se::PageImageExport<float, float> &&image) {
+              captured_values = std::move(image.values);
+              return true;
+            }));
+  });
+  capturing.wait();
+  CHECK(capture.wait_for(std::chrono::milliseconds(50)) ==
+        std::future_status::timeout);
+  resume_insert.count_down();
+  insert.get();
+  const auto cut = capture.get();
+  CHECK(captured_values.size() == 4);
+  CHECK(std::ranges::all_of(captured_values,
+                            [](float value) { return value == 7; }));
+  store.acknowledge_checkpoint_mutations(cut.mutation_watermark, "drained-cut",
+                                         cut.capture_id, cut.journal_identity);
+  CHECK(store.checkpoint_mutations().empty());
+}
+
+static void test_dirty_capture_visits_only_requested_keys() {
+  HogwildEmbeddingStore<uint64_t, float, float, ManualScorePolicy> store(
+      {4}, {}, nullptr, ManualScorePolicy{},
+      HogwildStoreOptions{
+          .thread_budget = 2,
+          .storage_tuning = {.entries_per_page = 4096,
+                             .max_pages = 1024,
+                             .calibrate_page_geometry = false}});
+  std::vector<uint64_t> keys(20000);
+  std::iota(keys.begin(), keys.end(), uint64_t{0});
+  std::vector<float> values(keys.size() * 4, 1);
+  std::vector<int64_t> lengths(keys.size(), 4);
+  store.assign<uint64_t>(keys, values, lengths);
+  auto prepare = pro::make_proxy<se::FunctionFacade<void(
+      std::span<const se::CheckpointMutation>, uint64_t)>>(
+      [](std::span<const se::CheckpointMutation>, uint64_t) {});
+  auto visitor = pro::make_proxy<
+      se::FunctionFacade<bool(size_t, se::PageImageExport<float, float> &&)>>(
+      [](size_t, se::PageImageExport<float, float> &&) { return true; });
+  const auto full = store.capture_checkpoint(
+      false, "", false, std::move(prepare), std::move(visitor));
+  store.acknowledge_checkpoint_mutations(full.mutation_watermark, "dirty-base",
+                                         full.capture_id,
+                                         full.journal_identity);
+  std::vector<uint64_t> changed{keys.back()};
+  std::vector<float> updated(4, 2);
+  std::vector<int64_t> changed_lengths{4};
+  store.assign<uint64_t>(changed, updated, changed_lengths);
+  size_t pages = 0, entries = 0;
+  const auto delta = store.capture_checkpoint(
+      true, "dirty-base", false,
+      pro::make_proxy<se::FunctionFacade<void(
+          std::span<const se::CheckpointMutation>, uint64_t)>>(
+          [&](std::span<const se::CheckpointMutation> mutations, uint64_t) {
+            CHECK(mutations.size() == 1);
+            CHECK(mutations.front().key == changed.front());
+          }),
+      pro::make_proxy<se::FunctionFacade<bool(
+          size_t, se::PageImageExport<float, float> &&)>>(
+          [&](size_t, se::PageImageExport<float, float> &&image) {
+            ++pages;
+            entries += image.keys.size();
+            CHECK(image.keys.front() == changed.front());
+            return true;
+          }));
+  CHECK(pages == 1);
+  CHECK(entries == 1);
+  store.cancel_checkpoint_capture(delta.capture_id, delta.journal_identity);
+  CHECK(store.checkpoint_mutations().size() == 1);
+}
+
 int main() {
   std::cout << "=== hogwild_score_checkpoint_test ===\n";
   test_no_score_memory();
@@ -333,6 +501,9 @@ int main() {
   test_checkpoint_roundtrip();
   test_incremental_export();
   test_evict_by_score();
+  test_capture_serializes_mutations();
+  test_capture_drains_inflight_insert();
+  test_dirty_capture_visits_only_requested_keys();
   std::cout << "=== ALL PASSED ===\n";
   return 0;
 }

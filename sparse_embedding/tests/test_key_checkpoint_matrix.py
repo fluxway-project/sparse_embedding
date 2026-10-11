@@ -134,12 +134,12 @@ def test_four_key_encodings_page_image_and_entry_restore_survive_compaction(
     committed = checkpoint.save_training_checkpoint(
         source, "page-types", include_page_images=True
     )
-    storage.compact_checkpoint(committed.handle)
+    compacted = storage.compact_checkpoint(committed.handle, include_page_images=True)
 
     page_restore = _store(key_dtype, optimizer=True)
     checkpoint.load_training_checkpoint(
         page_restore,
-        committed.handle,
+        compacted,
         encode_restore_options(
             PhysicalRestore(
                 CheckpointParticipant(0, 1),
@@ -151,7 +151,7 @@ def test_four_key_encodings_page_image_and_entry_restore_survive_compaction(
     entry_restore = _store(key_dtype, optimizer=True)
     checkpoint.load_training_checkpoint(
         entry_restore,
-        committed.handle,
+        compacted,
         encode_restore_options(
             PhysicalRestore(
                 CheckpointParticipant(0, 1),
@@ -245,7 +245,7 @@ def test_key_encoding_corruption_fails_before_target_mutation(
         expected = (
             (ValueError, InvalidCheckpointFragment)
             if corruption == "entries"
-            else LookupError
+            else InvalidCheckpointFragment
         )
 
     target = _store(key_dtype)

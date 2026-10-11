@@ -78,6 +78,11 @@ class UnsupportedCheckpointMode(SparseCheckpointError):
     pass
 
 
+class CheckpointSaveMode(str, Enum):
+    FULL = "full"
+    INCREMENTAL = "incremental"
+
+
 class StorageBudgetExceeded(SparseCheckpointError):
     pass
 
@@ -179,6 +184,58 @@ class CheckpointParticipant:
 
 
 @dataclass(frozen=True, slots=True)
+class CheckpointSaveContext:
+    mode: CheckpointSaveMode
+    parent: SparseCheckpointLocator | None
+    parent_reference_id: str
+    mutation_watermark: int
+    include_page_images: bool
+    entries_per_page: int
+    capture_id: int
+    journal_identity: str
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.mode, CheckpointSaveMode):
+            raise TypeError("mode must be CheckpointSaveMode")
+        if self.mode is CheckpointSaveMode.INCREMENTAL:
+            if self.parent is None or not self.parent_reference_id:
+                raise ValueError(
+                    "incremental context requires immutable parent identity"
+                )
+        elif self.parent is not None or self.parent_reference_id:
+            raise ValueError("FULL context cannot have a parent")
+        if (
+            isinstance(self.mutation_watermark, bool)
+            or not isinstance(self.mutation_watermark, int)
+            or not 0 <= self.mutation_watermark < 1 << 64
+        ):
+            raise ValueError("mutation watermark must be an unsigned 64-bit integer")
+        if (
+            not isinstance(self.entries_per_page, int)
+            or isinstance(self.entries_per_page, bool)
+            or self.entries_per_page <= 0
+            or self.entries_per_page & (self.entries_per_page - 1)
+        ):
+            raise ValueError("entries_per_page must be a positive power of two")
+        if (
+            isinstance(self.capture_id, bool)
+            or not isinstance(self.capture_id, int)
+            or not 0 <= self.capture_id < 1 << 64
+        ):
+            raise ValueError("capture_id must be an unsigned 64-bit integer")
+        if not isinstance(self.journal_identity, str) or bool(self.capture_id) != bool(
+            self.journal_identity
+        ):
+            raise ValueError(
+                "capture_id and journal_identity must describe the same live cut"
+            )
+        if self.mode is CheckpointSaveMode.INCREMENTAL and not self.capture_id:
+            raise ValueError("incremental context requires a live capture")
+        if not isinstance(self.include_page_images, bool):
+            raise TypeError("include_page_images must be boolean")
+
+
+@dataclass(frozen=True, slots=True)
 class CheckpointFragment:
     fragment_id: str
     checkpoint_name: str
@@ -188,6 +245,8 @@ class CheckpointFragment:
     page_count: int
     schema_digest: str
     content_digest: str
+    specification: TableSpecification
+    save_context: CheckpointSaveContext
 
     def __post_init__(self) -> None:
         for name in (
@@ -639,6 +698,14 @@ class CheckpointCleanup(Protocol):
 
 
 class SparseCheckpointProtocol(Protocol):
+    def resolve_checkpoint_manifest(
+        self, handle: CheckpointHandle
+    ) -> Mapping[str, Any]: ...
+
+    def acknowledge_store_mutations(
+        self, store: Any, handle: CheckpointHandle, participant_index: int = 0
+    ) -> None: ...
+
     def prepare_checkpoint(self, identity: CheckpointSaveIdentity) -> None: ...
 
     def write_checkpoint_fragment(
@@ -647,6 +714,8 @@ class SparseCheckpointProtocol(Protocol):
         identity: CheckpointSaveIdentity,
         participant: CheckpointParticipant,
         include_page_images: bool = False,
+        mode: CheckpointSaveMode = CheckpointSaveMode.FULL,
+        parent_manifest: Mapping[str, Any] | None = None,
     ) -> CheckpointFragment: ...
 
     def finalize_checkpoint(self, identity: CheckpointSaveIdentity) -> None: ...
@@ -692,9 +761,13 @@ class SparseCheckpointStorage(
 ):
     def close(self) -> None: ...
 
-    def compact_checkpoints(self) -> None: ...
+    def compact_checkpoints(
+        self, handles: Sequence[CheckpointHandle], *, include_page_images: bool = False
+    ) -> tuple[CheckpointHandle, ...]: ...
 
-    def compact_checkpoint(self, handle: CheckpointHandle) -> None: ...
+    def compact_checkpoint(
+        self, handle: CheckpointHandle, *, include_page_images: bool = False
+    ) -> CheckpointHandle: ...
 
     def compact_fragments(
         self,
@@ -702,9 +775,13 @@ class SparseCheckpointStorage(
         target_path: str | None = None,
     ) -> str: ...
 
-    async def compact_checkpoints_async(self) -> None: ...
+    async def compact_checkpoints_async(
+        self, handles: Sequence[CheckpointHandle], *, include_page_images: bool = False
+    ) -> tuple[CheckpointHandle, ...]: ...
 
-    async def compact_checkpoint_async(self, handle: CheckpointHandle) -> None: ...
+    async def compact_checkpoint_async(
+        self, handle: CheckpointHandle, *, include_page_images: bool = False
+    ) -> CheckpointHandle: ...
 
     async def compact_fragments_async(
         self,

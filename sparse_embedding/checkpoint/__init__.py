@@ -7,6 +7,7 @@ from .base import (
     SUPPORTED_KEY_DTYPES,
     CheckpointHandle,
     CheckpointParticipant,
+    CheckpointSaveMode,
     CommittedCheckpoint,
     ElasticRestore,
     PartitionSpec,
@@ -24,6 +25,7 @@ from .restore_options import encode_restore_options
 
 __all__ = [
     "CheckpointHandle",
+    "CheckpointSaveMode",
     "CheckpointParticipant",
     "CommittedCheckpoint",
     "ElasticRestore",
