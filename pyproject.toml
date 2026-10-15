@@ -16,6 +16,13 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
+test = [
+    "jax>=0.4.26",
+    "numpy>=2.0",
+    "pytest>=8.0",
+    "pytest-asyncio>=1.0",
+    "setuptools>=61.0",
+]
 analysis = ["duckdb>=1.5.6"]
 # Optional at runtime for lance checkpoint backend
 pylance = [
@@ -25,9 +32,6 @@ gravitino = [
     "boto3>=1.35.0",
     "pylance>=0.11.0",
 ]
-
-[tool.setuptools.packages.find]
-include = ["sparse_embedding*"]
 
 [tool.pytest.ini_options]
 testpaths = ["sparse_embedding/tests"]

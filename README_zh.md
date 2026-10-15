@@ -221,18 +221,38 @@ telemetry ring 发布固定大小诊断事件；单一 consumer 可以写入 `st
 本库现已集成标准的 Python packaging 流程，在底层自动调用 Bazel 完成 C++ 扩展的构建：
 
 ```bash
-# 从源码编译并安装 wheel
+# 从源码编译并安装
 pip install .
 
-# 推荐在开发时使用 editable mode
+# 推荐在本地开发时使用 editable mode
 pip install -e .
+
+# 构建二进制 wheel 分发包
+pip wheel . --no-build-isolation
 ```
 
-当然，如果您只需运行 C++ 二进制或单独测试：
+运行 Python 测试套件：
+
+```bash
+# 安装测试依赖并运行 pytest
+pip install -e ".[test]"
+pytest
+```
+
+默认启用 Lance。设置环境变量 `SE_BUILD_WITH_LANCE=0` 可进行不含 Lance 的独立构建：
+
+```bash
+SE_BUILD_WITH_LANCE=0 pip install -e .
+```
+
+直接通过 Bazel 构建与测试 C++ 目标：
 
 ```bash
 bazel build -c opt //sparse_embedding/...
+bazel test -c opt //sparse_embedding/...
 ```
+
+详细的架构规范与构建契约请参阅 [构建与测试指南](docs/building_and_testing_zh.md)。
 
 ## 运行基准测试
 

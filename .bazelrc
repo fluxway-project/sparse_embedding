@@ -7,7 +7,6 @@ build --local_resources=memory=HOST_RAM*0.75
 build --local_resources=cpu=HOST_CPUS
 
 build --cxxopt=-std=c++23
-build --enable_runfiles=false
 
 # Enable AVX512_BF16 extension to support bfloat16 at the hardware/compiler level.
 build --copt=-mavx512bf16

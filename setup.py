@@ -10,19 +10,17 @@ Environment variables
 SE_BUILD_WITH_LANCE
     Set to "0", "false", "off", or "no" to disable Lance-c integration and build
     the standalone core (//:package_core_extension). Defaults to "1" (Lance enabled).
-SE_SKIP_BAZEL
-    Set to any non-empty value to skip the Bazel step entirely (useful when
-    the .so is already present and only Python code needs repackaging).
 """
 
 import os
 import runpy
+import shlex
 import shutil
 import subprocess
 import sys
 from pathlib import Path
 
-from setuptools import setup
+from setuptools import find_namespace_packages, setup
 from setuptools.command.build_py import build_py
 from setuptools.dist import Distribution
 
@@ -41,7 +39,11 @@ _VERSIONS = runpy.run_path(str(_VERSIONS_FILE))
 def _is_lance_enabled() -> bool:
     """Return whether Lance integration is enabled (default: True)."""
     val = os.environ.get("SE_BUILD_WITH_LANCE", "1").strip().lower()
-    return val not in ("0", "false", "off", "no")
+    if val in ("1", "true", "on", "yes"):
+        return True
+    if val in ("0", "false", "off", "no"):
+        return False
+    raise ValueError(f"Invalid SE_BUILD_WITH_LANCE value: {val!r}")
 
 
 def _sync_version_py() -> None:
@@ -56,94 +58,74 @@ __lance_c_commit__ = "{_VERSIONS["LANCE_C_COMMIT"]}"
     version_file.write_text(content)
 
 
-def _bazel_bin_dir() -> Path:
-    """Ask Bazel for the canonical bazel-bin path, bypassing symlink issues."""
-    result = subprocess.run(
-        ["bazel", "info", "bazel-bin"],
-        cwd=_PROJECT_DIR,
-        check=True,
-        capture_output=True,
-        text=True,
-    )
-    return Path(result.stdout.strip())
-
-
-def _remove_stale_extension_artifacts() -> None:
-    """Remove ABI-tagged extensions left by older setuptools builds."""
-    candidates = list(_PKG_DIR.glob("_core.*.so"))
-    build_root = _PROJECT_DIR / "build"
-    if build_root.is_dir():
-        candidates.extend(build_root.glob("lib.*/sparse_embedding/_core.*.so"))
-    for candidate in candidates:
+def _remove_stale_extension_artifacts(build_package_dir: Path) -> None:
+    if build_package_dir.resolve().is_relative_to(_PKG_DIR):
+        raise ValueError("The build destination must be outside the source package")
+    if _PKG_DIR.is_relative_to(build_package_dir.resolve()):
+        raise ValueError("The build destination must not contain the source package")
+    if build_package_dir.exists():
+        shutil.rmtree(build_package_dir)
+    for candidate in _PKG_DIR.glob("*.so"):
         candidate.unlink()
 
 
-def _invoke_bazel(with_lance: bool) -> Path:
-    """Run Bazel and return the path to the compiled _core.so."""
-    if with_lance:
-        bazel_target = "//:core_extension_lance"
-        so_glob = "libcore_extension_lance.so"
-    else:
-        bazel_target = "//:package_core_extension"
-        so_glob = "_core.so"
-
-    cmd = ["bazel", "build", bazel_target]
-    if with_lance:
-        cmd.append("//:package_liblance_c")
+def _invoke_bazel(with_lance: bool) -> list[Path]:
+    target = "//:native_artifacts"
     env = os.environ.copy()
-    if "BAZEL_COPTS" in env:
-        import shlex
-
-        cmd.extend(shlex.split(env.pop("BAZEL_COPTS")))
-
+    options = shlex.split(env.pop("BAZEL_COPTS", ""))
+    options.append(f"--//:with_lance={str(with_lance).lower()}")
+    execution_root = subprocess.run(
+        ["bazel", "info", "execution_root", *options],
+        cwd=_PROJECT_DIR,
+        env=env,
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout.strip()
     subprocess.run(
-        cmd,
+        ["bazel", "build", target, *options],
         cwd=_PROJECT_DIR,
         env=env,
         check=True,
     )
 
-    bazel_bin = _bazel_bin_dir()
-    candidates = list(bazel_bin.rglob(so_glob))
-    if not candidates:
-        raise FileNotFoundError(
-            f"Bazel target {bazel_target!r} produced no file matching {so_glob!r}"
-            f" under {bazel_bin}"
-        )
-    return max(candidates, key=lambda p: p.stat().st_mtime)
+    result = subprocess.run(
+        ["bazel", "cquery", target, "--output=files", *options],
+        cwd=_PROJECT_DIR,
+        env=env,
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    artifacts = [
+        Path(execution_root) / path.strip()
+        for path in result.stdout.splitlines()
+        if path.strip()
+    ]
+    if not artifacts:
+        raise RuntimeError(f"Bazel target {target} declared no native artifacts")
+    for artifact in artifacts:
+        if not artifact.is_file():
+            raise FileNotFoundError(f"Bazel artifact does not exist: {artifact}")
+    return artifacts
 
 
-def _build_native_artifacts() -> None:
+def _build_native_artifacts(build_package_dir: Path) -> None:
     """Compile native libraries via Bazel and copy them into package directory."""
-    _sync_version_py()
-    _remove_stale_extension_artifacts()
-    if os.environ.get("SE_SKIP_BAZEL"):
-        print("[setup.py] SE_SKIP_BAZEL set — skipping Bazel build.", file=sys.stderr)
-        return
-
     with_lance = _is_lance_enabled()
+    _sync_version_py()
     print(
         f"[setup.py] Building C++ backend via Bazel (lance={'yes' if with_lance else 'no'})...",
         file=sys.stderr,
     )
-    so_src = _invoke_bazel(with_lance)
-    so_dst = _PKG_DIR / "_core.so"
-    if so_dst.exists():
-        so_dst.unlink()
-    shutil.copy2(so_src, so_dst)
-    print(f"[setup.py] Copied {so_src.name} -> {so_dst}", file=sys.stderr)
-
-    if with_lance:
-        lance_so = _PKG_DIR / "liblance_c.so"
-        lance_src = _bazel_bin_dir() / "sparse_embedding" / "liblance_c.so"
-        if not lance_src.is_file():
-            raise FileNotFoundError(
-                f"Lance target produced no shared library at {lance_src}"
-            )
-        if lance_so.exists() or lance_so.is_symlink():
-            lance_so.unlink()
-        shutil.copy2(lance_src, lance_so)
-        print(f"[setup.py] Copied {lance_src.name} -> {lance_so}", file=sys.stderr)
+    artifacts = _invoke_bazel(with_lance)
+    _remove_stale_extension_artifacts(build_package_dir)
+    for artifact in artifacts:
+        destination = _PKG_DIR / artifact.name
+        if destination.exists() or destination.is_symlink():
+            destination.unlink()
+        shutil.copy2(artifact, destination)
+        print(f"[setup.py] Copied {artifact} -> {destination}", file=sys.stderr)
 
     _generate_extension_stubs(
         extension_name="_core",
@@ -204,7 +186,7 @@ class BazelAwareBuildPy(build_py):
     """Extends build_py to run the Bazel compilation step first."""
 
     def run(self) -> None:
-        _build_native_artifacts()
+        _build_native_artifacts(Path(self.build_lib) / "sparse_embedding")
         super().run()
 
 
@@ -217,9 +199,15 @@ class BinaryDistribution(Distribution):
 
 if __name__ == "__main__":
     setup(
+        packages=find_namespace_packages(
+            include=["sparse_embedding*"],
+            exclude=["sparse_embedding.tests*"],
+        ),
         version=_VERSIONS["PACKAGE_VERSION"],
         python_requires=_VERSIONS["PYTHON_REQUIRES"],
         distclass=BinaryDistribution,
         cmdclass={"build_py": BazelAwareBuildPy},
+        include_package_data=False,
+        exclude_package_data={"sparse_embedding": ["tests/*", "tests/**/*"]},
         package_data={"sparse_embedding": ["*.so", "*.pyi", "py.typed"]},
     )

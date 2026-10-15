@@ -243,21 +243,41 @@ Debug builds throw immediately.
 
 ## Build & Install
 
-This library now integrates with the standard Python packaging workflow, automatically invoking Bazel underneath:
+This library integrates standard Python packaging with Bazel, compiling the C++ native extension under the hood:
 
 ```bash
-# Compile from source and install the wheel
+# Compile and install the package
 pip install .
 
-# Or install in editable mode for development
+# Or install in editable mode for local development
 pip install -e .
+
+# Build redistributable binary wheel
+pip wheel . --no-build-isolation
 ```
 
-If you only need to run the C++ binaries or test directly:
+Run Python test suite:
+
+```bash
+# Install test extras and run pytest
+pip install -e ".[test]"
+pytest
+```
+
+Lance integration is enabled by default. Set `SE_BUILD_WITH_LANCE=0` for a standalone build without Lance:
+
+```bash
+SE_BUILD_WITH_LANCE=0 pip install -e .
+```
+
+To build and test C++ targets directly via Bazel:
 
 ```bash
 bazel build -c opt //sparse_embedding/...
+bazel test -c opt //sparse_embedding/...
 ```
+
+See [Building and Testing Guide](docs/building_and_testing.md) for full architecture and configuration details.
 
 ## Running Benchmarks
 
