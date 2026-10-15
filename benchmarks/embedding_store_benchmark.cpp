@@ -237,7 +237,7 @@ void run_storage_pressure_benchmark() {
     store.lookup<uint64_t>(batch, output, row_lengths);
     store.assign<uint64_t>(batch, values, row_lengths);
     store.accumulate_gradients<uint64_t>(batch, gradients, row_lengths);
-    store.optimizer_step();
+    store.optimizer_step(1);
   }
   const double elapsed_ms = timer.elapsed_ms();
   std::this_thread::sleep_for(std::chrono::milliseconds(100));
@@ -486,7 +486,7 @@ int main(int argc, char **argv) {
                                            batches.front().row_lengths);
       timer.start();
       for (size_t r = 0; r < reps; ++r) {
-        store.optimizer_step();
+        store.optimizer_step(1);
         store.accumulate_gradients<uint64_t>(batches[r + 1].keys, flat_grads,
                                              batches[r + 1].row_lengths);
       }
@@ -496,7 +496,7 @@ int main(int argc, char **argv) {
       double gbps =
           store.size() * kDim * sizeof(float) * 2 / ms / 1e6; // read+write
       print_result({"optimizer_step", mops, gbps});
-      store.optimizer_step();
+      store.optimizer_step(1);
     }
 
     // ── 6. contains ───────────────────────────────────────────────────────

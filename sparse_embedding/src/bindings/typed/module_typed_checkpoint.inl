@@ -4,8 +4,6 @@
 // Implementation of CheckpointOpsImpl<ParamT, OptT> methods
 // =============================================================================
 
-#include <array>
-#include <charconv>
 #include <unordered_map>
 
 #include "sparse_embedding/src/bindings/arrow_c_bridge.hpp"
@@ -27,29 +25,40 @@ nb::dict CheckpointOpsImpl<ParamT, OptT>::write_native_fragment(
     const std::string &embedding_dtype, const std::string &optimizer_dtype,
     const std::string &score_policy, const std::string &key_dtype,
     const std::string &schema_digest, bool include_page_images,
-    bool incremental_mode, const std::string &expected_baseline) {
+    bool incremental_mode, const std::string &expected_baseline,
+    const std::string &page_dataset_uri, uint64_t page_dataset_version,
+    uint64_t expected_page_layout_generation) {
   se::NativeFragmentWriter writer;
   writer.begin_fragment(
       uri, participant_index, dimensions, embedding_dtype, optimizer_dtype,
       score_policy, key_dtype, schema_digest,
       self.get_store<ParamT, OptT>()->has_score_policy(), include_page_images,
-      static_cast<uint32_t>(
-          self.get_store<ParamT, OptT>()->entries_per_page()));
+      static_cast<uint32_t>(self.get_store<ParamT, OptT>()->entries_per_page()),
+      page_dataset_uri, page_dataset_version);
   se::CheckpointCaptureCut cut;
   {
     nb::gil_scoped_release release;
     cut = self.get_store<ParamT, OptT>()->capture_checkpoint(
         incremental_mode, expected_baseline, include_page_images,
+        expected_page_layout_generation,
         pro::make_proxy<se::FunctionFacade<void(
             std::span<const se::CheckpointMutation>, uint64_t)>>(
             [&](std::span<const se::CheckpointMutation> mutations, uint64_t) {
-              if (!incremental_mode)
-                return;
+              if (!incremental_mode) return;
               writer.set_incremental_mutations(mutations);
             }),
         pro::make_proxy<se::FunctionFacade<bool(
             size_t, se::PageImageExport<ParamT, OptT> &&)>>(
             [&](size_t dim, se::PageImageExport<ParamT, OptT> &&image) {
+              if (image.deleted_page) {
+                if (include_page_images) {
+                  writer.write_page_tombstone(
+                      dim, image.physical_page_id, image.page_slot_stride_bytes,
+                      static_cast<uint32_t>(
+                          self.get_store<ParamT, OptT>()->entries_per_page()));
+                }
+                return true;
+              }
               writer.write_page_image(
                   dim, image.physical_page_id, image.page_slot_stride_bytes,
                   sizeof(ParamT) * dim, image.slot_ordinals, image.keys,
@@ -76,6 +85,7 @@ nb::dict CheckpointOpsImpl<ParamT, OptT>::write_native_fragment(
     }
   }
   nb::dict result;
+  artifact.page_layout_generation = cut.page_layout_generation;
   result["entries_per_page"] = artifact.entries_per_page;
   result["capture_id"] = cut.capture_id;
   result["journal_identity"] = cut.journal_identity;
@@ -83,6 +93,7 @@ nb::dict CheckpointOpsImpl<ParamT, OptT>::write_native_fragment(
   result["locator"] = artifact.locator;
   result["entries_version"] = artifact.entries_version;
   result["page_images_version"] = artifact.page_images_version;
+  result["page_layout_generation"] = artifact.page_layout_generation;
   result["entry_count"] = artifact.entry_count;
   result["page_count"] = artifact.page_count;
   result["physical_bytes"] = artifact.physical_bytes;
@@ -95,66 +106,87 @@ template <typename ParamT, typename OptT>
 template <typename Scanner>
 void CheckpointOpsImpl<ParamT, OptT>::restore_native_entries_with_scan(
     EmbeddingStoreWrapper &self, Scanner &&scan, bool load_optimizer_state) {
+  std::vector<se::NativeEntryBatch> transaction_batches;
   {
     nb::gil_scoped_release release;
     scan([&](const se::NativeEntryBatch &batch) {
-      std::unordered_map<uint32_t, std::vector<size_t>> by_dimension;
-      for (size_t index = 0; index < batch.keys.size(); ++index)
-        by_dimension[batch.dimensions[index]].push_back(index);
-
-      se::dispatch_key_type(self.key_type_enum_, [&]<typename KeyT>() {
-        for (const auto &[dim, indices] : by_dimension) {
-          std::vector<KeyT> dim_keys;
-          std::vector<ParamT> values;
-          dim_keys.reserve(indices.size());
-          values.reserve(indices.size() * dim);
-          std::vector<int64_t> lengths(indices.size(), dim);
-          for (size_t index : indices) {
-            dim_keys.push_back(static_cast<KeyT>(batch.keys[index]));
-            const auto begin = batch.embedding_offsets[index];
-            const auto *source = reinterpret_cast<const ParamT *>(
-                batch.embedding_values.data() + begin);
-            values.insert(values.end(), source, source + dim);
-          }
-          self.get_store<ParamT, OptT>()->assign(
-              std::span<const KeyT>(dim_keys), std::span<const ParamT>(values),
-              std::span<const int64_t>(lengths));
-          if (!batch.scores.empty() &&
-              self.get_store<ParamT, OptT>()->has_score_policy()) {
-            std::vector<uint64_t> dim_scores;
-            dim_scores.reserve(indices.size());
-            for (size_t index : indices)
-              dim_scores.push_back(batch.scores[index]);
-            self.get_store<ParamT, OptT>()->assign_scores(
-                std::span<const KeyT>(dim_keys),
-                std::span<const uint64_t>(dim_scores));
-          }
-          const uint32_t optimizer_stride =
-              batch.optimizer_strides[indices.front()];
-          if (load_optimizer_state && optimizer_stride != 0) {
-            std::vector<OptT> optimizer;
-            optimizer.reserve(indices.size() * optimizer_stride);
-            for (size_t index : indices) {
-              const auto begin = batch.optimizer_offsets[index];
-              const auto *source = reinterpret_cast<const OptT *>(
-                  batch.optimizer_values.data() + begin);
-              optimizer.insert(optimizer.end(), source,
-                               source + optimizer_stride);
-            }
-            std::vector<uint32_t> steps;
-            steps.reserve(indices.size());
-            for (size_t index : indices)
-              steps.push_back(batch.steps[index]);
-            self.get_store<ParamT, OptT>()->assign_opt_states(
-                dim, std::span<const KeyT>(dim_keys),
-                std::span<const OptT>(optimizer),
-                std::span<const uint32_t>(steps));
-          }
-        }
-      });
+      const size_t row_count = batch.keys.size();
+      if (batch.dimensions.size() != row_count ||
+          batch.embedding_offsets.size() != row_count + 1 ||
+          batch.optimizer_offsets.size() != row_count + 1 ||
+          batch.optimizer_strides.size() != row_count ||
+          (!batch.steps.empty() && batch.steps.size() != row_count) ||
+          (!batch.scores.empty() && batch.scores.size() != row_count) ||
+          batch.embedding_offsets.front() != 0 ||
+          batch.optimizer_offsets.front() != 0 ||
+          batch.embedding_offsets.back() > batch.embedding_values.size() ||
+          batch.optimizer_offsets.back() > batch.optimizer_values.size())
+        throw std::runtime_error("native restore entry batch shape is invalid");
+      transaction_batches.push_back(batch);
       return true;
     });
   }
+
+  std::unordered_map<uint32_t, std::vector<size_t>> by_dimension;
+  for (const auto &batch : transaction_batches)
+    for (size_t index = 0; index < batch.keys.size(); ++index)
+      by_dimension[batch.dimensions[index]].push_back(index);
+
+  se::dispatch_key_type(self.key_type_enum_, [&]<typename KeyT>() {
+    for (const auto &[dim, unused] : by_dimension) {
+      (void)unused;
+      std::vector<KeyT> dim_keys;
+      std::vector<ParamT> values;
+      std::vector<uint64_t> scores;
+      std::vector<OptT> optimizer;
+      std::vector<uint32_t> steps;
+      for (const auto &batch : transaction_batches) {
+        for (size_t index = 0; index < batch.keys.size(); ++index) {
+          if (batch.dimensions[index] != dim) continue;
+          dim_keys.push_back(static_cast<KeyT>(batch.keys[index]));
+          const size_t begin = batch.embedding_offsets[index];
+          const size_t end = batch.embedding_offsets[index + 1];
+          if (end - begin != static_cast<size_t>(dim) * sizeof(ParamT))
+            throw std::runtime_error(
+                "native restore embedding payload shape is invalid");
+          const auto *source = reinterpret_cast<const ParamT *>(
+              batch.embedding_values.data() + begin);
+          values.insert(values.end(), source, source + dim);
+          if (!batch.scores.empty()) scores.push_back(batch.scores[index]);
+          const uint32_t stride = batch.optimizer_strides[index];
+          if (load_optimizer_state && stride != 0) {
+            const size_t optimizer_begin = batch.optimizer_offsets[index];
+            const size_t optimizer_end = batch.optimizer_offsets[index + 1];
+            if (optimizer_end - optimizer_begin !=
+                static_cast<size_t>(stride) * sizeof(OptT))
+              throw std::runtime_error(
+                  "native restore optimizer payload shape is invalid");
+            const auto *optimizer_source = reinterpret_cast<const OptT *>(
+                batch.optimizer_values.data() + optimizer_begin);
+            optimizer.insert(optimizer.end(), optimizer_source,
+                             optimizer_source + stride);
+            steps.push_back(batch.steps[index]);
+          }
+        }
+      }
+      std::vector<int64_t> lengths(dim_keys.size(), dim);
+      self.get_store<ParamT, OptT>()->assign(std::span<const KeyT>(dim_keys),
+                                             std::span<const ParamT>(values),
+                                             std::span<const int64_t>(lengths));
+      if (!scores.empty() && self.get_store<ParamT, OptT>()->has_score_policy())
+        self.get_store<ParamT, OptT>()->assign_scores(
+            std::span<const KeyT>(dim_keys), std::span<const uint64_t>(scores));
+      if (!optimizer.empty()) {
+        const size_t key_count = dim_keys.size();
+        if (optimizer.size() % key_count != 0 || steps.size() != key_count)
+          throw std::runtime_error(
+              "native restore optimizer batch shape is invalid");
+        self.get_store<ParamT, OptT>()->assign_opt_states(
+            dim, std::span<const KeyT>(dim_keys),
+            std::span<const OptT>(optimizer), std::span<const uint32_t>(steps));
+      }
+    }
+  });
 }
 
 template <typename ParamT, typename OptT>
@@ -189,7 +221,13 @@ template <typename ParamT, typename OptT>
 void CheckpointOpsImpl<ParamT, OptT>::restore_native_page_images(
     EmbeddingStoreWrapper &self, const std::vector<std::string> &uris,
     uint64_t version, uint32_t participant_index, const std::string &key_dtype,
-    const se::LanceStorageOptions &storage_options, bool load_optimizer_state) {
+    const se::LanceStorageOptions &storage_options, bool load_optimizer_state,
+    uint64_t page_layout_generation) {
+  // The generation comes from the checkpoint participant descriptor. It must
+  // be restored together with the page images so later incremental captures
+  // compare against the same physical page layout.
+  if (page_layout_generation == 0)
+    throw std::invalid_argument("page layout generation must be positive");
   std::vector<se::PageImageImport<ParamT, OptT>> imports;
   imports.reserve(se::CheckpointStreamPolicy::kPageImportBatchPages);
   {
@@ -253,22 +291,19 @@ void CheckpointOpsImpl<ParamT, OptT>::restore_native_page_images(
             }
             imports.push_back(se::PageImageImport<ParamT, OptT>{
                 page.embedding_dim, std::move(image)});
-            if (imports.size() >=
-                se::CheckpointStreamPolicy::kPageImportBatchPages) {
-              self.get_store<ParamT, OptT>()->import_page_images(imports);
-              imports.clear();
-            }
             return true;
           },
           load_optimizer_state, storage_options);
     }
-    if (!imports.empty()) {
-      self.get_store<ParamT, OptT>()->import_page_images(imports);
-      imports.clear();
-    }
+    // Do not use the plain import entry point here: it would restore values
+    // while leaving the store's page-layout generation unrelated to the
+    // checkpoint being restored.
+    if (!imports.empty())
+      self.get_store<ParamT, OptT>()->import_page_images_with_generation(
+          imports, page_layout_generation);
   }
 }
-#endif // SE_ENABLE_LANCE_C
+#endif  // SE_ENABLE_LANCE_C
 
 template <typename ParamT, typename OptT>
 void CheckpointOpsImpl<ParamT, OptT>::export_batches_dlpack(
@@ -276,14 +311,14 @@ void CheckpointOpsImpl<ParamT, OptT>::export_batches_dlpack(
     bool include_optimizer_state) {
   auto dispatch_key = [&]<typename Fn>(Fn &&fn) {
     switch (self.key_type_enum_) {
-    case KeyDType::kInt32:
-      return fn.template operator()<int32_t>();
-    case KeyDType::kUInt32:
-      return fn.template operator()<uint32_t>();
-    case KeyDType::kInt64:
-      return fn.template operator()<int64_t>();
-    case KeyDType::kUInt64:
-      return fn.template operator()<uint64_t>();
+      case KeyDType::kInt32:
+        return fn.template operator()<int32_t>();
+      case KeyDType::kUInt32:
+        return fn.template operator()<uint32_t>();
+      case KeyDType::kInt64:
+        return fn.template operator()<int64_t>();
+      case KeyDType::kUInt64:
+        return fn.template operator()<uint64_t>();
     }
     throw std::invalid_argument("unsupported key_dtype");
   };
@@ -351,14 +386,14 @@ void CheckpointOpsImpl<ParamT, OptT>::export_batches_arrow(
     bool include_optimizer_state) {
   auto dispatch_key = [&]<typename Fn>(Fn &&fn) {
     switch (self.key_type_enum_) {
-    case KeyDType::kInt32:
-      return fn.template operator()<int32_t>();
-    case KeyDType::kUInt32:
-      return fn.template operator()<uint32_t>();
-    case KeyDType::kInt64:
-      return fn.template operator()<int64_t>();
-    case KeyDType::kUInt64:
-      return fn.template operator()<uint64_t>();
+      case KeyDType::kInt32:
+        return fn.template operator()<int32_t>();
+      case KeyDType::kUInt32:
+        return fn.template operator()<uint32_t>();
+      case KeyDType::kInt64:
+        return fn.template operator()<int64_t>();
+      case KeyDType::kUInt64:
+        return fn.template operator()<uint64_t>();
     }
     throw std::invalid_argument("unsupported key_dtype");
   };
@@ -409,14 +444,14 @@ void CheckpointOpsImpl<ParamT, OptT>::assign_opt_state(
     size_t dimension, nb::object steps_obj) {
   auto dispatch_key = [&]<typename Fn>(Fn &&fn) {
     switch (self.key_type_enum_) {
-    case KeyDType::kInt32:
-      return fn.template operator()<int32_t>();
-    case KeyDType::kUInt32:
-      return fn.template operator()<uint32_t>();
-    case KeyDType::kInt64:
-      return fn.template operator()<int64_t>();
-    case KeyDType::kUInt64:
-      return fn.template operator()<uint64_t>();
+      case KeyDType::kInt32:
+        return fn.template operator()<int32_t>();
+      case KeyDType::kUInt32:
+        return fn.template operator()<uint32_t>();
+      case KeyDType::kInt64:
+        return fn.template operator()<int64_t>();
+      case KeyDType::kUInt64:
+        return fn.template operator()<uint64_t>();
     }
     throw std::invalid_argument("unsupported key_dtype");
   };
@@ -470,41 +505,5 @@ void CheckpointOpsImpl<ParamT, OptT>::assign_opt_state(
   });
 }
 
-template <typename ParamT, typename OptT>
-nb::list CheckpointOpsImpl<ParamT, OptT>::checkpoint_mutations(
-    EmbeddingStoreWrapper &self) {
-  nb::list result;
-  for (const auto &mutation :
-       self.get_store<ParamT, OptT>()->checkpoint_mutations()) {
-    nb::dict row;
-    row["dimension"] = mutation.dimension;
-    row["key"] = mutation.key;
-    row["mutation_sequence"] = mutation.mutation_sequence;
-    row["deleted"] = mutation.deleted;
-    result.append(std::move(row));
-  }
-  return result;
-}
+}  // namespace se::py::detail
 
-template <typename ParamT, typename OptT>
-std::string CheckpointOpsImpl<ParamT, OptT>::checkpoint_baseline(
-    EmbeddingStoreWrapper &self) {
-  return self.get_store<ParamT, OptT>()->checkpoint_baseline();
-}
-
-template <typename ParamT, typename OptT>
-uint64_t CheckpointOpsImpl<ParamT, OptT>::checkpoint_mutation_watermark(
-    EmbeddingStoreWrapper &self) {
-  return self.get_store<ParamT, OptT>()->checkpoint_mutation_watermark();
-}
-
-template <typename ParamT, typename OptT>
-void CheckpointOpsImpl<ParamT, OptT>::acknowledge_checkpoint_mutations(
-    EmbeddingStoreWrapper &self, uint64_t watermark,
-    const std::string &baseline, uint64_t capture_id,
-    const std::string &journal_identity) {
-  self.get_store<ParamT, OptT>()->acknowledge_checkpoint_mutations(
-      watermark, baseline, capture_id, journal_identity);
-}
-
-} // namespace se::py::detail

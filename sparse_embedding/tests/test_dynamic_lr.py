@@ -26,7 +26,7 @@ def update_for_score(policy, score, optimizer_type=se.Sgd):
     store.lookup_or_insert(keys, dim=DIM)
     store.assign_scores(keys, np.array([score], dtype=np.uint64))
     store.accumulate_gradients(keys, np.ones((1, DIM), dtype=np.float32))
-    store.optimizer_step()
+    store.optimizer_step(1)
     return -np.from_dlpack(store.lookup(keys, dim=DIM)[0]).copy()
 
 
@@ -77,7 +77,7 @@ def test_adam_applies_exact_dynamic_lr_across_steps():
     gradients = np.ones((1, DIM), dtype=np.float32)
     for _ in range(2):
         store.accumulate_gradients(keys, gradients)
-        store.optimizer_step()
+        store.optimizer_step(1)
     np.testing.assert_allclose(
         np.from_dlpack(store.lookup(keys, dim=DIM)[0]), -0.5, atol=2e-5
     )
@@ -98,7 +98,7 @@ def test_runtime_score_policies_drive_learning_rate(score_policy):
     gradients = np.ones((1, DIM), dtype=np.float32)
     store.accumulate_gradients(hot, gradients)
     store.accumulate_gradients(cold, gradients)
-    store.optimizer_step()
+    store.optimizer_step(1)
     hot_update = -np.from_dlpack(store.lookup(hot, dim=DIM)[0]).copy()
     cold_update = -np.from_dlpack(store.lookup(cold, dim=DIM)[0]).copy()
     assert np.all(hot_update < cold_update)
@@ -110,7 +110,7 @@ async def test_async_optimizer_step_uses_dynamic_lr():
     keys = np.array([5], dtype=np.int64)
     store.lookup_or_insert(keys, dim=DIM)
     store.accumulate_gradients(keys, np.ones((1, DIM), dtype=np.float32))
-    await store.async_optimizer_step()
+    await store.async_optimizer_step(1)
     np.testing.assert_allclose(
         np.from_dlpack(store.lookup(keys, dim=DIM)[0]), -0.25, atol=1e-6
     )
@@ -153,7 +153,7 @@ def test_constant_policy_does_not_allocate_score_storage():
     keys = np.array([1], dtype=np.int64)
     store.lookup_or_insert(keys, dim=DIM)
     store.accumulate_gradients(keys, np.ones((1, DIM), dtype=np.float32))
-    store.optimizer_step()
+    store.optimizer_step(1)
     np.testing.assert_allclose(
         np.from_dlpack(store.lookup(keys, dim=DIM)[0]), -1.0, atol=1e-6
     )
@@ -171,7 +171,7 @@ def test_default_optimizer_uses_static_learning_rate_path():
     keys = np.array([9], dtype=np.int64)
     store.lookup_or_insert(keys, dim=DIM)
     store.accumulate_gradients(keys, np.ones((1, DIM), dtype=np.float32))
-    store.optimizer_step()
+    store.optimizer_step(1)
     np.testing.assert_allclose(
         np.from_dlpack(store.lookup(keys, dim=DIM)[0]), -0.25, atol=1e-6
     )
@@ -183,7 +183,7 @@ def test_reset_preserves_dynamic_policy():
     keys = np.array([3], dtype=np.int64)
     store.lookup_or_insert(keys, dim=DIM)
     store.accumulate_gradients(keys, np.ones((1, DIM), dtype=np.float32))
-    store.optimizer_step()
+    store.optimizer_step(1)
     np.testing.assert_allclose(
         np.from_dlpack(store.lookup(keys, dim=DIM)[0]), -0.25, atol=1e-6
     )
@@ -201,7 +201,7 @@ def test_parallel_score_updates_and_optimizer_step():
 
     with ThreadPoolExecutor(max_workers=8) as executor:
         list(executor.map(accumulate, np.array_split(keys, 8)))
-    store.optimizer_step()
+    store.optimizer_step(1)
 
     actual = (
         -np.from_dlpack(store.lookup(keys, dim=DIM)[0]).copy().reshape(-1, DIM)[:, 0]

@@ -1,6 +1,6 @@
 # Storage Architecture and API Contracts
 
-[中文](storage_architecture_zh.md) | [Performance and Reliability Report](performance_and_reliability_report.md) | [Lance Storage and Gravitino Integration](lance_storage_and_gravitino.md)
+[中文](storage_architecture_zh.md) | [Incremental Checkpointing](incremental_checkpoint.md) | [Lance Storage and Gravitino Integration](lance_storage_and_gravitino.md) | [Performance and Reliability Report](performance_and_reliability_report.md) | [Dynamic Learning Rate](dynamic_learning_rate.md)
 
 This document provides a comprehensive technical overview of the Sparse Embedding storage engine, detailing its core architecture, concurrency and memory model, tiered storage topology, eviction scheduling, and distributed interface contracts.
 
@@ -186,9 +186,11 @@ The storage engine coordinates with the persistence subsystem under the followin
 - **Training vs. Inference State Isolation**:
   - Training instances allocate and manage optimizer state pages (e.g., Adam first/second moments).
   - Inference instances configure `EmbeddingConfig(enable_optimizer=False)` to create weight-only stores, skipping optimizer allocation.
+- **Topology-Adaptive Restoration**: `RestorePlan.from_topology` automatically inspects saved participant counts vs. current cluster topology, transparently routing to `RankRestore` (identical topology) or SIMD-vectorized `ReshardRestore` (cluster scaling / re-partitioning).
 - **Two-Phase Commit and Lance Lakehouse Persistence**: Underlying storage persists state via `snapshot_manifest.lance` (control-plane ledger) and `entries.lance` (data-plane physical slices).
+- **Incremental Checkpointing & Streaming Compaction**: Mutation journaling tracks dirty keys and deletion tombstones during training, enabling non-blocking cuts and native streaming compaction.
 
-> For detailed checkpoint architecture, Two-Phase Commit protocols, incremental restoration, and Gravitino integration, refer to [Lance Storage and Gravitino Integration](lance_storage_and_gravitino.md).
+> For detailed checkpoint architecture, Two-Phase Commit protocols, incremental restoration, and Gravitino integration, refer to [Lance Storage and Gravitino Integration](lance_storage_and_gravitino.md) and [Incremental Checkpointing and Streaming Compaction](incremental_checkpoint.md).
 
 ---
 
@@ -213,6 +215,10 @@ config = se.EmbeddingConfig(
     storage=storage,                     # Storage backend
     key_dtype="uint64",                  # Key dtype (int32/uint32/int64/uint64)
     value_dtype="float32",               # Value dtype
+    optimizer_dtype="float32",           # Optimizer moment dtype (supports bf16/fp16/fp32)
+    gradient_dtype="bfloat16",           # Gradient accumulation dtype (optional)
+    gradient_scale=1.0,                  # Gradient scaling factor
+    enable_optimizer=True,               # False for weight-only inference stores
     storage_tuning=se.StorageTuningOptions(
         target_capacity_keys=10_000_000, # Expected key capacity
         memory_budget_bytes=4 << 30,     # Memory tuning budget

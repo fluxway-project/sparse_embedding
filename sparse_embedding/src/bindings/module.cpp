@@ -633,7 +633,8 @@ NB_MODULE(_core, m) {
            nb::arg("keys"), nb::arg("scores"))
       .def("accumulate_gradients", &EmbeddingStoreWrapper::accumulate_gradients,
            nb::arg("keys"), nb::arg("grads"))
-      .def("optimizer_step", &EmbeddingStoreWrapper::optimizer_step)
+      .def("optimizer_step", &EmbeddingStoreWrapper::optimizer_step,
+           nb::arg("normalization_steps"))
 
       .def("async_lookup", &EmbeddingStoreWrapper::async_lookup,
            nb::arg("keys"), nb::arg("dim"),
@@ -655,8 +656,9 @@ NB_MODULE(_core, m) {
                    "object) -> typing.Awaitable[typing.Any]"))
       .def(
           "async_optimizer_step", &EmbeddingStoreWrapper::async_optimizer_step,
-          nb::sig(
-              "def async_optimizer_step(self) -> typing.Awaitable[typing.Any]"))
+          nb::arg("normalization_steps"),
+          nb::sig("def async_optimizer_step(self, normalization_steps: int) -> "
+                  "typing.Awaitable[typing.Any]"))
       .def("async_contains", &EmbeddingStoreWrapper::async_contains,
            nb::arg("keys"),
            nb::sig("def async_contains(self, keys: object) -> "
@@ -683,14 +685,22 @@ NB_MODULE(_core, m) {
            nb::arg("pages"))
       .def("checkpoint_mutations", &EmbeddingStoreWrapper::checkpoint_mutations)
       .def("checkpoint_baseline", &EmbeddingStoreWrapper::checkpoint_baseline)
+      .def("checkpoint_restore_is_pristine",
+           &EmbeddingStoreWrapper::checkpoint_restore_is_pristine)
+      .def("initialize_checkpoint_baseline",
+           &EmbeddingStoreWrapper::initialize_checkpoint_baseline,
+           nb::arg("baseline"), nb::arg("watermark"))
+      .def("mark_terminal_failure",
+           &EmbeddingStoreWrapper::mark_terminal_failure)
+      .def("is_operational", &EmbeddingStoreWrapper::is_operational)
       .def("checkpoint_mutation_watermark",
            &EmbeddingStoreWrapper::checkpoint_mutation_watermark)
       .def("cancel_checkpoint_capture",
            &EmbeddingStoreWrapper::cancel_checkpoint_capture,
            nb::arg("capture_id"), nb::arg("journal_identity"))
       .def_prop_ro("entries_per_page", &EmbeddingStoreWrapper::entries_per_page)
-      .def("acknowledge_checkpoint_mutations",
-           &EmbeddingStoreWrapper::acknowledge_checkpoint_mutations,
+      .def("advance_checkpoint_baseline",
+           &EmbeddingStoreWrapper::advance_checkpoint_baseline,
            nb::arg("watermark"), nb::arg("baseline"), nb::arg("capture_id"),
            nb::arg("journal_identity"))
       .def("value_dtype", &EmbeddingStoreWrapper::value_dtype)
@@ -789,17 +799,23 @@ NB_MODULE(_core, m) {
          const std::string &embedding_dtype, const std::string &optimizer_dtype,
          const std::string &score_policy, const std::string &key_dtype,
          const std::string &schema_digest, bool include_page_images,
-         bool incremental_mode, const std::string &expected_baseline) {
+         bool incremental_mode, const std::string &expected_baseline,
+         const std::string &page_dataset_uri, uint64_t page_dataset_version,
+         uint64_t expected_page_layout_generation) {
         return self.write_native_fragment(
             uri, participant_index, dimensions, embedding_dtype,
             optimizer_dtype, score_policy, key_dtype, schema_digest,
-            include_page_images, incremental_mode, expected_baseline);
+            include_page_images, incremental_mode, expected_baseline,
+            page_dataset_uri, page_dataset_version,
+            expected_page_layout_generation);
       },
       nb::arg("store"), nb::arg("uri"), nb::arg("participant_index"),
       nb::arg("dimensions"), nb::arg("embedding_dtype"),
       nb::arg("optimizer_dtype"), nb::arg("score_policy"), nb::arg("key_dtype"),
       nb::arg("schema_digest"), nb::arg("include_page_images") = false,
-      nb::arg("incremental_mode") = false, nb::arg("expected_baseline") = "");
+      nb::arg("incremental_mode") = false, nb::arg("expected_baseline") = "",
+      nb::arg("page_dataset_uri") = "", nb::arg("page_dataset_version") = 0,
+      nb::arg("expected_page_layout_generation") = 0);
   checkpoint.def(
       "restore_native_partition_entries",
       [](EmbeddingStoreWrapper &self, const std::vector<std::string> &uris,
@@ -832,15 +848,17 @@ NB_MODULE(_core, m) {
       [](EmbeddingStoreWrapper &self, const std::vector<std::string> &uris,
          uint64_t version, uint32_t participant_index,
          const std::string &key_dtype, const nb::dict &storage_options,
-         bool load_optimizer_state) {
+         bool load_optimizer_state, uint64_t page_layout_generation) {
         self.restore_native_page_images(
             uris, version, participant_index, key_dtype,
-            checkpoint_storage_options(storage_options), load_optimizer_state);
+            checkpoint_storage_options(storage_options), load_optimizer_state,
+            page_layout_generation);
       },
       nb::arg("store"), nb::arg("uris"), nb::arg("version"),
       nb::arg("participant_index"), nb::arg("key_dtype"),
       nb::arg("storage_options") = nb::dict(),
-      nb::arg("load_optimizer_state") = true);
+      nb::arg("load_optimizer_state") = true,
+      nb::arg("page_layout_generation"));
   checkpoint.def(
       "active_entry_keys",
       [](const std::string &uri, uint64_t version,
@@ -899,7 +917,8 @@ NB_MODULE(_core, m) {
          const std::string &embedding_dtype, const std::string &optimizer_dtype,
          const std::string &score_policy, const std::string &key_dtype,
          const std::string &schema_digest, bool include_page_images,
-         uint32_t entries_per_page, const nb::dict &storage_options) {
+         uint32_t entries_per_page, const std::string &page_dataset_uri,
+         const nb::dict &storage_options) {
         const auto options = checkpoint_storage_options(storage_options);
         se::NativeFragmentArtifact artifact;
         {
@@ -907,7 +926,8 @@ NB_MODULE(_core, m) {
           artifact = se::compact_native_checkpoint(
               target_uri, source_uris, participant_index, dimensions,
               embedding_dtype, optimizer_dtype, score_policy, key_dtype,
-              schema_digest, include_page_images, entries_per_page, options);
+              schema_digest, include_page_images, entries_per_page,
+              page_dataset_uri, options);
         }
         nb::dict result;
         result["entry_count"] = artifact.entry_count;
@@ -920,7 +940,7 @@ NB_MODULE(_core, m) {
       nb::arg("embedding_dtype"), nb::arg("optimizer_dtype"),
       nb::arg("score_policy"), nb::arg("key_dtype"), nb::arg("schema_digest"),
       nb::arg("include_page_images"), nb::arg("entries_per_page"),
-      nb::arg("storage_options"));
+      nb::arg("page_dataset_uri"), nb::arg("storage_options"));
   checkpoint.def(
       "compact_native_lance_sources",
       [](const std::string &target_uri,

@@ -1,6 +1,6 @@
 # 架构与 API 契约
 
-[English](storage_architecture.md) | [性能与可靠性报告](performance_and_reliability_report_zh.md) | [Lance 存储与 Gravitino 集成指南](lance_storage_and_gravitino_zh.md)
+[English](storage_architecture.md) | [增量检查点与流式 Compaction](incremental_checkpoint_zh.md) | [Lance 存储与 Gravitino 集成指南](lance_storage_and_gravitino_zh.md) | [性能与可靠性报告](performance_and_reliability_report_zh.md) | [动态学习率](dynamic_learning_rate_zh.md)
 
 本文档面向系统工程师与架构师，系统性阐述 Sparse Embedding 存储引擎的总体架构、并发与内存模型、分层存储拓扑、淘汰调度以及分布式接口契约。
 
@@ -186,9 +186,11 @@ ranks_func = se.partition(keys, partition_count=4, algorithm="sparse_embedding.h
 - **训练与推理状态隔离**：
   - 训练实例：分配并管理优化器状态页（Adam 一阶/二阶动量）；
   - 推理实例：配置 `EmbeddingConfig(enable_optimizer=False)` 构建权重专属 Store，杜绝分配优化器状态内存。
+- **拓扑自适应恢复**：`RestorePlan.from_topology` 自动比对检查点保存卡数与当前集群拓扑，卡数一致时走 `RankRestore`，扩缩容时自动路由为基于 AVX-512 SIMD 掩码过滤的 `ReshardRestore`。
 - **两阶段提交与 Lance 湖仓持久化**：底层通过 `snapshot_manifest.lance`（控制面元数据账本）与 `entries.lance`（数据面物理切片）实现 2PC 原子发布与恢复。
+- **增量检查点与流式合流**：分片变动日志追踪脏数据与删除墓碑，支持无阻塞一致性切片与多版本流式 Compaction。
 
-> 完整的 Lance 检查点存储架构、两阶段提交、增量恢复与 Gravitino 集成规范，请参阅专门文档：[Lance 存储与 Gravitino 集成指南](lance_storage_and_gravitino_zh.md)。
+> 完整的 Lance 检查点存储架构、两阶段提交、增量恢复与 Gravitino 集成规范，请参阅专门文档：[Lance 存储与 Gravitino 集成指南](lance_storage_and_gravitino_zh.md) 及 [增量检查点与流式 Compaction](incremental_checkpoint_zh.md)。
 
 ---
 
@@ -213,6 +215,10 @@ config = se.EmbeddingConfig(
     storage=storage,                     # 存储后端
     key_dtype="uint64",                  # 键数据类型 (支持 int32/uint32/int64/uint64)
     value_dtype="float32",               # 物理值类型
+    optimizer_dtype="float32",           # 优化器动量类型 (支持 bf16/fp16/fp32)
+    gradient_dtype="bfloat16",           # 梯度累积类型 (可选)
+    gradient_scale=1.0,                  # 梯度缩放系数
+    enable_optimizer=True,               # 设为 False 用于纯权重推理 Store
     storage_tuning=se.StorageTuningOptions(
         target_capacity_keys=10_000_000, # 预估键容量
         memory_budget_bytes=4 << 30,     # 内存调优预算

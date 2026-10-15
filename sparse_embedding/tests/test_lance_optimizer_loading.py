@@ -6,20 +6,20 @@ import pytest
 import sparse_embedding as se
 from sparse_embedding.checkpoint import (
     CheckpointParticipant,
-    ElasticRestore,
-    PhysicalRestore,
-    PhysicalRestoreStrategy,
+    IngestionEngine,
+    PartitionSpec,
+    RankRestore,
+    ReshardRestore,
     SparseCheckpoint,
-    SparsePartitionAssignmentSpec,
     encode_restore_options,
 )
 from sparse_embedding.checkpoint.lance_backend import LocalLanceStorage
 from sparse_embedding.checkpoint.schema import ENTRIES_DATASET
 
 
-def _modulo_restore(partition_count: int, partition_id: int) -> ElasticRestore:
-    return ElasticRestore(
-        SparsePartitionAssignmentSpec.modulo(),
+def _modulo_restore(partition_count: int, partition_id: int) -> ReshardRestore:
+    return ReshardRestore(
+        PartitionSpec.modulo(),
         partition_count,
         partition_id,
         "uint64",
@@ -45,7 +45,7 @@ def _store_with_optimizer_state():
     store.lookup_or_insert(keys, dim=4)
     gradients = np.ones((1, 4), dtype=np.float32)
     store.accumulate_gradients(keys, gradients)
-    store.optimizer_step()
+    store.optimizer_step(1)
     return store, keys, gradients
 
 
@@ -67,11 +67,11 @@ def test_default_and_disabled_optimizer_metadata_and_operations():
     with pytest.raises(RuntimeError, match="optimizer enabled"):
         disabled.accumulate_gradients(keys, gradients)
     with pytest.raises(RuntimeError, match="optimizer enabled"):
-        disabled.optimizer_step()
+        disabled.optimizer_step(1)
     with pytest.raises(RuntimeError, match="optimizer enabled"):
         asyncio.run(disabled.async_accumulate_gradients(keys, gradients))
     with pytest.raises(RuntimeError, match="optimizer enabled"):
-        asyncio.run(disabled.async_optimizer_step())
+        asyncio.run(disabled.async_optimizer_step(1))
     with pytest.raises(ValueError, match="optimizer_config cannot be provided"):
         se.EmbeddingStore(_config(enable_optimizer=False), optimizer_config=se.Adam())
 
@@ -95,7 +95,7 @@ def test_entries_snapshot_skips_optimizer_state_for_disabled_target(tmp_path):
 
     np.testing.assert_allclose(_lookup(target, keys), _lookup(source, keys))
     with pytest.raises(RuntimeError, match="optimizer enabled"):
-        target.optimizer_step()
+        target.optimizer_step(1)
 
 
 def test_page_image_snapshot_skips_optimizer_state_for_disabled_target(tmp_path):
@@ -112,9 +112,9 @@ def test_page_image_snapshot_skips_optimizer_state_for_disabled_target(tmp_path)
         target,
         locator.handle,
         encode_restore_options(
-            PhysicalRestore(
+            RankRestore(
                 CheckpointParticipant(0, 1),
-                strategy=PhysicalRestoreStrategy.FAST_PAGE_CACHE,
+                engine=IngestionEngine.FAST_PAGE_CACHE,
             )
         ),
         load_optimizer_state=False,
@@ -133,59 +133,46 @@ def test_training_restore_default_loads_optimizer_state(tmp_path):
     )
 
     SparseCheckpoint(storage).load_training_checkpoint(
-        target, locator.handle, encode_restore_options(_modulo_restore(1, 0))
+        target, locator.handle, _modulo_restore(1, 0)
     )
     source.accumulate_gradients(keys, gradients)
-    source.optimizer_step()
+    source.optimizer_step(1)
     target.accumulate_gradients(keys, gradients)
-    target.optimizer_step()
+    target.optimizer_step(1)
 
     np.testing.assert_allclose(_lookup(target, keys), _lookup(source, keys), atol=1e-3)
 
 
 def test_training_restore_explicit_weight_only_does_not_load_optimizer_state(tmp_path):
     source, keys, _ = _store_with_optimizer_state()
-    gradients = np.asarray([[2.0, 3.0, 4.0, 5.0]], dtype=np.float32)
     storage = LocalLanceStorage(tmp_path / "weight-only")
     locator = SparseCheckpoint(storage).save_training_checkpoint(source, "weight-only")
-    target = se.EmbeddingStore(
-        _config(optimizer_dtype="float16"), optimizer_config=se.Adam(lr=0.01)
-    )
+    target = se.EmbeddingStore(_config(enable_optimizer=False))
 
     SparseCheckpoint(storage).load_training_checkpoint(
         target,
         locator.handle,
-        encode_restore_options(_modulo_restore(1, 0)),
+        _modulo_restore(1, 0),
         load_optimizer_state=False,
     )
-    source.accumulate_gradients(keys, gradients)
-    source.optimizer_step()
-    target.accumulate_gradients(keys, gradients)
-    target.optimizer_step()
-
-    assert not np.allclose(_lookup(target, keys), _lookup(source, keys), atol=1e-3)
+    np.testing.assert_allclose(_lookup(target, keys), _lookup(source, keys))
 
 
-def test_training_weight_only_restore_accepts_disabled_or_different_optimizer(tmp_path):
+def test_training_weight_only_restore_requires_disabled_optimizer(tmp_path):
     source, keys, _ = _store_with_optimizer_state()
     storage = LocalLanceStorage(tmp_path / "weight-only-targets")
     locator = SparseCheckpoint(storage).save_training_checkpoint(
         source, "weight-only-targets"
     )
 
-    for target in (
-        se.EmbeddingStore(_config(enable_optimizer=False)),
-        se.EmbeddingStore(
-            _config(optimizer_dtype="float32"), optimizer_config=se.Adam(lr=0.01)
-        ),
-    ):
-        SparseCheckpoint(storage).load_training_checkpoint(
-            target,
-            locator.handle,
-            encode_restore_options(_modulo_restore(1, 0)),
-            load_optimizer_state=False,
-        )
-        np.testing.assert_allclose(_lookup(target, keys), _lookup(source, keys))
+    target = se.EmbeddingStore(_config(enable_optimizer=False))
+    SparseCheckpoint(storage).load_training_checkpoint(
+        target,
+        locator.handle,
+        _modulo_restore(1, 0),
+        load_optimizer_state=False,
+    )
+    np.testing.assert_allclose(_lookup(target, keys), _lookup(source, keys))
 
 
 def test_training_restore_rejects_optimizer_state_for_disabled_target(tmp_path):
@@ -196,5 +183,5 @@ def test_training_restore_rejects_optimizer_state_for_disabled_target(tmp_path):
 
     with pytest.raises(ValueError, match="load_optimizer_state requires"):
         SparseCheckpoint(storage).load_training_checkpoint(
-            target, locator.handle, encode_restore_options(_modulo_restore(1, 0))
+            target, locator.handle, _modulo_restore(1, 0)
         )

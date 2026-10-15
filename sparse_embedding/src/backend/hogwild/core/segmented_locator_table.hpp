@@ -18,15 +18,38 @@
 
 namespace se::hogwild_internal {
 
+using se::memory::PackedReadGuard;
 using se::memory::PackedWriteGuard;
 
-struct alignas(8) LocatorSlot {
-  std::atomic<uint64_t> packed{0};
-  uint64_t key{0};
-  std::atomic<uint32_t> readers{0};
+class CheckpointRecordRef {
+public:
+  constexpr CheckpointRecordRef() noexcept = default;
+
+  static constexpr CheckpointRecordRef from(void *record) noexcept {
+    return CheckpointRecordRef(record);
+  }
+
+  constexpr bool has_value() const noexcept { return pointer_ != nullptr; }
+
+  constexpr void *opaque_address() const noexcept { return pointer_; }
+
+private:
+  explicit constexpr CheckpointRecordRef(void *pointer) noexcept
+      : pointer_(pointer) {}
+
+  void *pointer_ = nullptr;
 };
 
-static_assert(sizeof(LocatorSlot) == 24);
+static_assert(sizeof(CheckpointRecordRef) == sizeof(void *));
+
+struct alignas(8) LocatorSlot {
+  mutable std::atomic<uint64_t> packed{0};
+  uint64_t key{0};
+  mutable std::atomic<uint32_t> readers{0};
+  std::atomic<void *> checkpoint_record{nullptr};
+};
+
+static_assert(sizeof(LocatorSlot) == 32);
 static_assert(alignof(LocatorSlot) == 8);
 static_assert(std::atomic<uint64_t>::is_always_lock_free);
 
@@ -53,7 +76,8 @@ public:
   SegmentedLocatorTable(const SegmentedLocatorTable &) = delete;
   SegmentedLocatorTable &operator=(const SegmentedLocatorTable &) = delete;
 
-  uint32_t allocate(uint64_t key, uint32_t arena_index) {
+  uint32_t allocate(uint64_t key, uint32_t arena_index,
+                    CheckpointRecordRef checkpoint_record) {
     const std::optional<uint32_t> recycled = take_recycled_slot();
     const uint32_t slot_id =
         recycled.has_value()
@@ -67,11 +91,18 @@ public:
       const uint64_t current = slot.packed.load(std::memory_order_acquire);
       if (decode_index(current) != 0)
         throw std::logic_error("recycled locator slot is still live");
+      if (slot.checkpoint_record.load(std::memory_order_relaxed) != nullptr)
+        throw std::logic_error(
+            "recycled locator slot retains checkpoint record");
       slot.key = key;
+      slot.checkpoint_record.store(checkpoint_record.opaque_address(),
+                                   std::memory_order_relaxed);
       slot.packed.store(pack(version_of(current), encode(arena_index)),
                         std::memory_order_release);
     } else {
       slot.key = key;
+      slot.checkpoint_record.store(checkpoint_record.opaque_address(),
+                                   std::memory_order_relaxed);
       slot.packed.store(pack(0, encode(arena_index)),
                         std::memory_order_release);
     }
@@ -88,6 +119,7 @@ public:
     const uint64_t current = slot.packed.load(std::memory_order_acquire);
     if (decode_index(current) == 0)
       throw std::logic_error("locator slot was already released");
+    slot.checkpoint_record.store(nullptr, std::memory_order_relaxed);
     slot.packed.store(pack(version_of(current), 0), std::memory_order_release);
     {
       std::lock_guard lock(recycle_mutex_);
@@ -147,6 +179,14 @@ public:
     return slot;
   }
 
+  CheckpointRecordRef checkpoint_record(uint32_t slot_id) const {
+    const LocatorSlot *slot = locate(slot_id);
+    if (slot == nullptr)
+      throw std::out_of_range("locator slot is not allocated");
+    return CheckpointRecordRef::from(
+        slot->checkpoint_record.load(std::memory_order_acquire));
+  }
+
   void prefetch_slot_cacheline(uint32_t slot_id) const noexcept {
     const LocatorSlot *slot = locate(slot_id);
     if (slot != nullptr) {
@@ -192,6 +232,7 @@ public:
   }
 
   template <typename Read> bool try_read(uint32_t slot_id, Read &&read) {
+    static_assert(std::is_invocable_v<Read, uint32_t>);
     const LocatorSlot *slot = locate(slot_id);
     if (slot == nullptr)
       return false;
@@ -213,7 +254,31 @@ public:
   }
 
   template <typename Read>
+  bool try_read_with_record(uint32_t slot_id, Read &&read) {
+    static_assert(std::is_invocable_v<Read, uint32_t, CheckpointRecordRef>);
+    const LocatorSlot *slot = locate(slot_id);
+    if (slot == nullptr)
+      return false;
+    while (true) {
+      PackedReadGuard guard(slot->packed, slot->readers);
+      const uint64_t before = slot->packed.load(std::memory_order_acquire);
+      const uint32_t encoded = decode_index(before);
+      if (encoded == 0)
+        return false;
+      se::memory::compiler_barrier();
+      std::forward<Read>(read)(
+          decode(encoded),
+          CheckpointRecordRef::from(
+              slot->checkpoint_record.load(std::memory_order_acquire)));
+      se::memory::compiler_barrier();
+      if (before == slot->packed.load(std::memory_order_acquire))
+        return true;
+    }
+  }
+
+  template <typename Read>
   bool try_read_key(uint32_t slot_id, uint64_t expected_key, Read &&read) {
+    static_assert(std::is_invocable_v<Read, uint32_t>);
     const LocatorSlot *slot = locate(slot_id);
     if (slot == nullptr)
       return false;
@@ -228,6 +293,30 @@ public:
         return false;
       se::memory::compiler_barrier();
       std::forward<Read>(read)(decode(encoded));
+      se::memory::compiler_barrier();
+      if (before == slot->packed.load(std::memory_order_acquire))
+        return true;
+    }
+  }
+
+  template <typename Read>
+  bool try_read_key_with_record(uint32_t slot_id, uint64_t expected_key,
+                                Read &&read) {
+    static_assert(std::is_invocable_v<Read, uint32_t, CheckpointRecordRef>);
+    const LocatorSlot *slot = locate(slot_id);
+    if (slot == nullptr)
+      return false;
+    while (true) {
+      PackedReadGuard guard(slot->packed, slot->readers);
+      const uint64_t before = slot->packed.load(std::memory_order_acquire);
+      const uint32_t encoded = decode_index(before);
+      if (encoded == 0 || slot->key != expected_key)
+        return false;
+      se::memory::compiler_barrier();
+      std::forward<Read>(read)(
+          decode(encoded),
+          CheckpointRecordRef::from(
+              slot->checkpoint_record.load(std::memory_order_acquire)));
       se::memory::compiler_barrier();
       if (before == slot->packed.load(std::memory_order_acquire))
         return true;
@@ -336,6 +425,7 @@ private:
     std::vector<LocatorSlot *> slots;
     std::vector<se::memory::PackedWriteTarget> targets;
     std::vector<uint32_t> indices;
+    std::vector<CheckpointRecordRef> checkpoint_records;
   };
 
   static KeyedBatchScratch &keyed_batch_scratch() {
@@ -347,6 +437,8 @@ public:
   template <typename Write>
   bool try_write_key_batch(std::span<const KeyedWriteSlot> entries,
                            Write &&write) {
+    static_assert(std::is_invocable_v<Write, std::span<const uint32_t>,
+                                      std::span<const CheckpointRecordRef>>);
     if (entries.empty())
       throw std::invalid_argument("locator keyed batch is empty");
     KeyedBatchScratch &scratch = keyed_batch_scratch();
@@ -383,6 +475,7 @@ public:
     scratch.slots.resize(entries.size());
     scratch.targets.resize(entries.size());
     scratch.indices.resize(entries.size());
+    scratch.checkpoint_records.resize(entries.size());
     for (size_t lock_position = 0; lock_position < scratch.lock_order.size();
          ++lock_position) {
       const size_t position = scratch.lock_order[lock_position];
@@ -409,18 +502,25 @@ public:
           break;
         }
         scratch.indices[position] = decode(encoded);
+        scratch.checkpoint_records[position] = CheckpointRecordRef::from(
+            slot.checkpoint_record.load(std::memory_order_acquire));
       }
       if (valid)
-        std::forward<Write>(write)(std::span<const uint32_t>(scratch.indices));
+        std::forward<Write>(write)(
+            std::span<const uint32_t>(scratch.indices),
+            std::span<const CheckpointRecordRef>(scratch.checkpoint_records));
     }
     scratch.slots.clear();
     scratch.targets.clear();
     scratch.indices.clear();
+    scratch.checkpoint_records.clear();
     return valid;
   }
 
   template <typename Retire>
   bool retire(uint32_t slot_id, uint32_t expected_index, Retire &&retire) {
+    static_assert(
+        std::is_nothrow_invocable_v<Retire, uint32_t, CheckpointRecordRef>);
     LocatorSlot &slot = locate_required(slot_id);
     if (version_of(slot.packed.load(std::memory_order_acquire)) >
         kRotationSequence)
@@ -429,14 +529,17 @@ public:
     const uint64_t current = slot.packed.load(std::memory_order_acquire);
     if (decode_index(current) != encode(expected_index))
       return false;
-    std::forward<Retire>(retire)(expected_index);
+    std::forward<Retire>(retire)(
+        expected_index, CheckpointRecordRef::from(slot.checkpoint_record.load(
+                            std::memory_order_acquire)));
     slot.packed.store(pack(version_of(current), 0), std::memory_order_release);
     return true;
   }
 
   template <typename Retire>
   bool retire_current(uint32_t slot_id, Retire &&retire) noexcept {
-    static_assert(std::is_nothrow_invocable_v<Retire, uint32_t>);
+    static_assert(
+        std::is_nothrow_invocable_v<Retire, uint32_t, CheckpointRecordRef>);
     LocatorSlot *located = const_cast<LocatorSlot *>(locate(slot_id));
     if (located == nullptr)
       std::terminate();
@@ -446,7 +549,9 @@ public:
     const uint32_t encoded = decode_index(current);
     if (encoded == 0)
       return false;
-    std::forward<Retire>(retire)(decode(encoded));
+    std::forward<Retire>(retire)(
+        decode(encoded), CheckpointRecordRef::from(slot.checkpoint_record.load(
+                             std::memory_order_acquire)));
     slot.packed.store(pack(version_of(current), 0), std::memory_order_release);
     return true;
   }
@@ -460,6 +565,7 @@ public:
     PackedWriteGuard guard(slot.packed, slot.readers);
     if (decode_index(slot.packed.load(std::memory_order_acquire)) != 0)
       std::terminate();
+    slot.checkpoint_record.store(nullptr, std::memory_order_relaxed);
     try {
       std::lock_guard lock(recycle_mutex_);
       recycled_slots_.push_back(slot_id);
@@ -587,6 +693,6 @@ private:
 };
 
 static_assert(sizeof(LocatorSlot) * SegmentedLocatorTable::kEntriesPerSegment ==
-              98304);
+              131072);
 
 } // namespace se::hogwild_internal

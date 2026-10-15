@@ -81,7 +81,7 @@ void run_optimizer_step_dim1_regression(std::string_view mode) {
       std::vector<float> gradients(key_count, 1.0F);
       for (size_t round = 0; round < rounds; ++round) {
         store.accumulate_gradients<uint64_t>(keys, gradients, lengths);
-        store.optimizer_step();
+        store.optimizer_step(1);
       }
     } catch (...) {
       errors[0] = std::current_exception();
@@ -200,7 +200,7 @@ int main(int argc, char **argv) {
                   static_cast<float>(row + 1));
     duplicate_gradient_store.accumulate_gradients<uint64_t>(
         repeated_keys, repeated_gradients, repeated_lengths);
-    duplicate_gradient_store.optimizer_step();
+    duplicate_gradient_store.optimizer_step(1);
   }
   constexpr se::AdaptivePageSelectorConfig sealing_config{0.0F, 0.0F, 0.75F, 1,
                                                           4096 * 64};
@@ -473,7 +473,7 @@ int main(int argc, char **argv) {
   hot_promotion_store.accumulate_gradients<uint64_t>(
       promoted_training_keys, promoted_training_gradients,
       promoted_training_lengths);
-  hot_promotion_store.optimizer_step();
+  hot_promotion_store.optimizer_step(1);
   std::array<float, 16> promoted_training_after{};
   hot_promotion_store.lookup<uint64_t>(promoted_training_keys,
                                        promoted_training_after,
@@ -1340,7 +1340,7 @@ int main(int argc, char **argv) {
   spill_training_gradients.fill(1.0F);
   watermark_store.accumulate_gradients<uint64_t>(
       watermark_key, spill_training_gradients, watermark_length);
-  watermark_store.optimizer_step();
+  watermark_store.optimizer_step(1);
   watermark_values.fill(0.0F);
   watermark_store.lookup<uint64_t>(watermark_key, watermark_values,
                                    watermark_length);

@@ -1,6 +1,6 @@
 # Lance Storage and Gravitino Checkpoint Integration Guide
 
-[中文](lance_storage_and_gravitino_zh.md) | [Architecture and API](storage_architecture.md) | [Performance and Reliability Report](performance_and_reliability_report.md)
+[中文](lance_storage_and_gravitino_zh.md) | [Architecture and API](storage_architecture.md) | [Incremental Checkpointing](incremental_checkpoint.md) | [Performance and Reliability Report](performance_and_reliability_report.md) | [Dynamic Learning Rate](dynamic_learning_rate.md)
 
 This document provides a comprehensive guide for engineers and architects integrating the Sparse Embedding checkpoint engine with the Lance columnar format, Apache Gravitino Lakehouse catalog, and Lance REST operations.
 
@@ -52,19 +52,22 @@ SparseCheckpoint
 
 ## 3. Quickstart: Checkpoint Save and Restore
 
-The following example demonstrates initializing local Lance storage, saving training state, and restoring via physical reconstruction or elastic re-sharding:
+The following example demonstrates initializing local Lance storage, saving training state, and restoring via automated topology routing or explicit plans:
 
 ```python
+import numpy as np
 import sparse_embedding as se
 from sparse_embedding.checkpoint import (
     CheckpointParticipant,
-    ElasticRestore,
+    CheckpointSaveMode,
+    IngestionEngine,
     LocalLanceStorage,
-    PhysicalRestore,
-    PhysicalRestoreStrategy,
+    PartitionSpec,
+    RankRestore,
+    ReshardRestore,
+    RestorePlan,
     SparseCheckpoint,
-    SparsePartitionAssignmentSpec,
-    encode_restore_options,
+    compact_fragments,
 )
 
 # 1. Initialize storage and checkpoint facade
@@ -72,40 +75,51 @@ storage = LocalLanceStorage.from_checkpoint_root("/checkpoints/user_embedding")
 checkpoint = SparseCheckpoint(storage)
 
 # 2. Save training checkpoint (default persists canonical entries, saving 50% write bandwidth)
-committed = checkpoint.save_training_checkpoint(store, "step-1000")
+committed = checkpoint.save_training_checkpoint(
+    store,
+    "user_embedding",
+    mode=CheckpointSaveMode.FULL,
+)
 
 # Optional: persist physical page images for fastest restore cold-start
-# committed = checkpoint.save_training_checkpoint(store, "step-1000", include_page_images=True)
+# committed = checkpoint.save_training_checkpoint(
+#     store, "user_embedding", include_page_images=True
+# )
 
-# 3. Scenario A: Physical Restore (PhysicalRestore)
-# Used when worker count and partition topology match; reconstructs pages deterministically
+# 3. Scenario A: Automated Topology-Aware Restore (Recommended)
+# Auto-selects RankRestore when cluster topology matches, or ReshardRestore when resized
 restored_store = se.EmbeddingStore(config)
+plan = RestorePlan.from_topology(
+    saved_participant_count=1,
+    participant=CheckpointParticipant(0, 1),
+    spec=PartitionSpec.hash(seed=42),
+    key_dtype="uint64",
+)
+checkpoint.load_training_checkpoint(restored_store, committed.handle, plan)
+
+# 4. Scenario B: Explicit Rank Restore (RankRestore)
+# Used when worker count and partition topology match; reconstructs pages deterministically
 checkpoint.load_training_checkpoint(
     restored_store,
     committed.handle,
-    encode_restore_options(
-        PhysicalRestore(
-            participant=CheckpointParticipant(0, 1),
-            strategy=PhysicalRestoreStrategy.RECONSTRUCT_ENTRIES,
-            key_dtype="uint64",
-        )
+    RestorePlan.from_participant(
+        CheckpointParticipant(0, 1),
+        engine=IngestionEngine.RECONSTRUCT_ENTRIES,
+        key_dtype="uint64",
     ),
 )
 
-# 4. Scenario B: Elastic Topology Restore (ElasticRestore)
+# 5. Scenario C: Explicit Reshard Restore (ReshardRestore)
 # Used when cluster size changes; dynamically filters keys for the current partition
-spec = SparsePartitionAssignmentSpec.hash()
 restored_store_elastic = se.EmbeddingStore(config)
 checkpoint.load_training_checkpoint(
     restored_store_elastic,
     committed.handle,
-    encode_restore_options(
-        ElasticRestore(
-            spec=spec,
-            partition_count=8,
-            partition_id=0,
-            key_dtype="uint64",
-        )
+    RestorePlan.from_partition(
+        PartitionSpec.hash(seed=42),
+        partition_count=8,
+        partition_id=0,
+        key_dtype="uint64",
     ),
 )
 ```
@@ -118,17 +132,20 @@ checkpoint.load_training_checkpoint(
 
 | Restore Strategy | Primary Use Case | Underlying Mechanism | Error & Defense Policy |
 |---|---|---|---|
-| **`PhysicalRestore (RECONSTRUCT_ENTRIES)`** | Identical topology, post-compaction restore | Reads canonical `entries.lance`, reconstructs native page layouts deterministically | Single Source of Truth (SSOT), fully deterministic |
-| **`PhysicalRestore (FAST_PAGE_CACHE)`** | Ultra-fast cold-start (requires `include_page_images=True`) | Direct bounded-batch mapping of `page_images.lance` binary pages, bypassing row builds | If cache was not saved, **strictly raises `FileNotFoundError`** with zero silent fallback |
-| **`ElasticRestore`** | Cluster resize, topological re-sharding, dynamic loading | Evaluates assignment spec (`hash`, `modulo`, `fast_range`) via native AVX-512 SIMD slice filtering (`filter_span`) | Missing or mismatched partitioner algorithm raises exception directly |
+| **`RestorePlan.from_topology`** | **Automated topology routing (Recommended)** | Inspects saved participant count: auto-routes to `RankRestore` if matching, or `ReshardRestore` if changed | Validates `saved_participant_count > 0`, zero silent fallback |
+| **`RankRestore (RECONSTRUCT_ENTRIES)`** | Identical topology, post-compaction restore | Reads canonical `entries.lance`, reconstructs native page layouts deterministically | Single Source of Truth (SSOT), fully deterministic |
+| **`RankRestore (FAST_PAGE_CACHE)`** | Ultra-fast cold-start (requires `include_page_images=True`) | Direct bounded-batch mapping of `page_images.lance` binary pages, bypassing row builds | If cache was not saved, **strictly raises `FileNotFoundError`** with zero silent fallback |
+| **`ReshardRestore`** | Cluster resize, topological re-sharding, dynamic loading | Evaluates partition spec (`hash`, `modulo`, `fast_range`) via native AVX-512 SIMD slice filtering (`filter_span`) | Missing or mismatched partitioner algorithm raises exception directly |
 
-### 4.2 Training vs. Inference Weight Isolation
+### 4.2 Training vs. Inference Weight Isolation and Orthogonal Restore Matrix
 
-- **Training Restore**: Default behavior loads full embedding weights and optimizer momentum state (`load_optimizer_state=True`).
-- **Inference Serving**:
-  - Inference stores configure `EmbeddingConfig(enable_optimizer=False)` to skip optimizer page allocation entirely.
-  - Dedicated entry point `inference_storage.load_inference_weights(...)` loads only embedding weights.
-  - Requesting optimizer state loading on an optimizer-disabled store raises an explicit exception.
+Restoration operates across two strictly orthogonal dimensions ($2 \times 2$ Cartesian product architecture):
+- **Payload Scope**:
+  - **Training Restore (`load_training_checkpoint`)**: Loads embedding weights and optimizer momentum states (`load_optimizer_state=True`).
+  - **Inference Restore (`load_inference_checkpoint`)**: Loads embedding weights only (`load_optimizer_state=False`), requiring the target store to disable optimizer state (`enable_optimizer=False`) to avoid memory waste. Requesting optimizer loading into an optimizer-disabled store raises an exception directly.
+- **Topology Routing Strategy (`RestorePlan`)**:
+  - Both training and inference **uniformly support** `RankRestore` and `ReshardRestore`.
+  - Inference supports `RankRestore(..., engine=IngestionEngine.FAST_PAGE_CACHE)` for ultra-fast direct binary page image mapping cold-start, as well as `ReshardRestore` for heterogeneous inference sharding.
 
 ### 4.3 Native Arrow Key DTypes and Pushdown
 
@@ -168,35 +185,44 @@ sample_keys, expected_ranks = generate_reference_vectors(
 
 ### 5.1 Incremental Workflow
 
-- **FULL Snapshot**: Captures all live keys and optimizer state.
-- **INCREMENTAL Snapshot**: Captures only dirty keys and deletion tombstones since the parent checkpoint. Empty deltas append only a manifest record without creating payload datasets.
+- **FULL Snapshot**: Captures all live keys and optimizer state (`CheckpointSaveMode.FULL`).
+- **INCREMENTAL Snapshot**: Captures only dirty keys and deletion tombstones since the parent checkpoint (`CheckpointSaveMode.INCREMENTAL`, specifying `parent_handle`). Empty deltas append only a manifest record without creating payload datasets.
 - **Restore Resolution**: The restore pipeline validates the parent chain and executes streaming multi-version reconciliation in native C++, eliminating deleted historical keys without inflating peak memory.
 
-### 5.2 Standalone Streaming Compaction
+### 5.2 Streaming Compaction
 
-As incremental checkpoints accumulate, independent offline jobs can compact fragments into a consolidated FULL version without starting a full training worker:
+As incremental checkpoints accumulate, multi-version delta chains can be compacted into a consolidated `FULL` version:
 
 ```python
-from sparse_embedding.checkpoint.lance_backend import compact_fragments
-
-# 1. Compact local filesystem slices
-compact_fragments(
-    "/checkpoints/user_embedding/_staging",
-    "/exports/user_embedding",
+# 1. Managed compaction: merges delta chain into a new self-contained FULL checkpoint
+compacted_handle = storage.compact_checkpoint(
+    committed_inc.handle,
+    include_page_images=True,  # Optional: generate page cache for instant cold-start
 )
 
-# 2. Compact remote object storage slices (supports s3:// and s3a:// URIs)
+# Future restores can load directly from the compacted FULL handle
+compacted_store = se.EmbeddingStore(config)
+checkpoint.load_training_checkpoint(
+    compacted_store,
+    compacted_handle,
+    RestorePlan.from_participant(
+        CheckpointParticipant(0, 1),
+        key_dtype="uint64",
+    ),
+)
+
+# 2. Standalone directory compaction: merge raw Lance fragment folders directly
+from sparse_embedding.checkpoint import compact_fragments
+
 compact_fragments(
-    "s3://my-bucket/checkpoints/user_embedding/_staging",
-    "s3://my-bucket/exports/user_embedding",
-    storage_options={
-        "endpoint": "http://s3.us-east-1.amazonaws.com",
-        "region": "us-east-1",
-    },
+    source_path="/checkpoints/user_embedding/_staging",
+    target_path="/exports/user_embedding",
 )
 ```
 
 Compaction utilizes native streaming readers and bounded channels configured via `checkpoint_stream_policy.hpp`, bounding memory usage and leaving source versions immutable.
+
+> For in-depth architecture, mutation journaling, and schema details, refer to [Incremental Checkpointing and Streaming Compaction](incremental_checkpoint.md).
 
 ---
 

@@ -10,11 +10,10 @@ import msgpack
 from .base import (
     SUPPORTED_KEY_DTYPES,
     CheckpointParticipant,
-    ElasticRestore,
+    IngestionEngine,
     PartitionSpec,
-    PhysicalRestore,
-    PhysicalRestoreStrategy,
-    RestoreMode,
+    RankRestore,
+    ReshardRestore,
     RestorePlan,
 )
 
@@ -45,10 +44,9 @@ def _reject_duplicate_map_keys(
 
 def _canonicalize(value: object) -> object:
     if isinstance(value, Mapping):
-        return {
-            str(key): _canonicalize(value[key])
-            for key in sorted(value, key=lambda item: str(item))
-        }
+        if any(not isinstance(key, str) for key in value):
+            raise TypeError("restore option map keys must be strings")
+        return {key: _canonicalize(value[key]) for key in sorted(value)}
     if isinstance(value, (list, tuple)):
         return [_canonicalize(item) for item in value]
     return value
@@ -64,9 +62,9 @@ def _pack(payload: Mapping[str, object]) -> bytes:
 
 def _unpack(payload: bytes) -> dict[str, object]:
     if not isinstance(payload, bytes):
-        raise TypeError("owner restore options must be bytes")
+        raise TypeError("restore options must be bytes")
     if not payload or len(payload) > _MAX_PAYLOAD_BYTES:
-        raise ValueError("owner restore options have an invalid size")
+        raise ValueError("restore options have an invalid size")
     try:
         decoded = msgpack.unpackb(
             payload,
@@ -81,11 +79,11 @@ def _unpack(payload: bytes) -> dict[str, object]:
             max_ext_len=0,
         )
     except (TypeError, ValueError, msgpack.exceptions.UnpackException) as error:
-        raise ValueError("owner restore options are malformed") from error
+        raise ValueError("restore options are malformed") from error
     if not isinstance(decoded, dict):
-        raise ValueError("owner restore options must contain a map")
+        raise ValueError("restore options must contain a map")
     if _pack(decoded) != payload:
-        raise ValueError("owner restore options are not canonical")
+        raise ValueError("restore options are not canonical")
     return decoded
 
 
@@ -95,29 +93,29 @@ def _require_integer(value: object, field: str) -> int:
     return value
 
 
-def encode_restore_options(mode: RestorePlan | RestoreMode) -> bytes:
-    """Encode one typed restore plan as canonical owner-owned opaque bytes."""
+def encode_restore_options(plan: RestorePlan) -> bytes:
+    """Encode one typed restore plan as canonical opaque bytes."""
 
-    if isinstance(mode, PhysicalRestore):
+    if isinstance(plan, RankRestore):
         payload: dict[str, object] = {
-            "key_dtype": mode.key_dtype,
-            "participant_count": mode.participant.participant_count,
-            "participant_index": mode.participant.participant_index,
-            "restore_kind": "physical",
-            "strategy": mode.strategy.value,
+            "key_dtype": plan.key_dtype,
+            "participant_count": plan.participant.participant_count,
+            "participant_index": plan.participant.participant_index,
+            "restore_kind": "rank",
+            "engine": plan.engine.value,
         }
-    elif isinstance(mode, ElasticRestore):
-        assignment = mode.assignment_spec
+    elif isinstance(plan, ReshardRestore):
+        assignment = plan.spec
         payload = {
-            "key_dtype": mode.key_dtype,
-            "partition_count": mode.partition_count,
-            "partition_id": mode.partition_id,
-            "restore_kind": "elastic",
+            "key_dtype": plan.key_dtype,
+            "partition_count": plan.partition_count,
+            "partition_id": plan.partition_id,
+            "restore_kind": "reshard",
             "sparse_assignment_name": assignment.name,
             "sparse_assignment_parameters": assignment.parameters,
         }
     else:
-        raise TypeError("restore mode must be PhysicalRestore or ElasticRestore")
+        raise TypeError("plan must be RankRestore or ReshardRestore")
     encoded = _pack(payload)
     if len(encoded) > _MAX_PAYLOAD_BYTES:
         raise ValueError("restore options exceed the maximum payload size")
@@ -132,38 +130,38 @@ def _decode_restore_options(payload: bytes) -> RestorePlan:
     if not isinstance(restore_kind, str):
         raise TypeError("restore_kind must be a string")
 
-    if restore_kind == "physical":
+    if restore_kind == "rank":
         required = {
+            "engine",
             "key_dtype",
             "participant_count",
             "participant_index",
             "restore_kind",
-            "strategy",
         }
         if set(decoded) != required:
-            raise ValueError("physical restore options contain unknown fields")
+            raise ValueError("rank restore options contain unknown fields")
         key_dtype = decoded["key_dtype"]
-        strategy_name = decoded["strategy"]
+        engine_name = decoded["engine"]
         if not isinstance(key_dtype, str):
-            raise TypeError("physical key_dtype must be a string")
-        if not isinstance(strategy_name, str):
-            raise TypeError("physical restore strategy must be a string")
+            raise TypeError("rank key_dtype must be a string")
+        if not isinstance(engine_name, str):
+            raise TypeError("rank ingestion engine must be a string")
         if key_dtype not in SUPPORTED_KEY_DTYPES:
-            raise ValueError(f"unsupported physical key_dtype: {key_dtype}")
+            raise ValueError(f"unsupported rank key_dtype: {key_dtype}")
         try:
-            strategy = PhysicalRestoreStrategy(strategy_name)
+            engine = IngestionEngine(engine_name)
         except ValueError as error:
-            raise ValueError("unsupported physical restore strategy") from error
-        return PhysicalRestore(
+            raise ValueError("unsupported rank ingestion engine") from error
+        return RankRestore(
             CheckpointParticipant(
                 _require_integer(decoded["participant_index"], "participant_index"),
                 _require_integer(decoded["participant_count"], "participant_count"),
             ),
-            strategy,
+            engine,
             key_dtype=key_dtype,
         )
 
-    if restore_kind == "elastic":
+    if restore_kind == "reshard":
         required = {
             "key_dtype",
             "partition_count",
@@ -173,7 +171,7 @@ def _decode_restore_options(payload: bytes) -> RestorePlan:
             "sparse_assignment_parameters",
         }
         if set(decoded) != required:
-            raise ValueError("elastic restore options contain unknown fields")
+            raise ValueError("reshard restore options contain unknown fields")
         assignment_name = decoded["sparse_assignment_name"]
         parameters = decoded["sparse_assignment_parameters"]
         key_dtype = decoded["key_dtype"]
@@ -184,12 +182,12 @@ def _decode_restore_options(payload: bytes) -> RestorePlan:
         if not isinstance(key_dtype, str):
             raise TypeError("key_dtype must be a string")
         if key_dtype not in SUPPORTED_KEY_DTYPES:
-            raise ValueError(f"unsupported elastic key_dtype: {key_dtype}")
+            raise ValueError(f"unsupported reshard key_dtype: {key_dtype}")
         assignment = PartitionSpec(
             assignment_name,
             parameters,
         )
-        return ElasticRestore(
+        return ReshardRestore(
             assignment,
             _require_integer(decoded["partition_count"], "partition_count"),
             _require_integer(decoded["partition_id"], "partition_id"),

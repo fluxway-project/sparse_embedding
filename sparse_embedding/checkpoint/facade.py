@@ -16,6 +16,7 @@ from .base import (
     RestorePlan,
     SparseCheckpointProtocol,
     SparseCheckpointStorage,
+    run_cleanup_preserving_primary,
 )
 
 
@@ -32,7 +33,7 @@ class SparseCheckpoint:
         store: Any,
         name: str,
         *,
-        weight_path: str | Path | None = None,
+        publish_weight_path: str | Path | None = None,
         include_page_images: bool = False,
         mode: CheckpointSaveMode = CheckpointSaveMode.FULL,
         parent_handle: CheckpointHandle | None = None,
@@ -43,11 +44,6 @@ class SparseCheckpoint:
             raise ValueError("full checkpoint must not specify parent_handle")
         if mode is CheckpointSaveMode.INCREMENTAL and parent_handle is None:
             raise ValueError("incremental checkpoint requires parent_handle")
-        parent_manifest = (
-            self._protocol.resolve_checkpoint_manifest(parent_handle)
-            if parent_handle is not None
-            else None
-        )
         attempt = uuid.uuid4().hex
         identity = CheckpointSaveIdentity(
             name,
@@ -61,58 +57,85 @@ class SparseCheckpoint:
         participant = CheckpointParticipant(0, 1)
         self._protocol.prepare_checkpoint(identity)
         committed: CommittedCheckpoint | None = None
-        fragment = None
+        fragment: bytes
         try:
-            fragment = self._protocol.write_checkpoint_fragment(
+            fragment = self._protocol.write_checkpoint_fragment_bytes(
                 store,
                 identity,
                 participant,
                 include_page_images=include_page_images,
                 mode=mode,
-                parent_manifest=parent_manifest,
+                parent_handle=parent_handle,
             )
             self._protocol.finalize_checkpoint(identity)
-            committed = self._protocol.commit_checkpoint(
+            committed = self._protocol.commit_checkpoint_bytes(
                 identity,
                 (fragment,),
             )
             self._protocol.acknowledge_store_mutations(store, committed.handle)
-            if weight_path is not None:
-                self._protocol.write_weight_reference(
-                    str(weight_path), committed.handle
+            if publish_weight_path is not None:
+                self._protocol.publish_weight_handle(
+                    str(publish_weight_path), committed.handle
                 )
             self._protocol.acknowledge_checkpoint(identity)
-            if weight_path is None:
+            if publish_weight_path is None:
                 self._protocol.release_reference(committed.handle)
             return committed
-        except Exception:
-            if fragment is not None:
-                store.cancel_checkpoint_capture(
-                    fragment.save_context.capture_id,
-                    fragment.save_context.journal_identity,
+        except BaseException as primary:
+            actions = []
+            if committed is None:
+                actions.append(
+                    (
+                        "checkpoint abort",
+                        lambda: self._protocol.abort_checkpoint(identity),
+                    )
                 )
-            self._protocol.abort_checkpoint(identity)
+            run_cleanup_preserving_primary(primary, actions, "training checkpoint save")
             raise
 
     def load_training_checkpoint(
         self,
         store: Any,
         storage_locator: CheckpointHandle,
-        restore: RestorePlan | bytes,
+        restore: RestorePlan,
         *,
         load_optimizer_state: bool = True,
     ) -> None:
-        if isinstance(restore, RestorePlan):
-            options = restore.encode()
-        elif isinstance(restore, bytes):
-            options = restore
-        else:
+        self._load_checkpoint(
+            store,
+            storage_locator,
+            restore,
+            load_optimizer_state=load_optimizer_state,
+        )
+
+    def load_inference_checkpoint(
+        self,
+        store: Any,
+        storage_locator: CheckpointHandle,
+        restore: RestorePlan,
+    ) -> None:
+        self._load_checkpoint(
+            store,
+            storage_locator,
+            restore,
+            load_optimizer_state=False,
+        )
+
+    def _load_checkpoint(
+        self,
+        store: Any,
+        storage_locator: CheckpointHandle,
+        restore: RestorePlan,
+        *,
+        load_optimizer_state: bool,
+    ) -> None:
+        if not isinstance(restore, RestorePlan):
             raise TypeError(
-                f"restore must be a RestorePlan instance or bytes; got {type(restore).__name__}"
+                f"restore must be a RestorePlan instance; got {type(restore).__name__}"
             )
         self._protocol.load_component_checkpoint(
             store,
             storage_locator,
-            options,
+            restore.encode(),
             load_optimizer_state=load_optimizer_state,
         )

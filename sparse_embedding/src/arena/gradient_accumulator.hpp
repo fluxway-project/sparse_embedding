@@ -127,20 +127,24 @@ public:
         arena_);
   }
 
-  template <typename Fn> void with_accumulated_batch(Fn &&fn) {
+  template <typename Fn>
+  void with_accumulated_batch(Fn &&fn, size_t normalization_steps) {
+    if (normalization_steps == 0)
+      throw std::invalid_argument("normalization_steps must be positive");
     std::visit(
         [&](auto &arena) {
           arena->with_accumulated_batch([&](const auto &raw) {
             using ArenaT = std::remove_reference_t<decltype(*arena)>;
             using StoredT = typename ArenaT::value_type;
             if constexpr (std::is_same_v<StoredT, ParamT>) {
-              if (scale_ == 1.0f) {
+              if (normalization_steps == 1 && scale_ == 1.0f) {
                 std::forward<Fn>(fn)(raw);
                 return;
               }
             }
-            GradientBatchView<ParamT> batch;
-            batch.assign(raw, dim_, scale_);
+            thread_local GradientBatchView<ParamT> batch;
+            batch.assign(raw, dim_,
+                         scale_ / static_cast<float>(normalization_steps));
             std::forward<Fn>(fn)(batch);
           });
         },

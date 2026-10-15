@@ -140,7 +140,7 @@ int main() {
               keys[i] = 30'000 + (i % 64);
             std::fill(values.begin(), values.end(), 1.0F);
             store.accumulate_gradients<uint64_t>(keys, values, lengths);
-            store.optimizer_step();
+            store.optimizer_step(1);
           }
         }
       } catch (...) {

@@ -31,6 +31,7 @@ namespace se {
 
 struct CheckpointCaptureCut {
   uint64_t mutation_watermark;
+  uint64_t page_layout_generation;
   uint64_t capture_id;
   std::string journal_identity;
 };
@@ -53,6 +54,7 @@ template <typename ParamT, typename OptT> struct PageImageExport {
   std::vector<uint64_t> scores;
   std::vector<OptT> optimizer_states;
   std::vector<uint32_t> steps;
+  bool deleted_page = false;
 };
 
 template <typename ParamT, typename OptT> struct PageImageImport {
@@ -108,14 +110,45 @@ PRO_DEF_MEM_DISPATCH(MemPromoteHotKeys, promote_hot_keys);
 PRO_DEF_MEM_DISPATCH(MemPromotedHotPageSize, promoted_hot_page_size);
 PRO_DEF_MEM_DISPATCH(MemExportPageImages, export_page_images);
 PRO_DEF_MEM_DISPATCH(MemImportPageImages, import_page_images);
+// Checkpoint restore must use this entry point when the persisted page images
+// carry a page-layout generation that must become the store's current version.
+PRO_DEF_MEM_DISPATCH(MemImportPageImagesWithGeneration,
+                     import_page_images_with_generation);
 PRO_DEF_MEM_DISPATCH(MemCaptureCheckpoint, capture_checkpoint);
 PRO_DEF_MEM_DISPATCH(MemCheckpointMutations, checkpoint_mutations);
 PRO_DEF_MEM_DISPATCH(MemCancelCheckpointCapture, cancel_checkpoint_capture);
 PRO_DEF_MEM_DISPATCH(MemCheckpointBaseline, checkpoint_baseline);
 PRO_DEF_MEM_DISPATCH(MemCheckpointMutationWatermark,
                      checkpoint_mutation_watermark);
-PRO_DEF_MEM_DISPATCH(MemAcknowledgeCheckpointMutations,
-                     acknowledge_checkpoint_mutations);
+// --- Incremental Checkpoint Baseline & Journal Control
+// ------------------------ Confirms that a previously captured checkpoint cut
+// has been successfully persisted. Advances the internal store baseline token
+// to `baseline`, updates acknowledged watermark, and prunes mutation journal
+// records with sequence <= watermark.
+PRO_DEF_MEM_DISPATCH(MemAdvanceCheckpointBaseline, advance_checkpoint_baseline);
+
+// Initializes a newly restored or cold-started store with an authoritative
+// checkpoint baseline token and starting sequence watermark. Flushes stale
+// journal entries, resets dirty mutation heads, and mints a unique journal
+// incarnation identity. Must be invoked once on a clean store following
+// physical parameter restoration.
+PRO_DEF_MEM_DISPATCH(MemInitializeCheckpointBaseline,
+                     initialize_checkpoint_baseline);
+PRO_DEF_MEM_DISPATCH(MemCheckpointRestoreIsPristine,
+                     checkpoint_restore_is_pristine);
+
+// --- Lifecycle / Fail-Stop Circuit Breaker -----------------------------------
+// Transitions the store into an irreversible terminal failure state.
+// Closes the internal invocation gate, wakes waiting threads, and ensures that
+// any subsequent read/write or control-plane access is immediately rejected
+// with an exception to prevent silent data corruption or tainted model
+// training.
+PRO_DEF_MEM_DISPATCH(MemMarkTerminalFailure, mark_terminal_failure);
+
+// Queries whether the store is operational and accepting invocations.
+// Provides a lock-free, noexcept probe for high-level coordinators to verify
+// store health before dispatching operations or attempting recovery.
+PRO_DEF_MEM_DISPATCH(MemIsOperational, is_operational);
 
 // --- Training: Forward -------------------------------------------------------
 PRO_DEF_MEM_DISPATCH(MemForwardLookup, forward_lookup);
@@ -226,6 +259,10 @@ using WeakMemOptimizerStep = pro::weak_dispatch<MemOptimizerStep>;
 #define SE_IMPORT_PAGE_IMAGES_FACADE_SIG                                       \
   void(std::span<const PageImageImport<ParamT, OptT>> images)
 
+#define SE_IMPORT_PAGE_IMAGES_WITH_GENERATION_FACADE_SIG                       \
+  void(std::span<const PageImageImport<ParamT, OptT>> images,                  \
+       uint64_t page_layout_generation)
+
 #define SE_ASSIGN_OPT_STATES_FACADE_SIG(key_t)                                 \
   void(std::size_t, std::span<const key_t>, std::span<const OptT>,             \
        std::span<const uint32_t>)
@@ -248,8 +285,7 @@ PRO_DEF_MEM_DISPATCH(MemExportOptStateBatchOwned, export_opt_state_batch_owned);
 
 // clang-format off
 // NOLINTBEGIN(whitespace/indent_namespace)
-template <typename ParamT, typename OptT>
-struct EmbeddingTableFacade : pro //
+struct EmbeddingTableBaseFacade : pro //
   ::facade_builder //
   // --- Lifecycle -------------------------------------------------------------
   ::add_convention<WeakMemInit,
@@ -272,21 +308,6 @@ struct EmbeddingTableFacade : pro //
                    std::error_code(std::span<const std::size_t> counts, std::size_t dim)> //
   ::add_convention<WeakMemInternalShardCount,
                    std::size_t() const> //
-
-  // --- Lookup ---------------------------------------------------------------
-  ::add_convention<WeakMemLookup,
-                   SE_LOOKUP_FACADE_SIG(int32_t), SE_LOOKUP_FACADE_SIG(uint32_t),
-                   SE_LOOKUP_FACADE_SIG(int64_t), SE_LOOKUP_FACADE_SIG(uint64_t)> //
-
-  // --- Lookup-or-insert -----------------------------------------------------
-  ::add_convention<WeakMemLookupOrInsert,
-                   SE_LOOKUP_OR_INSERT_FACADE_SIG(int32_t), SE_LOOKUP_OR_INSERT_FACADE_SIG(uint32_t),
-                   SE_LOOKUP_OR_INSERT_FACADE_SIG(int64_t), SE_LOOKUP_OR_INSERT_FACADE_SIG(uint64_t)> //
-
-  // --- Assign ---------------------------------------------------------------
-  ::add_convention<WeakMemAssign,
-                   SE_ASSIGN_FACADE_SIG(int32_t), SE_ASSIGN_FACADE_SIG(uint32_t),
-                   SE_ASSIGN_FACADE_SIG(int64_t), SE_ASSIGN_FACADE_SIG(uint64_t)> //
 
   // --- Contains -------------------------------------------------------------
   ::add_convention<WeakMemContains,
@@ -311,42 +332,80 @@ struct EmbeddingTableFacade : pro //
   ::add_convention<WeakMemAssignScores,
                    SE_ASSIGN_SCORES_FACADE_SIG(int32_t), SE_ASSIGN_SCORES_FACADE_SIG(uint32_t),
                    SE_ASSIGN_SCORES_FACADE_SIG(int64_t), SE_ASSIGN_SCORES_FACADE_SIG(uint64_t)> //
-  ::add_convention<WeakMemEvictByScore,
-                   SE_EVICT_BY_SCORE_FACADE_SIG(int32_t), SE_EVICT_BY_SCORE_FACADE_SIG(uint32_t),
-                   SE_EVICT_BY_SCORE_FACADE_SIG(int64_t), SE_EVICT_BY_SCORE_FACADE_SIG(uint64_t)> //
 
-  // --- Export / snapshot ----------------------------------------------------
-  ::add_convention<WeakMemExportBatch,
-                   SE_EXPORT_BATCH_FACADE_SIG(int32_t), SE_EXPORT_BATCH_FACADE_SIG(uint32_t),
-                   SE_EXPORT_BATCH_FACADE_SIG(int64_t), SE_EXPORT_BATCH_FACADE_SIG(uint64_t)> //
+  // --- Geometry / Page snapshot control -------------------------------------
   ::add_convention<WeakMemCompactPage, SE_COMPACT_PAGE_FACADE_SIG> //
   ::add_convention<WeakMemPromoteHotKeys, SE_PROMOTE_HOT_KEYS_FACADE_SIG> //
-  ::add_convention<WeakMemPromotedHotPageSize,                                \
+  ::add_convention<WeakMemPromotedHotPageSize,
                    SE_PROMOTED_HOT_PAGE_SIZE_FACADE_SIG> //
-  ::add_convention<WeakMemExportPageImages, SE_EXPORT_PAGE_IMAGES_FACADE_SIG> //
-  ::add_convention<WeakMemImportPageImages, SE_IMPORT_PAGE_IMAGES_FACADE_SIG> //
   ::add_convention<MemEntriesPerPage, size_t() const> //
-  ::add_convention<pro::weak_dispatch<MemCaptureCheckpoint>,
-                   CheckpointCaptureCut(bool, std::string, bool,
-                            se::Function<void(std::span<const CheckpointMutation>, uint64_t)>,
-                            se::Function<bool(size_t, PageImageExport<ParamT, OptT> &&)>)> //
   ::add_convention<pro::weak_dispatch<MemCheckpointMutations>,
                    std::vector<CheckpointMutation>() const> //
-  ::add_convention<pro::weak_dispatch<MemCancelCheckpointCapture>, void(uint64_t, std::string)> \
+  ::add_convention<pro::weak_dispatch<MemCancelCheckpointCapture>, void(uint64_t, std::string)>
   ::add_convention<pro::weak_dispatch<MemCheckpointBaseline>,
                    std::string() const> //
   ::add_convention<pro::weak_dispatch<MemCheckpointMutationWatermark>,
                    uint64_t() const> //
-  ::add_convention<pro::weak_dispatch<MemAcknowledgeCheckpointMutations>,
+  ::add_convention<pro::weak_dispatch<MemAdvanceCheckpointBaseline>,
                    void(uint64_t, std::string, uint64_t, std::string)> //
+  ::add_convention<pro::weak_dispatch<MemInitializeCheckpointBaseline>,
+                   std::string(std::string, uint64_t)> //
+  ::add_convention<pro::weak_dispatch<MemCheckpointRestoreIsPristine>,
+                   bool() const> //
+  ::add_convention<pro::weak_dispatch<MemMarkTerminalFailure>, void()> //
+  ::add_convention<pro::weak_dispatch<MemIsOperational>, bool() const> //
+
+  // --- Optimizer step -------------------------------------------------------
+  ::add_convention<WeakMemOptimizerStep,
+                   std::error_code(std::size_t normalization_steps)> //
+  ::build {};
+
+template <typename ParamT, typename OptT>
+struct EmbeddingTableFacade : pro //
+  ::facade_builder //
+  ::add_facade<EmbeddingTableBaseFacade> //
+
+  // --- Lookup ---------------------------------------------------------------
+  ::template add_convention<WeakMemLookup,
+                   SE_LOOKUP_FACADE_SIG(int32_t), SE_LOOKUP_FACADE_SIG(uint32_t),
+                   SE_LOOKUP_FACADE_SIG(int64_t), SE_LOOKUP_FACADE_SIG(uint64_t)> //
+
+  // --- Lookup-or-insert -----------------------------------------------------
+  ::template add_convention<WeakMemLookupOrInsert,
+                   SE_LOOKUP_OR_INSERT_FACADE_SIG(int32_t), SE_LOOKUP_OR_INSERT_FACADE_SIG(uint32_t),
+                   SE_LOOKUP_OR_INSERT_FACADE_SIG(int64_t), SE_LOOKUP_OR_INSERT_FACADE_SIG(uint64_t)> //
+
+  // --- Assign ---------------------------------------------------------------
+  ::template add_convention<WeakMemAssign,
+                   SE_ASSIGN_FACADE_SIG(int32_t), SE_ASSIGN_FACADE_SIG(uint32_t),
+                   SE_ASSIGN_FACADE_SIG(int64_t), SE_ASSIGN_FACADE_SIG(uint64_t)> //
+
+  // --- Eviction -------------------------------------------------------------
+  ::template add_convention<WeakMemEvictByScore,
+                   SE_EVICT_BY_SCORE_FACADE_SIG(int32_t), SE_EVICT_BY_SCORE_FACADE_SIG(uint32_t),
+                   SE_EVICT_BY_SCORE_FACADE_SIG(int64_t), SE_EVICT_BY_SCORE_FACADE_SIG(uint64_t)> //
+
+  // --- Export / snapshot ----------------------------------------------------
+  ::template add_convention<WeakMemExportBatch,
+                   SE_EXPORT_BATCH_FACADE_SIG(int32_t), SE_EXPORT_BATCH_FACADE_SIG(uint32_t),
+                   SE_EXPORT_BATCH_FACADE_SIG(int64_t), SE_EXPORT_BATCH_FACADE_SIG(uint64_t)> //
+  ::template add_convention<WeakMemExportPageImages, SE_EXPORT_PAGE_IMAGES_FACADE_SIG> //
+  ::template add_convention<WeakMemImportPageImages, SE_IMPORT_PAGE_IMAGES_FACADE_SIG> //
+  ::template add_convention<pro::weak_dispatch<MemImportPageImagesWithGeneration>,
+                   SE_IMPORT_PAGE_IMAGES_WITH_GENERATION_FACADE_SIG> //
+  ::template add_convention<pro::weak_dispatch<MemCaptureCheckpoint>,
+                   CheckpointCaptureCut(bool, std::string, bool,
+                            uint64_t,
+                            se::Function<void(std::span<const CheckpointMutation>, uint64_t)>,
+                            se::Function<bool(size_t, PageImageExport<ParamT, OptT> &&)>)> //
 
   // --- Training: Forward ----------------------------------------------------
-  ::add_convention<WeakMemForwardLookup,
+  ::template add_convention<WeakMemForwardLookup,
                    SE_FORWARD_LOOKUP_FACADE_SIG(int32_t), SE_FORWARD_LOOKUP_FACADE_SIG(uint32_t),
                    SE_FORWARD_LOOKUP_FACADE_SIG(int64_t), SE_FORWARD_LOOKUP_FACADE_SIG(uint64_t)> //
 
   // --- Training: Backward ---------------------------------------------------
-  ::add_convention<WeakMemAccumulateGradients,
+  ::template add_convention<WeakMemAccumulateGradients,
                    SE_ACCUMULATE_GRADIENTS_FACADE_SIG(int32_t, float),
                    SE_ACCUMULATE_GRADIENTS_FACADE_SIG(uint32_t, float),
                    SE_ACCUMULATE_GRADIENTS_FACADE_SIG(int64_t, float),
@@ -359,21 +418,19 @@ struct EmbeddingTableFacade : pro //
                    SE_ACCUMULATE_GRADIENTS_FACADE_SIG(uint32_t, se::bfloat16_t),
                    SE_ACCUMULATE_GRADIENTS_FACADE_SIG(int64_t, se::bfloat16_t),
                    SE_ACCUMULATE_GRADIENTS_FACADE_SIG(uint64_t, se::bfloat16_t)> //
-  ::add_convention<WeakMemOptimizerStep,
-                   std::error_code()> //
 
   // --- Optimizer state checkpoint -------------------------------------------
-  ::add_convention<pro::weak_dispatch<MemAssignOptStates>,
+  ::template add_convention<pro::weak_dispatch<MemAssignOptStates>,
                    SE_ASSIGN_OPT_STATES_FACADE_SIG(int32_t),
                    SE_ASSIGN_OPT_STATES_FACADE_SIG(uint32_t),
                    SE_ASSIGN_OPT_STATES_FACADE_SIG(int64_t),
                    SE_ASSIGN_OPT_STATES_FACADE_SIG(uint64_t)> //
-  ::add_convention<pro::weak_dispatch<MemExportOptStateBatch>,
+  ::template add_convention<pro::weak_dispatch<MemExportOptStateBatch>,
                    SE_EXPORT_OPT_STATE_BATCH_FACADE_SIG(int32_t),
                    SE_EXPORT_OPT_STATE_BATCH_FACADE_SIG(uint32_t),
                    SE_EXPORT_OPT_STATE_BATCH_FACADE_SIG(int64_t),
                    SE_EXPORT_OPT_STATE_BATCH_FACADE_SIG(uint64_t)> //
-  ::add_convention<pro::weak_dispatch<MemExportOptStateBatchOwned>,
+  ::template add_convention<pro::weak_dispatch<MemExportOptStateBatchOwned>,
                    SE_EXPORT_OPT_STATE_BATCH_OWNED_FACADE_SIG(int32_t),
                    SE_EXPORT_OPT_STATE_BATCH_OWNED_FACADE_SIG(uint32_t),
                    SE_EXPORT_OPT_STATE_BATCH_OWNED_FACADE_SIG(int64_t),

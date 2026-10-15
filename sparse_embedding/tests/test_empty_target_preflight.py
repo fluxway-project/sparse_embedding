@@ -4,11 +4,11 @@ import pytest
 import sparse_embedding as se
 from sparse_embedding.checkpoint import (
     CheckpointParticipant,
-    ElasticRestore,
     LocalLanceStorage,
-    PhysicalRestore,
+    PartitionSpec,
+    RankRestore,
+    ReshardRestore,
     SparseCheckpoint,
-    SparsePartitionAssignmentSpec,
     encode_restore_options,
     lance_backend,
 )
@@ -35,8 +35,8 @@ def _store(*, optimizer: bool, key: int, value: float) -> se.EmbeddingStore:
 
 def _elastic_options() -> bytes:
     return encode_restore_options(
-        ElasticRestore(
-            SparsePartitionAssignmentSpec.modulo(),
+        ReshardRestore(
+            PartitionSpec.modulo(),
             1,
             0,
             "uint64",
@@ -47,7 +47,7 @@ def _elastic_options() -> bytes:
 @pytest.mark.parametrize(
     "options",
     [
-        encode_restore_options(PhysicalRestore(CheckpointParticipant(0, 1))),
+        encode_restore_options(RankRestore(CheckpointParticipant(0, 1))),
         _elastic_options(),
     ],
 )
@@ -70,6 +70,7 @@ def test_training_restore_rejects_nonempty_target_before_native_scan(
     )
     with pytest.raises(RuntimeError, match="restore requires an empty target store"):
         storage.load_component_checkpoint(target, committed.handle, options)
+    assert target.is_operational() is True
     assert target.total_size() == 1
 
 
@@ -81,7 +82,7 @@ def test_inference_restore_rejects_nonempty_target_before_native_scan(
     asset.mkdir()
     storage = LocalLanceStorage.from_checkpoint_root(root)
     SparseCheckpoint(storage).save_training_checkpoint(
-        _store(optimizer=True, key=1, value=2), "source", weight_path=asset
+        _store(optimizer=True, key=1, value=2), "source", publish_weight_path=asset
     )
     target = _store(optimizer=False, key=9, value=3)
 
@@ -94,7 +95,8 @@ def test_inference_restore_rejects_nonempty_target_before_native_scan(
         fail_if_called,
     )
     with pytest.raises(RuntimeError, match="restore requires an empty target store"):
-        LocalLanceStorage.from_weight_path(asset).load_inference_weights(
+        LocalLanceStorage.from_published_weight(asset).load_inference_weights(
             target, _elastic_options()
         )
+    assert target.is_operational() is True
     assert target.total_size() == 1

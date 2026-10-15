@@ -1,5 +1,7 @@
 # 动态学习率 (Score-Based LR)
 
+[English](dynamic_learning_rate.md) | [架构与 API 契约](storage_architecture_zh.md) | [增量检查点与流式 Compaction](incremental_checkpoint_zh.md) | [Lance 存储与 Gravitino 集成指南](lance_storage_and_gravitino_zh.md) | [性能与可靠性报告](performance_and_reliability_report_zh.md)
+
 ## 使用前提
 
 该 API 随仓库 Python package 提供，并使用项目 Bazel toolchain 构建。选择会读取特征得分的
@@ -70,7 +72,7 @@ store.accumulate_gradients(keys, gradients)
 
 # 当调用 optimizer_step() 提交更新时，
 # 引擎将自动根据每个特征最新的 LFU 得分，应用衰减后的学习率！
-store.optimizer_step()
+store.optimizer_step(1)
 ```
 
 ## 重要注意事项

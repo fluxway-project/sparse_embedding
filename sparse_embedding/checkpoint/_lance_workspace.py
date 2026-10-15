@@ -9,7 +9,7 @@ import time
 import uuid
 from collections.abc import Callable, Iterator, Mapping
 from contextlib import contextmanager
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any, Protocol
 from urllib.parse import urlparse
@@ -18,12 +18,28 @@ import lance
 import pyarrow as pa
 
 
+def _validate_relative_path(relative: str) -> str:
+    if not isinstance(relative, str):
+        raise TypeError("workspace path must be a string")
+    if not relative:
+        return ""
+    parsed = urlparse(relative)
+    if parsed.scheme or parsed.netloc or relative.startswith("/"):
+        raise ValueError("workspace path must be relative")
+    parts = relative.split("/")
+    if any(not part or part in {".", ".."} for part in parts):
+        raise ValueError("workspace path contains an invalid segment")
+    if "\\" in relative:
+        raise ValueError("workspace path contains an invalid separator")
+    return relative
+
+
 def _resolve_pointer_relative(
     relative: str,
     read_pointer: Callable[[str], str | None],
     seen: set[str] | None = None,
 ) -> str:
-    clean = relative.strip("/")
+    clean = _validate_relative_path(relative)
     if not clean:
         return ""
     visited = seen if seen is not None else set()
@@ -36,9 +52,8 @@ def _resolve_pointer_relative(
         staged = read_pointer(prefix)
         if staged:
             suffix = "/".join(parts[index:])
-            return _resolve_pointer_relative(
-                f"{staged}/{suffix}", read_pointer, visited
-            )
+            redirected = staged if not suffix else f"{staged}/{suffix}"
+            return _resolve_pointer_relative(redirected, read_pointer, visited)
     return clean
 
 
@@ -65,6 +80,8 @@ class LanceWorkspace(Protocol):
 
     def child_prefixes(self, relative: str) -> tuple[str, ...]: ...
 
+    def child_files(self, relative: str) -> tuple[str, ...]: ...
+
     def publish_prefix(self, staged_relative: str, target_relative: str) -> None: ...
 
     def storage_bytes(self) -> int: ...
@@ -85,28 +102,40 @@ class LocalLanceWorkspace:
         self._root.mkdir(parents=True, exist_ok=True)
 
     def _read_pointer(self, relative: str) -> str | None:
-        pointer_file = self._root / relative / ".manifest_pointer.json"
+        pointer_file = self._local_path(relative) / ".manifest_pointer.json"
         if not pointer_file.is_file():
             return None
         data = json.loads(pointer_file.read_text(encoding="utf-8"))
         if not isinstance(data, dict):
-            raise ValueError(f"manifest pointer is not an object: {pointer_file}")
+            raise TypeError(f"manifest pointer is not an object: {pointer_file}")
         staged = data.get("staged_relative")
-        if not isinstance(staged, str) or not staged.strip("/"):
+        if not isinstance(staged, str) or not staged:
             raise ValueError(f"manifest pointer has no staged_relative: {pointer_file}")
-        clean = staged.strip("/")
-        if any(part in {"", ".", ".."} for part in Path(clean).parts):
+        try:
+            return _validate_relative_path(staged)
+        except (TypeError, ValueError) as error:
             raise ValueError(
                 f"manifest pointer target escapes workspace: {pointer_file}"
-            )
-        return clean
+            ) from error
+
+    def _local_path(self, relative: str) -> Path:
+        validated = _validate_relative_path(relative)
+        root = self._root.resolve()
+        candidate = (root / validated).resolve()
+        try:
+            candidate.relative_to(root)
+        except ValueError as error:
+            raise ValueError("workspace path escapes the configured root") from error
+        return candidate
 
     def _resolve_relative(self, relative: str) -> str:
-        return _resolve_pointer_relative(relative, self._read_pointer)
+        return _resolve_pointer_relative(
+            _validate_relative_path(relative), self._read_pointer
+        )
 
     def uri(self, relative: str) -> str:
         resolved = self._resolve_relative(relative)
-        return str(self._root / resolved)
+        return str(self._local_path(resolved))
 
     def storage_options(self) -> Mapping[str, str]:
         return {}
@@ -119,13 +148,13 @@ class LocalLanceWorkspace:
 
     def exists(self, relative: str) -> bool:
         resolved = self._resolve_relative(relative)
-        return (self._root / resolved).exists()
+        return self._local_path(resolved).exists()
 
     def create_prefix(self, relative: str) -> None:
-        (self._root / relative).mkdir(parents=True, exist_ok=False)
+        self._local_path(relative).mkdir(parents=True, exist_ok=False)
 
     def delete_prefix(self, relative: str, *, missing_ok: bool = False) -> None:
-        path = self._root / relative
+        path = self._local_path(self._resolve_relative(relative))
         if not path.exists():
             if not missing_ok:
                 raise FileNotFoundError(f"prefix does not exist: {relative}")
@@ -136,12 +165,22 @@ class LocalLanceWorkspace:
             shutil.rmtree(path)
 
     def child_prefixes(self, relative: str) -> tuple[str, ...]:
-        path = self._root / relative
+        path = self._local_path(self._resolve_relative(relative))
         if not path.exists():
             return ()
         return tuple(item.name for item in path.iterdir() if item.is_dir())
 
+    def child_files(self, relative: str) -> tuple[str, ...]:
+        path = self._local_path(self._resolve_relative(relative))
+        if not path.exists():
+            return ()
+        return tuple(item.name for item in path.iterdir() if item.is_file())
+
     def publish_prefix(self, staged_relative: str, target_relative: str) -> None:
+        staged_relative = _validate_relative_path(staged_relative)
+        target_relative = _validate_relative_path(target_relative)
+        if not staged_relative:
+            raise ValueError("staged prefix must be non-empty")
         source = Path(self.uri(staged_relative))
         target = Path(self.uri(target_relative))
         target.parent.mkdir(parents=True, exist_ok=True)
@@ -214,8 +253,11 @@ class S3LanceWorkspace:
         return None
 
     def _pointer_key(self, relative: str) -> str:
-        clean = relative.strip("/")
-        return self._key(f"{clean}/.manifest_pointer.json")
+        clean = _validate_relative_path(relative)
+        pointer = (
+            f"{clean}/.manifest_pointer.json" if clean else ".manifest_pointer.json"
+        )
+        return self._key(pointer)
 
     def _read_pointer(self, relative: str) -> str | None:
         key = self._pointer_key(relative)
@@ -234,17 +276,21 @@ class S3LanceWorkspace:
                     return None
             raise
         if not isinstance(data, dict):
-            raise ValueError(f"manifest pointer is not an object: {key}")
+            raise TypeError(f"manifest pointer is not an object: {key}")
         staged = data.get("staged_relative")
-        if not isinstance(staged, str) or not staged.strip("/"):
+        if not isinstance(staged, str) or not staged:
             raise ValueError(f"manifest pointer has no staged_relative: {key}")
-        clean = staged.strip("/")
-        if any(part in {"", ".", ".."} for part in Path(clean).parts):
-            raise ValueError(f"manifest pointer target escapes workspace: {key}")
-        return clean
+        try:
+            return _validate_relative_path(staged)
+        except (TypeError, ValueError) as error:
+            raise ValueError(
+                f"manifest pointer target escapes workspace: {key}"
+            ) from error
 
     def _resolve_relative(self, relative: str) -> str:
-        return _resolve_pointer_relative(relative, self._read_pointer)
+        return _resolve_pointer_relative(
+            _validate_relative_path(relative), self._read_pointer
+        )
 
     def uri(self, relative: str) -> str:
         resolved = self._resolve_relative(relative)
@@ -323,11 +369,11 @@ class S3LanceWorkspace:
                         if not isinstance(data, dict):
                             raise ValueError(f"manifest pointer is not an object: {k}")
                         staged_val = data.get("staged_relative")
-                        if not isinstance(staged_val, str) or not staged_val.strip("/"):
+                        if not isinstance(staged_val, str) or not staged_val:
                             raise ValueError(
                                 f"manifest pointer has no staged_relative: {k}"
                             )
-                        staged_to_cleanup.append(staged_val.strip("/"))
+                        staged_to_cleanup.append(_validate_relative_path(staged_val))
                 self._client.delete_objects(
                     Bucket=self._bucket,
                     Delete={"Objects": [{"Key": item["Key"]} for item in objects]},
@@ -342,26 +388,65 @@ class S3LanceWorkspace:
     def child_prefixes(self, relative: str) -> tuple[str, ...]:
         resolved = self._resolve_relative(relative)
         prefix = self._key(resolved, directory=True)
-        response = self._client.list_objects_v2(
-            Bucket=self._bucket,
-            Prefix=prefix,
-            Delimiter="/",
-        )
         result = []
-        for item in response.get("CommonPrefixes", ()):
-            child = item["Prefix"].removeprefix(prefix).rstrip("/")
-            if child and not child.startswith("."):
-                result.append(child)
+        continuation: str | None = None
+        while True:
+            kwargs: dict[str, Any] = {
+                "Bucket": self._bucket,
+                "Prefix": prefix,
+                "Delimiter": "/",
+            }
+            if continuation is not None:
+                kwargs["ContinuationToken"] = continuation
+            response = self._client.list_objects_v2(**kwargs)
+            for item in response.get("CommonPrefixes", ()):
+                child = item["Prefix"].removeprefix(prefix).rstrip("/")
+                if child and not child.startswith("."):
+                    result.append(child)
+            if not response.get("IsTruncated"):
+                break
+            continuation = response.get("NextContinuationToken")
+            if not isinstance(continuation, str):
+                raise TypeError("S3 listing omitted its continuation token")
+        return tuple(result)
+
+    def child_files(self, relative: str) -> tuple[str, ...]:
+        resolved = self._resolve_relative(relative)
+        prefix = self._key(resolved, directory=True)
+        result = []
+        continuation: str | None = None
+        while True:
+            kwargs: dict[str, Any] = {
+                "Bucket": self._bucket,
+                "Prefix": prefix,
+                "Delimiter": "/",
+            }
+            if continuation is not None:
+                kwargs["ContinuationToken"] = continuation
+            response = self._client.list_objects_v2(**kwargs)
+            for item in response.get("Contents", ()):
+                child = item["Key"].removeprefix(prefix)
+                if child and "/" not in child and not child.startswith("."):
+                    result.append(child)
+            if not response.get("IsTruncated"):
+                break
+            continuation = response.get("NextContinuationToken")
+            if not isinstance(continuation, str):
+                raise TypeError("S3 listing omitted its continuation token")
         return tuple(result)
 
     def publish_prefix(self, staged_relative: str, target_relative: str) -> None:
+        staged_relative = _validate_relative_path(staged_relative)
+        target_relative = _validate_relative_path(target_relative)
+        if not staged_relative:
+            raise ValueError("staged prefix must be non-empty")
         if not self.exists(staged_relative):
             raise FileNotFoundError(f"staged prefix does not exist: {staged_relative}")
         pointer_key = self._pointer_key(target_relative)
         old_staged = self._read_pointer(target_relative)
         payload = {
-            "staged_relative": staged_relative.strip("/"),
-            "published_at": datetime.now(timezone.utc).isoformat(),
+            "staged_relative": staged_relative,
+            "published_at": datetime.now(UTC).isoformat(),
         }
         body = json.dumps(payload, indent=2).encode("utf-8")
         self._client.put_object(
@@ -370,7 +455,7 @@ class S3LanceWorkspace:
             Body=body,
             ContentType="application/json",
         )
-        if old_staged and old_staged != staged_relative.strip("/"):
+        if old_staged and old_staged != staged_relative:
             self.delete_prefix(old_staged, missing_ok=True)
 
     def storage_bytes(self) -> int:
@@ -387,7 +472,7 @@ class S3LanceWorkspace:
                 return total
             continuation = response.get("NextContinuationToken")
             if not isinstance(continuation, str):
-                raise RuntimeError("S3 listing omitted its continuation token")
+                raise TypeError("S3 listing omitted its continuation token")
 
     def assert_commit_lock(self) -> None:
         held = getattr(self._thread_state, "lock", None)
@@ -429,7 +514,7 @@ class S3LanceWorkspace:
                 try:
                     with state["mutex"]:
                         state["etag"] = self._replace_lock(key, owner, state["etag"])
-                except BaseException as error:
+                except BaseException as error:  # noqa: BLE001
                     with state["mutex"]:
                         state["error"] = error
                     return
@@ -543,6 +628,6 @@ class S3LanceWorkspace:
         return etag.strip('"')
 
     def _key(self, relative: str, *, directory: bool = False) -> str:
-        suffix = relative.strip("/")
+        suffix = _validate_relative_path(relative)
         value = self._root_key if not suffix else f"{self._root_key}/{suffix}"
         return value.rstrip("/") + "/" if directory else value

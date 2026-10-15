@@ -127,29 +127,6 @@ void SyncOpsImpl<ParamT, OptT>::assign(EmbeddingStoreWrapper &self,
 }
 
 template <typename ParamT, typename OptT>
-nb::object SyncOpsImpl<ParamT, OptT>::contains(EmbeddingStoreWrapper &self,
-                                               nb::object keys) {
-  auto [dlm_keys, cap_keys] = se::py::extract_dlpack_tensor(keys);
-  size_t n = get_dlm_size(dlm_keys);
-  int64_t shape[1] = {static_cast<int64_t>(n)};
-  DLManagedTensor *dlm =
-      se::py::create_output_tensor<uint8_t>(std::span(shape));
-  auto *out = static_cast<uint8_t *>(dlm->dl_tensor.data);
-
-  std::error_code ec;
-  {
-    nb::gil_scoped_release release;
-    dispatch_on_key(dlm_keys, self.key_type_enum_, [&](auto ks) {
-      ec = self.get_store<ParamT, OptT>()->contains(ks,
-                                                    std::span<uint8_t>(out, n));
-    });
-  }
-
-  check_error(ec);
-  return se::py::wrap_output_tensor(dlm);
-}
-
-template <typename ParamT, typename OptT>
 void SyncOpsImpl<ParamT, OptT>::accumulate_gradients(
     EmbeddingStoreWrapper &self, nb::object keys, nb::object grads) {
   auto [dlm_keys, cap_keys] = se::py::extract_dlpack_tensor(keys);
@@ -185,69 +162,6 @@ void SyncOpsImpl<ParamT, OptT>::accumulate_gradients(
         ec = self.get_store<ParamT, OptT>()->accumulate_gradients(
             ks, grads_span, tls_row_lengths);
       });
-    });
-  }
-  check_error(ec);
-}
-
-template <typename ParamT, typename OptT>
-void SyncOpsImpl<ParamT, OptT>::optimizer_step(EmbeddingStoreWrapper &self) {
-  nb::gil_scoped_release release;
-  std::error_code ec;
-  ec = self.get_store<ParamT, OptT>()->optimizer_step();
-  check_error(ec);
-}
-
-template <typename ParamT, typename OptT>
-void SyncOpsImpl<ParamT, OptT>::erase(EmbeddingStoreWrapper &self,
-                                      nb::object keys) {
-  auto [dlm_keys, cap_keys] = se::py::extract_dlpack_tensor(keys);
-  std::error_code ec;
-  {
-    nb::gil_scoped_release release;
-    dispatch_on_key(dlm_keys, self.key_type_enum_, [&](auto ks) {
-      ec = self.get_store<ParamT, OptT>()->erase(ks);
-    });
-  }
-  check_error(ec);
-}
-
-template <typename ParamT, typename OptT>
-void SyncOpsImpl<ParamT, OptT>::erase_dimension(EmbeddingStoreWrapper &self,
-                                                nb::object keys,
-                                                int64_t dimension) {
-  if (dimension < 0)
-    throw std::invalid_argument("erase dimension must be non-negative");
-  auto [dlm_keys, cap_keys] = se::py::extract_dlpack_tensor(keys);
-  std::error_code ec;
-  {
-    nb::gil_scoped_release release;
-    dispatch_on_key(dlm_keys, self.key_type_enum_, [&](auto ks) {
-      ec = self.get_store<ParamT, OptT>()->erase_dimension(
-          static_cast<size_t>(dimension), ks);
-    });
-  }
-  check_error(ec);
-}
-
-template <typename ParamT, typename OptT>
-void SyncOpsImpl<ParamT, OptT>::clear(EmbeddingStoreWrapper &self) {
-  nb::gil_scoped_release release;
-  self.get_store<ParamT, OptT>()->clear();
-}
-
-template <typename ParamT, typename OptT>
-void SyncOpsImpl<ParamT, OptT>::assign_scores(EmbeddingStoreWrapper &self,
-                                              nb::object keys,
-                                              nb::object scores) {
-  auto [dlm_keys, cap_keys] = se::py::extract_dlpack_tensor(keys);
-  auto [dlm_scores, cap_scores] = se::py::extract_dlpack_tensor(scores);
-  std::error_code ec;
-  auto scores_span = se::py::dlpack_to_span<const uint64_t>(dlm_scores);
-  {
-    nb::gil_scoped_release release;
-    dispatch_on_key(dlm_keys, self.key_type_enum_, [&](auto ks) {
-      ec = self.get_store<ParamT, OptT>()->assign_scores(ks, scores_span);
     });
   }
   check_error(ec);

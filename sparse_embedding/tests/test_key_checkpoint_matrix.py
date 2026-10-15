@@ -1,3 +1,4 @@
+import json
 from pathlib import Path
 
 import lance
@@ -7,13 +8,14 @@ import pytest
 
 import sparse_embedding as se
 from sparse_embedding.checkpoint import (
-    ElasticRestore,
+    IngestionEngine,
     LocalLanceStorage,
-    PhysicalRestore,
-    PhysicalRestoreStrategy,
+    PartitionSpec,
+    RankRestore,
+    ReshardRestore,
     SparseCheckpoint,
-    SparsePartitionAssignmentSpec,
     encode_restore_options,
+    lance_backend,
 )
 from sparse_embedding.checkpoint.base import (
     CheckpointParticipant,
@@ -21,7 +23,6 @@ from sparse_embedding.checkpoint.base import (
 )
 from sparse_embedding.checkpoint.schema import (
     ENTRIES_DATASET,
-    PAGE_IMAGES_DATASET,
     SNAPSHOT_MANIFEST_DATASET,
 )
 
@@ -66,14 +67,12 @@ def _values(store: se.EmbeddingStore, keys: np.ndarray) -> np.ndarray:
     return np.from_dlpack(values).reshape((-1, 2))
 
 
-def _elastic_options(key_dtype: str, partition_count: int = 1) -> bytes:
-    return encode_restore_options(
-        ElasticRestore(
-            SparsePartitionAssignmentSpec.modulo(),
-            partition_count,
-            0,
-            key_dtype=key_dtype,
-        )
+def _elastic_options(key_dtype: str, partition_count: int = 1) -> ReshardRestore:
+    return ReshardRestore(
+        PartitionSpec.modulo(),
+        partition_count,
+        0,
+        key_dtype=key_dtype,
     )
 
 
@@ -92,7 +91,7 @@ def test_four_key_encodings_save_and_restore_physical_and_elastic(
         lance.dataset(str(root / SNAPSHOT_MANIFEST_DATASET)).to_table().to_pylist()[0]
     )
     assert manifest["key_dtype"] == key_dtype
-    fragment_root = root / storage._manifest_fragment_roots(manifest)[0]
+    fragment_root = root / storage._manifest_fragment_root_for_participant(manifest, 0)
     expected_arrow_type = getattr(pa, key_dtype)()
     assert (
         lance.dataset(str(fragment_root / ENTRIES_DATASET)).schema.field("key").type
@@ -103,11 +102,9 @@ def test_four_key_encodings_save_and_restore_physical_and_elastic(
     checkpoint.load_training_checkpoint(
         physical,
         committed.handle,
-        encode_restore_options(
-            PhysicalRestore(
-                CheckpointParticipant(0, 1),
-                key_dtype=key_dtype,
-            )
+        RankRestore(
+            CheckpointParticipant(0, 1),
+            key_dtype=key_dtype,
         ),
     )
     assert np.array_equal(_contains(physical, keys), np.ones(keys.size, dtype=bool))
@@ -140,23 +137,19 @@ def test_four_key_encodings_page_image_and_entry_restore_survive_compaction(
     checkpoint.load_training_checkpoint(
         page_restore,
         compacted,
-        encode_restore_options(
-            PhysicalRestore(
-                CheckpointParticipant(0, 1),
-                strategy=PhysicalRestoreStrategy.FAST_PAGE_CACHE,
-                key_dtype=key_dtype,
-            )
+        RankRestore(
+            CheckpointParticipant(0, 1),
+            engine=IngestionEngine.FAST_PAGE_CACHE,
+            key_dtype=key_dtype,
         ),
     )
     entry_restore = _store(key_dtype, optimizer=True)
     checkpoint.load_training_checkpoint(
         entry_restore,
         compacted,
-        encode_restore_options(
-            PhysicalRestore(
-                CheckpointParticipant(0, 1),
-                key_dtype=key_dtype,
-            )
+        RankRestore(
+            CheckpointParticipant(0, 1),
+            key_dtype=key_dtype,
         ),
     )
     assert np.array_equal(_contains(page_restore, keys), _contains(entry_restore, keys))
@@ -182,10 +175,10 @@ def test_four_key_encodings_weight_reference_versions_survive_compaction(
     _assign(first_source, keys, offset=1)
     _assign(second_source, keys, offset=9)
     first = checkpoint.save_training_checkpoint(
-        first_source, "inference-types", weight_path=first_asset
+        first_source, "inference-types", publish_weight_path=first_asset
     )
     second = checkpoint.save_training_checkpoint(
-        second_source, "inference-types", weight_path=second_asset
+        second_source, "inference-types", publish_weight_path=second_asset
     )
     storage.compact_checkpoint(first.handle)
     storage.compact_checkpoint(second.handle)
@@ -195,8 +188,8 @@ def test_four_key_encodings_weight_reference_versions_survive_compaction(
         (second_asset, second_source),
     ):
         target = _store(key_dtype, optimizer=False)
-        LocalLanceStorage.from_weight_path(asset).load_inference_weights(
-            target, _elastic_options(key_dtype)
+        LocalLanceStorage.from_published_weight(asset).load_inference_weights(
+            target, encode_restore_options(_elastic_options(key_dtype))
         )
         assert target.optimizer_enabled() is False
         assert np.array_equal(_contains(target, keys), np.ones(keys.size, dtype=bool))
@@ -221,7 +214,8 @@ def test_key_encoding_corruption_fails_before_target_mutation(
     )
     manifest_dataset = lance.dataset(str(root / SNAPSHOT_MANIFEST_DATASET))
     manifest = manifest_dataset.to_table().to_pylist()[0]
-    fragment_root = root / storage._manifest_fragment_roots(manifest)[0]
+    fragment_root = root / storage._manifest_fragment_root_for_participant(manifest, 0)
+    descriptor = json.loads(next(iter(manifest["fragment_descriptors"])))
 
     if corruption == "manifest":
         manifest_dataset.update(
@@ -230,18 +224,32 @@ def test_key_encoding_corruption_fails_before_target_mutation(
         )
         expected = RuntimeError
     else:
-        asset_names = (
-            (ENTRIES_DATASET, PAGE_IMAGES_DATASET)
-            if corruption == "entries"
-            else (PAGE_IMAGES_DATASET,)
-        )
-        for asset_name in asset_names:
-            dataset = lance.dataset(str(fragment_root / asset_name))
+        if corruption == "entries":
+            dataset = lance.dataset(str(fragment_root / ENTRIES_DATASET))
             metadata = dict(dataset.schema_metadata)
-            metadata["sparse_embedding.key_dtype"] = (
-                "unknown" if corruption == "entries" else "uint64"
-            )
+            metadata["sparse_embedding.key_dtype"] = "unknown"
             dataset.update_schema_metadata(metadata, replace=True)
+        else:
+            page_dataset = root / str(descriptor["page_dataset"])
+            dataset = lance.dataset(str(page_dataset))
+            metadata = dict(dataset.schema_metadata)
+            metadata["sparse_embedding.key_dtype"] = "uint64"
+            dataset.update_schema_metadata(metadata, replace=True)
+            latest_page_version = dataset.version
+            descriptor["page_version"] = latest_page_version
+            manifest["fragment_descriptors"] = [json.dumps(descriptor, sort_keys=True)]
+            manifest["participant_page_versions"] = [latest_page_version]
+            manifest["fragment_digest"] = lance_backend._canonical_digest([descriptor])
+            manifest_dataset.update(
+                {
+                    "fragment_descriptors": "['"
+                    + manifest["fragment_descriptors"][0].replace("'", "''")
+                    + "']",
+                    "participant_page_versions": f"[{latest_page_version}]",
+                    "fragment_digest": f"'{manifest['fragment_digest']}'",
+                },
+                where="checkpoint_name = 'corrupt-types'",
+            )
         expected = (
             (ValueError, InvalidCheckpointFragment)
             if corruption == "entries"
@@ -253,11 +261,9 @@ def test_key_encoding_corruption_fails_before_target_mutation(
         checkpoint.load_training_checkpoint(
             target,
             committed.handle,
-            encode_restore_options(
-                PhysicalRestore(
-                    CheckpointParticipant(0, 1),
-                    key_dtype=key_dtype,
-                )
+            RankRestore(
+                CheckpointParticipant(0, 1),
+                key_dtype=key_dtype,
             ),
         )
-    assert target.total_size() == 0
+    assert target.is_operational() is True
