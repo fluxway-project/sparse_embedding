@@ -8,9 +8,19 @@ Unified Python extension targets:
 load("@hedron_compile_commands//:refresh_compile_commands.bzl", "refresh_compile_commands")
 load("@rules_cc//cc:defs.bzl", "cc_binary")
 load("@rules_python//python:defs.bzl", "py_library")
-load("@rules_python//python:packaging.bzl", "py_wheel")
 load("@rules_shell//shell:sh_binary.bzl", "sh_binary")
-load("//:versions.bzl", "PACKAGE_VERSION", "PYTHON_REQUIRES")
+load("//:build_settings.bzl", "bool_flag")
+
+bool_flag(
+    name = "with_lance",
+    build_setting_default = True,
+)
+
+config_setting(
+    name = "lance_enabled",
+    flag_values = {":with_lance": "true"},
+    visibility = ["//visibility:public"],
+)
 
 sh_binary(
     name = "format",
@@ -22,7 +32,7 @@ refresh_compile_commands(
     exclude_external_sources = True,
     tags = ["manual"],
     targets = {
-        "//:core_extension_lance": "",
+        "//:core_extension": "",
     },
 )
 
@@ -39,10 +49,12 @@ cc_binary(
         "//sparse_embedding/src/ops:srcs",
     ],
     copts = ["-fvisibility=hidden"],
+    linkopts = ["-Wl,-rpath,$$ORIGIN"],
     linkshared = True,
     deps = [
         "//sparse_embedding/src/backend/hogwild:hogwild_embedding_store",
         "//sparse_embedding/src/bindings:checkpoint_instantiations",
+        "//sparse_embedding/src/bindings:module",
         "//sparse_embedding/src/checkpoint",
         "//sparse_embedding/src/common",
         "//sparse_embedding/src/eviction",
@@ -53,7 +65,10 @@ cc_binary(
         "@nanobind",
         "@proxy",
         "@stdexec",
-    ],
+    ] + select({
+        ":lance_enabled": ["//sparse_embedding/src/checkpoint:checkpoint_lance"],
+        "//conditions:default": [],
+    }),
 )
 
 genrule(
@@ -63,8 +78,6 @@ genrule(
     cmd = "cp $< $@",
 )
 
-# ---- _core.so with lance-c: opt-in build ----
-
 genrule(
     name = "package_liblance_c",
     srcs = ["@lance_c//:build_lance_c"],
@@ -73,78 +86,29 @@ genrule(
     tags = ["manual"],
 )
 
-cc_binary(
-    name = "core_extension_lance",
+filegroup(
+    name = "native_artifacts",
+    srcs = [":package_core_extension"] + select({
+        ":lance_enabled": [":package_liblance_c"],
+        "//conditions:default": [],
+    }),
+)
+
+filegroup(
+    name = "package_data",
     srcs = [
-        "//sparse_embedding/src/bindings:srcs_without_module",
-        "//sparse_embedding/src/ops:srcs",
-    ],
-    copts = ["-fvisibility=hidden"],
-    linkopts = ["-Wl,-rpath,$$ORIGIN"],
-    linkshared = True,
-    tags = ["manual"],
-    deps = [
-        "//sparse_embedding/src/backend/hogwild:hogwild_embedding_store",
-        "//sparse_embedding/src/bindings:checkpoint_instantiations_with_lance",
-        "//sparse_embedding/src/bindings:module_with_lance",
-        "//sparse_embedding/src/checkpoint",
-        "//sparse_embedding/src/checkpoint:checkpoint_lance",
-        "//sparse_embedding/src/common",
-        "//sparse_embedding/src/eviction",
-        "//sparse_embedding/src/initializer",
-        "//sparse_embedding/src/interface",
-        "//sparse_embedding/src/optimizer",
-        "@dlpack",
-        "@nanobind",
-        "@proxy",
-        "@stdexec",
+        "sparse_embedding/py.typed",
+        ":native_artifacts",
     ],
 )
 
 py_library(
     name = "sparse_embedding_lib",
-    srcs = glob(["sparse_embedding/**/*.py"]),
-    data = [
-        ":package_core_extension",
-    ],
+    srcs = glob(
+        ["sparse_embedding/**/*.py"],
+        exclude = ["sparse_embedding/tests/**"],
+    ),
+    data = [":package_data"],
     imports = ["."],
     visibility = ["//visibility:public"],
-)
-
-py_library(
-    name = "sparse_embedding_lib_with_lance",
-    srcs = glob(["sparse_embedding/**/*.py"]),
-    data = [
-        ":package_core_extension",
-        ":package_liblance_c",
-    ],
-    imports = ["."],
-    tags = ["manual"],
-    visibility = ["//visibility:public"],
-)
-
-py_wheel(
-    name = "sparse_embedding_wheel",
-    distribution = "sparse_embedding",
-    platform = "manylinux2014_x86_64",
-    python_requires = PYTHON_REQUIRES,
-    version = PACKAGE_VERSION,
-    deps = [
-        ":package_core_extension",
-        ":sparse_embedding_lib",
-    ],
-)
-
-py_wheel(
-    name = "sparse_embedding_wheel_with_lance",
-    distribution = "sparse_embedding",
-    platform = "manylinux2014_x86_64",
-    python_requires = PYTHON_REQUIRES,
-    tags = ["manual"],
-    version = PACKAGE_VERSION,
-    deps = [
-        ":package_core_extension",
-        ":package_liblance_c",
-        ":sparse_embedding_lib_with_lance",
-    ],
 )
