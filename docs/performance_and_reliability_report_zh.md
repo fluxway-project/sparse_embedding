@@ -1,6 +1,6 @@
 # Sparse Embedding 性能与可靠性
 
-[English](performance_and_reliability_report.md)
+[English](performance_and_reliability_report.md) | [架构与 API 契约](storage_architecture_zh.md) | [Lance 存储与 Gravitino 集成指南](lance_storage_and_gravitino_zh.md) | [增量检查点与流式 Compaction](incremental_checkpoint_zh.md) | [动态学习率](dynamic_learning_rate_zh.md)
 
 本文档给出 Sparse Embedding 的公开性能参考、推荐配置和可靠性保证。
 
@@ -21,7 +21,7 @@ producer 不执行 I/O，ring 满载时丢弃诊断且不阻塞训练路径。
 Lance checkpoint 以规范 `entries` 数据集作为 SSOT，物理 `page_images` 作为可选导入缓存，manifest 固定可见性边界。存储分层为控制面 `snapshot_manifest.lance` 与数据面 `entries.lance`，支持 4 种 Arrow 原生键类型（`int32/uint32/int64/uint64`）及 DuckDB 谓词下推。恢复引擎通过 `PartitionerRegistry` 与 AVX-512 `filter_span` 过滤切片。分片路由通过 `parallel_partitioner.hpp` 对接 Fluxway `FunctionPartition`，8 线程吞吐达 1.03B keys/s。写入与 Compaction 采用有界内存管道流式处理。本地目录使用 POSIX 原子 rename；远端对象存储使用暂存目录与 Pointer 原子发布并级联清理。
 page image 保存 slot 布局、`seq_count`、参数、score、optimizer state/step 和 SHA-256 checksum。
 增量 checkpoint 只追加变化 entry 与 tombstone，并由外部 coordinator 完成全局提交。
-推理使用 `EmbeddingConfig(enable_optimizer=False)` 与 `load_inference_weights`，
+推理使用 `EmbeddingConfig(enable_optimizer=False)` 与 `checkpoint.load_inference_checkpoint`（或存储层 `load_inference_weights`），
 避免分配和加载优化器状态。
 
 Compaction、热 Key 提升和 page eviction 都通过唯一权威目录更新 locator。源 page 在

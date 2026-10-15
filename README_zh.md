@@ -16,11 +16,19 @@
 - **C++23 标准并发**：基于 NVIDIA `stdexec` + `exec::static_thread_pool` 实现 Sender/Receiver 任务调度
 - **Epoch 内存安全**：通过 `epoch::with_epoch` 批次保护并发哈希表读写，避免 ABA 问题
 - **分布式 Lance Checkpoint**：两阶段提交协议，分为控制面 `snapshot_manifest.lance` 与数据面 `entries.lance`。支持 4 种 Arrow 原生整型键（`int32/uint32/int64/uint64`）与 DuckDB 谓词下推；支持可选物理页缓存。
-- **优化器参数选择性加载**：`EmbeddingConfig(enable_optimizer=False)` 创建推理 weight-only store。`load_inference_weights` 仅加载权重。
+- **优化器参数选择性加载**：`EmbeddingConfig(enable_optimizer=False)` 创建推理 weight-only store。`checkpoint.load_inference_checkpoint`（或存储层 `load_inference_weights`）仅加载权重。
 - **分片注册中心与并行调度 (PartitionerRegistry)**：基于 `pro::proxy<PartitionerFacade>` 支持 `modulo`、`hash`、`fast_range` 及自定义扩展。离线恢复支持 AVX-512 `filter_span`；在线调度（`parallel_partitioner.hpp`）对接 Fluxway `FunctionPartition`。
 - **跨仓参考向量校验 (Reference Vectors)**：提供 `generate_reference_vectors`，验证分布式路由与离线恢复在各键类型下的分区一致性。
 - **驱逐与内存管理**：高效的打分策略（如 LFU），使用线程安全的 `std::atomic_ref` 实现无锁并发状态更新
 - **页级冷热数据置换 (Page-Level Hot/Cold Swapping)**：后台线程基于可配置的内存水位线，通过保持虚拟地址稳定的 `MAP_FIXED` 重映射将冷数据页置换至磁盘后备存储。
+
+## 核心文档
+
+- [存储架构设计与 API 契约](docs/storage_architecture_zh.md)：无锁并发模型、SeqLock 槽位寻址、硬件自适应校准与 SSD 溢写机制。
+- [Lance 存储与 Gravitino 检查点集成指南](docs/lance_storage_and_gravitino_zh.md)：双 Lance 两阶段提交协议、Arrow 原生算子下推与湖仓元数据治理。
+- [增量检查点与流式 Compaction](docs/incremental_checkpoint_zh.md)：分片变动日志、无阻塞一致性切片与多版本合流压缩。
+- [动态学习率](docs/dynamic_learning_rate_zh.md)：基于访问频次分数的动态自适应学习率策略。
+- [性能与可靠性报告](docs/performance_and_reliability_report_zh.md)：基准评测数据、常驻内存水位线与可靠性校验。
 
 ## 系统依赖
 

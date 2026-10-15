@@ -90,7 +90,7 @@ def test_duckdb_direct_scan_preserves_native_keys_and_pushes_filters(
     manifest = (
         lance.dataset(str(root / SNAPSHOT_MANIFEST_DATASET)).to_table().to_pylist()[0]
     )
-    fragment_root = root / storage._manifest_fragment_roots(manifest)[0]
+    fragment_root = root / storage._manifest_fragment_root_for_participant(manifest, 0)
     entries_path = fragment_root / ENTRIES_DATASET
     table_reference = "'" + str(entries_path).replace("'", "''") + "'"
     predicates = [(f"key = {int(key)}", [(int(key),)]) for key in keys]

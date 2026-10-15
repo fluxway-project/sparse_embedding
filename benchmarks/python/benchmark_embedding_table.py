@@ -103,12 +103,12 @@ class EmbeddingTableBenchmark:
             # Warmup
             self.store.lookup_or_insert(keys, dim=self.dim)
             self.store.accumulate_gradients(keys, values)
-            self.store.optimizer_step()
+            self.store.optimizer_step(1)
 
             def e2e_step():
                 self.store.lookup(keys, dim=self.dim)
                 self.store.accumulate_gradients(keys, values)
-                self.store.optimizer_step()
+                self.store.optimizer_step(1)
 
             runner.run(e2e_step, batch_size)
 

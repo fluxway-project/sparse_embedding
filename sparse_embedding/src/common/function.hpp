@@ -25,11 +25,12 @@ namespace se {
 PRO_DEF_MEM_DISPATCH(MemCall, operator());
 
 template <typename Signature>
-struct FunctionFacade : pro                                               //
-                        ::facade_builder                                  //
-                        ::add_convention<MemCall, Signature>              //
-                        ::support_copy<pro::constraint_level::nontrivial> //
-                        ::build {};
+struct FunctionFacade
+    : pro                                                        //
+      ::facade_builder                                           //
+      ::add_convention<MemCall, Signature>                       //
+      ::template support_copy<pro::constraint_level::nontrivial> //
+      ::build {};
 
 template <typename Signature>
 using Function = pro::proxy<FunctionFacade<Signature>>;

@@ -13,11 +13,19 @@ High-performance Sparse Embedding Table library for large-scale recommendation s
 - **C++23 Standard Concurrency**: Sender/Receiver task scheduling based on NVIDIA `stdexec` + `exec::static_thread_pool`.
 - **Epoch Memory Safety**: Batch protection for concurrent hash map read/write using `epoch::with_epoch`, avoiding ABA problems.
 - **Distributed Lance Checkpointing**: Two-phase commit protocol separating `snapshot_manifest.lance` (control ledger) and `entries.lance` (worker slices). Supports 4 native Arrow integer key types (`int32`, `uint32`, `int64`, `uint64`) with DuckDB pushdown and optional physical page cache.
-- **Selective Optimizer Loading**: `EmbeddingConfig(enable_optimizer=False)` creates a weight-only inference store. `load_inference_weights` restores weights only.
+- **Selective Optimizer Loading**: `EmbeddingConfig(enable_optimizer=False)` creates a weight-only inference store. `checkpoint.load_inference_checkpoint` (or storage `load_inference_weights`) restores weights only.
 - **Partitioner Registry and Routing (PartitionerRegistry)**: Built on `pro::proxy<PartitionerFacade>` supporting `modulo`, `hash`, `fast_range`, and dynamic extensions. Offline restore uses AVX-512 `filter_span`; online routing (`parallel_partitioner.hpp`) integrates with Fluxway `FunctionPartition`.
 - **Reference Vector Validation**: Canonical `generate_reference_vectors` validates bit-identical partition mappings between distributed runtimes and offline restore engines across all key types.
 - **Eviction Management**: Memory-efficient scoring policies (e.g., LFU) using thread-safe `std::atomic_ref` for concurrent state updates without locking.
 - **Page-Level Hot/Cold Swapping**: Background eviction of cold data pages through address-stable `MAP_FIXED` remapping to file-backed storage based on configurable memory watermarks.
+
+## Documentation
+
+- [Storage Architecture and API Contracts](docs/storage_architecture.md): Concurrency model, SeqLock locator, hardware auto-tuning, and disk spilling.
+- [Lance Storage and Gravitino Integration](docs/lance_storage_and_gravitino.md): Dual-Lance 2PC protocol, Arrow native pushdown, and Lakehouse catalog.
+- [Incremental Checkpointing and Streaming Compaction](docs/incremental_checkpoint.md): Mutation journaling, non-blocking cuts, and streaming compaction.
+- [Dynamic Learning Rate](docs/dynamic_learning_rate.md): Score-based frequency-adaptive learning rate policies.
+- [Performance and Reliability Report](docs/performance_and_reliability_report.md): Concurrency scaling benchmarks, memory watermarks, and verification gates.
 
 ## System Dependencies
 

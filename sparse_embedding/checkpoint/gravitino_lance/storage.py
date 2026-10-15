@@ -132,10 +132,11 @@ class GravitinoLanceStorage(_LanceCheckpointStorage):
     ) -> Mapping[str, str]:
         if len(handles) != len(_DATASETS):
             raise ValueError("Gravitino checkpoint requires exactly one manifest table")
-        first = dict(handles[0].storage_options)
+        (first_handle, *rest_handles) = handles
+        first = dict(first_handle.storage_options)
         if not first:
             raise ValueError("Gravitino checkpoint storage options are empty")
-        for handle in handles[1:]:
+        for handle in rest_handles:
             if dict(handle.storage_options) != first:
                 raise ValueError(
                     f"Gravitino tables under {location!r} have different storage options"

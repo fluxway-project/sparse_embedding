@@ -1,5 +1,4 @@
 #include "sparse_embedding/src/checkpoint/lance/native_fragment_writer.hpp"
-#include "sparse_embedding/src/interface/embedding_table_interface.hpp"
 
 #include <ankerl/unordered_dense.h>
 #include <lance/lance.h>
@@ -29,6 +28,7 @@
 #include "sparse_embedding/src/checkpoint/checkpoint_stream_policy.hpp"
 #include "sparse_embedding/src/checkpoint/lance/layout_schema.hpp"
 #include "sparse_embedding/src/common/dtypes.hpp"
+#include "sparse_embedding/src/interface/embedding_table_interface.hpp"
 #include "sparse_embedding/src/ops/partitioner_registry.hpp"
 #include "sparse_embedding/src/storage/topology/storage_topology.hpp"
 
@@ -78,6 +78,214 @@ public:
   ArrowSchemaGuard(const ArrowSchemaGuard &) = delete;
   ArrowSchemaGuard &operator=(const ArrowSchemaGuard &) = delete;
 };
+
+class ArrowArrayGuard {
+  ArrowArray array_{};
+
+public:
+  ArrowArrayGuard() = default;
+  ~ArrowArrayGuard() { reset(); }
+  ArrowArrayGuard(const ArrowArrayGuard &) = delete;
+  ArrowArrayGuard &operator=(const ArrowArrayGuard &) = delete;
+  ArrowArrayGuard(ArrowArrayGuard &&other) noexcept : array_(other.array_) {
+    other.array_ = {};
+  }
+  ArrowArrayGuard &operator=(ArrowArrayGuard &&other) noexcept {
+    if (this == &other)
+      return *this;
+    reset();
+    array_ = other.array_;
+    other.array_ = {};
+    return *this;
+  }
+
+  ArrowArray *get() noexcept { return &array_; }
+  const ArrowArray *get() const noexcept { return &array_; }
+  ArrowArray *operator->() noexcept { return &array_; }
+  const ArrowArray *operator->() const noexcept { return &array_; }
+  ArrowArray &operator*() noexcept { return array_; }
+
+  void dismiss() noexcept { array_.release = nullptr; }
+  void reset() noexcept {
+    if (array_.release)
+      array_.release(&array_);
+    array_ = {};
+  }
+};
+
+class BinaryColumnView {
+  const ArrowArray *array_;
+  const int32_t *offsets_;
+  const std::byte *data_;
+  size_t data_bytes_;
+
+public:
+  BinaryColumnView(const ArrowArray *array, size_t data_bytes)
+      : array_(array),
+        offsets_(static_cast<const int32_t *>(array->buffers[1])),
+        data_(static_cast<const std::byte *>(array->buffers[2])),
+        data_bytes_(data_bytes) {
+    if (!array_ || array_->n_buffers < 3 || !offsets_ || (array_->length < 0) ||
+        (array_->offset > std::numeric_limits<int64_t>::max() - array_->length))
+      throw std::runtime_error("invalid Arrow binary column");
+    const int64_t first = array_->offset;
+    const int64_t last = first + array_->length;
+    if (offsets_[first] < 0 || offsets_[last] < offsets_[first] ||
+        static_cast<size_t>(offsets_[last]) > data_bytes_)
+      throw std::runtime_error("Arrow binary column exceeds its data buffer");
+  }
+
+  std::span<const std::byte> row(int64_t row_index) const {
+    if (row_index < 0 || row_index >= array_->length)
+      throw std::out_of_range("Arrow binary row is outside the record batch");
+    const int64_t index = array_->offset + row_index;
+    const int32_t begin = offsets_[index];
+    const int32_t end = offsets_[index + 1];
+    if (begin < 0 || end < begin || static_cast<size_t>(end) > data_bytes_)
+      throw std::runtime_error("Arrow binary offsets are invalid");
+    return {data_ + begin, static_cast<size_t>(end - begin)};
+  }
+};
+
+class ArrowRecordBatchView {
+  const ArrowArray *array_;
+  const ArrowSchema *schema_;
+
+public:
+  ArrowRecordBatchView(const ArrowArray *array, const ArrowSchema *schema)
+      : array_(array), schema_(schema) {
+    if (!array_ || !schema_ || array_->length < 0 || schema_->n_children < 0 ||
+        array_->n_children != schema_->n_children)
+      throw std::runtime_error("invalid Arrow record batch");
+  }
+
+  const ArrowArray *field(size_t index) const {
+    if (index >= static_cast<size_t>(array_->n_children) || !array_->children ||
+        !array_->children[index])
+      throw std::out_of_range("Arrow record batch field is outside the schema");
+    return array_->children[index];
+  }
+
+  const ArrowSchema *field_schema(size_t index) const {
+    if (index >= static_cast<size_t>(schema_->n_children) ||
+        !schema_->children || !schema_->children[index])
+      throw std::out_of_range("Arrow schema field is outside the schema");
+    return schema_->children[index];
+  }
+
+  template <typename T> std::span<const T> fixed(size_t index) const {
+    const auto *field_array = field(index);
+    if (field_array->n_buffers < 2 || !field_array->buffers[1] ||
+        field_array->length < 0 || field_array->offset < 0)
+      throw std::runtime_error("invalid Arrow fixed-width column");
+    const auto *values = static_cast<const T *>(field_array->buffers[1]);
+    return {values + field_array->offset,
+            static_cast<size_t>(field_array->length)};
+  }
+
+  BinaryColumnView binary(size_t index) const {
+    const auto *field_array = field(index);
+    if (field_array->n_buffers < 3 || !field_array->buffers[1] ||
+        !field_array->buffers[2])
+      throw std::runtime_error("invalid Arrow binary column");
+    const auto *offsets = static_cast<const int32_t *>(field_array->buffers[1]);
+    const int64_t offset = field_array->offset;
+    const int64_t length = field_array->length;
+    if (offset < 0 || length < 0 || offsets[offset] < 0 ||
+        offsets[offset + length] < offsets[offset])
+      throw std::runtime_error("invalid Arrow binary offsets");
+    return BinaryColumnView(field_array,
+                            static_cast<size_t>(offsets[offset + length]));
+  }
+
+  int64_t length() const noexcept { return array_->length; }
+};
+
+class ArrowArrayView {
+  const ArrowArray *array_;
+
+public:
+  explicit ArrowArrayView(const ArrowArray *array) : array_(array) {
+    if (!array_ || array_->length < 0 || array_->offset < 0)
+      throw std::runtime_error("invalid Arrow array");
+  }
+
+  BinaryColumnView binary() const {
+    if (array_->n_buffers < 3 || !array_->buffers[1] || !array_->buffers[2])
+      throw std::runtime_error("invalid Arrow binary column");
+    const auto *offsets = static_cast<const int32_t *>(array_->buffers[1]);
+    const int64_t last = array_->offset + array_->length;
+    if (last < array_->offset || offsets[array_->offset] < 0 ||
+        offsets[last] < offsets[array_->offset])
+      throw std::runtime_error("invalid Arrow binary offsets");
+    return BinaryColumnView(array_, static_cast<size_t>(offsets[last]));
+  }
+
+  template <typename T> T value(int64_t row) const {
+    if (row < 0 || row >= array_->length || array_->n_buffers < 2 ||
+        !array_->buffers[1])
+      throw std::out_of_range("Arrow fixed-width row is outside the array");
+    const auto *values = static_cast<const T *>(array_->buffers[1]);
+    return values[array_->offset + row];
+  }
+
+  template <typename T> std::span<const T> values() const {
+    if (array_->n_buffers < 2 || !array_->buffers[1])
+      throw std::runtime_error("invalid Arrow fixed-width column");
+    const auto *values = static_cast<const T *>(array_->buffers[1]);
+    return {values + array_->offset, static_cast<size_t>(array_->length)};
+  }
+
+  std::span<const std::byte> bytes(size_t width) const {
+    if (array_->n_buffers < 2 || !array_->buffers[1] ||
+        width > std::numeric_limits<size_t>::max() /
+                    static_cast<size_t>(array_->length))
+      throw std::runtime_error("invalid Arrow fixed-width column");
+    const auto *data = static_cast<const std::byte *>(array_->buffers[1]);
+    return {data + static_cast<size_t>(array_->offset) * width,
+            static_cast<size_t>(array_->length) * width};
+  }
+};
+
+inline void release_arrow_children(ArrowArray &array) noexcept {
+  if (!array.children)
+    return;
+  for (int64_t index = 0; index < array.n_children; ++index) {
+    auto *child = array.children[index];
+    if (child && child->release)
+      child->release(child);
+  }
+  delete[] array.children;
+  array.children = nullptr;
+}
+
+inline void release_arrow_schema_children(ArrowSchema &schema) noexcept {
+  if (!schema.children)
+    return;
+  for (int64_t index = 0; index < schema.n_children; ++index) {
+    auto *child = schema.children[index];
+    if (child->release)
+      child->release(child);
+  }
+  delete[] schema.children;
+  schema.children = nullptr;
+}
+
+inline const ArrowSchema *arrow_schema_field(const ArrowSchema &schema,
+                                             size_t index) {
+  if (index >= static_cast<size_t>(schema.n_children) || !schema.children ||
+      !schema.children[index])
+    throw std::out_of_range("Arrow schema field is outside the schema");
+  return schema.children[index];
+}
+
+inline const ArrowArray *arrow_array_field(const ArrowArray &array,
+                                           size_t index) {
+  if (index >= static_cast<size_t>(array.n_children) || !array.children ||
+      !array.children[index])
+    throw std::out_of_range("Arrow record batch field is outside the schema");
+  return array.children[index];
+}
 
 struct ColumnOwner {
   std::vector<std::byte> data;
@@ -227,15 +435,7 @@ std::vector<std::byte> string_bytes(std::string_view value) {
 }
 
 std::span<const std::byte> binary_value(const ArrowArray *array, int64_t row) {
-  const auto *offsets = static_cast<const int32_t *>(array->buffers[1]);
-  const auto *data = static_cast<const std::byte *>(array->buffers[2]);
-  const int64_t index = array->offset + row;
-  const int32_t begin = offsets[index];
-  const int32_t end = offsets[index + 1];
-  if (begin < 0 || end < begin)
-    throw std::runtime_error("native Lance binary offsets are invalid");
-  return std::span<const std::byte>(data + begin,
-                                    static_cast<size_t>(end - begin));
+  return ArrowArrayView(array).binary().row(row);
 }
 
 std::string binary_string(const ArrowArray *array, int64_t row) {
@@ -245,8 +445,7 @@ std::string binary_string(const ArrowArray *array, int64_t row) {
 }
 
 template <typename T> T fixed_value(const ArrowArray *array, int64_t row) {
-  const auto *values = static_cast<const T *>(array->buffers[1]);
-  return values[array->offset + row];
+  return ArrowArrayView(array).value<T>(row);
 }
 
 void append_binary(std::vector<std::byte> &data, std::vector<uint32_t> &offsets,
@@ -260,7 +459,8 @@ void append_binary(std::vector<std::byte> &data, std::vector<uint32_t> &offsets,
 inline size_t find_column_index(const ArrowSchema &schema,
                                 std::string_view name) {
   for (int64_t index = 0; index < schema.n_children; ++index) {
-    if (schema.children[index]->name && name == schema.children[index]->name) {
+    if (arrow_schema_field(schema, index)->name &&
+        name == arrow_schema_field(schema, index)->name) {
       return static_cast<size_t>(index);
     }
   }
@@ -527,6 +727,40 @@ uint64_t fnv1a(std::span<const std::byte> bytes,
   return hash;
 }
 
+template <typename T>
+void append_little_endian(std::vector<std::byte> &output, T value) {
+  static_assert(std::is_unsigned_v<T>);
+  for (size_t byte = 0; byte < sizeof(T); ++byte)
+    output.push_back(static_cast<std::byte>(value >> (byte * 8)));
+}
+
+void append_length_prefixed(std::vector<std::byte> &output,
+                            std::string_view value) {
+  if (value.size() > std::numeric_limits<uint32_t>::max())
+    throw std::length_error("canonical tombstone field is too large");
+  append_little_endian<uint32_t>(output, static_cast<uint32_t>(value.size()));
+  const auto bytes = string_bytes(value);
+  output.insert(output.end(), bytes.begin(), bytes.end());
+}
+
+std::vector<std::byte>
+canonical_entry_tombstone(uint32_t participant_index, uint32_t dimension,
+                          uint64_t key, uint64_t mutation_sequence,
+                          std::string_view embedding_dtype,
+                          std::string_view optimizer_dtype) {
+  std::vector<std::byte> record;
+  append_little_endian<uint8_t>(record, 1);
+  append_length_prefixed(record, "entry_tombstone");
+  append_little_endian<uint32_t>(record, participant_index);
+  append_little_endian<uint32_t>(record, dimension);
+  append_little_endian<uint64_t>(record, key);
+  append_little_endian<uint64_t>(record, mutation_sequence);
+  append_length_prefixed(record, embedding_dtype);
+  append_length_prefixed(record, optimizer_dtype);
+  append_little_endian<uint8_t>(record, 1);
+  return record;
+}
+
 std::string checksum(std::span<const std::byte> slots,
                      std::span<const std::byte> keys,
                      std::span<const std::byte> sequences,
@@ -568,10 +802,7 @@ ArrowArray make_struct_array(std::vector<ArrowArray *> children,
                     owned,
                     nullptr,
                     [](ArrowArray *array) {
-                      for (int64_t i = 0; i < array->n_children; ++i)
-                        if (array->children[i] && array->children[i]->release)
-                          array->children[i]->release(array->children[i]);
-                      delete[] array->children;
+                      release_arrow_children(*array);
                       delete[] array->buffers;
                       array->release = nullptr;
                     },
@@ -640,8 +871,8 @@ ArrowArray copy_selected_rows(const ArrowSchema &schema,
   children.reserve(static_cast<size_t>(schema.n_children));
   for (int64_t child_index = 0; child_index < schema.n_children;
        ++child_index) {
-    const auto *child_schema = schema.children[child_index];
-    const auto *child = source.children[child_index];
+    const auto *child_schema = arrow_schema_field(schema, child_index);
+    const auto *child = arrow_array_field(source, child_index);
     if (child_schema->format &&
         (child_schema->format[0] == 'u' || child_schema->format[0] == 'z')) {
       std::vector<std::byte> data;
@@ -662,12 +893,11 @@ ArrowArray copy_selected_rows(const ArrowSchema &schema,
     if (width == 0)
       throw std::runtime_error(
           "native Lance compaction column format is unsupported");
-    const auto *bytes = static_cast<const std::byte *>(child->buffers[1]);
     std::vector<std::byte> data;
     data.reserve(selected.size() * width);
     for (const int64_t row : selected) {
-      const auto *begin =
-          bytes + static_cast<size_t>(child->offset + row) * width;
+      const auto bytes = ArrowArrayView(child).bytes(width);
+      const auto *begin = bytes.data() + static_cast<size_t>(row) * width;
       data.insert(data.end(), begin, begin + width);
     }
     children.push_back(make_fixed_column(child_schema->format,
@@ -682,7 +912,7 @@ ArrowArray make_empty_array(const ArrowSchema &schema) {
   children.reserve(static_cast<size_t>(schema.n_children));
   for (int64_t child_index = 0; child_index < schema.n_children;
        ++child_index) {
-    const auto *child_schema = schema.children[child_index];
+    const auto *child_schema = arrow_schema_field(schema, child_index);
     if (child_schema->format &&
         (child_schema->format[0] == 'u' || child_schema->format[0] == 'z')) {
       children.push_back(make_binary_column({}, {0}));
@@ -827,6 +1057,7 @@ struct PipelinedWriterState {
   std::string root;
   std::string entries_uri;
   std::string pages_uri;
+  uint64_t page_dataset_version = 0;
   std::string embedding_dtype;
   std::string optimizer_dtype;
   std::string key_dtype;
@@ -878,21 +1109,14 @@ struct PipelinedWriterState {
 void NativeFragmentWriter::release_schema(ArrowSchema *schema) {
   if (!schema || !schema->release)
     return;
-  for (int64_t i = 0; i < schema->n_children; ++i)
-    if (schema->children[i] && schema->children[i]->release)
-      schema->children[i]->release(schema->children[i]);
-  delete[] schema->children;
-  schema->children = nullptr;
+  release_arrow_schema_children(*schema);
   schema->release = nullptr;
 }
 
 void NativeFragmentWriter::release_array(ArrowArray *array) {
   if (!array || !array->release)
     return;
-  for (int64_t i = 0; i < array->n_children; ++i)
-    if (array->children[i] && array->children[i]->release)
-      array->children[i]->release(array->children[i]);
-  delete[] array->children;
+  release_arrow_children(*array);
   delete[] array->buffers;
   array->release = nullptr;
 }
@@ -911,7 +1135,14 @@ void NativeFragmentWriter::set_incremental_mutations(
         "incremental mutations require an active fragment");
   state_->incremental_sequences.clear();
   state_->incremental_filter_enabled = true;
-  for (const auto &mutation : mutations) {
+  std::vector<CheckpointMutation> ordered(mutations.begin(), mutations.end());
+  std::ranges::sort(ordered, [](const auto &left, const auto &right) {
+    return std::tie(left.dimension, left.key, left.mutation_sequence,
+                    left.deleted) < std::tie(right.dimension, right.key,
+                                             right.mutation_sequence,
+                                             right.deleted);
+  });
+  for (const auto &mutation : ordered) {
     if (mutation.deleted) {
       write_tombstone(mutation.dimension, mutation.key,
                       mutation.mutation_sequence);
@@ -931,7 +1162,7 @@ void NativeFragmentWriter::write_tombstone(uint32_t dimension, uint64_t key,
   if (!state_)
     throw std::runtime_error("tombstone write requires an active fragment");
   std::vector<ArrowArray *> children;
-  children.reserve(16);
+  children.reserve(se::lance_layout::kEntryColumns.size());
   children.push_back(numeric_column(std::span<const uint32_t>(&dimension, 1)));
   const auto kdt = parse_key_dtype(state_->key_dtype);
   se::dispatch_key_type(kdt, [&]<typename KeyT>() {
@@ -956,7 +1187,6 @@ void NativeFragmentWriter::write_tombstone(uint32_t dimension, uint64_t key,
   const uint32_t slot = 0;
   children.push_back(numeric_column(std::span<const uint32_t>(&slot, 1)));
   children.push_back(make_repeated_binary_column(string_bytes("deleted"), 1));
-  children.push_back(numeric_column(std::span<const uint64_t>(&zero, 1)));
   children.push_back(
       numeric_column(std::span<const uint32_t>(&state_->participant_index, 1)));
   children.push_back(
@@ -964,14 +1194,10 @@ void NativeFragmentWriter::write_tombstone(uint32_t dimension, uint64_t key,
   start_entries();
   state_->entries_channel.push(make_struct_array(std::move(children), 1));
   ++state_->artifact.entry_count;
-  state_->content_hash =
-      fnv1a(std::as_bytes(std::span<const uint32_t>(&dimension, 1)),
-            state_->content_hash);
-  state_->content_hash = fnv1a(
-      std::as_bytes(std::span<const uint64_t>(&key, 1)), state_->content_hash);
-  state_->content_hash =
-      fnv1a(std::as_bytes(std::span<const uint64_t>(&mutation_sequence, 1)),
-            state_->content_hash);
+  const auto canonical = canonical_entry_tombstone(
+      state_->participant_index, dimension, key, mutation_sequence,
+      state_->embedding_dtype, state_->optimizer_dtype);
+  state_->content_hash = fnv1a(canonical, state_->content_hash);
 }
 
 void NativeFragmentWriter::begin_fragment(
@@ -979,14 +1205,21 @@ void NativeFragmentWriter::begin_fragment(
     std::span<const uint32_t> dimensions, std::string_view embedding_dtype,
     std::string_view optimizer_dtype, std::string_view score_policy,
     std::string_view key_dtype, std::string_view schema_digest, bool has_score,
-    bool include_page_images, uint32_t entries_per_page) {
+    bool include_page_images, uint32_t entries_per_page,
+    std::string_view page_dataset_uri, uint64_t page_dataset_version) {
   const storage::PageGeometry geometry(entries_per_page);
+  if (include_page_images && page_dataset_uri.empty())
+    throw std::invalid_argument(
+        "page dataset URI is required when page images are enabled");
+  if (!include_page_images && !page_dataset_uri.empty())
+    throw std::invalid_argument(
+        "page dataset URI is invalid when page images are disabled");
   state_ = std::make_unique<PipelinedWriterState>();
   state_->root = std::string(staging_uri);
   state_->entries_uri =
       state_->root + "/" + std::string(lance_layout::kEntriesDataset);
-  state_->pages_uri =
-      state_->root + "/" + std::string(lance_layout::kPageImagesDataset);
+  state_->pages_uri = std::string(page_dataset_uri);
+  state_->page_dataset_version = page_dataset_version;
   state_->embedding_dtype = std::string(embedding_dtype);
   state_->optimizer_dtype = std::string(optimizer_dtype);
   state_->key_dtype = std::string(key_dtype);
@@ -1066,10 +1299,27 @@ void NativeFragmentWriter::start_pages() {
         ArrowArrayStream stream{&channel_stream_schema, &channel_stream_next,
                                 &channel_stream_error, &channel_stream_release,
                                 stream_state};
-        check_lance(lance_dataset_write(state->pages_uri.c_str(), &schema,
-                                        &stream, LANCE_WRITE_CREATE, nullptr,
-                                        &state->pages_dataset),
-                    "native Lance fragment write pages");
+        if (state->page_dataset_version == 0) {
+          check_lance(lance_dataset_write(state->pages_uri.c_str(), &schema,
+                                          &stream, LANCE_WRITE_CREATE, nullptr,
+                                          &state->pages_dataset),
+                      "native Lance fragment write pages");
+        } else {
+          state->pages_dataset = lance_dataset_open(
+              state->pages_uri.c_str(), nullptr, state->page_dataset_version);
+          if (state->pages_dataset == nullptr)
+            check_lance(-1, "native Lance page parent open");
+          const char *const on_columns[] = {
+              "source_participant_index", "embedding_dim", "physical_page_id"};
+          const LanceMergeInsertParams params{
+              LANCE_MERGE_WHEN_MATCHED_UPDATE_ALL, nullptr,
+              LANCE_MERGE_WHEN_NOT_MATCHED_INSERT_ALL,
+              LANCE_MERGE_WHEN_NOT_MATCHED_BY_SOURCE_KEEP, nullptr};
+          check_lance(lance_dataset_merge_insert(state->pages_dataset,
+                                                 on_columns, 3, &stream,
+                                                 &params, nullptr),
+                      "native Lance page snapshot merge");
+        }
         if (schema.release)
           schema.release(&schema);
       } catch (...) {
@@ -1102,14 +1352,13 @@ void NativeFragmentWriter::write_page_image(
   if (!steps.empty() && steps.size() != keys.size())
     throw std::invalid_argument("native Lance page step shape mismatch");
 
-  auto slot_bytes = bytes_of(slots);
-  auto key_bytes = bytes_of(keys);
-  auto sequence_bytes = bytes_of(sequences);
-  auto value_bytes = std::vector<std::byte>(values.begin(), values.end());
-  auto score_bytes = bytes_of(scores);
-  auto optimizer_bytes =
-      std::vector<std::byte>(optimizer.begin(), optimizer.end());
-  auto step_bytes = bytes_of(steps);
+  const auto slot_bytes = std::as_bytes(slots);
+  const auto key_bytes = std::as_bytes(keys);
+  const auto sequence_bytes = std::as_bytes(sequences);
+  const auto value_bytes = values;
+  const auto score_bytes = std::as_bytes(scores);
+  const auto optimizer_bytes = optimizer;
+  const auto step_bytes = std::as_bytes(steps);
   std::string page_digest =
       checksum(slot_bytes, key_bytes, sequence_bytes, value_bytes, score_bytes,
                optimizer_bytes, step_bytes);
@@ -1162,7 +1411,7 @@ void NativeFragmentWriter::write_page_image(
   if (!keys.empty()) {
     const size_t count = keys.size();
     std::vector<ArrowArray *> children;
-    children.reserve(15);
+    children.reserve(se::lance_layout::kEntryColumns.size());
     children.push_back(numeric_column(
         std::vector<uint32_t>(count, static_cast<uint32_t>(embedding_dim))));
 
@@ -1204,8 +1453,6 @@ void NativeFragmentWriter::write_page_image(
     children.push_back(numeric_column(slots));
     const auto active_row_state = string_bytes("active");
     children.push_back(make_repeated_binary_column(active_row_state, count));
-    std::vector<uint64_t> last_ckpts(count, 0ULL);
-    children.push_back(numeric_column(last_ckpts));
     std::vector<uint32_t> part_indices(count, state_->participant_index);
     children.push_back(numeric_column(part_indices));
     std::vector<uint64_t> mutation_sequences(count, 0ULL);
@@ -1226,6 +1473,7 @@ void NativeFragmentWriter::write_page_image(
     start_pages();
     const size_t p_count = 1;
     std::vector<ArrowArray *> p_children;
+    p_children.reserve(se::lance_layout::kPageImageColumns.size());
     std::vector<uint32_t> part_col(p_count, state_->participant_index);
     p_children.push_back(numeric_column(part_col));
     std::vector<uint32_t> dim_col(p_count,
@@ -1235,7 +1483,7 @@ void NativeFragmentWriter::write_page_image(
     p_children.push_back(numeric_column(page_col));
     std::vector<uint32_t> stride_col(p_count, page_slot_stride_bytes);
     p_children.push_back(numeric_column(stride_col));
-    auto single_row = [p_count](std::span<const std::byte> val) {
+    auto single_row = [](std::span<const std::byte> val) {
       return p_count == 0 ? make_strided_binary_column({}, 0, 0)
                           : make_single_binary_column(val);
     };
@@ -1257,9 +1505,6 @@ void NativeFragmentWriter::write_page_image(
     p_children.push_back(single_row(step_bytes));
     p_children.push_back(scalar(page_digest));
     p_children.push_back(scalar("active"));
-    std::vector<uint64_t> zeros_col(p_count, 0ULL);
-    p_children.push_back(numeric_column(zeros_col));
-
     p_children.push_back(numeric_column(
         std::vector<uint32_t>(p_count, state_->artifact.entries_per_page)));
     auto page_array = make_struct_array(std::move(p_children), p_count);
@@ -1281,6 +1526,56 @@ void NativeFragmentWriter::write_page_image(
   if (error != std::errc{})
     throw std::runtime_error("failed to format native fragment digest");
   state_->artifact.content_digest.assign(digest.data(), end);
+}
+
+void NativeFragmentWriter::write_page_tombstone(size_t embedding_dim,
+                                                uint64_t physical_page_id,
+                                                uint32_t page_slot_stride_bytes,
+                                                uint32_t entries_per_page) {
+  if (!state_)
+    throw std::runtime_error(
+        "write_page_tombstone called without begin_fragment");
+  if (!state_->include_page_images)
+    throw std::logic_error("page tombstone requires page images");
+  if (page_slot_stride_bytes == 0 || entries_per_page == 0)
+    throw std::invalid_argument(
+        "native Lance page tombstone geometry is invalid");
+
+  start_pages();
+  const size_t count = 1;
+  std::vector<ArrowArray *> children;
+  children.reserve(se::lance_layout::kPageImageColumns.size());
+  children.push_back(
+      numeric_column(std::vector<uint32_t>(count, state_->participant_index)));
+  children.push_back(
+      numeric_column(std::vector<uint32_t>(count, embedding_dim)));
+  children.push_back(
+      numeric_column(std::vector<uint64_t>(count, physical_page_id)));
+  children.push_back(
+      numeric_column(std::vector<uint32_t>(count, page_slot_stride_bytes)));
+  const auto scalar = [](std::string_view value) {
+    const auto bytes = string_bytes(value);
+    return count == 0 ? make_strided_binary_column({}, 0, 0)
+                      : make_single_binary_column(bytes);
+  };
+  const auto empty = [] { return make_single_binary_column({}); };
+  children.push_back(scalar(state_->embedding_dtype));
+  children.push_back(empty());
+  children.push_back(empty());
+  children.push_back(empty());
+  children.push_back(empty());
+  children.push_back(empty());
+  children.push_back(empty());
+  children.push_back(scalar(state_->optimizer_dtype));
+  children.push_back(numeric_column(std::vector<uint32_t>(count, 0)));
+  children.push_back(empty());
+  children.push_back(scalar(checksum({}, {}, {}, {}, {}, {}, {})));
+  children.push_back(scalar("deleted"));
+  children.push_back(
+      numeric_column(std::vector<uint32_t>(count, entries_per_page)));
+  auto page_array = make_struct_array(std::move(children), count);
+  ++state_->artifact.page_count;
+  state_->pages_channel->push(std::move(page_array));
 }
 
 NativeFragmentArtifact NativeFragmentWriter::finalize() {
@@ -1397,7 +1692,7 @@ compact_native_lance_sources(std::string_view target_uri,
     std::optional<size_t> state_index;
     for (size_t index = 0;
          index < static_cast<size_t>(schema.get()->n_children); ++index) {
-      const char *name = schema.get()->children[index]->name;
+      const char *name = arrow_schema_field(*schema.get(), index)->name;
       if (!name)
         continue;
       if (std::string_view(name) == "dim")
@@ -1420,7 +1715,7 @@ compact_native_lance_sources(std::string_view target_uri,
         output_metadata = clone_arrow_metadata(schema.get()->metadata);
       is_entries_dataset = is_entries;
       if (is_entries && key_index.has_value()) {
-        const char *fmt = schema.get()->children[*key_index]->format;
+        const char *fmt = arrow_schema_field(*schema.get(), *key_index)->format;
         if (fmt) {
           if (std::string_view(fmt) == "i")
             compaction_key_dtype = "int32";
@@ -1483,7 +1778,7 @@ compact_native_lance_sources(std::string_view target_uri,
       selected_rows.reserve(static_cast<size_t>(batch.length));
       if (is_entries) {
         for (int64_t row = 0; row < batch.length; ++row) {
-          if (binary_string(batch.children[*state_index], row) !=
+          if (binary_string(arrow_array_field(batch, *state_index), row) !=
               kActiveRowState)
             continue;
           selected_rows.push_back(row);
@@ -1496,18 +1791,14 @@ compact_native_lance_sources(std::string_view target_uri,
           copy_selected_rows(*schema.get(), batch, selected_rows);
       const size_t row_count = selected_rows.size();
       for (int64_t col = 0; col < selected.n_children; ++col) {
-        const ArrowArray *child = selected.children[col];
-        const ArrowSchema *child_schema = schema.get()->children[col];
+        const ArrowArray *child = arrow_array_field(selected, col);
+        const ArrowSchema *child_schema =
+            arrow_schema_field(*schema.get(), col);
         if (child_schema->format && (child_schema->format[0] == 'z' ||
                                      child_schema->format[0] == 'u')) {
-          const auto *offsets = static_cast<const int32_t *>(child->buffers[1]);
-          const auto *data = static_cast<const std::byte *>(child->buffers[2]);
           for (int64_t row = 0; row < child->length; ++row) {
-            const size_t begin = offsets[child->offset + row];
-            const size_t end = offsets[child->offset + row + 1];
             content_hash =
-                fnv1a(std::span<const std::byte>(data + begin, end - begin),
-                      content_hash);
+                fnv1a(ArrowArrayView(child).binary().row(row), content_hash);
           }
           continue;
         }
@@ -1516,12 +1807,11 @@ compact_native_lance_sources(std::string_view target_uri,
           if (width == 0)
             throw std::runtime_error(
                 "native Lance compaction column format is unsupported");
-          const auto *bytes = static_cast<const std::byte *>(child->buffers[1]);
-          content_hash = fnv1a(
-              std::span<const std::byte>(
-                  bytes + static_cast<size_t>(child->offset + row) * width,
-                  width),
-              content_hash);
+          const auto bytes = ArrowArrayView(child).bytes(width);
+          content_hash =
+              fnv1a(std::span<const std::byte>(
+                        bytes.data() + static_cast<size_t>(row) * width, width),
+                    content_hash);
         }
       }
       batch.release(&batch);
@@ -1876,28 +2166,28 @@ void scan_native_active_entry_keys(std::string_view uri, uint64_t version,
       [&](const ArrowSchema &schema, ArrowArrayStream &stream) {
         const auto col = resolve_active_key_scan_indices(schema);
         for (;;) {
-          ArrowArray batch{};
-          if (stream.get_next(&stream, &batch) != 0)
+          ArrowArrayGuard batch;
+          if (stream.get_next(&stream, batch.get()) != 0)
             throw std::runtime_error(
                 "native Lance restore key batch read failed");
-          if (!batch.release)
+          if (!batch->release)
             break;
           std::vector<uint64_t> keys;
-          keys.reserve(static_cast<size_t>(batch.length));
-          for (int64_t row = 0; row < batch.length; ++row) {
-            if (binary_string(batch.children[col.row_state], row) !=
+          keys.reserve(static_cast<size_t>(batch->length));
+          for (int64_t row = 0; row < batch->length; ++row) {
+            if (binary_string(arrow_array_field(*batch, col.row_state), row) !=
                 kActiveRowState)
               continue;
             if (participant_index.has_value()) {
               const uint32_t src_idx = fixed_value<uint32_t>(
-                  batch.children[col.source_participant_index], row);
+                  arrow_array_field(*batch, col.source_participant_index), row);
               if (src_idx != *participant_index)
                 continue;
             }
-            keys.push_back(read_polymorphic_key(batch.children[col.key],
-                                                schema.children[col.key], row));
+            keys.push_back(
+                read_polymorphic_key(arrow_array_field(*batch, col.key),
+                                     arrow_schema_field(schema, col.key), row));
           }
-          batch.release(&batch);
           if (!keys.empty() && !visitor(keys))
             break;
         }
@@ -1918,27 +2208,27 @@ void validate_native_active_entry_keys(
         [&](const ArrowSchema &schema, ArrowArrayStream &stream) {
           const auto col = resolve_key_validation_indices(schema);
           for (;;) {
-            ArrowArray batch{};
-            if (stream.get_next(&stream, &batch) != 0)
+            ArrowArrayGuard batch;
+            if (stream.get_next(&stream, batch.get()) != 0)
               throw std::runtime_error(
                   "native Lance key validation batch read failed");
-            if (!batch.release)
+            if (!batch->release)
               break;
             try {
-              for (int64_t row = 0; row < batch.length; ++row) {
-                if (binary_string(batch.children[col.row_state], row) !=
-                    kActiveRowState)
+              for (int64_t row = 0; row < batch->length; ++row) {
+                if (binary_string(arrow_array_field(*batch, col.row_state),
+                                  row) != kActiveRowState)
                   continue;
                 validator.append(
-                    {fixed_value<uint32_t>(batch.children[col.dim], row),
-                     read_polymorphic_key(batch.children[col.key],
-                                          schema.children[col.key], row)});
+                    {fixed_value<uint32_t>(arrow_array_field(*batch, col.dim),
+                                           row),
+                     read_polymorphic_key(arrow_array_field(*batch, col.key),
+                                          arrow_schema_field(schema, col.key),
+                                          row)});
               }
             } catch (...) {
-              batch.release(&batch);
               throw;
             }
-            batch.release(&batch);
           }
         },
         storage_options, columns);
@@ -2002,19 +2292,21 @@ void validate_native_checkpoint_chain(
                 break;
               try {
                 for (int64_t row = 0; row < array.length; ++row) {
-                  const uint32_t dim =
-                      fixed_value<uint32_t>(array.children[dim_col], row);
+                  const uint32_t dim = fixed_value<uint32_t>(
+                      arrow_array_field(array, dim_col), row);
                   const uint64_t key = read_polymorphic_key(
-                      array.children[key_col], schema.children[key_col], row);
+                      arrow_array_field(array, key_col),
+                      arrow_schema_field(schema, key_col), row);
                   const auto identity = std::pair{dim, key};
-                  const uint64_t sequence =
-                      fixed_value<uint64_t>(array.children[mutation_col], row);
+                  const uint64_t sequence = fixed_value<uint64_t>(
+                      arrow_array_field(array, mutation_col), row);
                   const auto state =
-                      binary_string(array.children[state_col], row);
+                      binary_string(arrow_array_field(array, state_col), row);
                   if (std::find(dimensions.begin(), dimensions.end(), dim) ==
                           dimensions.end() ||
-                      fixed_value<uint32_t>(array.children[participant_col],
-                                            row) != participant)
+                      fixed_value<uint32_t>(
+                          arrow_array_field(array, participant_col), row) !=
+                          participant)
                     throw std::runtime_error("checkpoint entry dimension or "
                                              "participant identity mismatch");
                   if (!identities.insert(identity).second)
@@ -2096,18 +2388,21 @@ CheckpointWinners select_checkpoint_winners(
             try {
               for (int64_t row = 0; row < array.length; ++row) {
                 if (participant_index &&
-                    fixed_value<uint32_t>(array.children[participant_col],
-                                          row) != *participant_index)
+                    fixed_value<uint32_t>(
+                        arrow_array_field(array, participant_col), row) !=
+                        *participant_index)
                   throw std::runtime_error(
                       "checkpoint compact participant mismatch");
                 const auto identity = std::pair{
-                    fixed_value<uint32_t>(array.children[dim_col], row),
-                    read_polymorphic_key(array.children[key_col],
-                                         schema.children[key_col], row)};
-                const uint64_t sequence =
-                    fixed_value<uint64_t>(array.children[mutation], row);
+                    fixed_value<uint32_t>(arrow_array_field(array, dim_col),
+                                          row),
+                    read_polymorphic_key(arrow_array_field(array, key_col),
+                                         arrow_schema_field(schema, key_col),
+                                         row)};
+                const uint64_t sequence = fixed_value<uint64_t>(
+                    arrow_array_field(array, mutation), row);
                 const auto state =
-                    binary_string(array.children[state_col], row);
+                    binary_string(arrow_array_field(array, state_col), row);
                 if (state != "active" && state != "deleted")
                   throw std::runtime_error(
                       "checkpoint compact row state is invalid");
@@ -2140,15 +2435,16 @@ NativeFragmentArtifact compact_native_checkpoint(
     std::string_view embedding_dtype, std::string_view optimizer_dtype,
     std::string_view score_policy, std::string_view key_dtype,
     std::string_view schema_digest, bool include_page_images,
-    uint32_t entries_per_page, const LanceStorageOptions &storage_options) {
+    uint32_t entries_per_page, std::string_view page_dataset_uri,
+    const LanceStorageOptions &storage_options) {
   const auto winners = select_checkpoint_winners(
       source_uris, 0, participant_index, key_dtype, storage_options);
   const bool has_score = score_policy != "none";
   NativeFragmentWriter writer;
-  writer.begin_fragment(target_uri, participant_index, dimensions,
-                        embedding_dtype, optimizer_dtype, score_policy,
-                        key_dtype, schema_digest, has_score,
-                        include_page_images, entries_per_page);
+  writer.begin_fragment(
+      target_uri, participant_index, dimensions, embedding_dtype,
+      optimizer_dtype, score_policy, key_dtype, schema_digest, has_score,
+      include_page_images, entries_per_page, page_dataset_uri);
   std::unordered_map<uint32_t, uint64_t> next_page;
   struct PageBatch {
     std::vector<uint64_t> keys, sequences, scores;
@@ -2192,10 +2488,11 @@ NativeFragmentArtifact compact_native_checkpoint(
               break;
             try {
               for (int64_t row = 0; row < array.length; ++row) {
-                const uint32_t dim =
-                    fixed_value<uint32_t>(array.children[col.dim], row);
+                const uint32_t dim = fixed_value<uint32_t>(
+                    arrow_array_field(array, col.dim), row);
                 const uint64_t key = read_polymorphic_key(
-                    array.children[col.key], schema.children[col.key], row);
+                    arrow_array_field(array, col.key),
+                    arrow_schema_field(schema, col.key), row);
                 const auto &winner = winners.at({dim, key});
                 if (winner.source != source || winner.deleted)
                   continue;
@@ -2203,12 +2500,12 @@ NativeFragmentArtifact compact_native_checkpoint(
                     dimensions.end())
                   throw std::runtime_error(
                       "checkpoint compact dimension is invalid");
-                const auto values =
-                    binary_value(array.children[col.embedding_values], row);
+                const auto values = binary_value(
+                    arrow_array_field(array, col.embedding_values), row);
                 const auto optimizer = binary_value(
-                    array.children[col.optimizer_state_values], row);
+                    arrow_array_field(array, col.optimizer_state_values), row);
                 const uint32_t stride = fixed_value<uint32_t>(
-                    array.children[col.optimizer_state_stride], row);
+                    arrow_array_field(array, col.optimizer_state_stride), row);
                 if (values.size() != dim * dtype_itemsize(embedding_dtype) ||
                     optimizer.size() !=
                         stride * (optimizer_dtype.empty()
@@ -2224,18 +2521,18 @@ NativeFragmentArtifact compact_native_checkpoint(
                 page.optimizer_stride = stride;
                 page.slots.push_back(static_cast<uint32_t>(page.keys.size()));
                 page.keys.push_back(key);
-                page.sequences.push_back(
-                    fixed_value<uint64_t>(array.children[sequence_col], row));
+                page.sequences.push_back(fixed_value<uint64_t>(
+                    arrow_array_field(array, sequence_col), row));
                 page.values.insert(page.values.end(), values.begin(),
                                    values.end());
                 if (has_score)
-                  page.scores.push_back(
-                      fixed_value<uint64_t>(array.children[col.score], row));
+                  page.scores.push_back(fixed_value<uint64_t>(
+                      arrow_array_field(array, col.score), row));
                 page.optimizer.insert(page.optimizer.end(), optimizer.begin(),
                                       optimizer.end());
                 if (stride)
-                  page.steps.push_back(
-                      fixed_value<uint32_t>(array.children[col.step], row));
+                  page.steps.push_back(fixed_value<uint32_t>(
+                      arrow_array_field(array, col.step), row));
                 if (page.keys.size() == entries_per_page)
                   flush_page(dim, page);
               }
@@ -2284,8 +2581,8 @@ void scan_native_partition_entries(
             continue;
           }
 
-          const auto *key_col = batch_array.children[col.key];
-          const auto *key_schema = schema.children[col.key];
+          const auto *key_col = arrow_array_field(batch_array, col.key);
+          const auto *key_schema = arrow_schema_field(schema, col.key);
 
           std::unique_ptr<bool[]> mask(new bool[batch_len]);
           std::span<bool> mask_span(mask.get(), batch_len);
@@ -2294,34 +2591,22 @@ void scan_native_partition_entries(
               (key_schema && key_schema->format) ? key_schema->format[0] : '\0';
           switch (fmt) {
           case 'i': {
-            const auto *ptr =
-                static_cast<const int32_t *>(key_col->buffers[1]) +
-                key_col->offset;
-            partitioner->filter_span(std::span<const int32_t>(ptr, batch_len),
+            partitioner->filter_span(ArrowArrayView(key_col).values<int32_t>(),
                                      partition_id, mask_span);
             break;
           }
           case 'I': {
-            const auto *ptr =
-                static_cast<const uint32_t *>(key_col->buffers[1]) +
-                key_col->offset;
-            partitioner->filter_span(std::span<const uint32_t>(ptr, batch_len),
+            partitioner->filter_span(ArrowArrayView(key_col).values<uint32_t>(),
                                      partition_id, mask_span);
             break;
           }
           case 'l': {
-            const auto *ptr =
-                static_cast<const int64_t *>(key_col->buffers[1]) +
-                key_col->offset;
-            partitioner->filter_span(std::span<const int64_t>(ptr, batch_len),
+            partitioner->filter_span(ArrowArrayView(key_col).values<int64_t>(),
                                      partition_id, mask_span);
             break;
           }
           case 'L': {
-            const auto *ptr =
-                static_cast<const uint64_t *>(key_col->buffers[1]) +
-                key_col->offset;
-            partitioner->filter_span(std::span<const uint64_t>(ptr, batch_len),
+            partitioner->filter_span(ArrowArrayView(key_col).values<uint64_t>(),
                                      partition_id, mask_span);
             break;
           }
@@ -2338,32 +2623,35 @@ void scan_native_partition_entries(
           batch.optimizer_offsets.push_back(0);
           for (int64_t row = 0; row < batch_len; ++row) {
             if (!mask_span[row] ||
-                binary_string(batch_array.children[col.row_state], row) !=
-                    kActiveRowState)
+                binary_string(arrow_array_field(batch_array, col.row_state),
+                              row) != kActiveRowState)
               continue;
             if (source_participant_index.has_value() &&
                 fixed_value<uint32_t>(
-                    batch_array.children[col.source_participant_index], row) !=
-                    *source_participant_index)
+                    arrow_array_field(batch_array,
+                                      col.source_participant_index),
+                    row) != *source_participant_index)
               continue;
-            const uint64_t key = read_polymorphic_key(
-                batch_array.children[col.key], schema.children[col.key], row);
-            const uint32_t dimension =
-                fixed_value<uint32_t>(batch_array.children[col.dim], row);
+            const uint64_t key =
+                read_polymorphic_key(arrow_array_field(batch_array, col.key),
+                                     arrow_schema_field(schema, col.key), row);
+            const uint32_t dimension = fixed_value<uint32_t>(
+                arrow_array_field(batch_array, col.dim), row);
             if (select_entry && !select_entry(dimension, key))
               continue;
-            batch.dimensions.push_back(
-                fixed_value<uint32_t>(batch_array.children[col.dim], row));
+            batch.dimensions.push_back(fixed_value<uint32_t>(
+                arrow_array_field(batch_array, col.dim), row));
             batch.keys.push_back(key);
-            const auto embedding =
-                binary_value(batch_array.children[col.embedding_values], row);
+            const auto embedding = binary_value(
+                arrow_array_field(batch_array, col.embedding_values), row);
             append_binary(batch.embedding_values, batch.embedding_offsets,
                           embedding);
-            batch.embedding_dtype =
-                binary_string(batch_array.children[col.embedding_dtype], row);
+            batch.embedding_dtype = binary_string(
+                arrow_array_field(batch_array, col.embedding_dtype), row);
             if (load_optimizer_state) {
               const auto optimizer = binary_value(
-                  batch_array.children[col.optimizer_state_values], row);
+                  arrow_array_field(batch_array, col.optimizer_state_values),
+                  row);
               append_binary(batch.optimizer_values, batch.optimizer_offsets,
                             optimizer);
             } else {
@@ -2371,13 +2659,14 @@ void scan_native_partition_entries(
                   static_cast<uint32_t>(batch.optimizer_values.size()));
             }
             batch.optimizer_dtype = binary_string(
-                batch_array.children[col.optimizer_state_dtype], row);
+                arrow_array_field(batch_array, col.optimizer_state_dtype), row);
             batch.optimizer_strides.push_back(fixed_value<uint32_t>(
-                batch_array.children[col.optimizer_state_stride], row));
-            batch.steps.push_back(
-                fixed_value<uint32_t>(batch_array.children[col.step], row));
-            batch.scores.push_back(
-                fixed_value<uint64_t>(batch_array.children[col.score], row));
+                arrow_array_field(batch_array, col.optimizer_state_stride),
+                row));
+            batch.steps.push_back(fixed_value<uint32_t>(
+                arrow_array_field(batch_array, col.step), row));
+            batch.scores.push_back(fixed_value<uint64_t>(
+                arrow_array_field(batch_array, col.score), row));
           }
           batch_array.release(&batch_array);
           if (!batch.keys.empty() && !visitor(batch))
@@ -2450,26 +2739,28 @@ void scan_native_page_images(std::string_view uri, uint64_t version,
             break;
           for (int64_t row = 0; row < batch_array.length; ++row) {
             if (fixed_value<uint32_t>(
-                    batch_array.children[col.source_participant_index], row) !=
-                    participant_index ||
-                binary_string(batch_array.children[col.row_state], row) !=
-                    kActiveRowState)
+                    arrow_array_field(batch_array,
+                                      col.source_participant_index),
+                    row) != participant_index ||
+                binary_string(arrow_array_field(batch_array, col.row_state),
+                              row) != kActiveRowState)
               continue;
             NativePageImage page;
             page.entries_per_page = fixed_value<uint32_t>(
-                batch_array.children[col.entries_per_page], row);
+                arrow_array_field(batch_array, col.entries_per_page), row);
             page.embedding_dim = fixed_value<uint32_t>(
-                batch_array.children[col.embedding_dim], row);
+                arrow_array_field(batch_array, col.embedding_dim), row);
             page.physical_page_id = fixed_value<uint64_t>(
-                batch_array.children[col.physical_page_id], row);
+                arrow_array_field(batch_array, col.physical_page_id), row);
             page.page_slot_stride_bytes = fixed_value<uint32_t>(
-                batch_array.children[col.page_slot_stride_bytes], row);
-            page.embedding_dtype =
-                binary_string(batch_array.children[col.embedding_dtype], row);
+                arrow_array_field(batch_array, col.page_slot_stride_bytes),
+                row);
+            page.embedding_dtype = binary_string(
+                arrow_array_field(batch_array, col.embedding_dtype), row);
             auto copy_binary = [&](size_t col_idx,
                                    std::vector<std::byte> &out) {
               const auto bytes =
-                  binary_value(batch_array.children[col_idx], row);
+                  binary_value(arrow_array_field(batch_array, col_idx), row);
               out.assign(bytes.begin(), bytes.end());
             };
             std::vector<std::byte> slots, keys, sequences, scores, steps;
@@ -2479,9 +2770,10 @@ void scan_native_page_images(std::string_view uri, uint64_t version,
             copy_binary(col.embedding_values, page.values);
             copy_binary(col.scores, scores);
             const auto optimizer_bytes = binary_value(
-                batch_array.children[col.optimizer_state_values], row);
+                arrow_array_field(batch_array, col.optimizer_state_values),
+                row);
             const auto steps_bytes =
-                binary_value(batch_array.children[col.steps], row);
+                binary_value(arrow_array_field(batch_array, col.steps), row);
             const auto require_fixed_width =
                 [](std::span<const std::byte> bytes, size_t width,
                    const char *field) {
@@ -2505,8 +2797,8 @@ void scan_native_page_images(std::string_view uri, uint64_t version,
                  steps_bytes.size() / sizeof(uint32_t) != key_count))
               throw std::runtime_error(
                   "native Lance page image key and payload lengths differ");
-            page.checksum =
-                binary_string(batch_array.children[col.checksum], row);
+            page.checksum = binary_string(
+                arrow_array_field(batch_array, col.checksum), row);
             if (checksum(slots, keys, sequences, page.values, scores,
                          optimizer_bytes, steps_bytes) != page.checksum)
               throw std::runtime_error("page image checksum mismatch");
@@ -2534,9 +2826,10 @@ void scan_native_page_images(std::string_view uri, uint64_t version,
                               reinterpret_cast<const uint32_t *>(steps.data() +
                                                                  steps.size()));
             page.optimizer_dtype = binary_string(
-                batch_array.children[col.optimizer_state_dtype], row);
+                arrow_array_field(batch_array, col.optimizer_state_dtype), row);
             page.optimizer_stride = fixed_value<uint32_t>(
-                batch_array.children[col.optimizer_state_stride], row);
+                arrow_array_field(batch_array, col.optimizer_state_stride),
+                row);
             if (!visitor(std::move(page))) {
               batch_array.release(&batch_array);
               return;

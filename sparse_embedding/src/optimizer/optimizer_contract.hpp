@@ -67,31 +67,34 @@ struct OptimizerExtensionFacade
       ::add_convention<OptimizerClear, void()>              //
       ::add_convention<OptimizerKernelUpdate,
                        void(const OptimizerBatchView<ParamT> &, uint64_t)> //
-      ::add_convention<
+      ::template add_convention<
           pro::weak_dispatch<OptimizerKernelSetPageEvictionEnabled>,
           void(bool)> //
-      ::add_convention<pro::weak_dispatch<OptimizerKernelCapacity>,
-                       size_t() const> //
-      ::add_convention<pro::weak_dispatch<OptimizerKernelStepData>,
-                       uint32_t(uint32_t) const> //
-      ::add_convention<pro::weak_dispatch<OptimizerKernelSetStep>,
-                       void(uint32_t, uint32_t)> //
-      ::add_convention<pro::weak_dispatch<OptimizerKernelRequiresScore>,
-                       bool() const> //
-      ::add_convention<pro::weak_dispatch<OptimizerKernelPrefetchState>,
-                       void(uint32_t) const> //
-      ::add_convention<pro::weak_dispatch<OptimizerKernelStep>,
-                       void(uint32_t, std::span<ParamT>,
-                            std::span<const ParamT>, uint64_t, uint64_t)> //
-      ::add_convention<pro::weak_dispatch<OptimizerKernelStateData>,
-                       void(uint32_t, std::span<OptT>) const> //
-      ::add_convention<pro::weak_dispatch<OptimizerKernelStateDim>,
-                       size_t() const> //
-      ::add_convention<
+      ::template add_convention<pro::weak_dispatch<OptimizerKernelCapacity>,
+                                size_t() const> //
+      ::template add_convention<pro::weak_dispatch<OptimizerKernelStepData>,
+                                uint32_t(uint32_t) const> //
+      ::template add_convention<pro::weak_dispatch<OptimizerKernelSetStep>,
+                                void(uint32_t, uint32_t)> //
+      ::template add_convention<
+          pro::weak_dispatch<OptimizerKernelRequiresScore>,
+          bool() const> //
+      ::template add_convention<
+          pro::weak_dispatch<OptimizerKernelPrefetchState>,
+          void(uint32_t) const> //
+      ::template add_convention<pro::weak_dispatch<OptimizerKernelStep>,
+                                void(uint32_t, std::span<ParamT>,
+                                     std::span<const ParamT>, uint64_t,
+                                     uint64_t)> //
+      ::template add_convention<pro::weak_dispatch<OptimizerKernelStateData>,
+                                void(uint32_t, std::span<OptT>) const> //
+      ::template add_convention<pro::weak_dispatch<OptimizerKernelStateDim>,
+                                size_t() const> //
+      ::template add_convention<
           pro::weak_dispatch<OptimizerKernelAllocationBytesPerEntry>,
           size_t() const> //
-      ::add_convention<pro::weak_dispatch<OptimizerKernelSetState>,
-                       void(uint32_t, std::span<const OptT>)> //
+      ::template add_convention<pro::weak_dispatch<OptimizerKernelSetState>,
+                                void(uint32_t, std::span<const OptT>)> //
       ::build {};
 
 template <typename ParamT, typename OptT>

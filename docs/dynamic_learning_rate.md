@@ -1,5 +1,7 @@
 # Dynamic Learning Rate (Score-Based LR)
 
+[中文](dynamic_learning_rate_zh.md) | [Storage Architecture](storage_architecture.md) | [Incremental Checkpointing](incremental_checkpoint.md) | [Lance Storage and Gravitino Integration](lance_storage_and_gravitino.md) | [Performance and Reliability Report](performance_and_reliability_report.md)
+
 ## Requirements
 
 This API is available from the Python package built with the repository's
@@ -71,7 +73,7 @@ store.accumulate_gradients(keys, gradients)
 
 # When optimizer_step() is called, 
 # the learning rate will automatically scale based on the LFU score of each feature!
-store.optimizer_step()
+store.optimizer_step(1)
 ```
 
 ## Important Notes

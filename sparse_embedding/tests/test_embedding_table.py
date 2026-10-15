@@ -252,7 +252,7 @@ async def test_embedding_table_async():
     await store.async_accumulate_gradients(keys, grads)
 
     # test async_optimizer_step
-    await store.async_optimizer_step()
+    await store.async_optimizer_step(1)
 
     # test async_assign_scores
     await store.async_assign_scores(keys, scores)
@@ -293,21 +293,21 @@ def test_optimizer_per_id_step():
     grads_0 = np.ones((1, 128), dtype=np.float32)
     store.lookup_or_insert(keys_0, dim=128)
     store.accumulate_gradients(keys_0, grads_0)
-    store.optimizer_step()
+    store.optimizer_step(1)
 
     val_0_step1 = np.from_dlpack(store.lookup(keys_0, dim=128)[0]).copy()
 
     # 2. Step the optimizer globally 100 times using ID 0
     for _ in range(100):
         store.accumulate_gradients(keys_0, grads_0)
-        store.optimizer_step()
+        store.optimizer_step(1)
 
     # 3. Update ID 1 for the very first time, but at global step > 100
     keys_1 = np.array([1], dtype=np.uint64)
     grads_1 = np.ones((1, 128), dtype=np.float32)
     store.lookup_or_insert(keys_1, dim=128)
     store.accumulate_gradients(keys_1, grads_1)
-    store.optimizer_step()
+    store.optimizer_step(1)
 
     val_1_step1 = np.from_dlpack(store.lookup(keys_1, dim=128)[0]).copy()
 

@@ -12,17 +12,16 @@ import pytest
 
 import sparse_embedding as se
 from sparse_embedding.checkpoint import (
-    ElasticRestore,
+    PartitionSpec,
+    ReshardRestore,
     SparseCheckpoint,
-    SparsePartitionAssignmentSpec,
-    encode_restore_options,
 )
 from sparse_embedding.checkpoint.lance_backend import LocalLanceStorage
 
 
-def _modulo_restore(partition_count: int, partition_id: int) -> ElasticRestore:
-    return ElasticRestore(
-        SparsePartitionAssignmentSpec.modulo(),
+def _modulo_restore(partition_count: int, partition_id: int) -> ReshardRestore:
+    return ReshardRestore(
+        PartitionSpec.modulo(),
         partition_count,
         partition_id,
         "uint64",
@@ -179,7 +178,7 @@ def test_adam_optimizer_step(param_dtype, optimizer_dtype):
 
     grads = _make_array((1, dim), param_dtype, rng)
     store.accumulate_gradients(keys, grads)
-    store.optimizer_step()
+    store.optimizer_step(1)
 
     out_dlp, _ = store.lookup(keys, dim=dim)
     got = _to_numpy_f32(out_dlp, (1, dim), param_dtype)
@@ -189,10 +188,10 @@ def test_adam_optimizer_step(param_dtype, optimizer_dtype):
     store.lookup_or_insert(keys2, dim=dim)
     for _ in range(50):
         store.accumulate_gradients(keys, grads)
-        store.optimizer_step()
+        store.optimizer_step(1)
     grads2 = _make_array((1, dim), param_dtype, rng)
     store.accumulate_gradients(keys2, grads2)
-    store.optimizer_step()
+    store.optimizer_step(1)
     out1_dlp, _ = store.lookup(keys2, dim=dim)
     val_key1 = _to_numpy_f32(out1_dlp, (1, dim), param_dtype)
     assert np.abs(val_key1).max() > 0.005
@@ -215,7 +214,7 @@ async def test_async_accumulate_preserves_key_width(key_dtype):
     keys = np.array([1, 2], dtype=np.dtype(key_dtype))
     store.lookup_or_insert(keys, dim=2)
     await store.async_accumulate_gradients(keys, np.ones((2, 2), dtype=np.float32))
-    store.optimizer_step()
+    store.optimizer_step(1)
     out, _ = store.lookup(keys, dim=2)
     np.testing.assert_allclose(np.from_dlpack(out), -1.0)
 
@@ -254,7 +253,7 @@ def test_checkpoint_roundtrip(param_dtype, optimizer_dtype, tmp_path):
     for _ in range(3):
         grads = _make_array((n_keys, dim), param_dtype, rng)
         store1.accumulate_gradients(keys, grads)
-        store1.optimizer_step()
+        store1.optimizer_step(1)
 
     uri = str(tmp_path / "ckpt")
     checkpoint = SparseCheckpoint(LocalLanceStorage(uri))
@@ -265,7 +264,7 @@ def test_checkpoint_roundtrip(param_dtype, optimizer_dtype, tmp_path):
     checkpoint.load_training_checkpoint(
         store2,
         locator.handle,
-        encode_restore_options(_modulo_restore(1, 0)),
+        _modulo_restore(1, 0),
     )
 
     assert store2.total_size() == n_keys
@@ -283,9 +282,9 @@ def test_checkpoint_roundtrip(param_dtype, optimizer_dtype, tmp_path):
 
     gradients = _make_array((n_keys, dim), param_dtype, np.random.default_rng(999))
     store1.accumulate_gradients(keys, gradients)
-    store1.optimizer_step()
+    store1.optimizer_step(1)
     store2.accumulate_gradients(keys, gradients)
-    store2.optimizer_step()
+    store2.optimizer_step(1)
 
     after1, _ = store1.lookup(keys, dim=dim)
     after2, _ = store2.lookup(keys, dim=dim)
@@ -334,7 +333,7 @@ def test_independent_gradient_accumulator_dtype(
     store.lookup_or_insert(keys, dim=4)
     gradients = _make_array((1, 4), gradient_dtype, np.random.default_rng(17))
     store.accumulate_gradients(keys, gradients)
-    store.optimizer_step()
+    store.optimizer_step(1)
 
     out, _ = store.lookup(keys, dim=4)
     values = _to_numpy_f32(out, (1, 4), param_dtype)
@@ -370,7 +369,7 @@ async def test_async_accumulate_accepts_configured_gradient_dtype(
     store.lookup_or_insert(keys, dim=4)
     gradients = _make_array((1, 4), gradient_dtype, np.random.default_rng(23))
     await store.async_accumulate_gradients(keys, gradients)
-    store.optimizer_step()
+    store.optimizer_step(1)
 
 
 @pytest.mark.parametrize("gradient_scale", [1.0, 8.0])
@@ -396,10 +395,46 @@ def test_gradient_scale_round_trip(gradient_scale):
         )
         store.lookup_or_insert(key, dim=4)
         store.accumulate_gradients(key, grad)
-        store.optimizer_step()
+        store.optimizer_step(1)
         out, _ = store.lookup(key, dim=4)
         values.append(np.from_dlpack(out).astype(np.float32))
     np.testing.assert_allclose(values[0], values[1], atol=2e-4)
+
+
+@pytest.mark.parametrize("normalization_steps", [1, 2, 3])
+@pytest.mark.parametrize(
+    "gradient_scale,gradient_dtype", [(1.0, "float32"), (8.0, "float16")]
+)
+def test_optimizer_step_normalizes_actual_accumulation_window(
+    normalization_steps, gradient_scale, gradient_dtype
+):
+    keys = np.asarray([17], dtype=np.int64)
+    config = se.EmbeddingConfig(
+        dims=[1],
+        thread_budget=1,
+        value_dtype="float32",
+        optimizer_dtype="float32",
+        gradient_dtype=gradient_dtype,
+        gradient_scale=gradient_scale,
+        key_dtype="int64",
+    )
+    store = se.EmbeddingStore(
+        config,
+        optimizer_config=se.Sgd(lr=1.0),
+        initializer_config=se.Zeros(),
+    )
+    store.lookup_or_insert(keys, dim=1)
+    gradient = np.asarray([[3.0]], dtype=np.dtype(gradient_dtype))
+    for _ in range(normalization_steps):
+        store.accumulate_gradients(keys, gradient)
+
+    with pytest.raises(ValueError, match="normalization_steps"):
+        store.optimizer_step(normalization_steps=0)
+
+    store.optimizer_step(normalization_steps=normalization_steps)
+    values, _ = store.lookup(keys, dim=1)
+    actual = np.from_dlpack(values).reshape(-1)
+    np.testing.assert_allclose(actual, [-3.0], atol=2e-3)
 
 
 @pytest.mark.parametrize("gradient_scale", [0.0, -1.0, float("nan"), float("inf")])

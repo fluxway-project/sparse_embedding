@@ -21,11 +21,61 @@
 #include <atomic>
 #include <cstdint>
 #include <exception>
+#include <limits>
 #include <memory>
+#include <stdexcept>
 
 namespace se {
 
+enum class ScoreAccessResult : uint8_t {
+  kUnchanged = 0,
+  kUpdated = 1,
+  kClockExhausted = 2,
+};
+
 enum class ScorePolicyKind : uint8_t { kNone, kLfu, kLru, kManual };
+
+namespace detail {
+
+inline ScoreAccessResult increment_lfu(uint64_t *score_ptr) noexcept {
+  std::atomic_ref<uint64_t> score(*score_ptr);
+  uint64_t observed = score.load(std::memory_order_relaxed);
+  while (observed != std::numeric_limits<uint64_t>::max()) {
+    if (score.compare_exchange_weak(observed, observed + 1,
+                                    std::memory_order_relaxed,
+                                    std::memory_order_relaxed))
+      return ScoreAccessResult::kUpdated;
+  }
+  return ScoreAccessResult::kUnchanged;
+}
+
+inline ScoreAccessResult publish_lru(std::atomic<uint64_t> &clock,
+                                     uint64_t *score_ptr) noexcept {
+  uint64_t observed_clock = clock.load(std::memory_order_relaxed);
+  uint64_t timestamp = 0;
+  for (;;) {
+    if (observed_clock == std::numeric_limits<uint64_t>::max()) {
+      return ScoreAccessResult::kClockExhausted;
+    }
+    if (clock.compare_exchange_weak(observed_clock, observed_clock + 1,
+                                    std::memory_order_relaxed,
+                                    std::memory_order_relaxed)) {
+      timestamp = observed_clock;
+      break;
+    }
+  }
+  std::atomic_ref<uint64_t> score(*score_ptr);
+  uint64_t observed = score.load(std::memory_order_relaxed);
+  while (observed < timestamp) {
+    if (score.compare_exchange_weak(observed, timestamp,
+                                    std::memory_order_relaxed,
+                                    std::memory_order_relaxed))
+      return ScoreAccessResult::kUpdated;
+  }
+  return ScoreAccessResult::kUnchanged;
+}
+
+} // namespace detail
 
 class ScorePolicyRuntime {
 public:
@@ -36,25 +86,27 @@ public:
 
   bool enabled() const noexcept { return kind_ != ScorePolicyKind::kNone; }
 
-  void on_access(uint64_t *score_ptr) noexcept {
+  ScoreAccessResult on_access(uint64_t *score_ptr) noexcept {
     switch (kind_) {
     case ScorePolicyKind::kNone:
     case ScorePolicyKind::kManual:
-      return;
-    case ScorePolicyKind::kLfu: {
-      std::atomic_ref<uint64_t> score(*score_ptr);
-      score.store(score.load(std::memory_order_relaxed) + 1,
-                  std::memory_order_relaxed);
-      return;
-    }
+      return ScoreAccessResult::kUnchanged;
+    case ScorePolicyKind::kLfu:
+      return detail::increment_lfu(score_ptr);
     case ScorePolicyKind::kLru:
-      std::atomic_ref<uint64_t>(*score_ptr)
-          .store(clock_->fetch_add(1, std::memory_order_relaxed),
-                 std::memory_order_relaxed);
-      return;
+      return detail::publish_lru(*clock_, score_ptr);
     }
     std::terminate();
   }
+
+#ifdef SPARSE_EMBEDDING_TEST_HOOKS
+  void set_lru_clock_for_testing(uint64_t value) {
+    if (!clock_)
+      throw std::logic_error(
+          "LRU clock injection requires the LRU score policy");
+    clock_->store(value, std::memory_order_relaxed);
+  }
+#endif
 
 private:
   ScorePolicyKind kind_;
@@ -68,41 +120,39 @@ private:
 
 struct NoScorePolicy {
   static constexpr bool kHasScore = false;
-  inline void on_access(uint64_t *) {}
+  inline ScoreAccessResult on_access(uint64_t *) noexcept {
+    return ScoreAccessResult::kUnchanged;
+  }
 };
 
-// LFU: monotonically incrementing access counter.
-// NOTE: We use std::atomic_ref with memory_order_relaxed to safely increment
-// the score without incurring hardware lock prefix overhead (which is critical
-// for Hogwild performance), while strictly avoiding C++ Undefined Behavior (UB)
-// caused by data races.
+// LFU: monotonically incrementing, saturating access counter. Relaxed ordering
+// is sufficient because the score is a standalone heuristic/training input;
+// the atomic read-modify-write preserves every concurrent access.
 struct LfuScorePolicy {
   static constexpr bool kHasScore = true;
-  inline void on_access(uint64_t *score_ptr) {
-    std::atomic_ref<uint64_t> a(*score_ptr);
-    a.store(a.load(std::memory_order_relaxed) + 1, std::memory_order_relaxed);
+  inline ScoreAccessResult on_access(uint64_t *score_ptr) noexcept {
+    return detail::increment_lfu(score_ptr);
   }
 };
 
 // LRU: logical clock per-store shared across all threads via atomic.
-// Store passes a pointer to its own logical_clock_ field.
-// NOTE: Similar to LFU, we use std::atomic_ref with memory_order_relaxed to
-// write the score, ensuring maximum performance without undefined behavior.
+// Publication is monotonic even when a delayed thread observes an older
+// timestamp.
 struct LruScorePolicy {
   static constexpr bool kHasScore = true;
   std::unique_ptr<std::atomic<uint64_t>> clock;
   LruScorePolicy() : clock(std::make_unique<std::atomic<uint64_t>>(1)) {}
-  inline void on_access(uint64_t *score_ptr) {
-    std::atomic_ref<uint64_t>(*score_ptr)
-        .store(clock->fetch_add(1, std::memory_order_relaxed),
-               std::memory_order_relaxed);
+  inline ScoreAccessResult on_access(uint64_t *score_ptr) noexcept {
+    return detail::publish_lru(*clock, score_ptr);
   }
 };
 
 // Manual: on_access is a no-op; score set exclusively via assign_scores().
 struct ManualScorePolicy {
   static constexpr bool kHasScore = true;
-  inline void on_access(uint64_t *) {}
+  inline ScoreAccessResult on_access(uint64_t *) noexcept {
+    return ScoreAccessResult::kUnchanged;
+  }
 };
 
 inline constexpr ScorePolicyKind score_policy_kind(NoScorePolicy) noexcept {

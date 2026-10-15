@@ -2,10 +2,7 @@
 namespace se::py::detail {
 
 inline size_t EmbeddingStoreWrapper::total_size() {
-  size_t size = 0;
-  dispatch_types(
-      [&]<typename P, typename O>() { size = get_store<P, O>()->size(); });
-  return size;
+  return visit_store([](auto &store) { return store->size(); });
 }
 
 inline size_t EmbeddingStoreWrapper::max_dim() const {
@@ -55,11 +52,7 @@ inline std::string EmbeddingStoreWrapper::score_policy() const {
 }
 
 inline size_t EmbeddingStoreWrapper::internal_shard_count() {
-  size_t count = 0;
-  dispatch_types([&]<typename P, typename O>() {
-    count = get_store<P, O>()->internal_shard_count();
-  });
-  return count;
+  return visit_store([](auto &store) { return store->internal_shard_count(); });
 }
 
 inline nb::dict EmbeddingStoreWrapper::storage_stats() {
@@ -105,9 +98,8 @@ inline nb::dict EmbeddingStoreWrapper::storage_stats() {
 inline void EmbeddingStoreWrapper::reserve(size_t keys_count, int64_t dim) {
   if (dim <= 0)
     throw std::invalid_argument("dim must be > 0");
-  std::error_code error;
-  dispatch_types([&]<typename P, typename O>() {
-    error = get_store<P, O>()->reserve(keys_count, static_cast<size_t>(dim));
+  std::error_code error = visit_store([&](auto &store) {
+    return store->reserve(keys_count, static_cast<size_t>(dim));
   });
   check_error(error);
 }
@@ -117,9 +109,8 @@ EmbeddingStoreWrapper::reserve_per_shard(const std::vector<size_t> &counts,
                                          int64_t dim) {
   if (dim <= 0)
     throw std::invalid_argument("dim must be > 0");
-  std::error_code error;
-  dispatch_types([&]<typename P, typename O>() {
-    error = get_store<P, O>()->reserve_per_shard(
+  std::error_code error = visit_store([&](auto &store) {
+    return store->reserve_per_shard(
         std::span<const size_t>(counts.data(), counts.size()),
         static_cast<size_t>(dim));
   });
@@ -150,9 +141,25 @@ inline void EmbeddingStoreWrapper::assign(nb::object keys, nb::object values) {
 }
 
 inline nb::object EmbeddingStoreWrapper::contains(nb::object keys) {
-  return dispatch_types([&]<typename P, typename O>() {
-    return SyncOpsImpl<P, O>::contains(*this, keys);
-  });
+  auto [dlm_keys, cap_keys] = se::py::extract_dlpack_tensor(keys);
+  size_t n = get_dlm_size(dlm_keys);
+  int64_t shape[1] = {static_cast<int64_t>(n)};
+  DLManagedTensor *dlm =
+      se::py::create_output_tensor<uint8_t>(std::span(shape));
+  auto *out = static_cast<uint8_t *>(dlm->dl_tensor.data);
+
+  std::error_code ec;
+  {
+    nb::gil_scoped_release release;
+    dispatch_on_key(dlm_keys, key_type_enum_, [&](auto ks) {
+      ec = visit_store([&](auto &store) {
+        return store->contains(ks, std::span<uint8_t>(out, n));
+      });
+    });
+  }
+
+  check_error(ec);
+  return se::py::wrap_output_tensor(dlm);
 }
 
 inline void EmbeddingStoreWrapper::accumulate_gradients(nb::object keys,
@@ -164,42 +171,74 @@ inline void EmbeddingStoreWrapper::accumulate_gradients(nb::object keys,
   });
 }
 
-inline void EmbeddingStoreWrapper::optimizer_step() {
+inline void EmbeddingStoreWrapper::optimizer_step(size_t normalization_steps) {
   if (!optimizer_enabled_)
     throw std::runtime_error("optimizer_step requires optimizer enabled");
-  dispatch_types([&]<typename P, typename O>() {
-    SyncOpsImpl<P, O>::optimizer_step(*this);
+  nb::gil_scoped_release release;
+  std::error_code ec = visit_store([&](auto &store) {
+    return store->optimizer_step(normalization_steps);
   });
+  check_error(ec);
 }
 
 inline void EmbeddingStoreWrapper::erase(nb::object keys) {
-  dispatch_types(
-      [&]<typename P, typename O>() { SyncOpsImpl<P, O>::erase(*this, keys); });
+  auto [dlm_keys, cap_keys] = se::py::extract_dlpack_tensor(keys);
+  std::error_code ec;
+  {
+    nb::gil_scoped_release release;
+    dispatch_on_key(dlm_keys, key_type_enum_, [&](auto ks) {
+      ec = visit_store([&](auto &store) {
+        return store->erase(ks);
+      });
+    });
+  }
+  check_error(ec);
 }
 
 inline void EmbeddingStoreWrapper::erase_dimension(nb::object keys,
                                                    int64_t dimension) {
-  dispatch_types([&]<typename P, typename O>() {
-    SyncOpsImpl<P, O>::erase_dimension(*this, keys, dimension);
-  });
+  if (dimension < 0)
+    throw std::invalid_argument("erase dimension must be non-negative");
+  auto [dlm_keys, cap_keys] = se::py::extract_dlpack_tensor(keys);
+  std::error_code ec;
+  {
+    nb::gil_scoped_release release;
+    dispatch_on_key(dlm_keys, key_type_enum_, [&](auto ks) {
+      ec = visit_store([&](auto &store) {
+        return store->erase_dimension(static_cast<size_t>(dimension), ks);
+      });
+    });
+  }
+  check_error(ec);
 }
 
 inline void EmbeddingStoreWrapper::clear() {
-  dispatch_types(
-      [&]<typename P, typename O>() { SyncOpsImpl<P, O>::clear(*this); });
+  nb::gil_scoped_release release;
+  std::error_code ec = visit_store([](auto &store) { return store->clear(); });
+  check_error(ec);
 }
 
 inline void EmbeddingStoreWrapper::assign_scores(nb::object keys,
                                                  nb::object scores) {
-  dispatch_types([&]<typename P, typename O>() {
-    SyncOpsImpl<P, O>::assign_scores(*this, keys, scores);
-  });
+  auto [dlm_keys, cap_keys] = se::py::extract_dlpack_tensor(keys);
+  auto [dlm_scores, cap_scores] = se::py::extract_dlpack_tensor(scores);
+  std::error_code ec;
+  auto scores_span = se::py::dlpack_to_span<const uint64_t>(dlm_scores);
+  {
+    nb::gil_scoped_release release;
+    dispatch_on_key(dlm_keys, key_type_enum_, [&](auto ks) {
+      ec = visit_store([&](auto &store) {
+        return store->assign_scores(ks, scores_span);
+      });
+    });
+  }
+  check_error(ec);
 }
 
 inline size_t EmbeddingStoreWrapper::compact_page(size_t dim,
                                                   uint64_t page_id) {
-  return dispatch_types([&]<typename P, typename O>() {
-    return get_store<P, O>()->compact_page(dim, page_id);
+  return visit_store([&](auto &store) {
+    return store->compact_page(dim, page_id);
   });
 }
 
@@ -207,15 +246,14 @@ inline size_t EmbeddingStoreWrapper::promote_hot_keys(size_t dim,
                                                       uint64_t page_id,
                                                       size_t maximum_keys,
                                                       uint64_t minimum_score) {
-  return dispatch_types([&]<typename P, typename O>() {
-    return get_store<P, O>()->promote_hot_keys(dim, page_id, maximum_keys,
-                                               minimum_score);
+  return visit_store([&](auto &store) {
+    return store->promote_hot_keys(dim, page_id, maximum_keys, minimum_score);
   });
 }
 
 inline size_t EmbeddingStoreWrapper::promoted_hot_page_size(size_t dim) {
-  return dispatch_types([&]<typename P, typename O>() {
-    return get_store<P, O>()->promoted_hot_page_size(dim);
+  return visit_store([&](auto &store) {
+    return store->promoted_hot_page_size(dim);
   });
 }
 
@@ -325,37 +363,160 @@ EmbeddingStoreWrapper::async_accumulate_gradients(nb::object keys,
   });
 }
 
-inline nb::object EmbeddingStoreWrapper::async_optimizer_step() {
+inline nb::object EmbeddingStoreWrapper::async_optimizer_step(
+    size_t normalization_steps) {
   if (!optimizer_enabled_)
     throw std::runtime_error("async_optimizer_step requires optimizer enabled");
-  return dispatch_types([&]<typename P, typename O>() -> nb::object {
-    return AsyncOpsImpl<P, O>::async_optimizer_step(*this);
-  });
+  auto *wrapper_ptr = this;
+  return se::py::async_dispatch(
+      async_pool_,
+      [wrapper_ptr, normalization_steps]() -> std::error_code {
+        return wrapper_ptr->visit_store([&](auto &store) {
+          return store->optimizer_step(normalization_steps);
+        });
+      },
+      [](nb::object future, std::error_code ec) {
+        if (!ec) {
+          future.attr("set_result")(nb::none());
+        } else {
+          nb::module_ builtins = nb::module_::import_("builtins");
+          future.attr("set_exception")(
+              builtins.attr("RuntimeError")(ec.message()));
+        }
+      });
 }
 
 inline nb::object EmbeddingStoreWrapper::async_contains(nb::object keys) {
-  return dispatch_types([&]<typename P, typename O>() -> nb::object {
-    return AsyncOpsImpl<P, O>::async_contains(*this, keys);
-  });
+  auto [dlm_keys, cap_keys] = se::py::extract_dlpack_tensor(keys);
+  size_t n = get_dlm_size(dlm_keys);
+  auto kdt = detect_key_dtype(dlm_keys);
+  validate_key_dtype(kdt, key_type_enum_);
+  const void *keys_data =
+      reinterpret_cast<const char *>(dlm_keys->dl_tensor.data) +
+      dlm_keys->dl_tensor.byte_offset;
+  auto *wrapper_ptr = this;
+  return se::py::async_dispatch(
+      async_pool_,
+      [wrapper_ptr, n, kdt, keys_data,
+       keys_keeper = std::make_shared<se::py::AsyncPyObjectKeeper>(
+           cap_keys)]() -> DLManagedTensor * {
+        DLManagedTensor *out_dlm = nullptr;
+        try {
+          auto do_contains = [&](auto ks) {
+            int64_t shape[1] = {static_cast<int64_t>(n)};
+            out_dlm =
+                se::py::create_output_tensor<uint8_t>(std::span(shape));
+            auto *out = static_cast<uint8_t *>(out_dlm->dl_tensor.data);
+            auto ec = wrapper_ptr->visit_store([&](auto &store) {
+              return store->contains(ks, std::span<uint8_t>(out, n));
+            });
+            if (ec)
+              throw std::runtime_error(ec.message());
+          };
+          dispatch_key_span(kdt, keys_data, n, do_contains);
+        } catch (...) {
+          if (out_dlm)
+            out_dlm->deleter(out_dlm);
+          throw;
+        }
+        return out_dlm;
+      },
+      [](nb::object future, DLManagedTensor *mask_dlm) {
+        future.attr("set_result")(se::py::wrap_output_tensor(mask_dlm));
+      });
 }
 
 inline nb::object EmbeddingStoreWrapper::async_erase(nb::object keys) {
-  return dispatch_types([&]<typename P, typename O>() -> nb::object {
-    return AsyncOpsImpl<P, O>::async_erase(*this, keys);
-  });
+  auto [dlm_keys, cap_keys] = se::py::extract_dlpack_tensor(keys);
+  size_t n = get_dlm_size(dlm_keys);
+  auto kdt = detect_key_dtype(dlm_keys);
+  validate_key_dtype(kdt, key_type_enum_);
+  const void *keys_data =
+      reinterpret_cast<const char *>(dlm_keys->dl_tensor.data) +
+      dlm_keys->dl_tensor.byte_offset;
+  auto *wrapper_ptr = this;
+  return se::py::async_dispatch(
+      async_pool_,
+      [wrapper_ptr, n, kdt, keys_data,
+       keys_keeper = std::make_shared<se::py::AsyncPyObjectKeeper>(
+           cap_keys)]() -> std::error_code {
+        auto erase = [&](auto keys_span) {
+          return wrapper_ptr->visit_store([&](auto &store) {
+            return store->erase(keys_span);
+          });
+        };
+        return dispatch_key_span(kdt, keys_data, n, erase);
+      },
+      [](nb::object future, std::error_code ec) {
+        if (!ec) {
+          future.attr("set_result")(nb::none());
+        } else {
+          nb::module_ builtins = nb::module_::import_("builtins");
+          future.attr("set_exception")(
+              builtins.attr("RuntimeError")(ec.message()));
+        }
+      });
 }
 
 inline nb::object EmbeddingStoreWrapper::async_clear() {
-  return dispatch_types([&]<typename P, typename O>() -> nb::object {
-    return AsyncOpsImpl<P, O>::async_clear(*this);
-  });
+  auto *wrapper_ptr = this;
+  return se::py::async_dispatch(
+      async_pool_,
+      [wrapper_ptr]() -> std::error_code {
+        return wrapper_ptr->visit_store([&](auto &store) {
+          return store->clear();
+        });
+      },
+      [](nb::object future, std::error_code ec) {
+        if (!ec) {
+          future.attr("set_result")(nb::none());
+        } else {
+          nb::module_ builtins = nb::module_::import_("builtins");
+          future.attr("set_exception")(
+              builtins.attr("RuntimeError")(ec.message()));
+        }
+      });
 }
 
 inline nb::object
 EmbeddingStoreWrapper::async_assign_scores(nb::object keys, nb::object scores) {
-  return dispatch_types([&]<typename P, typename O>() -> nb::object {
-    return AsyncOpsImpl<P, O>::async_assign_scores(*this, keys, scores);
-  });
+  auto [dlm_keys, cap_keys] = se::py::extract_dlpack_tensor(keys);
+  auto [dlm_scores, cap_scores] = se::py::extract_dlpack_tensor(scores);
+  size_t n = get_dlm_size(dlm_keys);
+  auto kdt = detect_key_dtype(dlm_keys);
+  validate_key_dtype(kdt, key_type_enum_);
+  const void *keys_data =
+      reinterpret_cast<const char *>(dlm_keys->dl_tensor.data) +
+      dlm_keys->dl_tensor.byte_offset;
+  const void *scores_data =
+      reinterpret_cast<const char *>(dlm_scores->dl_tensor.data) +
+      dlm_scores->dl_tensor.byte_offset;
+  auto *wrapper_ptr = this;
+  return se::py::async_dispatch(
+      async_pool_,
+      [wrapper_ptr, n, kdt, keys_data, scores_data,
+       keys_keeper =
+           std::make_shared<se::py::AsyncPyObjectKeeper>(cap_keys),
+       scores_keeper = std::make_shared<se::py::AsyncPyObjectKeeper>(
+           cap_scores)]() -> std::error_code {
+        auto scores_span = std::span<const uint64_t>(
+            static_cast<const uint64_t *>(scores_data), n);
+        auto assign_scores = [&](auto keys_span) {
+          return wrapper_ptr->visit_store([&](auto &store) {
+            return store->assign_scores(keys_span, scores_span);
+          });
+        };
+        return dispatch_key_span(kdt, keys_data, n, assign_scores);
+      },
+      [](nb::object future, std::error_code ec) {
+        if (!ec) {
+          future.attr("set_result")(nb::none());
+        } else {
+          nb::module_ builtins = nb::module_::import_("builtins");
+          future.attr("set_exception")(
+              builtins.attr("RuntimeError")(ec.message()));
+        }
+      });
 }
 
 inline void EmbeddingStoreWrapper::export_batches_dlpack(
@@ -385,42 +546,77 @@ inline void EmbeddingStoreWrapper::assign_opt_state(nb::object keys_obj,
 }
 
 inline nb::list EmbeddingStoreWrapper::checkpoint_mutations() {
-  return dispatch_types([&]<typename P, typename O>() {
-    return CheckpointOpsImpl<P, O>::checkpoint_mutations(*this);
+  nb::list result;
+  std::vector<CheckpointMutation> mutations = visit_store([](auto &store) {
+    return store->checkpoint_mutations();
   });
+  for (const auto &mutation : mutations) {
+    nb::dict row;
+    row["dimension"] = mutation.dimension;
+    row["key"] = mutation.key;
+    row["mutation_sequence"] = mutation.mutation_sequence;
+    row["deleted"] = mutation.deleted;
+    result.append(std::move(row));
+  }
+  return result;
 }
 
 inline std::string EmbeddingStoreWrapper::checkpoint_baseline() {
-  return dispatch_types([&]<typename P, typename O>() {
-    return CheckpointOpsImpl<P, O>::checkpoint_baseline(*this);
+  return visit_store([](auto &store) {
+    return store->checkpoint_baseline();
+  });
+}
+
+inline bool EmbeddingStoreWrapper::checkpoint_restore_is_pristine() {
+  return visit_store([](auto &store) {
+    return store->checkpoint_restore_is_pristine();
+  });
+}
+
+inline std::string EmbeddingStoreWrapper::initialize_checkpoint_baseline(
+    const std::string &baseline, uint64_t watermark) {
+  return visit_store([&](auto &store) {
+    return store->initialize_checkpoint_baseline(baseline, watermark);
+  });
+}
+
+inline void EmbeddingStoreWrapper::mark_terminal_failure() {
+  visit_store([](auto &store) {
+    store->mark_terminal_failure();
+  });
+}
+
+inline bool EmbeddingStoreWrapper::is_operational() {
+  return visit_store([](auto &store) {
+    return store->is_operational();
   });
 }
 
 inline uint64_t EmbeddingStoreWrapper::checkpoint_mutation_watermark() {
-  return dispatch_types([&]<typename P, typename O>() {
-    return CheckpointOpsImpl<P, O>::checkpoint_mutation_watermark(*this);
+  return visit_store([](auto &store) {
+    return store->checkpoint_mutation_watermark();
   });
 }
 
 inline void EmbeddingStoreWrapper::cancel_checkpoint_capture(
     uint64_t capture_id, const std::string &journal_identity) {
-  dispatch_types([&]<typename P, typename O>() {
-    get_store<P, O>()->cancel_checkpoint_capture(capture_id, journal_identity);
+  visit_store([&](auto &store) {
+    store->cancel_checkpoint_capture(capture_id, journal_identity);
   });
 }
 
 inline size_t EmbeddingStoreWrapper::entries_per_page() {
-  return dispatch_types([&]<typename P, typename O>() {
-    return get_store<P, O>()->entries_per_page();
+  return visit_store([](auto &store) {
+    return store->entries_per_page();
   });
 }
 
-inline void EmbeddingStoreWrapper::acknowledge_checkpoint_mutations(
+inline void EmbeddingStoreWrapper::advance_checkpoint_baseline(
     uint64_t watermark, const std::string &baseline, uint64_t capture_id,
     const std::string &journal_identity) {
-  dispatch_types([&]<typename P, typename O>() {
-    CheckpointOpsImpl<P, O>::acknowledge_checkpoint_mutations(
-        *this, watermark, baseline, capture_id, journal_identity);
+  visit_store([&](auto &store) {
+    store->advance_checkpoint_baseline(watermark, baseline, capture_id,
+                                       journal_identity);
   });
 }
 

@@ -189,7 +189,10 @@ cc_library(
 cc_test(
     name = "hogwild_score_checkpoint_test",
     srcs = ["hogwild_score_checkpoint_test.cpp"],
-    defines = ["HOGWILD_EXPLICIT_INSTANTIATION"],
+    defines = [
+        "HOGWILD_EXPLICIT_INSTANTIATION",
+        "SPARSE_EMBEDDING_TEST_HOOKS",
+    ],
     linkopts = ["-pthread"],
     deps = [
         ":hogwild_headers",

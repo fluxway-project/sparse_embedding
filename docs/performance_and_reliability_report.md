@@ -1,6 +1,6 @@
 # Sparse Embedding Performance and Reliability
 
-[中文](performance_and_reliability_report_zh.md)
+[中文](performance_and_reliability_report_zh.md) | [Storage Architecture](storage_architecture.md) | [Lance Storage and Gravitino Integration](lance_storage_and_gravitino.md) | [Incremental Checkpointing](incremental_checkpoint.md) | [Dynamic Learning Rate](dynamic_learning_rate.md)
 
 This document provides public performance references, recommended configuration,
 and reliability guarantees for Sparse Embedding.
@@ -27,7 +27,7 @@ Lance checkpoints maintain canonical `entries` as the SSOT, optional `page_image
 Page images store slot layout, `seq_count`, parameters, score, optimizer state/step, and
 SHA-256 checksums. Incremental checkpoints append only changed entries and tombstones; an external coordinator
 performs global commit.
-Inference uses `EmbeddingConfig(enable_optimizer=False)` and `load_inference_weights`,
+Inference uses `EmbeddingConfig(enable_optimizer=False)` and `checkpoint.load_inference_checkpoint` (or storage `load_inference_weights`),
 which avoids optimizer-state allocation and loading.
 
 Compaction, hot-key promotion, and page eviction update one authoritative

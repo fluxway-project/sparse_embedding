@@ -378,3 +378,30 @@ def test_pointer_failures_are_not_fallbacks(tmp_path):
     remote._client = client
     with pytest.raises(RuntimeError, match="network failure"):
         remote.uri("published/entries")
+
+
+@pytest.mark.parametrize(
+    "relative", ("../escape", "/absolute", "a//b", "a/./b", "a/../b")
+)
+def test_workspace_rejects_noncanonical_relative_paths(tmp_path, relative):
+    from sparse_embedding.checkpoint._lance_workspace import LocalLanceWorkspace
+
+    workspace = LocalLanceWorkspace(tmp_path / "root")
+    with pytest.raises((TypeError, ValueError)):
+        workspace.uri(relative)
+    with pytest.raises((TypeError, ValueError)):
+        workspace.create_prefix(relative)
+    with pytest.raises((TypeError, ValueError)):
+        workspace.delete_prefix(relative, missing_ok=True)
+
+
+def test_local_workspace_rejects_symlink_escape(tmp_path):
+    from sparse_embedding.checkpoint._lance_workspace import LocalLanceWorkspace
+
+    root = tmp_path / "root"
+    outside = tmp_path / "outside"
+    root.mkdir()
+    outside.mkdir()
+    (root / "linked").symlink_to(outside, target_is_directory=True)
+    with pytest.raises(ValueError, match="escapes"):
+        LocalLanceWorkspace(root).uri("linked/entries")

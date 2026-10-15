@@ -3,6 +3,7 @@
 #ifndef SPARSE_EMBEDDING_LANCE_LAYOUT_SCHEMA_HPP_
 #define SPARSE_EMBEDDING_LANCE_LAYOUT_SCHEMA_HPP_
 
+#include <algorithm>
 #include <array>
 #include <cstdint>
 #include <stdexcept>
@@ -46,7 +47,7 @@ struct ColumnDef {
   const char *arrow_format;
 };
 
-inline constexpr std::array<ColumnDef, 16> kEntryColumns = {{
+inline constexpr std::array<ColumnDef, 15> kEntryColumns = {{
     {"dim", "I"},
     {"key", "L"},
     {"embedding_values", "z"},
@@ -60,12 +61,11 @@ inline constexpr std::array<ColumnDef, 16> kEntryColumns = {{
     {"physical_page_id", "L"},
     {"page_slot", "I"},
     {"row_state", "u"},
-    {"last_updated_checkpoint_version", "L"},
     {"source_participant_index", "I"},
     {"mutation_sequence", "L"},
 }};
 
-inline constexpr std::array<ColumnDef, 18> kPageImageColumns = {{
+inline constexpr std::array<ColumnDef, 17> kPageImageColumns = {{
     {"source_participant_index", "I"},
     {"embedding_dim", "I"},
     {"physical_page_id", "L"},
@@ -82,7 +82,6 @@ inline constexpr std::array<ColumnDef, 18> kPageImageColumns = {{
     {"steps", "z"},
     {"checksum", "u"},
     {"row_state", "u"},
-    {"last_updated_checkpoint_version", "L"},
     {"entries_per_page", "I"},
 }};
 
@@ -143,11 +142,11 @@ inline ArrowSchema *make_list_schema(const char *name, const char *child_name,
           [](ArrowSchema *self) noexcept {
             if (!self || !self->release)
               return;
-            if (self->children && self->children[0]) {
-              if (self->children[0]->release) {
-                self->children[0]->release(self->children[0]);
+            if (self->children && *self->children) {
+              if ((*self->children)->release) {
+                (*self->children)->release(*self->children);
               }
-              delete self->children[0];
+              delete *self->children;
             }
             delete[] self->children;
             self->children = nullptr;
@@ -192,7 +191,13 @@ inline const char *arrow_format_for_key_dtype(std::string_view dtype) {
 inline ArrowSchema make_entries_schema(std::string_view key_dtype = "uint64",
                                        const char *metadata = nullptr) {
   auto columns = kEntryColumns;
-  columns[1].arrow_format = arrow_format_for_key_dtype(key_dtype);
+  const auto key_column =
+      std::ranges::find_if(columns, [](const ColumnDef &column) {
+        return std::string_view(column.name) == "key";
+      });
+  if (key_column == columns.end())
+    throw std::logic_error("entry schema has no key column");
+  key_column->arrow_format = arrow_format_for_key_dtype(key_dtype);
   return make_columns_schema(columns, metadata);
 }
 
@@ -201,37 +206,66 @@ inline ArrowSchema make_page_images_schema(const char *metadata = nullptr) {
 }
 
 inline ArrowSchema make_manifest_schema(const char *metadata = nullptr) {
-  constexpr size_t kManifestFieldCount = 29;
-  auto **children = new ArrowSchema *[kManifestFieldCount];
-  children[0] = make_leaf_schema("checkpoint_name", "u");
-  children[1] = make_leaf_schema("checkpoint_version", "L");
-  children[2] = make_leaf_schema("parent_checkpoint_version", "L");
-  children[3] = make_leaf_schema("participant_count", "I");
-  children[4] = make_leaf_schema("checkpoint_mode", "u");
-  children[5] = make_leaf_schema("schema_digest", "u");
-  children[6] = make_leaf_schema("fragment_digest", "u");
-  children[7] = make_leaf_schema("save_attempt", "u");
-  children[8] = make_leaf_schema("authority_scope", "u");
-  children[9] = make_leaf_schema("authority_generation", "L");
-  children[10] = make_leaf_schema("commit_authority", "u");
-  children[11] = make_leaf_schema("created_at", "tsu:UTC");
-  children[12] = make_list_schema("dimensions", "item", "I");
-  children[13] = make_leaf_schema("embedding_dtype", "u");
-  children[14] = make_leaf_schema("optimizer_dtype", "u");
-  children[15] = make_leaf_schema("score_policy", "u");
-  children[16] = make_leaf_schema("key_dtype", "u");
-  children[17] = make_leaf_schema("reference_id", "u");
-  children[18] = make_list_schema("fragment_ids", "item", "u");
-  children[19] = make_leaf_schema("compacted_version", "L");
-  children[20] = make_leaf_schema("commit_state", "u");
-  children[21] = make_leaf_schema("storage_mode", "u");
-  children[22] = make_leaf_schema("format_version", "I");
-  children[23] = make_leaf_schema("parent_checkpoint_name", "u");
-  children[24] = make_leaf_schema("parent_reference_id", "u");
-  children[25] = make_list_schema("participant_watermarks", "item", "L");
-  children[26] = make_list_schema("fragment_descriptors", "item", "u");
-  children[27] = make_leaf_schema("include_page_images", "b");
-  children[28] = make_list_schema("participant_page_capacities", "item", "I");
+  constexpr size_t kManifestFieldCount = 32;
+  std::array<ArrowSchema *, kManifestFieldCount> fields{};
+  size_t field_count = 0;
+  const auto append = [&](ArrowSchema *field) {
+    if (field_count == fields.size()) {
+      release_arrow_schema(field);
+      delete field;
+      throw std::logic_error("manifest schema has too many fields");
+    }
+    fields[field_count++] = field;
+  };
+  const auto append_leaf = [&](const char *name, const char *format) {
+    append(make_leaf_schema(name, format));
+  };
+  const auto append_list = [&](const char *name, const char *item_name,
+                               const char *item_format) {
+    append(make_list_schema(name, item_name, item_format));
+  };
+  append_leaf("checkpoint_name", "u");
+  append_leaf("checkpoint_version", "L");
+  append_leaf("parent_checkpoint_version", "L");
+  append_leaf("participant_count", "I");
+  append_leaf("checkpoint_mode", "u");
+  append_leaf("schema_digest", "u");
+  append_leaf("fragment_digest", "u");
+  append_leaf("save_attempt", "u");
+  append_leaf("authority_scope", "u");
+  append_leaf("authority_generation", "L");
+  append_leaf("commit_authority", "u");
+  append_leaf("created_at", "tsu:UTC");
+  append_list("dimensions", "item", "I");
+  append_leaf("embedding_dtype", "u");
+  append_leaf("optimizer_dtype", "u");
+  append_leaf("score_policy", "u");
+  append_leaf("key_dtype", "u");
+  append_leaf("reference_id", "u");
+  append_list("fragment_ids", "item", "u");
+  append_leaf("compacted_version", "L");
+  append_leaf("commit_state", "u");
+  append_leaf("storage_mode", "u");
+  append_leaf("format_version", "I");
+  append_leaf("parent_checkpoint_name", "u");
+  append_leaf("parent_reference_id", "u");
+  append_list("participant_watermarks", "item", "L");
+  append_list("fragment_descriptors", "item", "u");
+  append_leaf("include_page_images", "b");
+  append_list("participant_page_capacities", "item", "I");
+  append_list("participant_page_datasets", "item", "u");
+  append_list("participant_page_versions", "item", "L");
+  append_list("participant_page_layout_generations", "item", "L");
+  if (field_count != fields.size()) {
+    for (size_t index = 0; index < field_count; ++index) {
+      release_arrow_schema(fields[index]);
+      delete fields[index];
+    }
+    throw std::logic_error("manifest schema field count is incomplete");
+  }
+  auto **children = new ArrowSchema *[fields.size()];
+  for (size_t index = 0; index < fields.size(); ++index)
+    children[index] = fields[index];
 
   return ArrowSchema{
       .format = "+s",

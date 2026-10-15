@@ -23,6 +23,7 @@ struct NativeFragmentArtifact {
   std::string locator;
   uint64_t entries_version = 0;
   uint64_t page_images_version = 0;
+  uint64_t page_layout_generation = 0;
   uint64_t entry_count = 0;
   uint64_t page_count = 0;
   uint64_t physical_bytes = 0;
@@ -65,7 +66,9 @@ public:
                       std::string_view optimizer_dtype,
                       std::string_view score_policy, std::string_view key_dtype,
                       std::string_view schema_digest, bool has_score,
-                      bool include_page_images, uint32_t entries_per_page);
+                      bool include_page_images, uint32_t entries_per_page,
+                      std::string_view page_dataset_uri,
+                      uint64_t page_dataset_version = 0);
 
   void write_page_image(
       size_t embedding_dim, uint64_t physical_page_id,
@@ -75,6 +78,10 @@ public:
       std::span<const uint64_t> scores, std::span<const std::byte> optimizer,
       size_t optimizer_stride, size_t optimizer_itemsize,
       std::span<const uint32_t> steps);
+
+  void write_page_tombstone(size_t embedding_dim, uint64_t physical_page_id,
+                            uint32_t page_slot_stride_bytes,
+                            uint32_t entries_per_page);
 
   void set_incremental_mutations(std::span<const CheckpointMutation> mutations);
   void write_tombstone(uint32_t dimension, uint64_t key,
@@ -95,7 +102,8 @@ NativeFragmentArtifact compact_native_checkpoint(
     std::string_view embedding_dtype, std::string_view optimizer_dtype,
     std::string_view score_policy, std::string_view key_dtype,
     std::string_view schema_digest, bool include_page_images,
-    uint32_t entries_per_page, const LanceStorageOptions &storage_options);
+    uint32_t entries_per_page, std::string_view page_dataset_uri,
+    const LanceStorageOptions &storage_options);
 
 NativeCompactionArtifact compact_native_lance_sources(
     std::string_view target_uri, std::span<const std::string> source_uris,

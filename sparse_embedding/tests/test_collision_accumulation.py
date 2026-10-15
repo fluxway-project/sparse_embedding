@@ -36,7 +36,7 @@ def test_heavy_collision_adam_update():
         store.accumulate_gradients(keys, grads)
 
     # Trigger optimizer step manually!
-    store.optimizer_step()
+    store.optimizer_step(1)
     res_vals, _ = store.lookup(keys, dim=16)
     v_end = np.from_dlpack(res_vals)
 
@@ -52,7 +52,7 @@ def test_heavy_collision_adam_update():
     for _ in range(4):
         grads = np.ones((2, 16), dtype=np.float32) * 0.1
         store.accumulate_gradients(keys, grads)
-    store.optimizer_step()
+    store.optimizer_step(1)
 
     res_vals2, _ = store.lookup(keys, dim=16)
     v_end2 = np.from_dlpack(res_vals2)

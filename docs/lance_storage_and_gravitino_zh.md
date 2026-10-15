@@ -1,6 +1,6 @@
 # Lance 存储与 Gravitino 检查点集成指南
 
-[English](lance_storage_and_gravitino.md) | [架构与 API 契约](storage_architecture_zh.md) | [性能与可靠性报告](performance_and_reliability_report_zh.md)
+[English](lance_storage_and_gravitino.md) | [架构与 API 契约](storage_architecture_zh.md) | [增量检查点与流式 Compaction](incremental_checkpoint_zh.md) | [性能与可靠性报告](performance_and_reliability_report_zh.md) | [动态学习率](dynamic_learning_rate_zh.md)
 
 本文档面向使用 Sparse Embedding 存储引擎的工程师与架构师，系统性阐述基于 Lance 列式格式与 Apache Gravitino Lakehouse 元数据目录的检查点（Checkpoint）架构设计、事务协议与集成规范。
 
@@ -14,7 +14,7 @@ Sparse Embedding 采用 **Lance 列式存储** 与 **Apache Gravitino** 协同�
 
 - **数据与元数据解耦的双 Lance 架构**：控制面记录事务账本，数据面并发流式落盘，消除多节点写锁竞争与版本爆炸。
 - **计算引擎零拷贝下推**：键列直接采用 Arrow 原生定长整型存储，原生支持 DuckDB、DataFusion 及 Lance 计算算子的谓词下推（Predicate Pushdown）。
-- **极速恢复与弹性拓扑**：支持从规范数据精确恢复物理页表；支持结合 SIMD 掩码过滤在集群扩缩容时直接执行逻辑分片重组（Elastic Restore）。
+- **极速恢复与弹性拓扑**：支持从规范数据精确恢复物理页表；支持结合 SIMD 掩码过滤在集群扩缩容时直接执行逻辑分片重组（Reshard Restore）。
 - **Lakehouse 标准元数据治理**：无缝对接 Gravitino 与 Lance REST 服务，实现多租户 Namespace、租约锁机制与统一凭据管理。
 
 ---
@@ -52,19 +52,22 @@ SparseCheckpoint
 
 ## 3. 快速上手：训练快照保存与加载
 
-以下示例演示如何在本地文件系统上初始化检查点、保存训练状态，以及执行物理恢复与弹性分片恢复：
+以下示例演示如何在本地文件系统上初始化检查点、保存训练状态，以及执行自适应拓扑恢复、物理恢复与弹性分片恢复：
 
 ```python
+import numpy as np
 import sparse_embedding as se
 from sparse_embedding.checkpoint import (
     CheckpointParticipant,
-    ElasticRestore,
+    CheckpointSaveMode,
+    IngestionEngine,
     LocalLanceStorage,
-    PhysicalRestore,
-    PhysicalRestoreStrategy,
+    PartitionSpec,
+    RankRestore,
+    ReshardRestore,
+    RestorePlan,
     SparseCheckpoint,
-    SparsePartitionAssignmentSpec,
-    encode_restore_options,
+    compact_fragments,
 )
 
 # 1. 初始化存储与 Checkpoint 客户端
@@ -72,40 +75,51 @@ storage = LocalLanceStorage.from_checkpoint_root("/checkpoints/user_embedding")
 checkpoint = SparseCheckpoint(storage)
 
 # 2. 保存训练检查点 (默认保存规范 entries，节约 50% 写入带宽与磁盘空间)
-committed = checkpoint.save_training_checkpoint(store, "step-1000")
+committed = checkpoint.save_training_checkpoint(
+    store,
+    "user_embedding",
+    mode=CheckpointSaveMode.FULL,
+)
 
 # 可选：显式生成物理页缓存以获取最快恢复速度
-# committed = checkpoint.save_training_checkpoint(store, "step-1000", include_page_images=True)
+# committed = checkpoint.save_training_checkpoint(
+#     store, "user_embedding", include_page_images=True
+# )
 
-# 3. 场景 A：物理对等恢复 (PhysicalRestore)
-# 适用于卡数与拓扑完全相同的场景，从规范 entries 精确还原物理页表
+# 3. 场景 A：推荐 - 拓扑自适应恢复 (RestorePlan.from_topology)
+# 自动比对检查点保存卡数与当前卡数：卡数一致时走 RankRestore，卡数变更时自动切换为 ReshardRestore
 restored_store = se.EmbeddingStore(config)
+plan = RestorePlan.from_topology(
+    saved_participant_count=1,
+    participant=CheckpointParticipant(0, 1),
+    spec=PartitionSpec.hash(seed=42),
+    key_dtype="uint64",
+)
+checkpoint.load_training_checkpoint(restored_store, committed.handle, plan)
+
+# 4. 场景 B：显式物理对等恢复 (RankRestore)
+# 适用于卡数与拓扑完全相同的场景，从规范 entries 精确还原物理页表
 checkpoint.load_training_checkpoint(
     restored_store,
     committed.handle,
-    encode_restore_options(
-        PhysicalRestore(
-            participant=CheckpointParticipant(0, 1),
-            strategy=PhysicalRestoreStrategy.RECONSTRUCT_ENTRIES,
-            key_dtype="uint64",
-        )
+    RestorePlan.from_participant(
+        CheckpointParticipant(0, 1),
+        engine=IngestionEngine.RECONSTRUCT_ENTRIES,
+        key_dtype="uint64",
     ),
 )
 
-# 4. 场景 B：弹性拓扑恢复 (ElasticRestore)
+# 5. 场景 C：显式弹性拓扑重组恢复 (ReshardRestore)
 # 适用于训练卡数扩缩容场景，通过分片算法极速筛选当前节点所属的键
-spec = SparsePartitionAssignmentSpec.hash()
 restored_store_elastic = se.EmbeddingStore(config)
 checkpoint.load_training_checkpoint(
     restored_store_elastic,
     committed.handle,
-    encode_restore_options(
-        ElasticRestore(
-            spec=spec,
-            partition_count=8,
-            partition_id=0,
-            key_dtype="uint64",
-        )
+    RestorePlan.from_partition(
+        PartitionSpec.hash(seed=42),
+        partition_count=8,
+        partition_id=0,
+        key_dtype="uint64",
     ),
 )
 ```
@@ -118,17 +132,20 @@ checkpoint.load_training_checkpoint(
 
 | 恢复策略 | 适用场景 | 底层机制 | 异常与防御策略 |
 |---|---|---|---|
-| **`PhysicalRestore (RECONSTRUCT_ENTRIES)`** | 拓扑不变恢复、Compaction 合流后恢复 | 读取规范 `entries.lance`，在 C++ 层确定性重建物理页布局与定位槽 | 唯一事实来源（SSOT），完全确定性 |
-| **`PhysicalRestore (FAST_PAGE_CACHE)`** | 极速冷启动（需保存时开启 `include_page_images=True`） | 按有界批次直接映射 `page_images.lance` 物理页镜像，绕过逐行构建 | 若检查点未持久化物理页缓存，**严格抛出 `FileNotFoundError`**，拒绝隐式降级 |
-| **`ElasticRestore`** | 训练集群扩缩容、拓扑重组、弹性分片加载 | 结合注册的分片算法（`hash`、`modulo`、`fast_range`），利用 AVX-512 SIMD 连续切片掩码（`filter_span`）极速过滤 | 分片算法未注册或参数不匹配直接抛出异常，无隐式回退 |
+| **`RestorePlan.from_topology`** | **拓扑自适应路由（推荐）** | 自动校验已保存卡数与当前卡数：匹配则走 `RankRestore`，扩缩容则走 `ReshardRestore` | 严格校验 `saved_participant_count > 0`，零静默降级 |
+| **`RankRestore (RECONSTRUCT_ENTRIES)`** | 拓扑不变恢复、Compaction 合流后恢复 | 读取规范 `entries.lance`，在 C++ 层确定性重建物理页布局与定位槽 | 唯一事实来源（SSOT），完全确定性 |
+| **`RankRestore (FAST_PAGE_CACHE)`** | 极速冷启动（需保存时开启 `include_page_images=True`） | 按有界批次直接映射 `page_images.lance` 物理页镜像，绕过逐行构建 | 若检查点未持久化物理页缓存，**严格抛出 `FileNotFoundError`**，拒绝隐式降级 |
+| **`ReshardRestore`** | 训练集群扩缩容、拓扑重组、弹性分片加载 | 结合注册的分片算法（`hash`、`modulo`、`fast_range`），利用 AVX-512 SIMD 连续切片掩码（`filter_span`）极速过滤 | 分片算法未注册或参数不匹配直接抛出异常，无隐式回退 |
 
-### 4.2 训练与推理权重隔离
+### 4.2 训练与推理权重隔离及正交恢复矩阵
 
-- **训练恢复**：默认完整加载嵌入表权重与优化器动量状态（`load_optimizer_state=True`）。
-- **推理服务**：
-  - 推理场景通过 `EmbeddingConfig(enable_optimizer=False)` 构建权重专属 Store（不分配优化器状态内存）。
-  - 推理加载入口调用 `inference_storage.load_inference_weights(...)`，仅拉取 Embedding 权重，避免浪费内存。
-  - 若对未启用优化器的 Store 请求加载优化器状态，系统直接抛出异常。
+恢复操作由两个完全正交的维度构成（$2 \times 2$ 笛卡尔积架构）：
+- **状态载荷范围（Scope / Payload）**：
+  - **训练恢复 (`load_training_checkpoint`)**：完整加载嵌入表权重与优化器动量状态（`load_optimizer_state=True`）。
+  - **推理恢复 (`load_inference_checkpoint`)**：仅拉取 Embedding 权重（`load_optimizer_state=False`），要求目标 Store 禁用优化器（`enable_optimizer=False`），避免浪费内存。若对未启用优化器的 Store 请求加载优化器状态，系统直接抛出异常。
+- **拓扑路由策略（RestorePlan）**：
+  - 训练与推理**均统一支持** `RankRestore` 与 `ReshardRestore`。
+  - 推理场景支持 `RankRestore(..., engine=IngestionEngine.FAST_PAGE_CACHE)` 实现物理页二进制镜像直接映射的极致冷启动，也支持 `ReshardRestore` 实现异构分片加载。
 
 ### 4.3 Arrow 原生键类型与算子下推
 
@@ -164,39 +181,48 @@ sample_keys, expected_ranks = generate_reference_vectors(
 
 ---
 
-## 5. 增量快照与离线流式压实 (Compaction)
+## 5. 增量快照与流式压实 (Compaction)
 
 ### 5.1 增量检查点工作机制
 
-- **全量保存 (FULL)**：保存当前表中所有存活键值与状态。
-- **增量保存 (INCREMENTAL)**：仅记录上一版本以来的增量变更（Dirty Keys）与删除标记（Tombstone）。空增量仅追加控制面 Manifest，不创建冗余数据表。
+- **全量保存 (FULL)**：保存当前表中所有存活键值与状态（`CheckpointSaveMode.FULL`）。
+- **增量保存 (INCREMENTAL)**：仅记录上一版本以来的增量变更（Dirty Keys）与删除标记（Tombstone），需指定 `parent_handle`。空增量仅追加控制面 Manifest，不创建冗余数据表。
 - **恢复链处理**：恢复时先校验 Parent 链的连续性与完整性，在 C++ 恢复引擎内流式执行状态合并与删除记录消除，被删除的历史键不会占用目标内存容量。
 
-### 5.2 独立流式压实 (Compaction)
+### 5.2 流式压实 (Compaction)
 
-随着增量保存次数增加，历史版本切片增多。系统支持通过独立离线任务对切片进行合并压实，无需启动完整的训练实例或加载全量数据：
+随着增量保存次数增加，历史版本切片增多。系统支持通过流式 Compaction 将增量链条合并为自包含的全量版本：
 
 ```python
-from sparse_embedding.checkpoint.lance_backend import compact_fragments
-
-# 1. 本地目录流式压实
-compact_fragments(
-    "/checkpoints/user_embedding/_staging",
-    "/exports/user_embedding",
+# 1. 托管式压实：将增量链合并为全新的自包含 FULL 检查点
+compacted_handle = storage.compact_checkpoint(
+    committed_inc.handle,
+    include_page_images=True,  # 可选：同步物化物理页镜像缓存，加速冷启动
 )
 
-# 2. 远端对象存储流式压实 (支持 s3:// 与 s3a:// 协议)
+# 后续恢复可直接挂载合流后的新句柄
+compacted_store = se.EmbeddingStore(config)
+checkpoint.load_training_checkpoint(
+    compacted_store,
+    compacted_handle,
+    RestorePlan.from_participant(
+        CheckpointParticipant(0, 1),
+        key_dtype="uint64",
+    ),
+)
+
+# 2. 独立目录压实：直接对底层 Lance Fragment 目录执行合流
+from sparse_embedding.checkpoint import compact_fragments
+
 compact_fragments(
-    "s3://my-bucket/checkpoints/user_embedding/_staging",
-    "s3://my-bucket/exports/user_embedding",
-    storage_options={
-        "endpoint": "http://s3.us-east-1.amazonaws.com",
-        "region": "us-east-1",
-    },
+    source_path="/checkpoints/user_embedding/_staging",
+    target_path="/exports/user_embedding",
 )
 ```
 
 流式合并由 C++ `checkpoint_stream_policy.hpp` 控制扫描批次与有界通道（`BoundedChannel`），严格控制峰值驻留内存，压实过程不修改输入版本。
+
+> 关于增量检查点的底层变动日志（Mutation Journaling）、物理 Schema 与一致性切片深度原理，请参见 [增量检查点与流式 Compaction](incremental_checkpoint_zh.md)。
 
 ---
 

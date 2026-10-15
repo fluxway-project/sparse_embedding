@@ -8,10 +8,9 @@ import pytest
 import sparse_embedding as se
 from sparse_embedding.checkpoint import (
     SUPPORTED_KEY_DTYPES,
-    ElasticRestore,
+    PartitionSpec,
+    ReshardRestore,
     SparseCheckpoint,
-    SparsePartitionAssignmentSpec,
-    encode_restore_options,
 )
 from sparse_embedding.checkpoint.lance_backend import LocalLanceStorage
 
@@ -108,13 +107,11 @@ def test_modulo_reference_vectors_match_native_elastic_restore(
             continue
         for partition_id in range(partition_count):
             target = _store(key_dtype)
-            options = encode_restore_options(
-                ElasticRestore(
-                    SparsePartitionAssignmentSpec.modulo(),
-                    partition_count,
-                    partition_id,
-                    key_dtype=key_dtype,
-                )
+            options = ReshardRestore(
+                PartitionSpec.modulo(),
+                partition_count,
+                partition_id,
+                key_dtype=key_dtype,
             )
             checkpoint.load_training_checkpoint(
                 target,

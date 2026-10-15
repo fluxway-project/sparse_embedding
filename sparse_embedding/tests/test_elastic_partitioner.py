@@ -23,7 +23,7 @@ from sparse_embedding.checkpoint import (
     SPARSE_EMBEDDING_FAST_RANGE_ASSIGNMENT_NAME,
     SPARSE_EMBEDDING_HASH_ASSIGNMENT_NAME,
     SPARSE_EMBEDDING_MODULO_ASSIGNMENT_NAME,
-    SparsePartitionAssignmentSpec,
+    PartitionSpec,
 )
 
 
@@ -39,7 +39,7 @@ def test_strategy_contract_inspection():
 
 def test_strategy_spec_ssot():
     modulo = se.ModuloPartition()
-    assert isinstance(modulo.spec, SparsePartitionAssignmentSpec)
+    assert isinstance(modulo.spec, PartitionSpec)
     assert modulo.spec.sparse_assignment_name == SPARSE_EMBEDDING_MODULO_ASSIGNMENT_NAME
     assert modulo.spec.sparse_assignment_parameters == {}
 

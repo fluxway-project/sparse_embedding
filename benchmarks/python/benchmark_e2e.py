@@ -56,7 +56,7 @@ def run_sync(keys: np.ndarray, values: np.ndarray, gradients: np.ndarray) -> Non
             store.lookup(keys, dim=DIM)
             store.assign(keys, values)
             store.accumulate_gradients(keys, gradients)
-            store.optimizer_step()
+            store.optimizer_step(1)
 
         durations = []
         for _ in range(RUNS):
@@ -64,7 +64,7 @@ def run_sync(keys: np.ndarray, values: np.ndarray, gradients: np.ndarray) -> Non
             store.lookup(keys, dim=DIM)
             store.assign(keys, values)
             store.accumulate_gradients(keys, gradients)
-            store.optimizer_step()
+            store.optimizer_step(1)
             durations.append(time.perf_counter() - started)
         require_eviction(store)
         summarize("sync_training_step", durations, len(keys))
@@ -81,7 +81,7 @@ async def run_async_measurements(
             await store.async_lookup(keys, dim=DIM)
             await store.async_assign(keys, values)
             await store.async_accumulate_gradients(keys, gradients)
-            await store.async_optimizer_step()
+            await store.async_optimizer_step(1)
 
         lookup_durations = []
         assign_durations = []
@@ -97,7 +97,7 @@ async def run_async_measurements(
 
             await store.async_accumulate_gradients(keys, gradients)
             started = time.perf_counter()
-            await store.async_optimizer_step()
+            await store.async_optimizer_step(1)
             optimizer_durations.append(time.perf_counter() - started)
 
         require_eviction(store)

@@ -68,7 +68,7 @@ void run_optimizer_step_eviction_regression() {
       std::vector<float> gradients(key_count, 1.0F);
       for (size_t round = 0; round < 128; ++round) {
         store.accumulate_gradients<uint64_t>(keys, gradients, lengths);
-        store.optimizer_step();
+        store.optimizer_step(1);
       }
     } catch (...) {
       errors[0] = std::current_exception();

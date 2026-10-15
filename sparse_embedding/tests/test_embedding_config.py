@@ -24,7 +24,7 @@ def test_embedding_config_can_disable_optimizer():
     store = EmbeddingStore(cfg)
     assert store.optimizer_enabled() is False
     with pytest.raises(RuntimeError, match="optimizer enabled"):
-        store.optimizer_step()
+        store.optimizer_step(1)
 
 
 def test_disabled_optimizer_rejects_optimizer_config():
