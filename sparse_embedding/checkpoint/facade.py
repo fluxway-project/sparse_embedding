@@ -16,6 +16,7 @@ from .base import (
     RestorePlan,
     SparseCheckpointProtocol,
     SparseCheckpointStorage,
+    resolve_effective_save_mode,
     run_cleanup_preserving_primary,
 )
 
@@ -28,6 +29,9 @@ class SparseCheckpoint:
     def integration_protocol(self) -> SparseCheckpointProtocol:
         return self._protocol
 
+    def requires_full_checkpoint(self, store: Any) -> bool:
+        return self._protocol.requires_full_checkpoint(store)
+
     def save_training_checkpoint(
         self,
         store: Any,
@@ -35,15 +39,40 @@ class SparseCheckpoint:
         *,
         publish_weight_path: str | Path | None = None,
         include_page_images: bool = False,
-        mode: CheckpointSaveMode = CheckpointSaveMode.FULL,
+        mode: CheckpointSaveMode | None = None,
         parent_handle: CheckpointHandle | None = None,
     ) -> CommittedCheckpoint:
-        if not isinstance(mode, CheckpointSaveMode):
-            raise TypeError("mode must be a CheckpointSaveMode")
-        if mode is CheckpointSaveMode.FULL and parent_handle is not None:
-            raise ValueError("full checkpoint must not specify parent_handle")
-        if mode is CheckpointSaveMode.INCREMENTAL and parent_handle is None:
-            raise ValueError("incremental checkpoint requires parent_handle")
+        if mode is None:
+            effective_mode, effective_parent = resolve_effective_save_mode(
+                CheckpointSaveMode.INCREMENTAL,
+                self.requires_full_checkpoint(store),
+                parent_handle,
+            )
+        else:
+            if not isinstance(mode, CheckpointSaveMode):
+                raise TypeError("mode must be a CheckpointSaveMode")
+            if mode is CheckpointSaveMode.FULL:
+                if parent_handle is not None:
+                    raise ValueError("full checkpoint must not specify parent_handle")
+                effective_mode, effective_parent = resolve_effective_save_mode(
+                    mode,
+                    False,
+                    None,
+                )
+            elif mode is CheckpointSaveMode.INCREMENTAL:
+                if parent_handle is None:
+                    raise ValueError("incremental checkpoint requires parent_handle")
+                effective_mode, effective_parent = resolve_effective_save_mode(
+                    mode,
+                    self.requires_full_checkpoint(store),
+                    parent_handle,
+                )
+                if effective_mode is CheckpointSaveMode.FULL:
+                    raise ValueError(
+                        "reshard restore requires the next training checkpoint to be FULL"
+                    )
+            else:
+                raise TypeError("mode must be a CheckpointSaveMode")
         attempt = uuid.uuid4().hex
         identity = CheckpointSaveIdentity(
             name,
@@ -64,8 +93,8 @@ class SparseCheckpoint:
                 identity,
                 participant,
                 include_page_images=include_page_images,
-                mode=mode,
-                parent_handle=parent_handle,
+                mode=effective_mode,
+                parent_handle=effective_parent,
             )
             self._protocol.finalize_checkpoint(identity)
             committed = self._protocol.commit_checkpoint_bytes(

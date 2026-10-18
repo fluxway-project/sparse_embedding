@@ -46,7 +46,6 @@ cc_binary(
     name = "core_extension",
     srcs = [
         "//sparse_embedding/src/bindings:srcs",
-        "//sparse_embedding/src/ops:srcs",
     ],
     copts = ["-fvisibility=hidden"],
     linkopts = ["-Wl,-rpath,$$ORIGIN"],
@@ -60,6 +59,7 @@ cc_binary(
         "//sparse_embedding/src/eviction",
         "//sparse_embedding/src/initializer",
         "//sparse_embedding/src/interface",
+        "//sparse_embedding/src/ops",
         "//sparse_embedding/src/optimizer",
         "@dlpack",
         "@nanobind",

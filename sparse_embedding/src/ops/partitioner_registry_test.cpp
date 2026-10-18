@@ -53,6 +53,19 @@ struct CustomRoundRobinPartitioner {
 int main() {
   auto &registry = se::ops::PartitionerRegistry::instance();
 
+  const uint64_t maximum_count = std::numeric_limits<uint32_t>::max();
+  require(se::ops::checked_partition_count(maximum_count) == maximum_count,
+          "maximum native partition count was rejected");
+  for (uint64_t count : {uint64_t{0}, maximum_count + 1, maximum_count + 2}) {
+    bool rejected = false;
+    try {
+      (void)se::ops::checked_partition_count(count);
+    } catch (const std::invalid_argument &) {
+      rejected = true;
+    }
+    require(rejected, "native partition count silently narrowed");
+  }
+
   // Test 1: Builtins are registered
   require(registry.is_registered(se::ops::kModuloPartitionerName),
           "modulo partitioner must be registered");

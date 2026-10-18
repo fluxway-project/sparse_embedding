@@ -108,6 +108,7 @@ cc_library(
         ":operation_dispatch_policy",
         ":store_page_eviction_proxy",
         "//sparse_embedding/src/arena",
+        "//sparse_embedding/src/checkpoint:ordered_checkpoint",
         "//sparse_embedding/src/common",
         "//sparse_embedding/src/eviction",
         "//sparse_embedding/src/execution",
@@ -208,6 +209,17 @@ cc_test(
     deps = [
         ":hogwild_headers",
         "//sparse_embedding/src/storage",
+    ],
+)
+
+cc_test(
+    name = "streaming_page_import_test",
+    srcs = ["streaming_page_import_test.cpp"],
+    linkopts = ["-pthread"],
+    deps = [
+        ":hogwild_embedding_store",
+        "//sparse_embedding/src/checkpoint:checkpoint_test_support",
+        "//sparse_embedding/src/optimizer",
     ],
 )
 

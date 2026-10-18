@@ -1,9 +1,10 @@
+import copy
 import inspect
 import json
-import tempfile
+import pickle
 from concurrent.futures import ThreadPoolExecutor
 from datetime import timedelta
-from pathlib import Path
+from types import MappingProxyType
 
 import lance
 import msgpack
@@ -15,8 +16,7 @@ import sparse_embedding as se
 from sparse_embedding.checkpoint import (
     IngestionEngine,
     PartitionSpec,
-    RankRestore,
-    ReshardRestore,
+    PartitionTarget,
     RestorePlan,
     SparseCheckpoint,
     encode_restore_options,
@@ -75,12 +75,27 @@ def populated_store(keys, value, *, dims=(4,)):
     return store
 
 
-def modulo_restore(partition_count: int, partition_id: int) -> ReshardRestore:
-    return ReshardRestore(
+def modulo_restore(partition_count: int, partition_id: int) -> RestorePlan:
+    return RestorePlan.from_partition(
         PartitionSpec.modulo(),
         partition_count,
         partition_id,
-        "uint64",
+        key_dtype="uint64",
+    )
+
+
+def target_restore(
+    participant: CheckpointParticipant,
+    *,
+    key_dtype: str = "uint64",
+    engine: IngestionEngine = IngestionEngine.RECONSTRUCT_ENTRIES,
+) -> RestorePlan:
+    return RestorePlan.from_partition(
+        PartitionSpec.modulo(),
+        participant.participant_count,
+        participant.participant_index,
+        key_dtype=key_dtype,
+        engine=engine,
     )
 
 
@@ -101,7 +116,7 @@ def test_user_facade_roundtrip(tmp_path):
     checkpoint.load_training_checkpoint(
         restored,
         handle(locator),
-        RankRestore(CheckpointParticipant(0, 1)),
+        target_restore(CheckpointParticipant(0, 1)),
     )
     np.testing.assert_allclose(lookup(restored, (1, 2)), 3)
 
@@ -213,7 +228,7 @@ def test_empty_incremental_checkpoint_has_no_entry_payload(tmp_path):
     assert not (tmp_path / "checkpoint" / root / PAGE_IMAGES_DATASET).exists()
     restored = se.EmbeddingStore(config())
     checkpoint.load_training_checkpoint(
-        restored, child.handle, RankRestore(CheckpointParticipant(0, 1))
+        restored, child.handle, target_restore(CheckpointParticipant(0, 1))
     )
     np.testing.assert_allclose(lookup(restored, (1,)), 1)
 
@@ -237,9 +252,9 @@ def test_checkpoint_publication_uses_opaque_handle_and_owner_version(tmp_path):
 
 def test_partition_assignment_spec_is_immutable_and_owner_approved():
     spec = PartitionSpec.modulo()
-    assert spec.sparse_assignment_name == "sparse_embedding.modulo"
-    assert dict(spec.sparse_assignment_parameters) == {}
-    with pytest.raises(ValueError, match="owner-approved"):
+    assert spec.name == "sparse_embedding.modulo"
+    assert dict(spec.parameters) == {}
+    with pytest.raises(ValueError, match="unregistered partition algorithm"):
         PartitionSpec("unknown", {})
     with pytest.raises(TypeError, match="unsupported value"):
         PartitionSpec("custom", {"callback": object()})
@@ -250,7 +265,8 @@ def test_owner_restore_options_are_canonical_and_opaque():
     assert isinstance(encoded, bytes)
     noncanonical = msgpack.packb(
         {
-            "restore_kind": "reshard",
+            "restore_kind": "partition",
+            "engine": "reconstruct_entries",
             "key_dtype": "uint64",
             "partition_count": 3,
             "partition_id": 1,
@@ -265,7 +281,7 @@ def test_owner_restore_options_are_canonical_and_opaque():
 @pytest.mark.parametrize("key_dtype", ["int32", "uint32", "int64", "uint64"])
 def test_modulo_restore_options_preserve_key_dtype(key_dtype):
     encoded = encode_restore_options(
-        ReshardRestore(
+        RestorePlan.from_partition(
             PartitionSpec.modulo(),
             3,
             1,
@@ -274,7 +290,7 @@ def test_modulo_restore_options_preserve_key_dtype(key_dtype):
     )
     decoded = msgpack.unpackb(encoded, raw=False)
     assert decoded["key_dtype"] == key_dtype
-    assert decoded["restore_kind"] == "reshard"
+    assert decoded["restore_kind"] == "partition"
 
 
 def test_restore_options_reject_typed_mode_and_unknown_fields(tmp_path):
@@ -282,7 +298,8 @@ def test_restore_options_reject_typed_mode_and_unknown_fields(tmp_path):
         _decode_restore_options(modulo_restore(1, 0))
     unknown = msgpack.packb(
         {
-            "restore_kind": "reshard",
+            "restore_kind": "partition",
+            "engine": "reconstruct_entries",
             "key_dtype": "uint64",
             "partition_count": 1,
             "partition_id": 0,
@@ -306,7 +323,7 @@ def test_opaque_handle_rejects_another_storage_root(tmp_path):
         second.load_component_checkpoint(
             se.EmbeddingStore(config()),
             committed.handle,
-            encode_restore_options(RankRestore(CheckpointParticipant(0, 1))),
+            encode_restore_options(target_restore(CheckpointParticipant(0, 1))),
         )
 
 
@@ -336,14 +353,14 @@ def test_fragment_manifests_restore_exact_checkpoint(tmp_path):
     checkpoint.load_training_checkpoint(
         old_store,
         handle(first),
-        RankRestore(CheckpointParticipant(0, 1)),
+        target_restore(CheckpointParticipant(0, 1)),
     )
     np.testing.assert_allclose(lookup(old_store, (1, 2)), 1)
     new_store = se.EmbeddingStore(config())
     checkpoint.load_training_checkpoint(
         new_store,
         handle(second),
-        RankRestore(CheckpointParticipant(0, 1)),
+        target_restore(CheckpointParticipant(0, 1)),
     )
     np.testing.assert_allclose(lookup(new_store, (2, 3)), 2)
     elastic_store = se.EmbeddingStore(config())
@@ -355,19 +372,11 @@ def test_fragment_manifests_restore_exact_checkpoint(tmp_path):
     np.testing.assert_allclose(lookup(elastic_store, (2, 3)), 2)
 
 
-def test_elastic_restore_uses_bounded_native_partition_scan(tmp_path, monkeypatch):
+def test_restore_filters_target_partition(tmp_path):
     storage = LocalLanceStorage(tmp_path / "checkpoint")
     source = populated_store(range(96), 5)
     committed = SparseCheckpoint(storage).save_training_checkpoint(source, "bounded")
 
-    def reject_materialized_keys(*args, **kwargs):
-        raise AssertionError("elastic restore must not materialize active keys")
-
-    monkeypatch.setattr(
-        lance_backend._checkpoint_native,
-        "active_entry_keys",
-        reject_materialized_keys,
-    )
     restored = se.EmbeddingStore(config())
     SparseCheckpoint(storage).load_training_checkpoint(
         restored,
@@ -375,6 +384,7 @@ def test_elastic_restore_uses_bounded_native_partition_scan(tmp_path, monkeypatc
         modulo_restore(3, 1),
     )
     expected = np.asarray([key for key in range(96) if key % 3 == 1], dtype=np.uint64)
+    assert restored.total_size() == expected.size
     np.testing.assert_allclose(lookup(restored, expected), 5)
 
 
@@ -396,7 +406,7 @@ def test_inference_weights_restore_from_physical_reference(tmp_path):
     physical_restored = se.EmbeddingStore(inference_config())
     LocalLanceStorage.from_published_weight(asset).load_inference_weights(
         physical_restored,
-        encode_restore_options(RankRestore(CheckpointParticipant(0, 1))),
+        encode_restore_options(target_restore(CheckpointParticipant(0, 1))),
     )
     np.testing.assert_allclose(lookup(physical_restored, (1, 2)), 7)
     with pytest.raises(ValueError, match="optimizer enabled"):
@@ -506,7 +516,7 @@ def test_page_image_restore_can_skip_optimizer_state(tmp_path):
     SparseCheckpoint(storage).load_training_checkpoint(
         target,
         handle(locator),
-        RankRestore(
+        target_restore(
             CheckpointParticipant(0, 1),
             engine=IngestionEngine.FAST_PAGE_CACHE,
         ),
@@ -580,7 +590,7 @@ def test_physical_restore_preserves_source_participant_after_compaction(tmp_path
             restored,
             compacted,
             encode_restore_options(
-                RankRestore(CheckpointParticipant(participant_index, 2))
+                target_restore(CheckpointParticipant(participant_index, 2))
             ),
         )
         expected = np.asarray(
@@ -593,7 +603,7 @@ def test_physical_restore_preserves_source_participant_after_compaction(tmp_path
         )
 
 
-def test_elastic_restore_does_not_materialize_global_active_keys(tmp_path, monkeypatch):
+def test_restore_merges_multiple_participants(tmp_path):
     storage = LocalLanceStorage(tmp_path / "checkpoint")
     identity = CheckpointSaveIdentity("duplicate", "attempt", authority())
     storage.prepare_checkpoint(identity)
@@ -607,14 +617,6 @@ def test_elastic_restore_does_not_materialize_global_active_keys(tmp_path, monke
     ]
     locator = storage._commit_checkpoint(identity, fragments)
 
-    def reject_materialized_keys(*args, **kwargs):
-        raise AssertionError("elastic restore must not materialize active keys")
-
-    monkeypatch.setattr(
-        lance_backend._checkpoint_native,
-        "active_entry_keys",
-        reject_materialized_keys,
-    )
     restored = se.EmbeddingStore(config())
     storage.load_component_checkpoint(
         restored,
@@ -622,14 +624,16 @@ def test_elastic_restore_does_not_materialize_global_active_keys(tmp_path, monke
         encode_restore_options(modulo_restore(1, 0)),
     )
     assert restored.total_size() == 2
+    np.testing.assert_allclose(lookup(restored, (0,)), 1)
+    np.testing.assert_allclose(lookup(restored, (1,)), 2)
 
 
-def test_elastic_restore_rejects_duplicate_active_keys(tmp_path):
+def test_elastic_restore_rejects_duplicate_active_keys(tmp_path, monkeypatch):
+    temporary_root = tmp_path / "native-scratch"
+    temporary_root.mkdir()
+    monkeypatch.setenv("TMPDIR", str(temporary_root))
     storage = LocalLanceStorage(tmp_path / "checkpoint")
-    temporary_root = Path(tempfile.gettempdir())
-    temporary_runs_before = set(
-        temporary_root.glob("sparse_embedding_duplicate_validation-*")
-    )
+    temporary_runs_before = set(temporary_root.glob("sparse_embedding_checkpoint-*"))
     identity = CheckpointSaveIdentity("duplicate", "attempt", authority())
     storage.prepare_checkpoint(identity)
     fragments = [
@@ -649,7 +653,7 @@ def test_elastic_restore_rejects_duplicate_active_keys(tmp_path):
             encode_restore_options(modulo_restore(1, 0)),
         )
     assert restored.is_operational() is True
-    assert set(temporary_root.glob("sparse_embedding_duplicate_validation-*")) == (
+    assert set(temporary_root.glob("sparse_embedding_checkpoint-*")) == (
         temporary_runs_before
     )
 
@@ -690,7 +694,8 @@ def test_legacy_restore_fields_reject_before_store_mutation(tmp_path):
         dict(
             sorted(
                 {
-                    "restore_kind": "reshard",
+                    "restore_kind": "partition",
+                    "engine": "reconstruct_entries",
                     "key_dtype": "uint64",
                     "partition_count": 2,
                     "partition_id": 0,
@@ -724,7 +729,8 @@ def test_modulo_restore_options_validate_descriptor_fields(
         populated_store((1, 2), 1), "descriptor-validation"
     )
     payload = {
-        "restore_kind": "reshard",
+        "restore_kind": "partition",
+        "engine": "reconstruct_entries",
         "key_dtype": "uint64",
         "partition_count": 1,
         "partition_id": 0,
@@ -904,14 +910,14 @@ def test_reclaim_reservation_removes_only_released_reference(tmp_path):
     storage.load_component_checkpoint(
         restored,
         handle(current),
-        encode_restore_options(RankRestore(CheckpointParticipant(0, 1))),
+        encode_restore_options(target_restore(CheckpointParticipant(0, 1))),
     )
     np.testing.assert_allclose(lookup(restored, (1,)), 2)
     with pytest.raises(LookupError):
         storage.load_component_checkpoint(
             se.EmbeddingStore(config()),
             handle(old),
-            encode_restore_options(RankRestore(CheckpointParticipant(0, 1))),
+            encode_restore_options(target_restore(CheckpointParticipant(0, 1))),
         )
 
 
@@ -999,7 +1005,7 @@ def test_committed_attempt_is_idempotent_and_not_abortable_after_storage_restart
     restarted.load_component_checkpoint(
         se.EmbeddingStore(config()),
         locator.handle,
-        encode_restore_options(RankRestore(CheckpointParticipant(0, 1))),
+        encode_restore_options(target_restore(CheckpointParticipant(0, 1))),
     )
 
     checkpoint = SparseCheckpoint(LocalLanceStorage(root))
@@ -1060,7 +1066,7 @@ def test_restore_rejects_incompatible_target_specification_before_mutation(tmp_p
         checkpoint.load_training_checkpoint(
             target,
             handle(locator),
-            RankRestore(CheckpointParticipant(0, 1)),
+            target_restore(CheckpointParticipant(0, 1)),
         )
     assert target.is_operational() is True
 
@@ -1141,7 +1147,7 @@ def test_compact_checkpoint_can_materialize_page_images(tmp_path):
         restored,
         compacted,
         encode_restore_options(
-            RankRestore(
+            target_restore(
                 CheckpointParticipant(0, 1),
                 engine=IngestionEngine.FAST_PAGE_CACHE,
             )
@@ -1157,7 +1163,7 @@ def test_inference_storage_requires_a_published_weight_path(tmp_path):
     storage = LocalLanceStorage(tmp_path / "checkpoint")
     store = se.EmbeddingStore(config())
     options = encode_restore_options(
-        ReshardRestore(PartitionSpec.modulo(), 1, 0, key_dtype="uint64")
+        RestorePlan.from_partition(PartitionSpec.modulo(), 1, 0, key_dtype="uint64")
     )
     with pytest.raises(RuntimeError, match="from_published_weight"):
         storage.load_inference_weights(store, options)
@@ -1372,8 +1378,6 @@ def test_partition_spec_declarative_contracts():
     modulo_spec = PartitionSpec.modulo()
     assert modulo_spec.name == "sparse_embedding.modulo"
     assert modulo_spec.parameters == {}
-    assert modulo_spec.sparse_assignment_name == modulo_spec.name
-    assert modulo_spec.sparse_assignment_parameters == modulo_spec.parameters
 
     hash_spec = PartitionSpec.hash(seed=1024)
     assert hash_spec.name == "sparse_embedding.hash"
@@ -1394,25 +1398,72 @@ def test_partition_spec_declarative_contracts():
     with pytest.raises(TypeError):
         PartitionSpec(name=123)  # type: ignore
 
+    with pytest.raises(
+        TypeError, match="type 'PartitionSpec' is not an acceptable base type"
+    ):
+
+        class _IllegalSubclass(PartitionSpec):
+            pass
+
+
+def test_partition_spec_copy_and_serialization_contracts():
+    specs = [
+        PartitionSpec.modulo(),
+        PartitionSpec.hash(seed=1024),
+        PartitionSpec.fast_range(),
+        PartitionSpec(
+            "sparse_embedding.modulo",
+            {"level1": {"level2": [1, 2, 3], "tag": "test"}},
+        ),
+    ]
+
+    for spec in specs:
+        assert copy.copy(spec) is spec
+        assert copy.deepcopy(spec) is spec
+        assert copy.deepcopy(spec, {}) is spec
+
+        pickled = pickle.dumps(spec)
+        restored = pickle.loads(pickled)
+        assert restored == spec
+        assert hash(restored) == hash(spec)
+        assert isinstance(restored.parameters, MappingProxyType)
+
+        with pytest.raises(TypeError):
+            restored.parameters["mutation"] = "illegal"  # type: ignore
+
+        target = PartitionTarget(spec, 4, 1)
+        assert copy.copy(target).spec is spec
+        assert copy.deepcopy(target).spec is spec
+        target_restored = pickle.loads(pickle.dumps(target))
+        assert target_restored == target
+        assert target_restored.spec == spec
+
+        plan = RestorePlan.from_partition(spec, 4, 1)
+        assert copy.copy(plan).target.spec is spec
+        assert copy.deepcopy(plan).target.spec is spec
+        plan_restored = pickle.loads(pickle.dumps(plan))
+        assert plan_restored == plan
+        assert plan_restored.target.spec == spec
+
 
 def test_restore_plan_polymorphism_and_validation():
     strategy = se.ModuloPartition()
-    plan = ReshardRestore(
+    plan = RestorePlan.from_partition(
         spec=strategy.spec,
         partition_count=4,
         partition_id=1,
         key_dtype="uint64",
     )
-    assert plan.spec == PartitionSpec.modulo()
-    assert plan.partition_count == 4
-    assert plan.partition_id == 1
+    assert plan.target.spec == PartitionSpec.modulo()
+    assert plan.target.partition_count == 4
+    assert plan.target.partition_id == 1
 
     encoded = plan.encode()
     assert isinstance(encoded, bytes)
     assert encoded == encode_restore_options(plan)
 
     decoded = RestorePlan.from_bytes(encoded)
-    assert isinstance(decoded, ReshardRestore)
+    assert isinstance(decoded, RestorePlan)
     assert decoded == plan
 
     factory_plan = RestorePlan.from_partition(
@@ -1425,69 +1476,50 @@ def test_restore_plan_polymorphism_and_validation():
 
     # Strict bounds and dtype assertions without fallback
     with pytest.raises(ValueError):
-        ReshardRestore(strategy.spec, 4, 4)
+        RestorePlan.from_partition(strategy.spec, 4, 4)
 
     with pytest.raises(ValueError):
-        ReshardRestore(strategy.spec, 0, 0)
+        RestorePlan.from_partition(strategy.spec, 0, 0)
 
     with pytest.raises(TypeError):
-        ReshardRestore(strategy.spec, 4.0, 0)  # type: ignore
+        RestorePlan.from_partition(strategy.spec, 4.0, 0)  # type: ignore
 
     with pytest.raises(ValueError):
-        ReshardRestore(strategy.spec, 4, 0, key_dtype="invalid_dtype")
+        RestorePlan.from_partition(strategy.spec, 4, 0, key_dtype="invalid_dtype")
 
 
-def test_physical_restore_factory_and_properties():
-    participant = CheckpointParticipant(0, 2)
-    plan = RankRestore(participant)
-    assert plan.participant == participant
-    assert plan.engine == IngestionEngine.RECONSTRUCT_ENTRIES
-    assert plan.key_dtype == "uint64"
-
-    encoded = plan.encode()
-    assert RestorePlan.from_bytes(encoded) == plan
-
-    factory_plan = RestorePlan.from_participant(participant)
-    assert factory_plan == plan
-
+def test_restore_plan_uses_one_target_contract():
+    plan = RestorePlan(
+        PartitionTarget(PartitionSpec.modulo(), 2, 1),
+        key_dtype="uint64",
+    )
+    assert plan.target.partition_count == 2
+    assert plan.target.partition_id == 1
+    assert RestorePlan.from_bytes(plan.encode()) == plan
     with pytest.raises(TypeError):
-        RankRestore(participant="invalid")  # type: ignore
-
-    with pytest.raises(TypeError):
-        RankRestore()  # type: ignore
+        RestorePlan("invalid")  # type: ignore
 
 
-def test_restore_plan_selects_topology_specific_plan():
-    same_topology = RestorePlan.from_topology(
-        saved_participant_count=2,
-        participant=CheckpointParticipant(1, 2),
-        spec=PartitionSpec.modulo(),
-        key_dtype="uint64",
+@pytest.mark.parametrize("key_dtype", ["int32", "uint32", "int64", "uint64"])
+@pytest.mark.parametrize("engine", list(IngestionEngine))
+def test_restore_plan_constructors_agree(key_dtype, engine):
+    spec = PartitionSpec.hash(seed=42)
+    direct = RestorePlan(
+        PartitionTarget(spec, 3, 1), key_dtype=key_dtype, engine=engine
     )
-    assert same_topology == RankRestore(CheckpointParticipant(1, 2))
-
-    changed_topology = RestorePlan.from_topology(
-        saved_participant_count=2,
-        participant=CheckpointParticipant(3, 4),
-        spec=PartitionSpec.modulo(),
-        key_dtype="uint64",
+    assert direct == RestorePlan.from_partition(
+        spec, 3, 1, key_dtype=key_dtype, engine=engine
     )
-    assert changed_topology == ReshardRestore(PartitionSpec.modulo(), 4, 3, "uint64")
+    assert RestorePlan.from_bytes(direct.encode()) == direct
 
-    inference_topology = RestorePlan.from_topology(
-        saved_participant_count=None,
-        participant=CheckpointParticipant(0, 1),
-        spec=PartitionSpec.modulo(),
-        key_dtype="uint64",
-    )
-    assert inference_topology == ReshardRestore(PartitionSpec.modulo(), 1, 0, "uint64")
 
-    with pytest.raises(ValueError, match="saved_participant_count must be positive"):
-        RestorePlan.from_topology(
-            saved_participant_count=0,
-            participant=CheckpointParticipant(0, 1),
-            spec=PartitionSpec.modulo(),
-        )
+def test_restore_plan_rejects_positional_policy_arguments():
+    spec = PartitionSpec.modulo()
+    target = PartitionTarget(spec, 3, 1)
+    with pytest.raises(TypeError, match="positional"):
+        RestorePlan(target, "uint64")  # type: ignore
+    with pytest.raises(TypeError, match="positional"):
+        RestorePlan.from_partition(spec, 3, 1, "uint64")  # type: ignore
 
 
 def test_sparse_checkpoint_load_with_typed_restore_plan(tmp_path):
@@ -1514,6 +1546,63 @@ def test_sparse_checkpoint_load_with_typed_restore_plan(tmp_path):
             committed.handle,
             "unsupported_restore_type",  # type: ignore
         )
+
+
+def test_same_and_changed_target_topologies_share_native_entry_path(
+    tmp_path, monkeypatch
+):
+    storage = LocalLanceStorage(tmp_path / "checkpoint")
+    checkpoint = SparseCheckpoint(storage)
+    committed = checkpoint.save_training_checkpoint(
+        populated_store(range(8), 3.0), "unified-targets"
+    )
+    native_restore = lance_backend._checkpoint_native.restore_native_partition_entries
+    calls = []
+
+    def record_call(*args, **kwargs):
+        calls.append(
+            {
+                "partition_count": args[3],
+                "partition_id": args[4],
+                "source_participant_index": args[6],
+                "assignment_name": args[9],
+            }
+        )
+        return native_restore(*args, **kwargs)
+
+    monkeypatch.setattr(
+        lance_backend._checkpoint_native,
+        "restore_native_partition_entries",
+        record_call,
+    )
+
+    same_target = RestorePlan.from_partition(PartitionSpec.modulo(), 1, 0)
+    changed_target = RestorePlan.from_partition(PartitionSpec.modulo(), 2, 0)
+    assert isinstance(same_target, RestorePlan)
+    assert isinstance(changed_target, RestorePlan)
+
+    same_store = se.EmbeddingStore(config())
+    checkpoint.load_training_checkpoint(same_store, committed.handle, same_target)
+    changed_store = se.EmbeddingStore(config())
+    checkpoint.load_training_checkpoint(changed_store, committed.handle, changed_target)
+
+    assert calls == [
+        {
+            "partition_count": 1,
+            "partition_id": 0,
+            "source_participant_index": None,
+            "assignment_name": "sparse_embedding.modulo",
+        },
+        {
+            "partition_count": 2,
+            "partition_id": 0,
+            "source_participant_index": None,
+            "assignment_name": "sparse_embedding.modulo",
+        },
+    ]
+    assert same_store.total_size() == 8
+    assert changed_store.total_size() == 4
+    np.testing.assert_allclose(lookup(changed_store, (0, 2, 4, 6)), 3.0)
 
 
 @pytest.mark.parametrize("include_page_images", [False, True])
@@ -1557,7 +1646,7 @@ def test_incremental_commit_context_survives_coordinator_restart(
     SparseCheckpoint(committer).load_training_checkpoint(
         restored,
         child.handle,
-        RankRestore(CheckpointParticipant(0, 1), engine=strategy),
+        target_restore(CheckpointParticipant(0, 1), engine=strategy),
     )
     np.testing.assert_allclose(lookup(restored, (1,)), 1)
     np.testing.assert_allclose(lookup(restored, (2,)), 9)
@@ -1715,7 +1804,7 @@ def test_lookup_score_survives_incremental_restore(tmp_path):
     )
     restored = se.EmbeddingStore(config(), score_policy="lfu")
     checkpoint.load_training_checkpoint(
-        restored, child.handle, RankRestore(CheckpointParticipant(0, 1))
+        restored, child.handle, target_restore(CheckpointParticipant(0, 1))
     )
     assert restored.total_size() == 2
     image = restored.export_page_images()[0]
@@ -1748,7 +1837,7 @@ def test_mutation_after_capture_survives_acknowledgement(tmp_path, monkeypatch):
     assert len(source.checkpoint_mutations()) == 1
     restored = se.EmbeddingStore(config())
     checkpoint.load_training_checkpoint(
-        restored, child.handle, RankRestore(CheckpointParticipant(0, 1))
+        restored, child.handle, target_restore(CheckpointParticipant(0, 1))
     )
     np.testing.assert_allclose(lookup(restored, (1,)), 2)
     np.testing.assert_allclose(lookup(source, (1,)), 3)
@@ -1778,6 +1867,35 @@ def test_stale_acknowledgement_cannot_roll_back_baseline(tmp_path):
     assert store.checkpoint_baseline() == baseline
 
 
+@pytest.mark.parametrize("engine", tuple(IngestionEngine))
+@pytest.mark.parametrize("load_optimizer_state", [True, False])
+def test_restore_requires_target_optimizer_state(
+    tmp_path, engine, load_optimizer_state
+):
+    source = se.EmbeddingStore(config(), optimizer_config=se.Sgd(lr=0.01))
+    source.assign(np.asarray([7], dtype=np.uint64), np.ones((1, 4), dtype=np.float32))
+    checkpoint = SparseCheckpoint(LocalLanceStorage(tmp_path / "checkpoint"))
+    saved = checkpoint.save_training_checkpoint(
+        source, "optimizer-layout", include_page_images=True
+    )
+    target = (
+        se.EmbeddingStore(config(), optimizer_config=se.Adam(lr=0.01))
+        if load_optimizer_state
+        else se.EmbeddingStore(inference_config())
+    )
+    plan = target_restore(CheckpointParticipant(0, 1), engine=engine)
+    if load_optimizer_state:
+        with pytest.raises(ValueError, match="optimizer state"):
+            checkpoint.load_training_checkpoint(
+                target, saved.handle, plan, load_optimizer_state=True
+            )
+    else:
+        checkpoint.load_training_checkpoint(
+            target, saved.handle, plan, load_optimizer_state=False
+        )
+        np.testing.assert_array_equal(lookup(target, [7]), np.ones((1, 4), np.float32))
+
+
 def test_compact_pages_respect_explicit_geometry(tmp_path):
     tuning = se.StorageTuningOptions(
         entries_per_page=4096, max_pages=64, calibrate_page_geometry=False
@@ -1786,9 +1904,10 @@ def test_compact_pages_respect_explicit_geometry(tmp_path):
         dims=[4], thread_budget=1, key_dtype="uint64", storage_tuning=tuning
     )
     source = se.EmbeddingStore(cfg, optimizer_config=se.Adam(lr=0.01))
-    keys = np.arange(5000, dtype=np.uint64)
-    source.assign(keys, np.ones((5000, 4), dtype=np.float32))
-    gradients = np.arange(5000 * 4, dtype=np.float32).reshape(5000, 4) / 20000
+    count = 17 * 4096 + 3
+    keys = np.arange(count, dtype=np.uint64)
+    source.assign(keys, np.ones((count, 4), dtype=np.float32))
+    gradients = np.arange(count * 4, dtype=np.float32).reshape(count, 4) / (count * 4)
     source.accumulate_gradients(keys, gradients)
     source.optimizer_step(1)
     storage = LocalLanceStorage(tmp_path / "checkpoint")
@@ -1799,17 +1918,17 @@ def test_compact_pages_respect_explicit_geometry(tmp_path):
     checkpoint.load_training_checkpoint(
         restored,
         compacted,
-        RankRestore(
+        target_restore(
             CheckpointParticipant(0, 1),
             engine=IngestionEngine.FAST_PAGE_CACHE,
         ),
         load_optimizer_state=True,
     )
-    assert restored.total_size() == 5000
+    assert restored.total_size() == count
     np.testing.assert_allclose(lookup(restored, keys), lookup(source, keys))
     assert sorted(len(image["keys"]) for image in restored.export_page_images()) == [
-        904,
-        4096,
+        3,
+        *([4096] * 17),
     ]
     for store in (source, restored):
         store.accumulate_gradients(keys, gradients)
@@ -1829,12 +1948,34 @@ def test_compact_pages_respect_explicit_geometry(tmp_path):
         checkpoint.load_training_checkpoint(
             incompatible,
             compacted,
-            RankRestore(
+            target_restore(
                 CheckpointParticipant(0, 1),
                 engine=IngestionEngine.FAST_PAGE_CACHE,
             ),
         )
     assert incompatible.is_operational() is True
+
+
+def test_page_image_materialization_rejects_changed_target_topology(tmp_path):
+    storage = LocalLanceStorage(tmp_path / "checkpoint")
+    checkpoint = SparseCheckpoint(storage)
+    committed = checkpoint.save_training_checkpoint(
+        populated_store((1, 2), 4.0), "page-topology", include_page_images=True
+    )
+    target = se.EmbeddingStore(config())
+    plan = RestorePlan.from_partition(
+        PartitionSpec.modulo(),
+        partition_count=2,
+        partition_id=0,
+        engine=IngestionEngine.FAST_PAGE_CACHE,
+    )
+    with pytest.raises(
+        ValueError,
+        match="page-image materialization requires the saved partition topology",
+    ):
+        checkpoint.load_training_checkpoint(target, committed.handle, plan)
+    assert target.is_operational() is True
+    assert target.total_size() == 0
 
 
 @pytest.mark.parametrize("include_page_images", [False, True])
@@ -1951,6 +2092,114 @@ def test_reclaim_recovery_releases_parent_chain_reference(
         restarted.resolve_checkpoint_manifest(child.handle)
 
 
+def test_rejected_native_ack_preserves_resharded_full_requirement():
+    store = se.EmbeddingStore(config())
+    store.initialize_checkpoint_baseline("resharded-base", 0, resharded=True)
+    baseline = store.checkpoint_baseline()
+    assert store.checkpoint_requires_full()
+
+    with pytest.raises(ValueError, match="journal incarnation"):
+        store.advance_checkpoint_baseline(0, "next-base", 999, "other-journal")
+
+    assert store.checkpoint_baseline() == baseline
+    assert store.checkpoint_requires_full()
+
+
+@pytest.mark.parametrize("include_page_images", [False, True])
+@pytest.mark.parametrize("failure_boundary", ["marker", "payload", "post_manifest"])
+def test_abort_reclaim_failure_preserves_lineage_and_recovers(
+    tmp_path, monkeypatch, include_page_images, failure_boundary
+):
+    root = tmp_path / "checkpoint"
+    storage = LocalLanceStorage(root)
+    source = populated_store((1,), 1)
+    parent = SparseCheckpoint(storage).save_training_checkpoint(
+        source, "abort-chain", include_page_images=include_page_images
+    )
+    source.assign(
+        np.asarray([1], dtype=np.uint64), np.full((1, 4), 2, dtype=np.float32)
+    )
+    identity = CheckpointSaveIdentity("abort-chain", "orphan", authority(2))
+    storage.prepare_checkpoint(identity)
+    fragment = storage.write_checkpoint_fragment_bytes(
+        source,
+        identity,
+        CheckpointParticipant(0, 1),
+        include_page_images=include_page_images,
+        mode=CheckpointSaveMode.INCREMENTAL,
+        parent_handle=parent.handle,
+    )
+    storage.finalize_checkpoint(identity)
+    committed = storage.commit_checkpoint_bytes(identity, [fragment])
+    locator, _ = storage._resolve_handle(committed.handle)
+    manifest = storage.resolve_checkpoint_manifest(committed.handle)
+    marker = storage._reclaim_pending_tag(locator)
+    intent = storage._intent_tag(identity, locator)
+    dataset = storage._workspace.dataset(SNAPSHOT_MANIFEST_DATASET)
+
+    if failure_boundary == "marker":
+        tag_type = type(dataset.tags)
+        original = tag_type.create
+
+        def fault(tags, tag, version):
+            if tag == marker:
+                raise OSError("injected abort reclaim fault")
+            return original(tags, tag, version)
+
+        monkeypatch.setattr(tag_type, "create", fault)
+    elif failure_boundary == "payload":
+        roots = set(storage._manifest_fragment_roots(manifest).values())
+        original = storage._workspace.delete_prefix
+
+        def fault(path, **kwargs):
+            result = original(path, **kwargs)
+            if path in roots:
+                raise OSError("injected abort reclaim fault")
+            return result
+
+        monkeypatch.setattr(storage._workspace, "delete_prefix", fault)
+    else:
+        dataset_type = type(dataset)
+        original = dataset_type.delete
+
+        def fault(dataset, predicate, *args, **kwargs):
+            result = original(dataset, predicate, *args, **kwargs)
+            if f"AND checkpoint_version = {locator.checkpoint_version}" in predicate:
+                raise OSError("injected abort reclaim fault")
+            return result
+
+        monkeypatch.setattr(dataset_type, "delete", fault)
+
+    with pytest.raises(OSError, match="injected abort reclaim fault"):
+        storage.abort_checkpoint(identity)
+    tags = dataset.tags.list()
+    assert intent in tags
+    assert (marker in tags) is (failure_boundary != "marker")
+    assert storage.resolve_lineage_head("abort-chain")["checkpoint_version"] == 1
+
+    monkeypatch.undo()
+    storage.close()
+    restarted = LocalLanceStorage(root)
+    try:
+        restarted.abort_checkpoint(identity)
+        with restarted.exclusive_recovery():
+            restarted.reclaim()
+            restarted.reclaim()
+        tags = restarted._workspace.dataset(SNAPSHOT_MANIFEST_DATASET).tags.list()
+        assert intent not in tags
+        assert marker not in tags
+        assert restarted.resolve_lineage_head("abort-chain")["checkpoint_version"] == 1
+        with pytest.raises(LookupError):
+            restarted.resolve_checkpoint_manifest(committed.handle)
+        target = se.EmbeddingStore(config())
+        SparseCheckpoint(restarted).load_training_checkpoint(
+            target, parent.handle, modulo_restore(1, 0)
+        )
+        np.testing.assert_allclose(lookup(target, (1,)), 1)
+    finally:
+        restarted.close()
+
+
 @pytest.mark.parametrize("capture_target", [False, True])
 def test_acknowledgement_rejects_other_journal_incarnation(tmp_path, capture_target):
     storage = LocalLanceStorage(tmp_path / "checkpoint")
@@ -1981,7 +2230,7 @@ def test_page_restore_requires_new_full_baseline(tmp_path):
     checkpoint.load_training_checkpoint(
         store,
         parent.handle,
-        RankRestore(
+        target_restore(
             CheckpointParticipant(0, 1),
             engine=IngestionEngine.FAST_PAGE_CACHE,
         ),
@@ -2003,8 +2252,10 @@ def test_page_restore_requires_new_full_baseline(tmp_path):
         mode=CheckpointSaveMode.INCREMENTAL,
         parent_handle=fresh.handle,
     )
-    restored = se.EmbeddingStore(config())
-    checkpoint.load_training_checkpoint(restored, child.handle, modulo_restore(1, 0))
+    restored = se.EmbeddingStore(inference_config())
+    checkpoint.load_training_checkpoint(
+        restored, child.handle, modulo_restore(1, 0), load_optimizer_state=False
+    )
     np.testing.assert_allclose(lookup(restored, (1,)), 1)
 
 
@@ -2018,7 +2269,7 @@ def test_physical_weight_only_restore_does_not_install_baseline(tmp_path):
     checkpoint.load_training_checkpoint(
         target,
         committed.handle,
-        RankRestore(CheckpointParticipant(0, 1)),
+        target_restore(CheckpointParticipant(0, 1)),
         load_optimizer_state=False,
     )
     assert target.checkpoint_baseline() == ""
@@ -2037,6 +2288,8 @@ def test_elastic_training_restore_establishes_origin_and_requires_full(tmp_path)
         modulo_restore(2, 0),
     )
     assert target.checkpoint_baseline()
+    assert checkpoint.requires_full_checkpoint(target)
+    assert storage.requires_full_checkpoint(target)
     target.assign(
         np.asarray([3], dtype=np.uint64), np.full((1, 4), 2, dtype=np.float32)
     )
@@ -2049,8 +2302,20 @@ def test_elastic_training_restore_establishes_origin_and_requires_full(tmp_path)
             mode=CheckpointSaveMode.INCREMENTAL,
             parent_handle=committed.handle,
         )
-    full = checkpoint.save_training_checkpoint(target, "elastic-training")
-    assert full.handle
+    auto_full = checkpoint.save_training_checkpoint(
+        target, "elastic-training", parent_handle=committed.handle
+    )
+    assert auto_full.handle
+    assert not checkpoint.requires_full_checkpoint(target)
+    assert not storage.requires_full_checkpoint(target)
+
+    target.assign(
+        np.asarray([4], dtype=np.uint64), np.full((1, 4), 3, dtype=np.float32)
+    )
+    incremental = checkpoint.save_training_checkpoint(
+        target, "elastic-training", parent_handle=auto_full.handle
+    )
+    assert incremental.handle
 
 
 def test_elastic_origin_uses_validated_chain_and_maximum_watermark():
@@ -2073,7 +2338,7 @@ def test_elastic_origin_uses_validated_chain_and_maximum_watermark():
         },
     )
     plan = modulo_restore(2, 1)
-    baseline, watermark = LocalLanceStorage._reshard_restore_origin(chain, plan)
+    baseline, watermark = LocalLanceStorage._target_restore_origin(chain, plan)
     assert baseline
     assert watermark == 13
 
@@ -2097,9 +2362,7 @@ def test_elastic_origin_uses_final_manifest_watermark_only():
             "checkpoint_mode": "incremental",
         },
     )
-    _, watermark = LocalLanceStorage._reshard_restore_origin(
-        chain, modulo_restore(1, 0)
-    )
+    _, watermark = LocalLanceStorage._target_restore_origin(chain, modulo_restore(1, 0))
     assert watermark == 13
 
 
@@ -2147,7 +2410,7 @@ def test_empty_full_delta_and_compact_without_payload(tmp_path, include_page_ima
         checkpoint.load_training_checkpoint(
             target,
             saved,
-            RankRestore(
+            target_restore(
                 CheckpointParticipant(0, 1),
                 engine=IngestionEngine.FAST_PAGE_CACHE
                 if include_page_images
@@ -2155,6 +2418,20 @@ def test_empty_full_delta_and_compact_without_payload(tmp_path, include_page_ima
             ),
         )
         assert target.total_size() == 0
+    if include_page_images:
+        resumed = checkpoint.save_training_checkpoint(
+            target,
+            "restored-empty",
+            include_page_images=True,
+        )
+        assert (
+            storage.resolve_checkpoint_manifest(resumed.handle)[
+                "participant_page_layout_generations"
+            ]
+            == storage.resolve_checkpoint_manifest(compacted)[
+                "participant_page_layout_generations"
+            ]
+        )
 
 
 @pytest.mark.parametrize("include_page_images", [False, True])
@@ -2199,7 +2476,7 @@ def test_compact_preserves_delta_tombstones_optimizer_and_scores(
     checkpoint.load_training_checkpoint(
         merged,
         compacted,
-        RankRestore(
+        target_restore(
             CheckpointParticipant(0, 1),
             engine=IngestionEngine.FAST_PAGE_CACHE
             if include_page_images
@@ -2370,3 +2647,337 @@ def test_native_restore_uses_one_explicit_lance_version(tmp_path):
     )
     assert target.total_size() == 1
     np.testing.assert_allclose(lookup(target, (1,)), 1)
+
+
+@pytest.mark.parametrize("key_dtype", ["int64", "uint64"])
+def test_native_entry_restore_preserves_multi_batch_dimension_state(
+    tmp_path, key_dtype
+):
+    cfg = se.EmbeddingConfig(
+        dims=[3, 5],
+        thread_budget=1,
+        key_dtype=key_dtype,
+        optimizer_dtype="float16",
+    )
+    source = se.EmbeddingStore(
+        cfg, optimizer_config=se.Adam(lr=0.01), score_policy="lfu"
+    )
+    keys = np.arange(8200, dtype=key_dtype)
+    keys += -4100 if key_dtype == "int64" else 1 << 63
+    for dim in (3, 5):
+        values = np.arange(len(keys) * dim, dtype=np.float32).reshape(-1, dim) / 256
+        source.assign(keys, values)
+        source.accumulate_gradients(keys, np.full_like(values, dim / 10))
+    source.optimizer_step(1)
+    for dim in (3, 3, 5):
+        source.lookup(keys, dim=dim)
+
+    def scores(store):
+        return {
+            (image["embedding_dim"], int(key)): int(score)
+            for image in store.export_page_images()
+            for key, score in zip(image["keys"], image["scores"], strict=True)
+        }
+
+    expected_scores = scores(source)
+    first_key = int(keys[0]) % (1 << 64)
+    assert expected_scores[(3, first_key)] != expected_scores[(5, first_key)]
+    checkpoint = SparseCheckpoint(LocalLanceStorage(tmp_path / "checkpoint"))
+    saved = checkpoint.save_training_checkpoint(source, "multi-batch-state")
+    target = se.EmbeddingStore(
+        cfg, optimizer_config=se.Adam(lr=0.01), score_policy="lfu"
+    )
+    checkpoint.load_training_checkpoint(
+        target,
+        saved.handle,
+        RestorePlan.from_partition(PartitionSpec.modulo(), 1, 0, key_dtype=key_dtype),
+    )
+    assert target.total_size() == len(keys) * 2
+    assert scores(target) == expected_scores
+    for store in (source, target):
+        for dim in (3, 5):
+            store.accumulate_gradients(
+                keys, np.full((len(keys), dim), dim / 7, dtype=np.float32)
+            )
+        store.optimizer_step(1)
+    for dim in (3, 5):
+        np.testing.assert_array_equal(
+            np.from_dlpack(target.lookup(keys, dim=dim)[0]),
+            np.from_dlpack(source.lookup(keys, dim=dim)[0]),
+        )
+
+
+def _commit_partitioned_restore_fixture(
+    storage, stores, name, attempt, generation, *, parent=None, pages=False
+):
+    identity = CheckpointSaveIdentity(name, attempt, authority(generation))
+    storage.prepare_checkpoint(identity)
+    fragments = [
+        storage._write_checkpoint_fragment(
+            store,
+            identity,
+            CheckpointParticipant(index, len(stores)),
+            include_page_images=pages,
+            mode=CheckpointSaveMode.INCREMENTAL if parent else CheckpointSaveMode.FULL,
+            parent_manifest=storage.resolve_checkpoint_manifest(parent.handle)
+            if parent
+            else None,
+        )
+        for index, store in enumerate(stores)
+    ]
+    committed = storage._commit_checkpoint(identity, fragments)
+    storage.acknowledge_checkpoint(identity)
+    for index, store in enumerate(stores):
+        storage.acknowledge_store_mutations(
+            store, committed.handle, participant_index=index
+        )
+    return committed
+
+
+def test_equal_count_reassignment_rejects_pages_and_requires_full(tmp_path):
+    storage = LocalLanceStorage(tmp_path / "checkpoint")
+    sources = [populated_store((0, 2), 3), populated_store((1, 3), 3)]
+    parent = _commit_partitioned_restore_fixture(
+        storage, sources, "layout", "full", 0, pages=True
+    )
+    checkpoint = SparseCheckpoint(storage)
+    target = se.EmbeddingStore(config())
+    plan = RestorePlan.from_partition(
+        PartitionSpec.fast_range(), 2, 0, engine=IngestionEngine.FAST_PAGE_CACHE
+    )
+    with pytest.raises(ValueError, match="source partition ownership"):
+        checkpoint.load_training_checkpoint(target, parent.handle, plan)
+    assert target.is_operational() is True
+    assert target.total_size() == 0
+    restored = []
+    for index in range(2):
+        target = se.EmbeddingStore(config())
+        checkpoint.load_training_checkpoint(
+            target,
+            parent.handle,
+            RestorePlan.from_partition(PartitionSpec.fast_range(), 2, index),
+        )
+        restored.append(target)
+    assert [store.total_size() for store in restored] == [4, 0]
+    np.testing.assert_allclose(lookup(restored[0], (0, 1, 2, 3)), 3)
+    with pytest.raises(
+        ValueError, match="requires the next training checkpoint to be FULL"
+    ):
+        checkpoint.save_training_checkpoint(
+            restored[0],
+            "layout",
+            mode=CheckpointSaveMode.INCREMENTAL,
+            parent_handle=parent.handle,
+        )
+    full = _commit_partitioned_restore_fixture(
+        storage, restored, "new-layout", "full", 0
+    )
+    restored[0].assign(np.asarray([1], dtype=np.uint64), np.full((1, 4), 9, np.float32))
+    child = _commit_partitioned_restore_fixture(
+        storage, restored, "new-layout", "delta", 1, parent=full
+    )
+    result = se.EmbeddingStore(config())
+    checkpoint.load_training_checkpoint(
+        result,
+        child.handle,
+        RestorePlan.from_partition(PartitionSpec.fast_range(), 2, 0),
+    )
+    np.testing.assert_allclose(lookup(result, (1,)), 9)
+    np.testing.assert_allclose(lookup(result, (0, 2, 3)), 3)
+
+
+@pytest.mark.parametrize("key_dtype", ["int32", "uint32", "int64", "uint64"])
+def test_native_layout_proof_preserves_typed_fast_range_pages(tmp_path, key_dtype):
+    dtype = np.dtype(key_dtype)
+    high = np.iinfo(dtype).min if dtype.kind == "i" else 1 << (dtype.itemsize * 8 - 1)
+    groups = [
+        np.asarray([0, 1], dtype=dtype),
+        np.asarray([high, high + 1], dtype=dtype),
+    ]
+    cfg = se.EmbeddingConfig(dims=[4], thread_budget=1, key_dtype=key_dtype)
+    sources = [se.EmbeddingStore(cfg) for _ in groups]
+    for source, keys in zip(sources, groups, strict=True):
+        source.assign(keys, np.full((len(keys), 4), 3, np.float32))
+    storage = LocalLanceStorage(tmp_path / "checkpoint")
+    checkpoint = SparseCheckpoint(storage)
+    parent = _commit_partitioned_restore_fixture(
+        storage, sources, "typed-layout", "full", 0, pages=True
+    )
+    restored = []
+    for index, keys in enumerate(groups):
+        target = se.EmbeddingStore(cfg)
+        checkpoint.load_training_checkpoint(
+            target,
+            parent.handle,
+            RestorePlan.from_partition(
+                PartitionSpec.fast_range(),
+                2,
+                index,
+                key_dtype=key_dtype,
+                engine=IngestionEngine.FAST_PAGE_CACHE,
+            ),
+        )
+        assert target.total_size() == len(keys)
+        np.testing.assert_allclose(np.from_dlpack(target.lookup(keys, dim=4)[0]), 3)
+        target.assign(keys, np.full((len(keys), 4), 9, np.float32))
+        restored.append(target)
+    child = _commit_partitioned_restore_fixture(
+        storage, restored, "typed-layout", "delta", 1, parent=parent
+    )
+    for index, keys in enumerate(groups):
+        target = se.EmbeddingStore(cfg)
+        checkpoint.load_training_checkpoint(
+            target,
+            child.handle,
+            RestorePlan.from_partition(
+                PartitionSpec.fast_range(), 2, index, key_dtype=key_dtype
+            ),
+        )
+        assert target.total_size() == len(keys)
+        np.testing.assert_allclose(np.from_dlpack(target.lookup(keys, dim=4)[0]), 9)
+
+
+def test_layout_proof_includes_deleted_identities(tmp_path):
+    storage = LocalLanceStorage(tmp_path / "checkpoint")
+    high = 1 << 63
+    sources = [populated_store((0, high), 3), se.EmbeddingStore(config())]
+    parent = _commit_partitioned_restore_fixture(
+        storage, sources, "deleted-layout", "full", 0, pages=True
+    )
+    sources[0].erase_dimension(np.asarray([high], dtype=np.uint64), dimension=4)
+    child = _commit_partitioned_restore_fixture(
+        storage, sources, "deleted-layout", "delta", 1, parent=parent, pages=True
+    )
+    checkpoint = SparseCheckpoint(storage)
+    target = se.EmbeddingStore(config())
+    with pytest.raises(ValueError, match="source partition ownership"):
+        checkpoint.load_training_checkpoint(
+            target,
+            child.handle,
+            RestorePlan.from_partition(
+                PartitionSpec.fast_range(), 2, 0, engine=IngestionEngine.FAST_PAGE_CACHE
+            ),
+        )
+    assert target.is_operational() is True
+    assert target.total_size() == 0
+    checkpoint.load_training_checkpoint(
+        target,
+        child.handle,
+        RestorePlan.from_partition(PartitionSpec.fast_range(), 2, 0),
+    )
+    assert target.total_size() == 1
+    with pytest.raises(
+        ValueError, match="requires the next training checkpoint to be FULL"
+    ):
+        checkpoint.save_training_checkpoint(
+            target,
+            "deleted-layout",
+            mode=CheckpointSaveMode.INCREMENTAL,
+            parent_handle=child.handle,
+        )
+
+
+@pytest.mark.parametrize(
+    ("partition_count", "partition_id"),
+    [(1 << 32, 0), ((1 << 32) + 1, 0), ((1 << 32) + 1, 1 << 32)],
+)
+def test_partition_count_rejects_native_narrowing(partition_count, partition_id):
+    with pytest.raises(ValueError, match="UINT32_MAX"):
+        RestorePlan.from_partition(
+            PartitionSpec.modulo(), partition_count, partition_id
+        )
+    wire = msgpack.unpackb(encode_restore_options(modulo_restore(1, 0)), raw=False)
+    wire["partition_count"] = partition_count
+    wire["partition_id"] = partition_id
+    with pytest.raises(ValueError, match="UINT32_MAX"):
+        RestorePlan.from_bytes(msgpack.packb(wire, use_bin_type=True))
+    target = se.EmbeddingStore(config())
+    with pytest.raises(ValueError, match="UINT32_MAX"):
+        lance_backend._checkpoint_native.restore_native_partition_entries(
+            target, [], 0, partition_count, partition_id, "uint64"
+        )
+    assert target.is_operational() is True
+    assert target.total_size() == 0
+
+
+def test_maximum_native_partition_count_round_trips_and_routes(tmp_path):
+    plan = RestorePlan.from_partition(PartitionSpec.modulo(), (1 << 32) - 1, 0)
+    assert RestorePlan.from_bytes(encode_restore_options(plan)) == plan
+    storage = LocalLanceStorage(tmp_path / "checkpoint")
+    checkpoint = SparseCheckpoint(storage)
+    saved = checkpoint.save_training_checkpoint(
+        populated_store((0, 1, 2), 3), "max-count"
+    )
+    target = se.EmbeddingStore(config())
+    checkpoint.load_training_checkpoint(target, saved.handle, plan)
+    assert target.total_size() == 1
+    np.testing.assert_allclose(lookup(target, (0,)), 3)
+
+
+def test_orphan_head_lineage_resolution_and_reclaim(tmp_path):
+    storage = LocalLanceStorage(tmp_path / "checkpoint")
+    store = populated_store((0, 1), 1)
+    lineage = "test_lineage"
+
+    # Save 1: acknowledged FULL commit
+    auth1 = CheckpointCommitAuthority("scope", 1, "auth1")
+    id1 = CheckpointSaveIdentity(lineage, "attempt1", auth1)
+    storage.prepare_checkpoint(id1)
+    frag1 = storage.write_checkpoint_fragment_bytes(
+        store, id1, CheckpointParticipant(0, 1), mode=CheckpointSaveMode.FULL
+    )
+    storage.finalize_checkpoint(id1)
+    committed1 = storage.commit_checkpoint_bytes(id1, [frag1])
+    storage.acknowledge_store_mutations(store, committed1.handle, 0)
+    storage.acknowledge_checkpoint(id1)
+
+    # Save 2: committed but NOT acknowledged (simulates crash before publish/ack)
+    auth2 = CheckpointCommitAuthority("scope", 2, "auth2")
+    id2 = CheckpointSaveIdentity(lineage, "attempt2", auth2)
+    storage.prepare_checkpoint(id2)
+    frag2 = storage.write_checkpoint_fragment_bytes(
+        store,
+        id2,
+        CheckpointParticipant(0, 1),
+        mode=CheckpointSaveMode.INCREMENTAL,
+        parent_handle=committed1.handle,
+    )
+    storage.finalize_checkpoint(id2)
+    _ = storage.commit_checkpoint_bytes(id2, [frag2])
+
+    # Unacknowledged Save 2 must not be resolved as lineage head
+    head = storage.resolve_lineage_head(lineage)
+    assert head is not None
+    assert head["checkpoint_version"] == 1
+
+    # Save 3: recovery attempt saves on top of acknowledged Save 1
+    auth3 = CheckpointCommitAuthority("scope", 3, "auth3")
+    id3 = CheckpointSaveIdentity(lineage, "attempt3", auth3)
+    storage.prepare_checkpoint(id3)
+    frag3 = storage.write_checkpoint_fragment_bytes(
+        store,
+        id3,
+        CheckpointParticipant(0, 1),
+        mode=CheckpointSaveMode.INCREMENTAL,
+        parent_handle=committed1.handle,
+    )
+    storage.finalize_checkpoint(id3)
+    committed3 = storage.commit_checkpoint_bytes(id3, [frag3])
+    storage.acknowledge_store_mutations(store, committed3.handle, 0)
+    storage.acknowledge_checkpoint(id3)
+
+    head3 = storage.resolve_lineage_head(lineage)
+    assert head3 is not None
+    assert head3["checkpoint_version"] == 3
+    assert head3["parent_checkpoint_version"] == 1
+
+    # Reclaim purges orphaned Save 2
+    with storage.exclusive_recovery():
+        storage.reclaim()
+
+    rows = storage._manifest_rows()
+    versions = [
+        r["checkpoint_version"] for r in rows if r["checkpoint_name"] == lineage
+    ]
+    assert sorted(versions) == [1, 3]
+    storage.close()

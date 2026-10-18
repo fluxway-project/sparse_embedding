@@ -27,6 +27,7 @@
 #include <proxy/proxy.h>
 
 #include <algorithm>
+#include <atomic>
 #include <cstdint>
 #include <cstring>
 #include <exec/static_thread_pool.hpp>
@@ -235,10 +236,6 @@ template <typename ParamT, typename OptT> struct CheckpointOpsImpl {
       const std::string &page_dataset_uri = "",
       uint64_t page_dataset_version = 0,
       uint64_t expected_page_layout_generation = 0);
-  template <typename Scanner>
-  static void restore_native_entries_with_scan(EmbeddingStoreWrapper &self,
-                                               Scanner &&scan,
-                                               bool load_optimizer_state);
   static void restore_native_partition_entries(
       EmbeddingStoreWrapper &self, const std::vector<std::string> &uris,
       uint64_t version, uint64_t partition_count, uint64_t partition_id,
@@ -320,6 +317,7 @@ class EmbeddingStoreWrapper {
   std::string score_policy_name_;
   std::vector<size_t> dims_;
   se::PageStorage storage_;
+  std::atomic<bool> requires_full_checkpoint_{false};
 
   template <typename ParamT, typename OptT> auto &get_store() {
     return std::get<pro::proxy<se::EmbeddingTableFacade<ParamT, OptT>>>(store_);
@@ -426,7 +424,8 @@ public:
   std::string checkpoint_baseline();
   bool checkpoint_restore_is_pristine();
   std::string initialize_checkpoint_baseline(const std::string &baseline,
-                                             uint64_t watermark);
+                                             uint64_t watermark,
+                                             bool resharded = false);
   void mark_terminal_failure();
   bool is_operational();
   uint64_t checkpoint_mutation_watermark();
@@ -437,6 +436,9 @@ public:
                                    const std::string &baseline,
                                    uint64_t capture_id,
                                    const std::string &journal_identity);
+  bool checkpoint_requires_full() const noexcept {
+    return requires_full_checkpoint_.load(std::memory_order_relaxed);
+  }
 };
 
 } // namespace se::py::detail

@@ -8,8 +8,7 @@ from sparse_embedding.checkpoint import (
     CheckpointParticipant,
     IngestionEngine,
     PartitionSpec,
-    RankRestore,
-    ReshardRestore,
+    RestorePlan,
     SparseCheckpoint,
     encode_restore_options,
 )
@@ -17,12 +16,25 @@ from sparse_embedding.checkpoint.lance_backend import LocalLanceStorage
 from sparse_embedding.checkpoint.schema import ENTRIES_DATASET
 
 
-def _modulo_restore(partition_count: int, partition_id: int) -> ReshardRestore:
-    return ReshardRestore(
+def _modulo_restore(partition_count: int, partition_id: int) -> RestorePlan:
+    return RestorePlan.from_partition(
         PartitionSpec.modulo(),
         partition_count,
         partition_id,
-        "uint64",
+        key_dtype="uint64",
+    )
+
+
+def _target_restore(
+    participant: CheckpointParticipant,
+    *,
+    engine: IngestionEngine = IngestionEngine.RECONSTRUCT_ENTRIES,
+) -> RestorePlan:
+    return RestorePlan.from_partition(
+        PartitionSpec.modulo(),
+        participant.participant_count,
+        participant.participant_index,
+        engine=engine,
     )
 
 
@@ -112,7 +124,7 @@ def test_page_image_snapshot_skips_optimizer_state_for_disabled_target(tmp_path)
         target,
         locator.handle,
         encode_restore_options(
-            RankRestore(
+            _target_restore(
                 CheckpointParticipant(0, 1),
                 engine=IngestionEngine.FAST_PAGE_CACHE,
             )

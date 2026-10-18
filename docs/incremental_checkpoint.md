@@ -10,42 +10,45 @@ This document provides a comprehensive architecture specification and user guide
 
 In large-scale recommendation training, embedding tables frequently contain hundreds of millions of sparse parameters. Performing periodic full snapshots consumes excessive I/O bandwidth, introduces prolonged training stalls, and produces redundant storage data.
 
-Sparse Embedding provides native, production-grade **Incremental Checkpointing** and **Streaming Compaction**:
+Sparse Embedding provides native **Incremental Checkpointing** and **Streaming Compaction**:
 
-- **Non-Blocking Consistent Cuts**: Snapshots dirty entries and deletion tombstones under epoch protection, decoupling memory capture from disk I/O and eliminating training stalls.
+- **Consistent Cuts**: Capture quiesces competing store invocations and uses epoch protection. Bounded native writer channels provide backpressure; slow IO can delay capture.
 - **Native In-Memory Mutation Journaling**: Shard-local journals record key-level mutations and monotonic sequence numbers with zero mutex contention on forward lookup hot paths.
-- **Delta-Chain Schema & Tombstone Tracking**: Physical Lance slices persist `mutation_sequence`, `row_state` (`"active"` vs. `"tombstone"`), and optional eviction `score` (LFU/LRU).
-- **Streaming Multi-Version Reconciliation**: The restore engine deterministically resolves surviving keys across the delta chain (`FULL` → `INCREMENTAL` → ...) in native C++, skipping tombstoned historical entries without inflating peak RAM.
-- **Offline / Online Streaming Compaction**: Bounded-channel streaming compaction consolidates multi-version delta chains into a new, self-contained `FULL` checkpoint with bounded memory footprint.
+- **Delta-Chain Schema & Tombstone Tracking**: Physical Lance slices persist `mutation_sequence`, `row_state` (`"active"` vs. `"deleted"`), and optional eviction `score` (LFU/LRU).
+- **Native Multi-Version Reconciliation**: Bounded external sorting validates historical identities and selects surviving records across the delta chain (`FULL` → `INCREMENTAL` → ...). Requested payload is staged during one Lance source pass and replayed in source order; only surviving keys allocate target slots.
+- **Offline / Online Streaming Compaction**: Compaction shares reconciliation and payload decoding with entry restore, while bounded writer channels produce a self-contained `FULL` checkpoint. Temporary disk grows with staged history; sorter and batch RAM follow `CheckpointStreamPolicy`.
+
+- **Page-Image Restoration Boundaries**: Page-image restoration consumes bounded page scan batches in one store-owned empty-target lifecycle. It is eligible only when native validation proves unchanged source ownership and the target page geometry matches. A changed assignment that moves historical identities requires a `FULL` save after entries restoration, including when the partition count stays the same (see Section 2.4).
+- **Lifecycle & Operational Invariants**: Generation is published after all page imports and checks succeed; a failed import attempt leaves the target terminal before access reopens. Training restore requires the target optimizer's actual state layout; weight-only loading is an explicit scope. Final store memory, sparse physical optimizer capacity, and Lance runtime caches are separate from bounded temporary buffers. Restore includes control-plane and I/O synchronization and is not an entirely lock-free operation.
 
 ---
 
 ## 2. Architecture and Data Flow
 
 ```text
-┌────────────────────────────────────────────────────────────────────────┐
-│                        Online Training Pipeline                        │
-│   Forward / Backward ──► Shard Mutation ──► CheckpointMutationJournal  │
-└───────────────────────────────────┬────────────────────────────────────┘
-                                    │ capture_checkpoint() (non-blocking)
-┌───────────────────────────────────▼────────────────────────────────────┐
-│                  Consistent Cut & Fragment Staging                     │
-│   Dirty Entries + Tombstones ──► _staging/<attempt>/<participant_id>/entries.lance
-└───────────────────────────────────┬────────────────────────────────────┘
-                                    │ 2PC Atomic Commit (Manifest Append)
-┌───────────────────────────────────▼────────────────────────────────────┐
-│                    Lance Lakehouse Metadata Ledger                     │
-│   snapshot_manifest.lance (parent_reference, watermarks, mode)         │
-└───────────────────────────────────┬────────────────────────────────────┘
-                                    │
-            ┌───────────────────────┴───────────────────────┐
-            ▼                                               ▼
-┌───────────────────────────────┐       ┌────────────────────────────────┐
-│   Native Restore Resolution   │       │      Streaming Compaction      │
-│  Multi-version delta chain    │       │  Consolidates delta chain into │
-│  reconciled in C++ streaming  │       │  a clean FULL snapshot via     │
-│  RestorePlan.from_topology()  │       │  storage.compact_checkpoint()  │
-└───────────────────────────────┘       └────────────────────────────────┘
+┌──────────────────────────────────────────────────────────────────────────────────────┐
+│                               Online Training Pipeline                               │
+│   Forward / Backward ──► Shard Mutation ──► CheckpointMutationJournal                │
+└──────────────────────────────────────────┬───────────────────────────────────────────┘
+                                           │ capture_checkpoint() (non-blocking)
+┌──────────────────────────────────────────▼───────────────────────────────────────────┐
+│                          Consistent Cut & Fragment Staging                           │
+│   Dirty Entries + Tombstones ──► _staging/<attempt>/<participant_id>/entries.lance   │
+└──────────────────────────────────────────┬───────────────────────────────────────────┘
+                                           │ 2PC Atomic Commit (Manifest Append)
+┌──────────────────────────────────────────▼───────────────────────────────────────────┐
+│                           Lance Lakehouse Metadata Ledger                            │
+│   snapshot_manifest.lance (parent_reference, watermarks, mode)                       │
+└──────────────────────────────────────────┬───────────────────────────────────────────┘
+                                           │
+                    ┌──────────────────────┴────────────────────────┐
+                    ▼                                               ▼
+┌──────────────────────────────────────┐        ┌──────────────────────────────────────┐
+│      Native Restore Resolution       │        │         Streaming Compaction         │
+│  Multi-version delta chain           │        │  Consolidates delta chain into       │
+│  reconciled in C++ streaming         │        │  a clean FULL snapshot via           │
+│  RestorePlan.from_partition()        │        │  storage.compact_checkpoint()        │
+└──────────────────────────────────────┘        └──────────────────────────────────────┘
 ```
 
 ### 2.1 In-Memory Mutation Journaling
@@ -80,6 +83,44 @@ Physical entry slices (`entries.lance`) store canonical rows adhering to `kEntry
 | `mutation_sequence` | `uint64` | Monotonically increasing sequence number per participant |
 | `row_state` | `utf8` | Entry state: `"active"` (live) or `"tombstone"` (deleted) |
 | `source_participant_index` | `uint32` | Originating participant rank index |
+
+### 2.4 Physical Source Shards and Cross-Topology Checkpoint Invariants
+
+Incremental checkpointing represents a delta over a base snapshot: $f(\text{Base}) + \Delta$. When cluster topology changes (such as worker count scaling or partition specification updates), key ownership shifts across participants. In this scenario, the next checkpoint following topology reconfiguration must be a `FULL` checkpoint rather than an `INCREMENTAL` checkpoint.
+
+#### 1. Physical Architecture: Independent Participant Shards
+On distributed training paths, achieving zero mutex contention and non-blocking cuts requires that distributed workers write into isolated physical directories without concurrent table lock contention. Each training worker independently tracks mutations for its local shards and stages entries directly into its dedicated physical sub-directory:
+```
+_staging/<attempt>/<participant_id>/entries.lance
+```
+The global manifest `snapshot_manifest.lance` references these discrete Lance fragments as lightweight pointers. As a result, physical Lance storage is inherently partitioned by participant (source shards).
+
+#### 2. Cross-Topology Invariants and Snapshot Consolidation
+Because deltas rely on a deterministic baseline and monotonic sequence numbers within each participant journal, shifting key ownership across topology changes introduces key requirements:
+
+```text
+┌──────────────────────────────────────────────────────────────────────────────────────┐
+│ Topology 1 (2 Workers Training):                                                     │
+│  Worker 0 ──► Fragment 0 [Key 100 @ seq=10] ─┐                                       │
+│  Worker 1 ──► Fragment 1 [Key 200 @ seq=12]  │                                       │
+│                                              │ Resharding (2 -> 4 Workers)           │
+│                                              ▼ Restored to: Worker 3                 │
+│ Topology 2 (4 Workers Training) ── Post-Reshard Checkpoint Invariant:                │
+│                                                                                      │
+│ [Disallowed Cross-Topology INCREMENTAL]      [Enforced Invariant: FULL Baseline]     │
+│   • Worker 3 logs only newly dirtied keys      • Worker 3 materializes full state    │
+│   • Unmodified Key 100 missing from delta      • Key 100 captured in Fragment 3      │
+│   • Future restore must scan all old shards    • Truncates old topological chain     │
+│   • Read explosion + tombstone resurrection    • Enables GC of obsolete fragments    │
+│   (❌ Violates consistency & bounds)           (✅ Subsequent saves resume INC)       │
+└──────────────────────────────────────────────────────────────────────────────────────┘
+```
+
+The invariant enforcing `FULL` checkpointing after topology reconfiguration addresses four core issues:
+1. **Base Slice Continuity**: An incremental fragment contains only entries mutated in the current step. If a worker saves an incremental delta immediately after adopting new keys, historical keys that were not mutated in the subsequent step would be absent from the delta. Reconstructing state would require recursively backtracking into fragments across all predecessor workers.
+2. **Bounded Read Amplification**: Cascading cross-topology deltas would require scanning historical fragments across all prior topologies during recovery, degrading restore time from $O(N_{\text{checkpoints}})$ to $O(N_{\text{participants}} \times N_{\text{checkpoints}})$.
+3. **Sequence Domain Isolation & Tombstone Elimination**: Sequence numbers are local to each worker journal without a global cluster clock. Cross-node merges across different sequence domains risk misordering deletion tombstones against active keys.
+4. **Lineage Truncation & Safe Garbage Collection**: If incremental chains traversed topology boundaries, storage files from older topologies would remain pinned indefinitely by downstream references. A `FULL` checkpoint serves as a **snapshot consolidation and lineage truncation boundary**, establishing a self-contained baseline for each participant and allowing historical fragments to be reclaimed by storage garbage collection. Subsequent iterations resume lightweight incremental checkpoints against the new baseline.
 
 ---
 
@@ -127,21 +168,16 @@ The restore pipeline validates parent continuity and reconciles multi-version re
 
 ```python
 from sparse_embedding.checkpoint import (
-    CheckpointParticipant,
     IngestionEngine,
     PartitionSpec,
-    RankRestore,
-    ReshardRestore,
     RestorePlan,
 )
 
-# Scenario A: Automated topology-aware restore (Recommended)
-# Automatically selects RankRestore when saved and current participant counts match,
-# or ReshardRestore when the cluster scales or re-shards.
-plan = RestorePlan.from_topology(
-    saved_participant_count=1,
-    participant=CheckpointParticipant(0, 1),
+# Scenario A: Same target topology. The plan identifies the current partition.
+plan = RestorePlan.from_partition(
     spec=PartitionSpec.modulo(),
+    partition_count=1,
+    partition_id=0,
     key_dtype="uint64",
 )
 restore_store = se.EmbeddingStore(config)
@@ -151,19 +187,12 @@ checkpoint.load_training_checkpoint(
     plan,
 )
 
-# Scenario B: Explicit rank-preserving restore (identical cluster topology)
-rank_plan = RestorePlan.from_participant(
-    CheckpointParticipant(0, 1),
-    engine=IngestionEngine.RECONSTRUCT_ENTRIES,
-    key_dtype="uint64",
-)
-checkpoint.load_training_checkpoint(restore_store, committed_inc.handle, rank_plan)
-
-# Scenario C: Explicit reshard restore (dynamic cluster re-sharding)
+# Scenario B: The same plan type also handles a changed target topology.
 reshard_plan = RestorePlan.from_partition(
     PartitionSpec.hash(seed=42),
     partition_count=8,
     partition_id=0,
+    engine=IngestionEngine.RECONSTRUCT_ENTRIES,
     key_dtype="uint64",
 )
 elastic_store = se.EmbeddingStore(config)
@@ -186,8 +215,10 @@ compacted_store = se.EmbeddingStore(config)
 checkpoint.load_training_checkpoint(
     compacted_store,
     compacted_handle,
-    RestorePlan.from_participant(
-        CheckpointParticipant(0, 1),
+    RestorePlan.from_partition(
+        PartitionSpec.modulo(),
+        partition_count=1,
+        partition_id=0,
         key_dtype="uint64",
     ),
 )
@@ -217,8 +248,10 @@ infer_store = se.EmbeddingStore(infer_config)
 checkpoint.load_inference_checkpoint(
     infer_store,
     committed_inc.handle,
-    RankRestore(
-        participant=CheckpointParticipant(0, 1),
+    RestorePlan.from_partition(
+        PartitionSpec.modulo(),
+        partition_count=1,
+        partition_id=0,
         key_dtype="uint64",
     ),
 )
@@ -228,10 +261,17 @@ checkpoint.load_inference_checkpoint(
 
 ## 4. Reliability and Integrity Guarantees
 
-- **Strict Lineage Fencing**: Incremental checkpoints require monotonic sequence increments and matching lineage names. Cross-lineage parent references raise `CheckpointConflictError`.
+- **Strict Lineage Fencing & Head Resolution**: Incremental checkpoints require monotonic sequence increments and matching lineage names. Cross-lineage parent references raise `CheckpointConflictError`. Unacknowledged checkpoints (retaining active `seintent` intent tags or `sereclaiming` exclusion markers) are strictly excluded from lineage head resolution.
+- **Atomic Abort & Reclaim Protocol**: Aborting an unacknowledged save or reclaiming an orphaned committed row adheres to a strict fail-safe lifecycle order:
+  1. Persist the `sereclaiming.<locator>` exclusion marker to ensure exclusion from lineage resolution even if subsequent steps fail;
+  2. Physically delete fragment data roots;
+  3. Purge parent chain references, reference tags, and page attempt/write intents;
+  4. Delete the row from `snapshot_manifest.lance` and invalidate manifest caches;
+  5. Delete the `seintent` intent tag, pending outcome, and committed tag;
+  6. Finally delete the `sereclaiming` marker.
+  This invariant ensures that an unacknowledged or aborted checkpoint can never be exposed as the lineage head across crashes or partial deletion failures.
 - **Parent Reference Pinning**: Active parent datasets are pinned by reference tags. Storage cleanup tasks will never prune datasets that are still required by downstream delta chains.
 - **Empty Delta Optimization**: When no mutations occur within an interval, the checkpoint engine appends a lightweight commit record to `snapshot_manifest.lance` without creating empty payload datasets.
-- **Zero Orphan Cleanup**: Failed or aborted checkpoint attempts automatically trigger staged prefix cleanup with preserved primary exception diagnostics.
 - **Deterministic Resolution**: Conflicting key updates across multi-version deltas are resolved strictly by the highest `(version, mutation_sequence)` tuple, guaranteeing bit-identical consistency regardless of chunk read order.
 
 ---

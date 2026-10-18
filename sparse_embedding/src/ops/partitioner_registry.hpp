@@ -20,6 +20,7 @@
 
 #include <cstdint>
 #include <functional>
+#include <limits>
 #include <memory>
 #include <shared_mutex>
 #include <string>
@@ -36,6 +37,13 @@ inline constexpr std::string_view kHashPartitionerName =
     "sparse_embedding.hash";
 inline constexpr std::string_view kFastRangePartitionerName =
     "sparse_embedding.fast_range";
+
+inline uint32_t checked_partition_count(uint64_t count) {
+  if (count == 0 || count > std::numeric_limits<uint32_t>::max())
+    throw std::invalid_argument(
+        "partition_count must be within [1, UINT32_MAX]");
+  return static_cast<uint32_t>(count);
+}
 
 using PartitionerProxy = pro::proxy<PartitionerFacade>;
 using PartitionerFactory = std::function<PartitionerProxy(

@@ -3,11 +3,9 @@ import pytest
 
 import sparse_embedding as se
 from sparse_embedding.checkpoint import (
-    CheckpointParticipant,
     LocalLanceStorage,
     PartitionSpec,
-    RankRestore,
-    ReshardRestore,
+    RestorePlan,
     SparseCheckpoint,
     encode_restore_options,
     lance_backend,
@@ -33,26 +31,20 @@ def _store(*, optimizer: bool, key: int, value: float) -> se.EmbeddingStore:
     return store
 
 
-def _elastic_options() -> bytes:
+def _restore_options(partition_count: int) -> bytes:
     return encode_restore_options(
-        ReshardRestore(
+        RestorePlan.from_partition(
             PartitionSpec.modulo(),
-            1,
+            partition_count,
             0,
-            "uint64",
+            key_dtype="uint64",
         )
     )
 
 
-@pytest.mark.parametrize(
-    "options",
-    [
-        encode_restore_options(RankRestore(CheckpointParticipant(0, 1))),
-        _elastic_options(),
-    ],
-)
+@pytest.mark.parametrize("partition_count", [1, 3])
 def test_training_restore_rejects_nonempty_target_before_native_scan(
-    tmp_path, monkeypatch, options
+    tmp_path, monkeypatch, partition_count
 ):
     storage = LocalLanceStorage(tmp_path / "checkpoint")
     committed = SparseCheckpoint(storage).save_training_checkpoint(
@@ -69,7 +61,9 @@ def test_training_restore_rejects_nonempty_target_before_native_scan(
         fail_if_called,
     )
     with pytest.raises(RuntimeError, match="restore requires an empty target store"):
-        storage.load_component_checkpoint(target, committed.handle, options)
+        storage.load_component_checkpoint(
+            target, committed.handle, _restore_options(partition_count)
+        )
     assert target.is_operational() is True
     assert target.total_size() == 1
 
@@ -96,7 +90,7 @@ def test_inference_restore_rejects_nonempty_target_before_native_scan(
     )
     with pytest.raises(RuntimeError, match="restore requires an empty target store"):
         LocalLanceStorage.from_published_weight(asset).load_inference_weights(
-            target, _elastic_options()
+            target, _restore_options(3)
         )
     assert target.is_operational() is True
     assert target.total_size() == 1

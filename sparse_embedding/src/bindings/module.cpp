@@ -63,6 +63,15 @@ checkpoint_storage_options(const nb::dict &storage_options) {
   }
   return se::LanceStorageOptions(options);
 }
+
+std::unordered_map<std::string, std::string>
+checkpoint_assignment_parameters(const nb::dict &parameters) {
+  std::unordered_map<std::string, std::string> result;
+  for (auto [key, value] : parameters)
+    result[nb::cast<std::string>(nb::str(key))] =
+        nb::cast<std::string>(nb::str(value));
+  return result;
+}
 #endif
 
 } // namespace
@@ -689,7 +698,8 @@ NB_MODULE(_core, m) {
            &EmbeddingStoreWrapper::checkpoint_restore_is_pristine)
       .def("initialize_checkpoint_baseline",
            &EmbeddingStoreWrapper::initialize_checkpoint_baseline,
-           nb::arg("baseline"), nb::arg("watermark"))
+           nb::arg("baseline"), nb::arg("watermark"),
+           nb::arg("resharded") = false)
       .def("mark_terminal_failure",
            &EmbeddingStoreWrapper::mark_terminal_failure)
       .def("is_operational", &EmbeddingStoreWrapper::is_operational)
@@ -708,8 +718,10 @@ NB_MODULE(_core, m) {
       .def("key_dtype", &EmbeddingStoreWrapper::key_dtype)
       .def("optimizer_enabled", &EmbeddingStoreWrapper::optimizer_enabled)
       .def("score_policy", &EmbeddingStoreWrapper::score_policy)
-
-      ;
+      .def("checkpoint_requires_full",
+           &EmbeddingStoreWrapper::checkpoint_requires_full)
+      .def("requires_full_checkpoint",
+           &EmbeddingStoreWrapper::checkpoint_requires_full);
 
   auto checkpoint = m.def_submodule("checkpoint");
   checkpoint.attr("ENTRIES_DATASET") =
@@ -825,14 +837,10 @@ NB_MODULE(_core, m) {
          const nb::dict &storage_options, bool load_optimizer_state,
          const std::string &assignment_name,
          const nb::dict &assignment_parameters) {
-        std::unordered_map<std::string, std::string> params;
-        for (auto [k, v] : assignment_parameters) {
-          params[nb::cast<std::string>(nb::str(k))] =
-              nb::cast<std::string>(nb::str(v));
-        }
         self.restore_native_partition_entries(
             uris, version, partition_count, partition_id, key_dtype,
-            assignment_name, params,
+            assignment_name,
+            checkpoint_assignment_parameters(assignment_parameters),
             checkpoint_storage_options(storage_options), load_optimizer_state,
             source_participant_index);
       },
@@ -860,55 +868,37 @@ NB_MODULE(_core, m) {
       nb::arg("load_optimizer_state") = true,
       nb::arg("page_layout_generation"));
   checkpoint.def(
-      "active_entry_keys",
-      [](const std::string &uri, uint64_t version,
-         const nb::dict &storage_options,
-         std::optional<uint32_t> participant_index) {
-        std::vector<uint64_t> keys;
-        const auto options = checkpoint_storage_options(storage_options);
-        {
-          nb::gil_scoped_release release;
-          se::scan_native_active_entry_keys(
-              uri, version,
-              [&](std::span<const uint64_t> batch) {
-                keys.insert(keys.end(), batch.begin(), batch.end());
-                return true;
-              },
-              participant_index, options);
-        }
-        auto output = se::py::create_output_tensor<uint64_t>(
-            std::array<int64_t, 1>{static_cast<int64_t>(keys.size())});
-        std::copy(keys.begin(), keys.end(),
-                  static_cast<uint64_t *>(output->dl_tensor.data));
-        return se::py::wrap_output_tensor(output);
-      },
-      nb::arg("uri"), nb::arg("version"),
-      nb::arg("storage_options") = nb::dict(),
-      nb::arg("participant_index") = nb::none());
-  checkpoint.def(
-      "validate_active_entry_keys",
-      [](const std::vector<std::string> &uris, uint64_t version,
-         const nb::dict &storage_options) {
-        const auto options = checkpoint_storage_options(storage_options);
-        nb::gil_scoped_release release;
-        se::validate_native_active_entry_keys(uris, version, options);
-      },
-      nb::arg("uris"), nb::arg("version"),
-      nb::arg("storage_options") = nb::dict());
-  checkpoint.def(
       "validate_native_checkpoint_chain",
       [](const std::vector<std::vector<std::string>> &source_uris,
          const std::vector<std::vector<uint64_t>> &participant_watermarks,
          const std::vector<uint32_t> &dimensions, const std::string &key_dtype,
-         const nb::dict &storage_options) {
+         const nb::dict &storage_options,
+         std::optional<uint64_t> partition_count,
+         const std::string &assignment_name,
+         const nb::dict &assignment_parameters) {
         const auto options = checkpoint_storage_options(storage_options);
+        const auto parameters =
+            checkpoint_assignment_parameters(assignment_parameters);
         nb::gil_scoped_release release;
-        se::validate_native_checkpoint_chain(source_uris,
-                                             participant_watermarks, dimensions,
-                                             key_dtype, options);
+        pro::proxy<se::ops::PartitionerFacade> target_partitioner;
+        uint32_t native_partition_count = 0;
+        if (partition_count) {
+          native_partition_count =
+              se::ops::checked_partition_count(*partition_count);
+          target_partitioner = se::ops::PartitionerRegistry::instance().create(
+              assignment_name, native_partition_count, parameters);
+        } else if (!assignment_name.empty() || !parameters.empty()) {
+          throw std::invalid_argument(
+              "checkpoint target assignment requires partition_count");
+        }
+        return se::validate_native_checkpoint_chain(
+            source_uris, participant_watermarks, dimensions, key_dtype, options,
+            std::move(target_partitioner), native_partition_count);
       },
       nb::arg("source_uris"), nb::arg("participant_watermarks"),
-      nb::arg("dimensions"), nb::arg("key_dtype"), nb::arg("storage_options"));
+      nb::arg("dimensions"), nb::arg("key_dtype"), nb::arg("storage_options"),
+      nb::arg("partition_count") = nb::none(), nb::arg("assignment_name") = "",
+      nb::arg("assignment_parameters") = nb::dict());
   checkpoint.def(
       "compact_native_checkpoint",
       [](const std::string &target_uri,

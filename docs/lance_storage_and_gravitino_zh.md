@@ -58,13 +58,10 @@ SparseCheckpoint
 import numpy as np
 import sparse_embedding as se
 from sparse_embedding.checkpoint import (
-    CheckpointParticipant,
     CheckpointSaveMode,
     IngestionEngine,
     LocalLanceStorage,
     PartitionSpec,
-    RankRestore,
-    ReshardRestore,
     RestorePlan,
     SparseCheckpoint,
     compact_fragments,
@@ -86,34 +83,20 @@ committed = checkpoint.save_training_checkpoint(
 #     store, "user_embedding", include_page_images=True
 # )
 
-# 3. 场景 A：推荐 - 拓扑自适应恢复 (RestorePlan.from_topology)
-# 自动比对检查点保存卡数与当前卡数：卡数一致时走 RankRestore，卡数变更时自动切换为 ReshardRestore
+# 3. 场景 A：恢复到保存时的目标分区
 restored_store = se.EmbeddingStore(config)
-plan = RestorePlan.from_topology(
-    saved_participant_count=1,
-    participant=CheckpointParticipant(0, 1),
+plan = RestorePlan.from_partition(
     spec=PartitionSpec.hash(seed=42),
+    partition_count=1,
+    partition_id=0,
     key_dtype="uint64",
 )
 checkpoint.load_training_checkpoint(restored_store, committed.handle, plan)
 
-# 4. 场景 B：显式物理对等恢复 (RankRestore)
-# 适用于卡数与拓扑完全相同的场景，从规范 entries 精确还原物理页表
+# 4. 场景 B：恢复到变化后的目标拓扑
+elastic_store = se.EmbeddingStore(config)
 checkpoint.load_training_checkpoint(
-    restored_store,
-    committed.handle,
-    RestorePlan.from_participant(
-        CheckpointParticipant(0, 1),
-        engine=IngestionEngine.RECONSTRUCT_ENTRIES,
-        key_dtype="uint64",
-    ),
-)
-
-# 5. 场景 C：显式弹性拓扑重组恢复 (ReshardRestore)
-# 适用于训练卡数扩缩容场景，通过分片算法极速筛选当前节点所属的键
-restored_store_elastic = se.EmbeddingStore(config)
-checkpoint.load_training_checkpoint(
-    restored_store_elastic,
+    elastic_store,
     committed.handle,
     RestorePlan.from_partition(
         PartitionSpec.hash(seed=42),
@@ -132,10 +115,13 @@ checkpoint.load_training_checkpoint(
 
 | 恢复策略 | 适用场景 | 底层机制 | 异常与防御策略 |
 |---|---|---|---|
-| **`RestorePlan.from_topology`** | **拓扑自适应路由（推荐）** | 自动校验已保存卡数与当前卡数：匹配则走 `RankRestore`，扩缩容则走 `ReshardRestore` | 严格校验 `saved_participant_count > 0`，零静默降级 |
-| **`RankRestore (RECONSTRUCT_ENTRIES)`** | 拓扑不变恢复、Compaction 合流后恢复 | 读取规范 `entries.lance`，在 C++ 层确定性重建物理页布局与定位槽 | 唯一事实来源（SSOT），完全确定性 |
-| **`RankRestore (FAST_PAGE_CACHE)`** | 极速冷启动（需保存时开启 `include_page_images=True`） | 按有界批次直接映射 `page_images.lance` 物理页镜像，绕过逐行构建 | 若检查点未持久化物理页缓存，**严格抛出 `FileNotFoundError`**，拒绝隐式降级 |
-| **`ReshardRestore`** | 训练集群扩缩容、拓扑重组、弹性分片加载 | 结合注册的分片算法（`hash`、`modulo`、`fast_range`），利用 AVX-512 SIMD 连续切片掩码（`filter_span`）极速过滤 | 分片算法未注册或参数不匹配直接抛出异常，无隐式回退 |
+| **`RestorePlan.from_partition` + `RECONSTRUCT_ENTRIES`** | 同拓扑或变化后的目标拓扑 | 读取规范 `entries.lance`，由 native 层按目标分区过滤 key | 分片算法与目标边界严格校验，契约错误直接抛出 |
+| **`RestorePlan.from_partition` + `FAST_PAGE_CACHE`** | native 证明 source ownership 不变且存在 page images | ownership、几何与 generation 校验后加载目标 participant 的 page image | 缺少缓存、owner/分区数变化或几何不兼容直接抛出 |
+
+native partitioner 的分区数量范围为 `1..UINT32_MAX`。chain validation 使用原始
+Arrow key 类型检查目标 assignment，并包含历史 tombstone。只有通过该证明才能复用
+保存 participant 的 baseline；owner 改变后必须先保存 FULL。由于检查点元数据不
+持久化源分片算法名称，此处的证明验证的是整条历史链上的 ownership 等价性。
 
 ### 4.2 训练与推理权重隔离及正交恢复矩阵
 
@@ -144,8 +130,8 @@ checkpoint.load_training_checkpoint(
   - **训练恢复 (`load_training_checkpoint`)**：完整加载嵌入表权重与优化器动量状态（`load_optimizer_state=True`）。
   - **推理恢复 (`load_inference_checkpoint`)**：仅拉取 Embedding 权重（`load_optimizer_state=False`），要求目标 Store 禁用优化器（`enable_optimizer=False`），避免浪费内存。若对未启用优化器的 Store 请求加载优化器状态，系统直接抛出异常。
 - **拓扑路由策略（RestorePlan）**：
-  - 训练与推理**均统一支持** `RankRestore` 与 `ReshardRestore`。
-  - 推理场景支持 `RankRestore(..., engine=IngestionEngine.FAST_PAGE_CACHE)` 实现物理页二进制镜像直接映射的极致冷启动，也支持 `ReshardRestore` 实现异构分片加载。
+  - 训练与推理**均使用同一个** `RestorePlan`，优化器加载范围仍由独立参数决定。
+  - 推理可在 native 证明 source ownership 不变且 page descriptor 与目标几何匹配时选择 `IngestionEngine.FAST_PAGE_CACHE`。
 
 ### 4.3 Arrow 原生键类型与算子下推
 
@@ -187,7 +173,7 @@ sample_keys, expected_ranks = generate_reference_vectors(
 
 - **全量保存 (FULL)**：保存当前表中所有存活键值与状态（`CheckpointSaveMode.FULL`）。
 - **增量保存 (INCREMENTAL)**：仅记录上一版本以来的增量变更（Dirty Keys）与删除标记（Tombstone），需指定 `parent_handle`。空增量仅追加控制面 Manifest，不创建冗余数据表。
-- **恢复链处理**：恢复时先校验 Parent 链的连续性与完整性，在 C++ 恢复引擎内流式执行状态合并与删除记录消除，被删除的历史键不会占用目标内存容量。
+- **恢复链处理**：共用的有界外部排序在 entries 目标分配前校验历史 identity 并选出存活 key。源 payload 扫描一次并按源顺序回放；page images 在 store 内流式导入，全部成功后才发布 generation。
 
 ### 5.2 流式压实 (Compaction)
 
@@ -205,8 +191,10 @@ compacted_store = se.EmbeddingStore(config)
 checkpoint.load_training_checkpoint(
     compacted_store,
     compacted_handle,
-    RestorePlan.from_participant(
-        CheckpointParticipant(0, 1),
+    RestorePlan.from_partition(
+        PartitionSpec.modulo(),
+        partition_count=1,
+        partition_id=0,
         key_dtype="uint64",
     ),
 )
@@ -220,7 +208,9 @@ compact_fragments(
 )
 ```
 
-流式合并由 C++ `checkpoint_stream_policy.hpp` 控制扫描批次与有界通道（`BoundedChannel`），严格控制峰值驻留内存，压实过程不修改输入版本。
+流式合并由 C++ `checkpoint_stream_policy.hpp` 控制扫描批次与有界通道（`BoundedChannel`），
+压实过程不修改输入版本。restore 与 compaction 共用有界的历史记录合流和 payload
+解码。临时磁盘随历史数据增长；最终目标分配和 Lance 缓存与有界临时工作缓冲分开计算。
 
 > 关于增量检查点的底层变动日志（Mutation Journaling）、物理 Schema 与一致性切片深度原理，请参见 [增量检查点与流式 Compaction](incremental_checkpoint_zh.md)。
 

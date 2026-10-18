@@ -58,13 +58,10 @@ The following example demonstrates initializing local Lance storage, saving trai
 import numpy as np
 import sparse_embedding as se
 from sparse_embedding.checkpoint import (
-    CheckpointParticipant,
     CheckpointSaveMode,
     IngestionEngine,
     LocalLanceStorage,
     PartitionSpec,
-    RankRestore,
-    ReshardRestore,
     RestorePlan,
     SparseCheckpoint,
     compact_fragments,
@@ -86,34 +83,20 @@ committed = checkpoint.save_training_checkpoint(
 #     store, "user_embedding", include_page_images=True
 # )
 
-# 3. Scenario A: Automated Topology-Aware Restore (Recommended)
-# Auto-selects RankRestore when cluster topology matches, or ReshardRestore when resized
+# 3. Scenario A: Restore to the saved target partition
 restored_store = se.EmbeddingStore(config)
-plan = RestorePlan.from_topology(
-    saved_participant_count=1,
-    participant=CheckpointParticipant(0, 1),
+plan = RestorePlan.from_partition(
     spec=PartitionSpec.hash(seed=42),
+    partition_count=1,
+    partition_id=0,
     key_dtype="uint64",
 )
 checkpoint.load_training_checkpoint(restored_store, committed.handle, plan)
 
-# 4. Scenario B: Explicit Rank Restore (RankRestore)
-# Used when worker count and partition topology match; reconstructs pages deterministically
+# 4. Scenario B: Restore to a changed target topology
+elastic_store = se.EmbeddingStore(config)
 checkpoint.load_training_checkpoint(
-    restored_store,
-    committed.handle,
-    RestorePlan.from_participant(
-        CheckpointParticipant(0, 1),
-        engine=IngestionEngine.RECONSTRUCT_ENTRIES,
-        key_dtype="uint64",
-    ),
-)
-
-# 5. Scenario C: Explicit Reshard Restore (ReshardRestore)
-# Used when cluster size changes; dynamically filters keys for the current partition
-restored_store_elastic = se.EmbeddingStore(config)
-checkpoint.load_training_checkpoint(
-    restored_store_elastic,
+    elastic_store,
     committed.handle,
     RestorePlan.from_partition(
         PartitionSpec.hash(seed=42),
@@ -132,10 +115,15 @@ checkpoint.load_training_checkpoint(
 
 | Restore Strategy | Primary Use Case | Underlying Mechanism | Error & Defense Policy |
 |---|---|---|---|
-| **`RestorePlan.from_topology`** | **Automated topology routing (Recommended)** | Inspects saved participant count: auto-routes to `RankRestore` if matching, or `ReshardRestore` if changed | Validates `saved_participant_count > 0`, zero silent fallback |
-| **`RankRestore (RECONSTRUCT_ENTRIES)`** | Identical topology, post-compaction restore | Reads canonical `entries.lance`, reconstructs native page layouts deterministically | Single Source of Truth (SSOT), fully deterministic |
-| **`RankRestore (FAST_PAGE_CACHE)`** | Ultra-fast cold-start (requires `include_page_images=True`) | Direct bounded-batch mapping of `page_images.lance` binary pages, bypassing row builds | If cache was not saved, **strictly raises `FileNotFoundError`** with zero silent fallback |
-| **`ReshardRestore`** | Cluster resize, topological re-sharding, dynamic loading | Evaluates partition spec (`hash`, `modulo`, `fast_range`) via native AVX-512 SIMD slice filtering (`filter_span`) | Missing or mismatched partitioner algorithm raises exception directly |
+| **`RestorePlan.from_partition` with `RECONSTRUCT_ENTRIES`** | Same or changed target topology | Reads canonical `entries.lance`; native code filters keys for the requested target | The assignment and target bounds are validated; invalid contracts raise directly |
+| **`RestorePlan.from_partition` with `FAST_PAGE_CACHE`** | Native-proven unchanged source ownership with page images | Loads the target participant page image after ownership, geometry, and generation checks | Missing cache, changed ownership/count, or incompatible geometry raises directly |
+
+Partition counts are limited to `1..UINT32_MAX` by the native partitioner ABI.
+Chain validation checks the requested assignment with the original Arrow key
+type, including historical tombstones. Only that proof permits reuse of a saved
+participant baseline; changed ownership requires a FULL save next. Because the
+checkpoint metadata does not persist source algorithm names, this ownership proof
+validates identity across the history chain.
 
 ### 4.2 Training vs. Inference Weight Isolation and Orthogonal Restore Matrix
 
@@ -144,8 +132,8 @@ Restoration operates across two strictly orthogonal dimensions ($2 \times 2$ Car
   - **Training Restore (`load_training_checkpoint`)**: Loads embedding weights and optimizer momentum states (`load_optimizer_state=True`).
   - **Inference Restore (`load_inference_checkpoint`)**: Loads embedding weights only (`load_optimizer_state=False`), requiring the target store to disable optimizer state (`enable_optimizer=False`) to avoid memory waste. Requesting optimizer loading into an optimizer-disabled store raises an exception directly.
 - **Topology Routing Strategy (`RestorePlan`)**:
-  - Both training and inference **uniformly support** `RankRestore` and `ReshardRestore`.
-  - Inference supports `RankRestore(..., engine=IngestionEngine.FAST_PAGE_CACHE)` for ultra-fast direct binary page image mapping cold-start, as well as `ReshardRestore` for heterogeneous inference sharding.
+  - Both training and inference use the same `RestorePlan`; state scope remains the separate optimizer-loading argument.
+  - Inference may select `IngestionEngine.FAST_PAGE_CACHE` when native validation proves unchanged source ownership and the saved page descriptor matches the target geometry.
 
 ### 4.3 Native Arrow Key DTypes and Pushdown
 
@@ -187,7 +175,7 @@ sample_keys, expected_ranks = generate_reference_vectors(
 
 - **FULL Snapshot**: Captures all live keys and optimizer state (`CheckpointSaveMode.FULL`).
 - **INCREMENTAL Snapshot**: Captures only dirty keys and deletion tombstones since the parent checkpoint (`CheckpointSaveMode.INCREMENTAL`, specifying `parent_handle`). Empty deltas append only a manifest record without creating payload datasets.
-- **Restore Resolution**: The restore pipeline validates the parent chain and executes streaming multi-version reconciliation in native C++, eliminating deleted historical keys without inflating peak memory.
+- **Restore Resolution**: Shared bounded external ordering validates historical identities and selects survivors before entry allocation. Source payloads are staged once and replayed in source order; page images use one store-owned streaming lifecycle with generation committed after success.
 
 ### 5.2 Streaming Compaction
 
@@ -205,8 +193,10 @@ compacted_store = se.EmbeddingStore(config)
 checkpoint.load_training_checkpoint(
     compacted_store,
     compacted_handle,
-    RestorePlan.from_participant(
-        CheckpointParticipant(0, 1),
+    RestorePlan.from_partition(
+        PartitionSpec.modulo(),
+        partition_count=1,
+        partition_id=0,
         key_dtype="uint64",
     ),
 )
@@ -220,7 +210,11 @@ compact_fragments(
 )
 ```
 
-Compaction utilizes native streaming readers and bounded channels configured via `checkpoint_stream_policy.hpp`, bounding memory usage and leaving source versions immutable.
+Compaction uses native streaming readers and bounded channels configured via
+`checkpoint_stream_policy.hpp`, while source versions remain immutable. Restore
+and compaction share bounded historical reconciliation and payload decoding.
+Scratch disk grows with staged history; final target allocations and Lance caches
+are distinct from the bounded temporary working buffers.
 
 > For in-depth architecture, mutation journaling, and schema details, refer to [Incremental Checkpointing and Streaming Compaction](incremental_checkpoint.md).
 

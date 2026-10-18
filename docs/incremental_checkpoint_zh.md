@@ -10,42 +10,45 @@
 
 在大规模推荐系统与稀疏嵌入表训练场景中，嵌入表通常包含数亿到数十亿参数。周期性生成全量快照会带来巨大的 I/O 吞吐开销、引起训练停顿，并在持久化层造成极大的数据冗余。
 
-Sparse Embedding 提供了生产级原生**增量检查点**与**流式 Compaction** 能力：
+Sparse Embedding 提供原生**增量检查点**与**流式 Compaction** 能力：
 
-- **无阻塞一致性切片（Consistent Cut）**：在 Epoch 内存安全保护下秒级完成脏数据与删除墓碑的快照捕获，内存切片与磁盘 I/O 彻底解耦，训练过程零等待、无停顿。
+- **一致性切片（Consistent Cut）**：捕获阶段暂时阻止并等待竞争中的 store 调用，使用 Epoch 保护内存。native writer 通道有界，慢 I/O 可以通过背压延长捕获时间。
 - **分片原生内存变动日志（Mutation Journaling）**：Shard 本地管理变动条目与单调递增序列号，Forward 前向热路径无任何互斥锁开销与原子写争用。
-- **Delta 增量物理模式与墓碑追踪**：底层 Lance 列存切片原生持久化 `mutation_sequence`、`row_state`（`"active"` vs. `"tombstone"`）以及可选的逐特征淘汰评分 `score`（LFU/LRU）。
-- **流式多版本合流解析**：恢复引擎在 C++ 原生层高效遍历 Delta 增量链（`FULL` → `INCREMENTAL` → ...），确定性合并最新版本并自动剔除墓碑数据，峰值内存受严格控制。
-- **离线/在线流式 Compaction**：利用原生有界通道（`BoundedChannel`）将冗长增量链合并为全新的自包含 `FULL` 检查点，消除历史冗余并支持物理页缓存重建。
+- **Delta 增量物理模式与墓碑追踪**：底层 Lance 列存保存 `mutation_sequence`、`row_state`（`"active"` 与 `"deleted"`）以及可选的淘汰评分 `score`（LFU/LRU）。
+- **原生多版本合流解析**：有界外部排序校验历史 identity 并选出增量链（`FULL` → `INCREMENTAL` → ...）的存活记录。每个 Lance 源的 payload 扫描一次，请求的数据写入临时文件，随后按源顺序回放；只有存活 key 分配目标 slot。
+- **离线/在线流式 Compaction**：与 entries restore 共用合流和 payload 解码，再通过有界 writer 通道输出自包含 `FULL`。临时磁盘随历史数据增长，排序与 batch 的 RAM 上限由 `CheckpointStreamPolicy` 控制。
+
+- **Page-Image 恢复边界**：page-image 恢复按有界 page batch 扫描，并在 store 内持有一次空目标导入生命周期。只有 native 证明历史 identity 的 source owner 不变且目标 page geometry 匹配时才可使用。目标 assignment 移动历史 identity 后，entries 恢复的下一次保存必须为 `FULL`；分区数量相同也适用（详见 2.4 节）。
+- **生命周期与资源约束**：全部页面和校验成功后才发布 generation；导入尝试失败后，目标在重新开放访问前进入 terminal 状态。训练恢复要求符合目标 optimizer 的实际状态布局；只加载权重是显式 scope。最终目标表、稀疏物理页对应的 optimizer 容量及 Lance 运行时缓存不属于有界临时缓冲。恢复包含控制面和 I/O 同步，不能称为全过程无锁。
 
 ---
 
 ## 2. 系统架构与数据流
 
 ```text
-┌────────────────────────────────────────────────────────────────────────┐
-│                              在线训练引擎                              │
-│   Forward / Backward ──► 分片本地变更 ──► CheckpointMutationJournal    │
-└───────────────────────────────────┬────────────────────────────────────┘
-                                    │ capture_checkpoint() (无锁快速捕获)
-┌───────────────────────────────────▼────────────────────────────────────┐
-│                       一致性切片与分片临时落盘                         │
-│   脏数据条目 + 删除墓碑 ──► _staging/<attempt>/<participant_id>/entries.lance
-└───────────────────────────────────┬────────────────────────────────────┘
-                                    │ 2PC 两阶段原子提交 (Manifest 追加)
-┌───────────────────────────────────▼────────────────────────────────────┐
-│                    Lance Lakehouse 元数据事务总线                      │
-│   snapshot_manifest.lance (记录父版本引用、水位线、检查点模式)         │
-└───────────────────────────────────┬────────────────────────────────────┘
-                                    │
-            ┌───────────────────────┴───────────────────────┐
-            ▼                                               ▼
-┌───────────────────────────────┐       ┌────────────────────────────────┐
-│       原生高效合流恢复        │       │       流式 Compaction 合流     │
-│  在 C++ 原生流式扫描中遍历    │       │  将增量链条合并为自包含的全量  │
-│  Delta 增量链，消除墓碑与冗余 │       │  快照: storage.compact_checkpoint()
-│  RestorePlan.from_topology()  │       │                                │
-└───────────────────────────────┘       └────────────────────────────────┘
+┌──────────────────────────────────────────────────────────────────────────────────────┐
+│                                     在线训练引擎                                     │
+│   Forward / Backward ──► 分片本地变更 ──► CheckpointMutationJournal                  │
+└──────────────────────────────────────────┬───────────────────────────────────────────┘
+                                           │ capture_checkpoint() (无锁快速捕获)
+┌──────────────────────────────────────────▼───────────────────────────────────────────┐
+│                               一致性切片与分片临时落盘                               │
+│   脏数据条目 + 删除墓碑 ──► _staging/<attempt>/<participant_id>/entries.lance        │
+└──────────────────────────────────────────┬───────────────────────────────────────────┘
+                                           │ 2PC 两阶段原子提交 (Manifest 追加)
+┌──────────────────────────────────────────▼───────────────────────────────────────────┐
+│                            Lance Lakehouse 元数据事务总线                            │
+│   snapshot_manifest.lance (记录父版本引用、水位线、检查点模式)                       │
+└──────────────────────────────────────────┬───────────────────────────────────────────┘
+                                           │
+                    ┌──────────────────────┴────────────────────────┐
+                    ▼                                               ▼
+┌──────────────────────────────────────┐        ┌──────────────────────────────────────┐
+│           原生高效合流恢复           │        │         流式 Compaction 合流         │
+│  在 C++ 原生流式扫描中遍历           │        │  将增量链条合并为自包含的全量        │
+│  Delta 增量链，消除墓碑与冗余        │        │  快照: storage.compact_checkpoint()  │
+│  RestorePlan.from_partition()        │        │                                      │
+└──────────────────────────────────────┘        └──────────────────────────────────────┘
 ```
 
 ### 2.1 分片内存变动日志 (Mutation Journaling)
@@ -80,6 +83,44 @@ Sparse Embedding 提供了生产级原生**增量检查点**与**流式 Compacti
 | `mutation_sequence` | `uint64` | 分片单调递增变动序号 |
 | `row_state` | `utf8` | 记录状态：`"active"`（存活）或 `"tombstone"`（删除墓碑） |
 | `source_participant_index` | `uint32` | 写入节点 Rank 序号 |
+
+### 2.4 物理 Source 分片存储与跨拓扑检查点不变量
+
+增量检查点在数学上定义为基线快照之上的增量变动：$f(\text{Base}) + \Delta$。当集群拓扑变更（如 Worker 数量扩缩容或分片算法更新）导致 Key 所有权发生转移时，拓扑重构后的首个检查点必须保存为 `FULL` 全量检查点，而非 `INCREMENTAL` 增量检查点。
+
+#### 1. 物理架构：独立的 Participant 分片存储
+在分布式训练写路径上，为实现零互斥锁争用与无阻塞捕获，分布式 Worker 不会并发写入同一个物理 Lance 表文件。每个训练 Worker 独立维护本地 Shard 的变动日志，并在切片时将变动条目写出至独占的物理子目录：
+```
+_staging/<attempt>/<participant_id>/entries.lance
+```
+全局清单 `snapshot_manifest.lance` 则以轻量级元数据记录这一组离散的物理 Lance 片段（Fragment）。因此，Lance 底层天然是以 Participant（即 source 分片）为独立单元组织的。
+
+#### 2. 跨拓扑不变量与状态物化
+增量检查点依赖于确定性的基线状态与各 Participant 日志内单调递增的变动序号。当拓扑重组导致键归属发生迁移时，必须遵循以下状态规约：
+
+```text
+┌──────────────────────────────────────────────────────────────────────────────────────┐
+│ 拓扑 1 (2 Workers 训练):                                                             │
+│  Worker 0 ──► 片段 0 [Key 100 @ seq=10] ─────┐                                       │
+│  Worker 1 ──► 片段 1 [Key 200 @ seq=12]      │                                       │
+│                                              │ 拓扑变更 (2 -> 4 Workers)             │
+│                                              ▼ 恢复路由: Key 100 迁移给 Worker 3     │
+│ 拓扑 2 (4 Workers 训练) ── 拓扑重组后的检查点不变量:                                 │
+│                                                                                      │
+│ [禁止跨拓扑 INCREMENTAL]                     [系统强制规约: FULL 基线物化]           │
+│   • Worker 3 仅记录本步新修改 Key              • Worker 3 立即物化自包含全量         │
+│   • 未修改的 Key 100 遗失在新增量中            • Key 100 完整收录至片段 3            │
+│   • 下次恢复需全量遍历所有历史旧 Worker 碎片   • 彻底切断旧拓扑长链依赖              │
+│   • 读放大爆炸 + 墓碑复活 + 旧数据无法 GC      • 允许安全 GC 回收旧拓扑历史文件      │
+│   (❌ 破坏一致性与有界性能)                    (✅ 后续检查点恢复极速 INCREMENTAL)   │
+└──────────────────────────────────────────────────────────────────────────────────────┘
+```
+
+拓扑重构后首个检查点强制为 `FULL` 的技术考量：
+1. **分片基线连续性（Base Slice Continuity）**：增量片段仅记录当前步变更的条目。若在新节点接管键后直接保存增量，未在该步被修改的历史键将遗失在增量之外，后续恢复将无法仅依赖新节点的父链还原完整状态，退化为跨节点递归回溯。
+2. **有界读取开销（Bounded Read Amplification）**：若允许多次跨拓扑增量链级联，节点恢复时需扫描历史上所有拓扑结构下的所有碎片，读取复杂度从 $O(N_{\text{checkpoints}})$ 退化为 $O(N_{\text{participants}} \times N_{\text{checkpoints}})$。
+3. **序列号域隔离与墓碑消除（Sequence Domain Isolation & Tombstone Elimination）**：变动序号仅在各 Worker 本地单调递增，无全局物理时钟。跨节点的删除墓碑若直接多源归并，极易因缺乏绝对偏序导致已删除条目被误判或复活。
+4. **血缘截断与存储垃圾回收（Lineage Truncation & Safe GC）**：若增量跨拓扑延续，历史拓扑的物理文件将被下游增量依赖永久锚定无法释放。强制执行一次 `FULL` 本质上是**状态物化与血缘截断边界**，使新节点建立完整自包含基线，旧拓扑历史文件得以被安全回收。完成该全量保存后，后续训练步骤可继续执行轻量级 `INCREMENTAL` 保存。
 
 ---
 
@@ -127,21 +168,16 @@ print("已提交增量版本:", committed_inc.version_id.decode())
 
 ```python
 from sparse_embedding.checkpoint import (
-    CheckpointParticipant,
     IngestionEngine,
     PartitionSpec,
-    RankRestore,
-    ReshardRestore,
     RestorePlan,
 )
 
-# 场景 A：推荐 - 拓扑自适应恢复 (RestorePlan.from_topology)
-# 自动比对检查点保存卡数与当前卡数：卡数一致时走极致性能的 RankRestore，
-# 扩缩容变更时自动切换为带 SIMD 分区掩码过滤的 ReshardRestore。
-plan = RestorePlan.from_topology(
-    saved_participant_count=1,
-    participant=CheckpointParticipant(0, 1),
+# 场景 A：目标拓扑不变，计划直接描述当前分区。
+plan = RestorePlan.from_partition(
     spec=PartitionSpec.modulo(),
+    partition_count=1,
+    partition_id=0,
     key_dtype="uint64",
 )
 restore_store = se.EmbeddingStore(config)
@@ -151,19 +187,12 @@ checkpoint.load_training_checkpoint(
     plan,
 )
 
-# 场景 B：显式物理对等恢复 (拓扑完全对等)
-rank_plan = RestorePlan.from_participant(
-    CheckpointParticipant(0, 1),
-    engine=IngestionEngine.RECONSTRUCT_ENTRIES,
-    key_dtype="uint64",
-)
-checkpoint.load_training_checkpoint(restore_store, committed_inc.handle, rank_plan)
-
-# 场景 C：显式弹性拓扑重组恢复 (集群扩缩容分片过滤)
+# 场景 B：同一种计划类型也处理目标拓扑变化。
 reshard_plan = RestorePlan.from_partition(
     PartitionSpec.hash(seed=42),
     partition_count=8,
     partition_id=0,
+    engine=IngestionEngine.RECONSTRUCT_ENTRIES,
     key_dtype="uint64",
 )
 elastic_store = se.EmbeddingStore(config)
@@ -186,8 +215,10 @@ compacted_store = se.EmbeddingStore(config)
 checkpoint.load_training_checkpoint(
     compacted_store,
     compacted_handle,
-    RestorePlan.from_participant(
-        CheckpointParticipant(0, 1),
+    RestorePlan.from_partition(
+        PartitionSpec.modulo(),
+        partition_count=1,
+        partition_id=0,
         key_dtype="uint64",
     ),
 )
@@ -217,8 +248,10 @@ infer_store = se.EmbeddingStore(infer_config)
 checkpoint.load_inference_checkpoint(
     infer_store,
     committed_inc.handle,
-    RankRestore(
-        participant=CheckpointParticipant(0, 1),
+    RestorePlan.from_partition(
+        PartitionSpec.modulo(),
+        partition_count=1,
+        partition_id=0,
         key_dtype="uint64",
     ),
 )
@@ -228,10 +261,17 @@ checkpoint.load_inference_checkpoint(
 
 ## 4. 可靠性与一致性保证
 
-- **严格 Lineage 隔离保护**：增量检查点强制校验变动序号的单调递增性与 Lineage 名称一致性，跨血缘父引用直接触发 `CheckpointConflictError`。
+- **严格 Lineage 隔离与 Head 解析保护**：增量检查点强制校验变动序号的单调递增性与 Lineage 名称一致性，跨血缘父引用直接触发 `CheckpointConflictError`。未被确认的检查点（持有活跃 `seintent` 意图标签或 `sereclaiming` 排除标记）严格排除在 Lineage Head 解析之外（`resolve_lineage_head`）。
+- **原子 Abort 与孤儿回收协议**：中止未决保存或回收孤儿 committed 检查点严格遵循故障安全的生命周期时序：
+  1. 首先持久化 `sereclaiming.<locator>` 排除标记，确保即便后续流程异常，该版本也不会被误作为 Lineage Head；
+  2. 物理删除碎片文件（Fragment Roots）；
+  3. 清理父链引用（Parent Chain References）、引用标签及 Page 写入意图；
+  4. 从 `snapshot_manifest.lance` 删除元数据记录并使缓存失效；
+  5. 删除 `seintent` 意图标签、Pending Outcome 与 Committed 标签；
+  6. 最后删除 `sereclaiming` 排除标记。
+  该不变量确保在进程崩溃、I/O 中断或清理失败等任何中间故障下，未确认或已孤儿的检查点绝不会被错误暴露为血缘头指针。
 - **父版本生命周期锚定（Parent Pinning）**：活跃的父数据集由内部引用标签加锁保护。存储垃圾回收任务绝不会清理仍被下游增量链依赖的数据文件。
 - **空变动开销消除（Empty Delta Optimization）**：若训练间隔内无任何权重更新，系统仅向 `snapshot_manifest.lance` 追加紧凑的元数据记录，跳过空数据集的无谓创建。
-- **零孤儿文件级联清理**：异常中断或中止的检查点保存任务将自动清理其暂存目录前缀，主异常信息严格保真传递，拒绝静默失败。
 - **多版本确定性决胜规则**：跨多版本的数据冲突严格按照最高 `(version, mutation_sequence)` 胜出，保证跨环境、跨语言还原出的数据绝对位一致（Bit-Identical）。
 
 ---

@@ -186,7 +186,7 @@ The storage engine coordinates with the persistence subsystem under the followin
 - **Training vs. Inference State Isolation**:
   - Training instances allocate and manage optimizer state pages (e.g., Adam first/second moments).
   - Inference instances configure `EmbeddingConfig(enable_optimizer=False)` to create weight-only stores, skipping optimizer allocation.
-- **Topology-Adaptive Restoration**: `RestorePlan.from_topology` automatically inspects saved participant counts vs. current cluster topology, transparently routing to `RankRestore` (identical topology) or SIMD-vectorized `ReshardRestore` (cluster scaling / re-partitioning).
+- **Partition-Target Restoration**: `RestorePlan.from_partition` explicitly describes the current assignment. The same plan type serves identical and changed target topologies; canonical entry routing remains in the native partitioner, while page-image loading is selected only through `IngestionEngine.FAST_PAGE_CACHE`.
 - **Two-Phase Commit and Lance Lakehouse Persistence**: Underlying storage persists state via `snapshot_manifest.lance` (control-plane ledger) and `entries.lance` (data-plane physical slices).
 - **Incremental Checkpointing & Streaming Compaction**: Mutation journaling tracks dirty keys and deletion tombstones during training, enabling non-blocking cuts and native streaming compaction.
 

@@ -9,11 +9,9 @@ import msgpack
 
 from .base import (
     SUPPORTED_KEY_DTYPES,
-    CheckpointParticipant,
     IngestionEngine,
     PartitionSpec,
-    RankRestore,
-    ReshardRestore,
+    PartitionTarget,
     RestorePlan,
 )
 
@@ -96,26 +94,18 @@ def _require_integer(value: object, field: str) -> int:
 def encode_restore_options(plan: RestorePlan) -> bytes:
     """Encode one typed restore plan as canonical opaque bytes."""
 
-    if isinstance(plan, RankRestore):
-        payload: dict[str, object] = {
-            "key_dtype": plan.key_dtype,
-            "participant_count": plan.participant.participant_count,
-            "participant_index": plan.participant.participant_index,
-            "restore_kind": "rank",
-            "engine": plan.engine.value,
-        }
-    elif isinstance(plan, ReshardRestore):
-        assignment = plan.spec
-        payload = {
-            "key_dtype": plan.key_dtype,
-            "partition_count": plan.partition_count,
-            "partition_id": plan.partition_id,
-            "restore_kind": "reshard",
-            "sparse_assignment_name": assignment.name,
-            "sparse_assignment_parameters": assignment.parameters,
-        }
-    else:
-        raise TypeError("plan must be RankRestore or ReshardRestore")
+    if not isinstance(plan, RestorePlan):
+        raise TypeError("plan must be a RestorePlan")
+    assignment = plan.target.spec
+    payload: dict[str, object] = {
+        "engine": plan.engine.value,
+        "key_dtype": plan.key_dtype,
+        "partition_count": plan.target.partition_count,
+        "partition_id": plan.target.partition_id,
+        "restore_kind": "partition",
+        "sparse_assignment_name": assignment.name,
+        "sparse_assignment_parameters": assignment.parameters,
+    }
     encoded = _pack(payload)
     if len(encoded) > _MAX_PAYLOAD_BYTES:
         raise ValueError("restore options exceed the maximum payload size")
@@ -126,75 +116,48 @@ def _decode_restore_options(payload: bytes) -> RestorePlan:
     """Decode owner options; this boundary is private to sparse_embedding."""
 
     decoded = _unpack(payload)
-    restore_kind = decoded.get("restore_kind")
-    if not isinstance(restore_kind, str):
-        raise TypeError("restore_kind must be a string")
-
-    if restore_kind == "rank":
-        required = {
-            "engine",
-            "key_dtype",
-            "participant_count",
-            "participant_index",
-            "restore_kind",
-        }
-        if set(decoded) != required:
-            raise ValueError("rank restore options contain unknown fields")
-        key_dtype = decoded["key_dtype"]
-        engine_name = decoded["engine"]
-        if not isinstance(key_dtype, str):
-            raise TypeError("rank key_dtype must be a string")
-        if not isinstance(engine_name, str):
-            raise TypeError("rank ingestion engine must be a string")
-        if key_dtype not in SUPPORTED_KEY_DTYPES:
-            raise ValueError(f"unsupported rank key_dtype: {key_dtype}")
-        try:
-            engine = IngestionEngine(engine_name)
-        except ValueError as error:
-            raise ValueError("unsupported rank ingestion engine") from error
-        return RankRestore(
-            CheckpointParticipant(
-                _require_integer(decoded["participant_index"], "participant_index"),
-                _require_integer(decoded["participant_count"], "participant_count"),
-            ),
-            engine,
-            key_dtype=key_dtype,
-        )
-
-    if restore_kind == "reshard":
-        required = {
-            "key_dtype",
-            "partition_count",
-            "partition_id",
-            "restore_kind",
-            "sparse_assignment_name",
-            "sparse_assignment_parameters",
-        }
-        if set(decoded) != required:
-            raise ValueError("reshard restore options contain unknown fields")
-        assignment_name = decoded["sparse_assignment_name"]
-        parameters = decoded["sparse_assignment_parameters"]
-        key_dtype = decoded["key_dtype"]
-        if not isinstance(assignment_name, str):
-            raise TypeError("sparse_assignment_name must be a string")
-        if not isinstance(parameters, dict):
-            raise TypeError("sparse_assignment_parameters must be a map")
-        if not isinstance(key_dtype, str):
-            raise TypeError("key_dtype must be a string")
-        if key_dtype not in SUPPORTED_KEY_DTYPES:
-            raise ValueError(f"unsupported reshard key_dtype: {key_dtype}")
-        assignment = PartitionSpec(
-            assignment_name,
-            parameters,
-        )
-        return ReshardRestore(
+    required = {
+        "engine",
+        "key_dtype",
+        "partition_count",
+        "partition_id",
+        "restore_kind",
+        "sparse_assignment_name",
+        "sparse_assignment_parameters",
+    }
+    if set(decoded) != required:
+        raise ValueError("restore options contain unknown fields")
+    restore_kind = decoded["restore_kind"]
+    if restore_kind != "partition":
+        raise ValueError(f"unsupported restore_kind: {restore_kind!r}")
+    assignment_name = decoded["sparse_assignment_name"]
+    parameters = decoded["sparse_assignment_parameters"]
+    key_dtype = decoded["key_dtype"]
+    engine_name = decoded["engine"]
+    if not isinstance(assignment_name, str):
+        raise TypeError("sparse_assignment_name must be a string")
+    if not isinstance(parameters, dict):
+        raise TypeError("sparse_assignment_parameters must be a map")
+    if not isinstance(key_dtype, str):
+        raise TypeError("key_dtype must be a string")
+    if key_dtype not in SUPPORTED_KEY_DTYPES:
+        raise ValueError(f"unsupported key_dtype: {key_dtype}")
+    if not isinstance(engine_name, str):
+        raise TypeError("restore ingestion engine must be a string")
+    try:
+        engine = IngestionEngine(engine_name)
+    except ValueError as error:
+        raise ValueError("unsupported restore ingestion engine") from error
+    assignment = PartitionSpec(assignment_name, parameters)
+    return RestorePlan(
+        PartitionTarget(
             assignment,
             _require_integer(decoded["partition_count"], "partition_count"),
             _require_integer(decoded["partition_id"], "partition_id"),
-            key_dtype=key_dtype,
-        )
-
-    raise ValueError(f"unsupported restore_kind: {restore_kind!r}")
+        ),
+        engine=engine,
+        key_dtype=key_dtype,
+    )
 
 
 __all__ = ["encode_restore_options"]

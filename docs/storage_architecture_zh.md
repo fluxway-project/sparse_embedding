@@ -186,7 +186,7 @@ ranks_func = se.partition(keys, partition_count=4, algorithm="sparse_embedding.h
 - **训练与推理状态隔离**：
   - 训练实例：分配并管理优化器状态页（Adam 一阶/二阶动量）；
   - 推理实例：配置 `EmbeddingConfig(enable_optimizer=False)` 构建权重专属 Store，杜绝分配优化器状态内存。
-- **拓扑自适应恢复**：`RestorePlan.from_topology` 自动比对检查点保存卡数与当前集群拓扑，卡数一致时走 `RankRestore`，扩缩容时自动路由为基于 AVX-512 SIMD 掩码过滤的 `ReshardRestore`。
+- **目标分区恢复**：`RestorePlan.from_partition` 直接描述当前分区。同一种计划类型同时覆盖相同与变化后的目标拓扑；规范 entries 的路由仍由 native 分片器负责，page-image 加载只通过 `IngestionEngine.FAST_PAGE_CACHE` 选择。
 - **两阶段提交与 Lance 湖仓持久化**：底层通过 `snapshot_manifest.lance`（控制面元数据账本）与 `entries.lance`（数据面物理切片）实现 2PC 原子发布与恢复。
 - **增量检查点与流式合流**：分片变动日志追踪脏数据与删除墓碑，支持无阻塞一致性切片与多版本流式 Compaction。
 

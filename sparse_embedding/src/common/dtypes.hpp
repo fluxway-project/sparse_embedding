@@ -3,6 +3,7 @@
 
 #pragma once
 
+#include <cstddef>
 #include <cstdint>
 #include <stdexcept>
 #include <string>
@@ -186,6 +187,11 @@ decltype(auto) dispatch_dtype_pair(ValueDType param_dtype,
       return fn.template operator()<ParamT, OptT>();
     });
   });
+}
+
+inline size_t value_dtype_itemsize(ValueDType dtype) {
+  return dispatch_value_type(dtype,
+                             []<typename ValueT>() { return sizeof(ValueT); });
 }
 
 } // namespace se
