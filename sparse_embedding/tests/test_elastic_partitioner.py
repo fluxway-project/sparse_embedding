@@ -40,18 +40,50 @@ def test_strategy_contract_inspection():
 def test_strategy_spec_ssot():
     modulo = se.ModuloPartition()
     assert isinstance(modulo.spec, PartitionSpec)
-    assert modulo.spec.sparse_assignment_name == SPARSE_EMBEDDING_MODULO_ASSIGNMENT_NAME
-    assert modulo.spec.sparse_assignment_parameters == {}
+    assert modulo.spec.name == SPARSE_EMBEDDING_MODULO_ASSIGNMENT_NAME
+    assert modulo.spec.parameters == {}
+    assert modulo.parameters is modulo.spec.parameters
 
     hashed = se.HashPartition(seed=42)
-    assert hashed.spec.sparse_assignment_name == SPARSE_EMBEDDING_HASH_ASSIGNMENT_NAME
-    assert hashed.spec.sparse_assignment_parameters == {"seed": "42"}
+    assert hashed.spec.name == SPARSE_EMBEDDING_HASH_ASSIGNMENT_NAME
+    assert hashed.spec.parameters == {"seed": "42"}
+    assert hashed.parameters is hashed.spec.parameters
 
     fast_range = se.FastRangePartition()
-    assert (
-        fast_range.spec.sparse_assignment_name
-        == SPARSE_EMBEDDING_FAST_RANGE_ASSIGNMENT_NAME
-    )
+    assert fast_range.spec.name == SPARSE_EMBEDDING_FAST_RANGE_ASSIGNMENT_NAME
+
+
+@pytest.mark.parametrize(
+    "name", [SPARSE_EMBEDDING_MODULO_ASSIGNMENT_NAME, "test.custom"]
+)
+def test_spec_and_strategy_use_native_registration(monkeypatch, name):
+    monkeypatch.setattr(se._core, "is_partitioner_registered", lambda _: False)
+    for constructor in (PartitionSpec, se.PartitionStrategy):
+        with pytest.raises(ValueError, match="unregistered partition algorithm"):
+            constructor(name)
+
+    monkeypatch.setattr(se._core, "is_partitioner_registered", lambda _: True)
+    spec = PartitionSpec(name)
+    strategy = se.PartitionStrategy(name)
+    assert strategy.spec == spec
+    assert strategy.name == spec.name
+
+
+@pytest.mark.parametrize("error_type", [ImportError, AttributeError])
+@pytest.mark.parametrize(
+    "name", [SPARSE_EMBEDDING_MODULO_ASSIGNMENT_NAME, "test.custom"]
+)
+def test_registry_initialization_error_is_preserved(monkeypatch, name, error_type):
+    error = error_type("registry initialization failed")
+
+    def fail_registry(_):
+        raise error
+
+    monkeypatch.setattr(se._core, "is_partitioner_registered", fail_registry)
+    for constructor in (PartitionSpec, se.PartitionStrategy):
+        with pytest.raises(error_type) as caught:
+            constructor(name)
+        assert caught.value is error
 
 
 def test_dynamic_topology_late_binding():

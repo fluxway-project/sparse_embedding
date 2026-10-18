@@ -20,6 +20,7 @@
 
 #include <proxy/proxy.h>
 
+#include <optional>
 #include <span>
 #include <system_error>
 #include <vector>
@@ -62,6 +63,22 @@ template <typename ParamT, typename OptT> struct PageImageImport {
   PageImageExport<ParamT, OptT> image;
 };
 
+template <typename ParamT, typename OptT>
+using PageImageVisitor = Function<void(const PageImageImport<ParamT, OptT> &)>;
+
+template <typename ParamT, typename OptT>
+using PageImageSource = Function<void(PageImageVisitor<ParamT, OptT>)>;
+
+template <typename ParamT, typename OptT>
+PageImageSource<ParamT, OptT>
+page_image_source(std::span<const PageImageImport<ParamT, OptT>> images) {
+  return pro::make_proxy<FunctionFacade<void(PageImageVisitor<ParamT, OptT>)>>(
+      [images](PageImageVisitor<ParamT, OptT> visitor) {
+        for (const auto &image : images)
+          (*visitor)(image);
+      });
+}
+
 struct NotImplemented {
   explicit NotImplemented(auto &&...) {
     throw std::runtime_error{
@@ -85,6 +102,8 @@ PRO_DEF_MEM_DISPATCH(MemReserve, reserve);
 PRO_DEF_MEM_DISPATCH(MemReservePerShard, reserve_per_shard);
 PRO_DEF_MEM_DISPATCH(MemInternalShardCount, internal_shard_count);
 PRO_DEF_MEM_DISPATCH(MemEntriesPerPage, entries_per_page);
+PRO_DEF_MEM_DISPATCH(MemValidateOptimizerStateLayout,
+                     validate_optimizer_state_layout);
 
 // --- Core read/write ---------------------------------------------------------
 PRO_DEF_MEM_DISPATCH(MemLookup, lookup);
@@ -214,6 +233,11 @@ using WeakMemOptimizerStep = pro::weak_dispatch<MemOptimizerStep>;
 #define SE_ASSIGN_SCORES_FACADE_SIG(key_t)                                     \
   std::error_code(std::span<const key_t> keys, std::span<const uint64_t> scores)
 
+#define SE_ASSIGN_SCORES_WITH_DIMENSIONS_FACADE_SIG(key_t)                     \
+  std::error_code(std::span<const key_t> keys,                                 \
+                  std::span<const uint64_t> scores,                            \
+                  std::span<const int64_t> row_lengths)
+
 #define SE_FORWARD_LOOKUP_FACADE_SIG(key_t)                                    \
   std::error_code(std::span<const key_t> keys, std::span<ParamT> out_values,   \
                   std::span<const int64_t> row_lengths)
@@ -258,6 +282,11 @@ using WeakMemOptimizerStep = pro::weak_dispatch<MemOptimizerStep>;
 
 #define SE_IMPORT_PAGE_IMAGES_FACADE_SIG                                       \
   void(std::span<const PageImageImport<ParamT, OptT>> images)
+
+#define SE_IMPORT_PAGE_IMAGE_STREAM_FACADE_SIG                                 \
+  void(PageImageSource<ParamT, OptT> source,                                   \
+       std::optional<uint64_t> page_layout_generation,                         \
+       bool load_optimizer_state)
 
 #define SE_IMPORT_PAGE_IMAGES_WITH_GENERATION_FACADE_SIG                       \
   void(std::span<const PageImageImport<ParamT, OptT>> images,                  \
@@ -331,7 +360,11 @@ struct EmbeddingTableBaseFacade : pro //
                    bool() const> //
   ::add_convention<WeakMemAssignScores,
                    SE_ASSIGN_SCORES_FACADE_SIG(int32_t), SE_ASSIGN_SCORES_FACADE_SIG(uint32_t),
-                   SE_ASSIGN_SCORES_FACADE_SIG(int64_t), SE_ASSIGN_SCORES_FACADE_SIG(uint64_t)> //
+                   SE_ASSIGN_SCORES_FACADE_SIG(int64_t), SE_ASSIGN_SCORES_FACADE_SIG(uint64_t),
+                   SE_ASSIGN_SCORES_WITH_DIMENSIONS_FACADE_SIG(int32_t),
+                   SE_ASSIGN_SCORES_WITH_DIMENSIONS_FACADE_SIG(uint32_t),
+                   SE_ASSIGN_SCORES_WITH_DIMENSIONS_FACADE_SIG(int64_t),
+                   SE_ASSIGN_SCORES_WITH_DIMENSIONS_FACADE_SIG(uint64_t)> //
 
   // --- Geometry / Page snapshot control -------------------------------------
   ::add_convention<WeakMemCompactPage, SE_COMPACT_PAGE_FACADE_SIG> //
@@ -339,6 +372,8 @@ struct EmbeddingTableBaseFacade : pro //
   ::add_convention<WeakMemPromotedHotPageSize,
                    SE_PROMOTED_HOT_PAGE_SIZE_FACADE_SIG> //
   ::add_convention<MemEntriesPerPage, size_t() const> //
+  ::add_convention<pro::weak_dispatch<MemValidateOptimizerStateLayout>,
+                   void(std::span<const uint32_t>, std::span<const uint32_t>) const> //
   ::add_convention<pro::weak_dispatch<MemCheckpointMutations>,
                    std::vector<CheckpointMutation>() const> //
   ::add_convention<pro::weak_dispatch<MemCancelCheckpointCapture>, void(uint64_t, std::string)>
@@ -391,6 +426,7 @@ struct EmbeddingTableFacade : pro //
                    SE_EXPORT_BATCH_FACADE_SIG(int64_t), SE_EXPORT_BATCH_FACADE_SIG(uint64_t)> //
   ::template add_convention<WeakMemExportPageImages, SE_EXPORT_PAGE_IMAGES_FACADE_SIG> //
   ::template add_convention<WeakMemImportPageImages, SE_IMPORT_PAGE_IMAGES_FACADE_SIG> //
+  ::template add_convention<WeakMemImportPageImages, SE_IMPORT_PAGE_IMAGE_STREAM_FACADE_SIG> //
   ::template add_convention<pro::weak_dispatch<MemImportPageImagesWithGeneration>,
                    SE_IMPORT_PAGE_IMAGES_WITH_GENERATION_FACADE_SIG> //
   ::template add_convention<pro::weak_dispatch<MemCaptureCheckpoint>,
@@ -447,6 +483,7 @@ struct EmbeddingTableFacade : pro //
 #undef SE_ERASE_FACADE_SIG
 #undef SE_ERASE_DIMENSION_FACADE_SIG
 #undef SE_ASSIGN_SCORES_FACADE_SIG
+#undef SE_ASSIGN_SCORES_WITH_DIMENSIONS_FACADE_SIG
 #undef SE_FORWARD_LOOKUP_FACADE_SIG
 #undef SE_ACCUMULATE_GRADIENTS_FACADE_SIG
 #undef SE_EVICT_BY_SCORE_FACADE_SIG
@@ -456,6 +493,7 @@ struct EmbeddingTableFacade : pro //
 #undef SE_PROMOTED_HOT_PAGE_SIZE_FACADE_SIG
 #undef SE_EXPORT_PAGE_IMAGES_FACADE_SIG
 #undef SE_IMPORT_PAGE_IMAGES_FACADE_SIG
+#undef SE_IMPORT_PAGE_IMAGE_STREAM_FACADE_SIG
 #undef SE_ASSIGN_OPT_STATES_FACADE_SIG
 #undef SE_EXPORT_OPT_STATE_BATCH_FACADE_SIG
 #undef SE_EXPORT_OPT_STATE_BATCH_OWNED_FACADE_SIG

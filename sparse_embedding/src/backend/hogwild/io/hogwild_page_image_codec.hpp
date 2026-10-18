@@ -18,8 +18,8 @@ size_t validate_page_image_columns(const PageImageExport<ParamT, OptT> &image,
       image.page_slot_stride_bytes != expected_stride)
     throw std::invalid_argument("page-image layout does not match slot");
   const size_t count = image.keys.size();
-  if (count == 0 || image.slot_ordinals.size() != count ||
-      image.seq_counts.size() != count)
+  if (count == 0 || count > entries_per_page ||
+      image.slot_ordinals.size() != count || image.seq_counts.size() != count)
     throw std::invalid_argument("page-image columns are inconsistent");
   if (expected_dim != 0 &&
       count > std::numeric_limits<size_t>::max() / expected_dim)

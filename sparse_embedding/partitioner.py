@@ -19,13 +19,11 @@ from __future__ import annotations
 
 import threading
 from collections.abc import Mapping
-from types import MappingProxyType
 from typing import Any
 
 from ._core import (
     Partitioner,
     create_partitioner,
-    is_partitioner_registered,
 )
 from .checkpoint.base import (
     SPARSE_EMBEDDING_FAST_RANGE_ASSIGNMENT_NAME,
@@ -43,45 +41,24 @@ class PartitionStrategy:
     explicit binding, and transparent JIT kernel specialization caching.
     """
 
-    __slots__ = ("_name", "_parameters", "_spec", "_kernel_cache", "_lock")
+    __slots__ = ("_spec", "_kernel_cache", "_lock")
 
     def __init__(
         self,
         name: str = SPARSE_EMBEDDING_MODULO_ASSIGNMENT_NAME,
         parameters: Mapping[str, object] | None = None,
     ) -> None:
-        if not isinstance(name, str) or not name.strip():
-            raise ValueError(
-                "PartitionStrategy algorithm name must be a non-empty string"
-            )
-        if not is_partitioner_registered(name):
-            raise ValueError(f"Unknown or unregistered partitioner algorithm: '{name}'")
-
-        resolved_params: dict[str, object] = {}
-        if parameters is not None:
-            if not isinstance(parameters, Mapping):
-                raise TypeError("parameters must be a mapping of string keys to values")
-            for k, v in parameters.items():
-                if not isinstance(k, str) or not k.strip():
-                    raise TypeError("parameter keys must be non-empty strings")
-                resolved_params[k] = v
-
-        self._name = name
-        self._parameters = MappingProxyType(resolved_params)
-        self._spec = PartitionSpec(
-            name=self._name,
-            parameters=dict(self._parameters),
-        )
+        self._spec = PartitionSpec(name, parameters)
         self._kernel_cache: dict[int, Partitioner] = {}
         self._lock = threading.Lock()
 
     @property
     def name(self) -> str:
-        return self._name
+        return self._spec.name
 
     @property
     def parameters(self) -> Mapping[str, object]:
-        return self._parameters
+        return self._spec.parameters
 
     @property
     def spec(self) -> PartitionSpec:
@@ -99,7 +76,7 @@ class PartitionStrategy:
             kernel = self._kernel_cache.get(partition_count)
             if kernel is None:
                 kernel = create_partitioner(
-                    self._name, partition_count, dict(self._parameters)
+                    self.name, partition_count, dict(self.parameters)
                 )
                 self._kernel_cache[partition_count] = kernel
             return kernel
@@ -143,7 +120,7 @@ class PartitionStrategy:
         )
 
     def __repr__(self) -> str:
-        return f"PartitionStrategy(name={self._name!r}, parameters={dict(self._parameters)!r})"
+        return f"PartitionStrategy(name={self.name!r}, parameters={dict(self.parameters)!r})"
 
 
 class ModuloPartition(PartitionStrategy):

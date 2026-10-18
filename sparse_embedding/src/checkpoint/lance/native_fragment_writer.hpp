@@ -11,7 +11,9 @@
 #include <utility>
 #include <vector>
 
+#include "sparse_embedding/src/checkpoint/checkpoint_stream_statistics.hpp"
 #include "sparse_embedding/src/checkpoint/lance/arrow/c/abi.h"
+#include "sparse_embedding/src/checkpoint/lance/native_entry_batch.hpp"
 #include "sparse_embedding/src/checkpoint/lance/storage_options.hpp"
 #include "sparse_embedding/src/ops/partitioner.hpp"
 
@@ -90,11 +92,16 @@ public:
   NativeFragmentArtifact finalize();
 };
 
-void validate_native_checkpoint_chain(
+// Validate the chain and, when a target assignment is supplied, prove that all
+// historical identities retain their source participant. An absent target
+// performs chain validation only and returns false (no layout proof).
+bool validate_native_checkpoint_chain(
     std::span<const std::vector<std::string>> source_uris,
     std::span<const std::vector<uint64_t>> participant_watermarks,
     std::span<const uint32_t> dimensions, std::string_view key_dtype,
-    const LanceStorageOptions &storage_options);
+    const LanceStorageOptions &storage_options,
+    pro::proxy<se::ops::PartitionerFacade> target_partitioner = {},
+    uint32_t target_partition_count = 0);
 
 NativeFragmentArtifact compact_native_checkpoint(
     std::string_view target_uri, std::span<const std::string> source_uris,
@@ -109,21 +116,7 @@ NativeCompactionArtifact compact_native_lance_sources(
     std::string_view target_uri, std::span<const std::string> source_uris,
     const LanceStorageOptions &storage_options = LanceStorageOptions{});
 
-struct NativeEntryBatch {
-  std::vector<uint32_t> dimensions;
-  std::vector<uint64_t> keys;
-  std::vector<std::byte> embedding_values;
-  std::vector<uint32_t> embedding_offsets;
-  std::string embedding_dtype;
-  std::vector<std::byte> optimizer_values;
-  std::vector<uint32_t> optimizer_offsets;
-  std::string optimizer_dtype;
-  std::vector<uint32_t> optimizer_strides;
-  std::vector<uint32_t> steps;
-  std::vector<uint64_t> scores;
-};
-
-struct NativePageImage {
+struct NativePageImageView {
   uint32_t entries_per_page = 0;
   uint32_t embedding_dim = 0;
   uint64_t physical_page_id = 0;
@@ -132,41 +125,19 @@ struct NativePageImage {
   std::vector<uint32_t> slot_ordinals;
   std::vector<uint64_t> keys;
   std::vector<uint64_t> sequences;
-  std::vector<std::byte> values;
+  std::span<const std::byte> values;
   std::vector<uint64_t> scores;
-  std::vector<std::byte> optimizer_values;
+  std::span<const std::byte> optimizer_values;
   std::string optimizer_dtype;
   uint32_t optimizer_stride = 0;
   std::vector<uint32_t> steps;
   std::string checksum;
 };
 
-using NativeKeyBatchVisitor = std::function<bool(std::span<const uint64_t>)>;
 using NativeEntryBatchVisitor = std::function<bool(const NativeEntryBatch &)>;
-using NativePageImageVisitor = std::function<bool(NativePageImage &&)>;
+using NativePageImageVisitor = std::function<bool(NativePageImageView &&)>;
 
-void scan_native_active_entry_keys(
-    std::string_view uri, uint64_t version, NativeKeyBatchVisitor visitor,
-    std::optional<uint32_t> participant_index = std::nullopt,
-    const LanceStorageOptions &storage_options = LanceStorageOptions{});
-void validate_native_active_entry_keys(
-    std::span<const std::string> uris, uint64_t version,
-    const LanceStorageOptions &storage_options = LanceStorageOptions{});
-void scan_native_partition_entries(
-    std::string_view uri, uint64_t version,
-    pro::proxy<se::ops::PartitionerFacade> &partitioner, uint32_t partition_id,
-    std::string_view key_dtype, NativeEntryBatchVisitor visitor,
-    bool load_optimizer_state = true,
-    const LanceStorageOptions &storage_options = LanceStorageOptions{},
-    std::optional<uint32_t> source_participant_index = std::nullopt,
-    const std::function<bool(uint32_t, uint64_t)> &select_entry = {});
-void scan_native_partition_entries(
-    std::string_view uri, uint64_t version, uint64_t partition_count,
-    uint64_t partition_id, std::string_view key_dtype,
-    NativeEntryBatchVisitor visitor, bool load_optimizer_state = true,
-    const LanceStorageOptions &storage_options = LanceStorageOptions{},
-    std::optional<uint32_t> source_participant_index = std::nullopt);
-void scan_native_checkpoint_entries(
+checkpoint::NativeEntryScanStatistics scan_native_checkpoint_entries(
     std::span<const std::string> uris, uint64_t version,
     pro::proxy<se::ops::PartitionerFacade> partitioner, uint32_t partition_id,
     std::string_view key_dtype, NativeEntryBatchVisitor visitor,

@@ -1,24 +1,20 @@
 #include "sparse_embedding/src/checkpoint/lance/native_fragment_writer.hpp"
+#include "sparse_embedding/src/checkpoint/lance/native_payload.hpp"
 
-#include <ankerl/unordered_dense.h>
 #include <lance/lance.h>
 
 #include <algorithm>
 #include <array>
-#include <atomic>
 #include <charconv>
-#include <chrono>
 #include <condition_variable>
 #include <cstring>
 #include <filesystem>
-#include <fstream>
 #include <limits>
 #include <map>
 #include <memory>
 #include <mutex>
 #include <optional>
 #include <queue>
-#include <random>
 #include <stdexcept>
 #include <thread>
 #include <tuple>
@@ -26,7 +22,9 @@
 #include <unordered_map>
 
 #include "sparse_embedding/src/checkpoint/checkpoint_stream_policy.hpp"
+#include "sparse_embedding/src/checkpoint/entry_payload_spool.hpp"
 #include "sparse_embedding/src/checkpoint/lance/layout_schema.hpp"
+#include "sparse_embedding/src/checkpoint/ordered_checkpoint.hpp"
 #include "sparse_embedding/src/common/dtypes.hpp"
 #include "sparse_embedding/src/interface/embedding_table_interface.hpp"
 #include "sparse_embedding/src/ops/partitioner_registry.hpp"
@@ -115,24 +113,25 @@ public:
 
 class BinaryColumnView {
   const ArrowArray *array_;
-  const int32_t *offsets_;
-  const std::byte *data_;
-  size_t data_bytes_;
+  const int32_t *offsets_ = nullptr;
+  const std::byte *data_ = nullptr;
+  size_t data_bytes_ = 0;
 
 public:
-  BinaryColumnView(const ArrowArray *array, size_t data_bytes)
-      : array_(array),
-        offsets_(static_cast<const int32_t *>(array->buffers[1])),
-        data_(static_cast<const std::byte *>(array->buffers[2])),
-        data_bytes_(data_bytes) {
-    if (!array_ || array_->n_buffers < 3 || !offsets_ || (array_->length < 0) ||
-        (array_->offset > std::numeric_limits<int64_t>::max() - array_->length))
+  explicit BinaryColumnView(const ArrowArray *array) : array_(array) {
+    if (!array || array->n_buffers < 3 || !array->buffers ||
+        !array->buffers[1] || array->length < 0 || array->offset < 0 ||
+        array->offset > std::numeric_limits<int64_t>::max() - array->length)
       throw std::runtime_error("invalid Arrow binary column");
-    const int64_t first = array_->offset;
-    const int64_t last = first + array_->length;
-    if (offsets_[first] < 0 || offsets_[last] < offsets_[first] ||
-        static_cast<size_t>(offsets_[last]) > data_bytes_)
-      throw std::runtime_error("Arrow binary column exceeds its data buffer");
+    offsets_ = static_cast<const int32_t *>(array->buffers[1]);
+    data_ = static_cast<const std::byte *>(array->buffers[2]);
+    const int64_t first = array->offset;
+    const int64_t last = first + array->length;
+    if (offsets_[first] < 0 || offsets_[last] < offsets_[first])
+      throw std::runtime_error("invalid Arrow binary offsets");
+    data_bytes_ = static_cast<size_t>(offsets_[last]);
+    if (data_bytes_ != 0 && !data_)
+      throw std::runtime_error("Arrow binary column has no data buffer");
   }
 
   std::span<const std::byte> row(int64_t row_index) const {
@@ -143,6 +142,8 @@ public:
     const int32_t end = offsets_[index + 1];
     if (begin < 0 || end < begin || static_cast<size_t>(end) > data_bytes_)
       throw std::runtime_error("Arrow binary offsets are invalid");
+    if (end == begin)
+      return {};
     return {data_ + begin, static_cast<size_t>(end - begin)};
   }
 };
@@ -184,18 +185,7 @@ public:
   }
 
   BinaryColumnView binary(size_t index) const {
-    const auto *field_array = field(index);
-    if (field_array->n_buffers < 3 || !field_array->buffers[1] ||
-        !field_array->buffers[2])
-      throw std::runtime_error("invalid Arrow binary column");
-    const auto *offsets = static_cast<const int32_t *>(field_array->buffers[1]);
-    const int64_t offset = field_array->offset;
-    const int64_t length = field_array->length;
-    if (offset < 0 || length < 0 || offsets[offset] < 0 ||
-        offsets[offset + length] < offsets[offset])
-      throw std::runtime_error("invalid Arrow binary offsets");
-    return BinaryColumnView(field_array,
-                            static_cast<size_t>(offsets[offset + length]));
+    return BinaryColumnView(field(index));
   }
 
   int64_t length() const noexcept { return array_->length; }
@@ -210,16 +200,7 @@ public:
       throw std::runtime_error("invalid Arrow array");
   }
 
-  BinaryColumnView binary() const {
-    if (array_->n_buffers < 3 || !array_->buffers[1] || !array_->buffers[2])
-      throw std::runtime_error("invalid Arrow binary column");
-    const auto *offsets = static_cast<const int32_t *>(array_->buffers[1]);
-    const int64_t last = array_->offset + array_->length;
-    if (last < array_->offset || offsets[array_->offset] < 0 ||
-        offsets[last] < offsets[array_->offset])
-      throw std::runtime_error("invalid Arrow binary offsets");
-    return BinaryColumnView(array_, static_cast<size_t>(offsets[last]));
-  }
+  BinaryColumnView binary() const { return BinaryColumnView(array_); }
 
   template <typename T> T value(int64_t row) const {
     if (row < 0 || row >= array_->length || array_->n_buffers < 2 ||
@@ -448,14 +429,6 @@ template <typename T> T fixed_value(const ArrowArray *array, int64_t row) {
   return ArrowArrayView(array).value<T>(row);
 }
 
-void append_binary(std::vector<std::byte> &data, std::vector<uint32_t> &offsets,
-                   std::span<const std::byte> value) {
-  if (data.size() > UINT32_MAX - value.size())
-    throw std::length_error("native Lance restore batch exceeds offset range");
-  data.insert(data.end(), value.begin(), value.end());
-  offsets.push_back(static_cast<uint32_t>(data.size()));
-}
-
 inline size_t find_column_index(const ArrowSchema &schema,
                                 std::string_view name) {
   for (int64_t index = 0; index < schema.n_children; ++index) {
@@ -468,39 +441,6 @@ inline size_t find_column_index(const ArrowSchema &schema,
                            std::string(name));
 }
 
-struct ActiveKeyScanIndices {
-  size_t dim = 0;
-  size_t key = 0;
-  size_t row_state = 0;
-  size_t source_participant_index = 0;
-};
-
-inline ActiveKeyScanIndices
-resolve_active_key_scan_indices(const ArrowSchema &schema) {
-  return {
-      .dim = find_column_index(schema, "dim"),
-      .key = find_column_index(schema, "key"),
-      .row_state = find_column_index(schema, "row_state"),
-      .source_participant_index =
-          find_column_index(schema, "source_participant_index"),
-  };
-}
-
-struct KeyValidationIndices {
-  size_t dim = 0;
-  size_t key = 0;
-  size_t row_state = 0;
-};
-
-inline KeyValidationIndices
-resolve_key_validation_indices(const ArrowSchema &schema) {
-  return {
-      .dim = find_column_index(schema, "dim"),
-      .key = find_column_index(schema, "key"),
-      .row_state = find_column_index(schema, "row_state"),
-  };
-}
-
 struct EntryScanIndices {
   size_t dim = 0;
   size_t key = 0;
@@ -511,24 +451,35 @@ struct EntryScanIndices {
   size_t optimizer_state_stride = 0;
   size_t step = 0;
   size_t score = 0;
+  size_t sequence = 0;
+  size_t mutation_sequence = 0;
   size_t row_state = 0;
   size_t source_participant_index = 0;
 };
 
-inline EntryScanIndices resolve_entry_scan_indices(const ArrowSchema &schema) {
+inline EntryScanIndices resolve_entry_scan_indices(const ArrowSchema &schema,
+                                                   bool load_optimizer_state) {
   return {
       .dim = find_column_index(schema, "dim"),
       .key = find_column_index(schema, "key"),
       .embedding_values = find_column_index(schema, "embedding_values"),
       .embedding_dtype = find_column_index(schema, "embedding_dtype"),
       .optimizer_state_values =
-          find_column_index(schema, "optimizer_state_values"),
+          load_optimizer_state
+              ? find_column_index(schema, "optimizer_state_values")
+              : 0,
       .optimizer_state_dtype =
-          find_column_index(schema, "optimizer_state_dtype"),
+          load_optimizer_state
+              ? find_column_index(schema, "optimizer_state_dtype")
+              : 0,
       .optimizer_state_stride =
-          find_column_index(schema, "optimizer_state_stride"),
-      .step = find_column_index(schema, "step"),
+          load_optimizer_state
+              ? find_column_index(schema, "optimizer_state_stride")
+              : 0,
+      .step = load_optimizer_state ? find_column_index(schema, "step") : 0,
       .score = find_column_index(schema, "score"),
+      .sequence = find_column_index(schema, "sequence"),
+      .mutation_sequence = find_column_index(schema, "mutation_sequence"),
       .row_state = find_column_index(schema, "row_state"),
       .source_participant_index =
           find_column_index(schema, "source_participant_index"),
@@ -584,11 +535,7 @@ resolve_page_image_scan_indices(const ArrowSchema &schema) {
 }
 
 size_t dtype_itemsize(std::string_view dtype) {
-  if (dtype == "float32")
-    return sizeof(float);
-  if (dtype == "float16" || dtype == "bfloat16")
-    return sizeof(uint16_t);
-  throw std::invalid_argument("unsupported native Lance payload dtype");
+  return value_dtype_itemsize(checkpoint::canonical_payload_dtype(dtype));
 }
 
 std::vector<char> make_arrow_metadata(
@@ -681,6 +628,18 @@ void require_schema_key_dtype(const ArrowSchema &schema,
   if (actual.empty() || actual != expected)
     throw std::invalid_argument(
         "native Lance schema key dtype does not match restore request");
+  // Entry schemas expose a scalar key column; page schemas encode keys in
+  // their page payload instead. Check the physical entry format before any
+  // typed span can trust metadata for its width and signedness.
+  for (int64_t column = 0; column < schema.n_children; ++column) {
+    const auto *field = arrow_schema_field(schema, column);
+    if (field && field->name && std::string_view(field->name) == "key" &&
+        (!field->format ||
+         std::string_view(field->format) !=
+             lance_layout::arrow_format_for_key_dtype(expected)))
+      throw std::invalid_argument(
+          "native Lance schema key dtype does not match restore request");
+  }
 }
 
 template <typename KeyT>
@@ -1864,7 +1823,8 @@ template <typename Callback>
 void scan_dataset(
     std::string_view uri, uint64_t version, Callback &&callback,
     const LanceStorageOptions &storage_options = LanceStorageOptions{},
-    const char *const *columns = nullptr) {
+    const char *const *columns = nullptr,
+    int64_t batch_rows = CheckpointStreamPolicy::kScanBatchRows) {
   const char *const *options = storage_options.lance_options();
   std::unique_ptr<LanceDataset, DatasetDeleter> dataset(
       lance_dataset_open(std::string(uri).c_str(), options, version));
@@ -1874,8 +1834,7 @@ void scan_dataset(
       lance_scanner_new(dataset.get(), columns, nullptr));
   if (!scanner)
     throw std::runtime_error("native Lance restore scanner creation failed");
-  lance_scanner_set_batch_size(scanner.get(),
-                               CheckpointStreamPolicy::kScanBatchRows);
+  lance_scanner_set_batch_size(scanner.get(), batch_rows);
   ArrowStreamGuard stream;
   if (lance_scanner_to_arrow_stream(scanner.get(), stream.get()) != 0)
     check_lance(-1, "native Lance restore scanner");
@@ -1885,393 +1844,58 @@ void scan_dataset(
   callback(*schema.get(), *stream.get());
 }
 
-struct ActiveKeyIdentity {
-  uint32_t dimension;
-  uint64_t key;
-
-  friend bool operator<(const ActiveKeyIdentity &left,
-                        const ActiveKeyIdentity &right) noexcept {
-    return std::tie(left.dimension, left.key) <
-           std::tie(right.dimension, right.key);
-  }
-
-  friend bool operator==(const ActiveKeyIdentity &left,
-                         const ActiveKeyIdentity &right) noexcept {
-    return left.dimension == right.dimension && left.key == right.key;
-  }
-};
-
-void write_active_key(std::ostream &output, const ActiveKeyIdentity &record) {
-  output.write(reinterpret_cast<const char *>(&record.dimension),
-               sizeof(record.dimension));
-  output.write(reinterpret_cast<const char *>(&record.key), sizeof(record.key));
-  if (!output)
-    throw std::runtime_error(
-        "native Lance duplicate validation temporary run write failed");
-}
-
-bool read_active_key(std::istream &input, ActiveKeyIdentity &record) {
-  input.read(reinterpret_cast<char *>(&record.dimension),
-             sizeof(record.dimension));
-  if (input.gcount() == 0 && input.eof())
-    return false;
-  if (input.gcount() != static_cast<std::streamsize>(sizeof(record.dimension)))
-    throw std::runtime_error(
-        "native Lance duplicate validation temporary run is truncated");
-  input.read(reinterpret_cast<char *>(&record.key), sizeof(record.key));
-  if (input.gcount() != static_cast<std::streamsize>(sizeof(record.key)))
-    throw std::runtime_error(
-        "native Lance duplicate validation temporary run is truncated");
-  return true;
-}
-
-class TemporaryRunDirectory {
-  std::filesystem::path path_;
-
-  static std::filesystem::path create_path() {
-    static std::atomic<uint64_t> sequence{0};
-    const auto base = std::filesystem::temp_directory_path();
-    std::random_device entropy;
-    for (;;) {
-      const auto now = std::chrono::steady_clock::now().time_since_epoch();
-      const auto timestamp = static_cast<uint64_t>(
-          std::chrono::duration_cast<std::chrono::nanoseconds>(now).count());
-      const uint64_t token = (static_cast<uint64_t>(entropy()) << 32) ^
-                             static_cast<uint64_t>(entropy());
-      const auto candidate =
-          base /
-          ("sparse_embedding_duplicate_validation-" +
-           std::to_string(timestamp) + "-" +
-           std::to_string(sequence.fetch_add(1, std::memory_order_relaxed)) +
-           "-" + std::to_string(token));
-      std::error_code error;
-      if (std::filesystem::create_directory(candidate, error)) {
-        std::filesystem::permissions(candidate,
-                                     std::filesystem::perms::owner_read |
-                                         std::filesystem::perms::owner_write |
-                                         std::filesystem::perms::owner_exec,
-                                     std::filesystem::perm_options::replace,
-                                     error);
-        if (error) {
-          std::error_code cleanup_error;
-          std::filesystem::remove(candidate, cleanup_error);
-          throw std::filesystem::filesystem_error(
-              "native Lance duplicate validation temporary permissions",
-              candidate, error);
-        }
-        return candidate;
-      }
-      if (error)
-        throw std::filesystem::filesystem_error(
-            "native Lance duplicate validation temporary directory", candidate,
-            error);
-    }
-  }
-
-public:
-  TemporaryRunDirectory() : path_(create_path()) {}
-  ~TemporaryRunDirectory() {
-    if (path_.empty())
-      return;
-    std::error_code ignored;
-    std::filesystem::remove_all(path_, ignored);
-  }
-
-  TemporaryRunDirectory(const TemporaryRunDirectory &) = delete;
-  TemporaryRunDirectory &operator=(const TemporaryRunDirectory &) = delete;
-
-  const std::filesystem::path &path() const noexcept { return path_; }
-
-  void cleanup() {
-    if (path_.empty())
-      return;
-    std::error_code error;
-    std::filesystem::remove_all(path_, error);
-    if (error)
-      throw std::filesystem::filesystem_error(
-          "native Lance duplicate validation temporary cleanup", path_, error);
-    path_.clear();
-  }
-};
-
-class ExternalActiveKeyValidator {
-  struct MergeNode {
-    ActiveKeyIdentity record;
-    size_t input_index;
-  };
-
-  struct MergeNodeGreater {
-    bool operator()(const MergeNode &left,
-                    const MergeNode &right) const noexcept {
-      return right.record < left.record;
-    }
-  };
-
-  TemporaryRunDirectory directory_;
-  std::vector<ActiveKeyIdentity> buffer_;
-  std::vector<std::filesystem::path> runs_;
-  uint64_t next_run_id_ = 0;
-  bool finished_ = false;
-
-  std::filesystem::path next_run_path() {
-    return directory_.path() /
-           ("run-" + std::to_string(next_run_id_++) + ".bin");
-  }
-
-  void write_sorted_run() {
-    if (buffer_.empty())
-      return;
-    std::ranges::sort(buffer_, [](const auto &left, const auto &right) {
-      return left < right;
-    });
-    const auto path = next_run_path();
-    std::ofstream output(path, std::ios::binary | std::ios::trunc);
-    if (!output)
-      throw std::runtime_error(
-          "native Lance duplicate validation temporary run open failed");
-    std::optional<ActiveKeyIdentity> previous;
-    for (const auto &record : buffer_) {
-      if (previous.has_value() && *previous == record)
-        throw std::invalid_argument(
-            "native Lance restore rejected duplicate active key");
-      write_active_key(output, record);
-      previous = record;
-    }
-    output.flush();
-    if (!output)
-      throw std::runtime_error(
-          "native Lance duplicate validation temporary run flush failed");
-    output.close();
-    if (!output)
-      throw std::runtime_error(
-          "native Lance duplicate validation temporary run close failed");
-    runs_.push_back(path);
-    buffer_.clear();
-  }
-
-  std::filesystem::path
-  merge_runs(std::span<const std::filesystem::path> input_paths) {
-    if (input_paths.empty())
-      throw std::invalid_argument(
-          "native Lance duplicate validation cannot merge no runs");
-    std::vector<std::ifstream> inputs;
-    inputs.reserve(input_paths.size());
-    std::priority_queue<MergeNode, std::vector<MergeNode>, MergeNodeGreater>
-        queue;
-    for (size_t index = 0; index < input_paths.size(); ++index) {
-      inputs.emplace_back(input_paths[index], std::ios::binary);
-      if (!inputs.back())
-        throw std::runtime_error(
-            "native Lance duplicate validation temporary run open failed");
-      ActiveKeyIdentity record{};
-      if (read_active_key(inputs.back(), record))
-        queue.push({record, index});
-    }
-
-    const auto output_path = next_run_path();
-    std::ofstream output(output_path, std::ios::binary | std::ios::trunc);
-    if (!output)
-      throw std::runtime_error(
-          "native Lance duplicate validation temporary merge open failed");
-    std::optional<ActiveKeyIdentity> previous;
-    while (!queue.empty()) {
-      const MergeNode node = queue.top();
-      queue.pop();
-      if (previous.has_value() && *previous == node.record)
-        throw std::invalid_argument(
-            "native Lance restore rejected duplicate active key");
-      write_active_key(output, node.record);
-      previous = node.record;
-
-      ActiveKeyIdentity next{};
-      if (read_active_key(inputs[node.input_index], next))
-        queue.push({next, node.input_index});
-    }
-    output.flush();
-    if (!output)
-      throw std::runtime_error(
-          "native Lance duplicate validation temporary merge flush failed");
-    output.close();
-    if (!output)
-      throw std::runtime_error(
-          "native Lance duplicate validation temporary merge close failed");
-    inputs.clear();
-    for (const auto &path : input_paths) {
-      std::error_code error;
-      if (!std::filesystem::remove(path, error) || error)
-        throw std::filesystem::filesystem_error(
-            "native Lance duplicate validation temporary run removal", path,
-            error);
-    }
-    return output_path;
-  }
-
-  void collapse_runs() {
-    if (runs_.size() < CheckpointStreamPolicy::kDuplicateValidationMergeFanIn)
-      return;
-    const auto merged = merge_runs(runs_);
-    runs_.clear();
-    runs_.push_back(merged);
-  }
-
-public:
-  ExternalActiveKeyValidator() {
-    static_assert(CheckpointStreamPolicy::kDuplicateValidationRunRecords > 0);
-    static_assert(CheckpointStreamPolicy::kDuplicateValidationMergeFanIn > 1);
-    buffer_.reserve(CheckpointStreamPolicy::kDuplicateValidationRunRecords);
-  }
-
-  ~ExternalActiveKeyValidator() = default;
-  ExternalActiveKeyValidator(const ExternalActiveKeyValidator &) = delete;
-  ExternalActiveKeyValidator &
-  operator=(const ExternalActiveKeyValidator &) = delete;
-
-  void append(ActiveKeyIdentity record) {
-    if (finished_)
-      throw std::logic_error(
-          "native Lance duplicate validation received a record after finish");
-    buffer_.push_back(record);
-    if (buffer_.size() ==
-        CheckpointStreamPolicy::kDuplicateValidationRunRecords) {
-      write_sorted_run();
-      collapse_runs();
-    }
-  }
-
-  void finish() {
-    if (finished_)
-      throw std::logic_error(
-          "native Lance duplicate validation finished more than once");
-    write_sorted_run();
-    if (runs_.size() > 1) {
-      const auto merged = merge_runs(runs_);
-      runs_.clear();
-      runs_.push_back(merged);
-    }
-    directory_.cleanup();
-    finished_ = true;
-  }
-};
-
 } // namespace
 
-void scan_native_active_entry_keys(std::string_view uri, uint64_t version,
-                                   NativeKeyBatchVisitor visitor,
-                                   std::optional<uint32_t> participant_index,
-                                   const LanceStorageOptions &storage_options) {
-  if (!visitor)
-    throw std::invalid_argument("native Lance key visitor is empty");
-  scan_dataset(
-      uri, version,
-      [&](const ArrowSchema &schema, ArrowArrayStream &stream) {
-        const auto col = resolve_active_key_scan_indices(schema);
-        for (;;) {
-          ArrowArrayGuard batch;
-          if (stream.get_next(&stream, batch.get()) != 0)
-            throw std::runtime_error(
-                "native Lance restore key batch read failed");
-          if (!batch->release)
-            break;
-          std::vector<uint64_t> keys;
-          keys.reserve(static_cast<size_t>(batch->length));
-          for (int64_t row = 0; row < batch->length; ++row) {
-            if (binary_string(arrow_array_field(*batch, col.row_state), row) !=
-                kActiveRowState)
-              continue;
-            if (participant_index.has_value()) {
-              const uint32_t src_idx = fixed_value<uint32_t>(
-                  arrow_array_field(*batch, col.source_participant_index), row);
-              if (src_idx != *participant_index)
-                continue;
-            }
-            keys.push_back(
-                read_polymorphic_key(arrow_array_field(*batch, col.key),
-                                     arrow_schema_field(schema, col.key), row));
-          }
-          if (!keys.empty() && !visitor(keys))
-            break;
-        }
-      },
-      storage_options);
-}
-
-void validate_native_active_entry_keys(
-    std::span<const std::string> uris, uint64_t version,
-    const LanceStorageOptions &storage_options) {
-  if (uris.empty())
-    throw std::invalid_argument("native Lance key validation requires sources");
-  ExternalActiveKeyValidator validator;
-  const char *const columns[] = {"dim", "key", "row_state", nullptr};
-  for (const auto &uri : uris) {
-    scan_dataset(
-        uri, version,
-        [&](const ArrowSchema &schema, ArrowArrayStream &stream) {
-          const auto col = resolve_key_validation_indices(schema);
-          for (;;) {
-            ArrowArrayGuard batch;
-            if (stream.get_next(&stream, batch.get()) != 0)
-              throw std::runtime_error(
-                  "native Lance key validation batch read failed");
-            if (!batch->release)
-              break;
-            try {
-              for (int64_t row = 0; row < batch->length; ++row) {
-                if (binary_string(arrow_array_field(*batch, col.row_state),
-                                  row) != kActiveRowState)
-                  continue;
-                validator.append(
-                    {fixed_value<uint32_t>(arrow_array_field(*batch, col.dim),
-                                           row),
-                     read_polymorphic_key(arrow_array_field(*batch, col.key),
-                                          arrow_schema_field(schema, col.key),
-                                          row)});
-              }
-            } catch (...) {
-              throw;
-            }
-          }
-        },
-        storage_options, columns);
-  }
-  validator.finish();
-}
-
-void validate_native_checkpoint_chain(
+bool validate_native_checkpoint_chain(
     std::span<const std::vector<std::string>> source_uris,
     std::span<const std::vector<uint64_t>> participant_watermarks,
     std::span<const uint32_t> dimensions, std::string_view key_dtype,
-    const LanceStorageOptions &storage_options) {
+    const LanceStorageOptions &storage_options,
+    pro::proxy<se::ops::PartitionerFacade> target_partitioner,
+    uint32_t target_partition_count) {
   if (source_uris.empty() ||
       source_uris.size() != participant_watermarks.size() ||
       source_uris.front().empty())
     throw std::invalid_argument(
         "checkpoint chain participant cuts are invalid");
   const size_t participant_count = source_uris.front().size();
+  if (target_partitioner.has_value() != (target_partition_count != 0))
+    throw std::invalid_argument("checkpoint target assignment is incomplete");
+  const auto key_type = parse_key_dtype(key_dtype);
+  bool preserves_source_ownership = target_partitioner.has_value() &&
+                                    target_partition_count == participant_count;
+  std::array<uint32_t, CheckpointStreamPolicy::kScanBatchRows>
+      target_partitions;
   std::vector<uint64_t> previous_watermarks(participant_count, 0);
-  ankerl::unordered_dense::map<std::pair<uint32_t, uint64_t>, uint32_t>
-      ownership;
+  checkpoint::ExternalSortedRecords<checkpoint::CheckpointEntryRecord>
+      identities;
+  checkpoint::ExternalSortedRecords<checkpoint::MutationSequenceIdentity>
+      sequences;
   const char *const columns[] = {"dim",
                                  "key",
                                  "row_state",
                                  "mutation_sequence",
                                  "source_participant_index",
                                  nullptr};
-  for (size_t checkpoint = 0; checkpoint < source_uris.size(); ++checkpoint) {
-    if (source_uris[checkpoint].size() != participant_count ||
-        participant_watermarks[checkpoint].size() != participant_count)
+  for (size_t checkpoint_index = 0; checkpoint_index < source_uris.size();
+       ++checkpoint_index) {
+    if (source_uris[checkpoint_index].size() != participant_count ||
+        participant_watermarks[checkpoint_index].size() != participant_count)
       throw std::runtime_error("checkpoint chain participant topology changed");
-    ankerl::unordered_dense::set<std::pair<uint32_t, uint64_t>> identities;
-    ankerl::unordered_dense::set<std::pair<uint32_t, uint64_t>> sequences;
     for (uint32_t participant = 0; participant < participant_count;
          ++participant) {
       const uint64_t watermark =
-          participant_watermarks[checkpoint][participant];
+          participant_watermarks[checkpoint_index][participant];
       if (watermark < previous_watermarks[participant])
         throw std::runtime_error(
             "checkpoint participant watermark is retrograde");
-      const auto &uri = source_uris[checkpoint][participant];
+      const auto &uri = source_uris[checkpoint_index][participant];
       if (uri.empty())
         continue;
+      const uint64_t source = checkpoint::checked_sum(
+          checkpoint::checked_byte_count(checkpoint_index, participant_count),
+          participant);
+      uint64_t source_row = 0;
       scan_dataset(
           uri, 0,
           [&](const ArrowSchema &schema, ArrowArrayStream &stream) {
@@ -2284,150 +1908,231 @@ void validate_native_checkpoint_chain(
             const auto participant_col =
                 find_column_index(schema, "source_participant_index");
             for (;;) {
-              ArrowArray array{};
+              ArrowArrayGuard batch;
+              auto &array = *batch;
               if (stream.get_next(&stream, &array) != 0)
                 throw std::runtime_error(
                     "checkpoint chain validation scan failed");
               if (!array.release)
                 break;
-              try {
-                for (int64_t row = 0; row < array.length; ++row) {
-                  const uint32_t dim = fixed_value<uint32_t>(
-                      arrow_array_field(array, dim_col), row);
-                  const uint64_t key = read_polymorphic_key(
-                      arrow_array_field(array, key_col),
-                      arrow_schema_field(schema, key_col), row);
-                  const auto identity = std::pair{dim, key};
-                  const uint64_t sequence = fixed_value<uint64_t>(
-                      arrow_array_field(array, mutation_col), row);
-                  const auto state =
-                      binary_string(arrow_array_field(array, state_col), row);
-                  if (std::find(dimensions.begin(), dimensions.end(), dim) ==
-                          dimensions.end() ||
-                      fixed_value<uint32_t>(
-                          arrow_array_field(array, participant_col), row) !=
-                          participant)
-                    throw std::runtime_error("checkpoint entry dimension or "
-                                             "participant identity mismatch");
-                  if (!identities.insert(identity).second)
-                    throw std::invalid_argument("duplicate active checkpoint "
-                                                "key or tombstone identity");
-                  auto [owner, inserted] =
-                      ownership.try_emplace(identity, participant);
-                  if (owner->second != participant)
-                    throw std::runtime_error("checkpoint key ownership changed "
-                                             "across incremental chain");
-                  if (state != "active" && state != "deleted")
-                    throw std::runtime_error("checkpoint row state is invalid");
-                  if (checkpoint == 0) {
-                    if (sequence != 0 || state != "active")
-                      throw std::runtime_error(
-                          "FULL checkpoint entry is invalid");
-                  } else if (!(previous_watermarks[participant] < sequence &&
-                               sequence <= watermark)) {
-                    throw std::runtime_error("checkpoint mutation sequence is "
-                                             "outside its participant cut");
-                  }
-                  if (sequence != 0 &&
-                      !sequences.emplace(participant, sequence).second)
-                    throw std::runtime_error("checkpoint participant mutation "
-                                             "sequence is duplicated");
-                }
-              } catch (...) {
-                array.release(&array);
-                throw;
+              CheckpointStreamPolicy::validate_scan_batch_rows(array.length);
+              if (preserves_source_ownership) {
+                dispatch_key_type(key_type, [&]<typename KeyT>() {
+                  target_partitioner->partition_span(
+                      ArrowArrayView(arrow_array_field(array, key_col))
+                          .values<KeyT>(),
+                      std::span<uint32_t>(target_partitions.data(),
+                                          array.length));
+                });
               }
-              array.release(&array);
+              for (int64_t row = 0; row < array.length; ++row) {
+                const uint32_t dim = fixed_value<uint32_t>(
+                    arrow_array_field(array, dim_col), row);
+                const uint64_t key = read_polymorphic_key(
+                    arrow_array_field(array, key_col),
+                    arrow_schema_field(schema, key_col), row);
+                const uint64_t sequence = fixed_value<uint64_t>(
+                    arrow_array_field(array, mutation_col), row);
+                const auto state =
+                    binary_string(arrow_array_field(array, state_col), row);
+                if (std::find(dimensions.begin(), dimensions.end(), dim) ==
+                        dimensions.end() ||
+                    fixed_value<uint32_t>(
+                        arrow_array_field(array, participant_col), row) !=
+                        participant)
+                  throw std::runtime_error("checkpoint entry dimension or "
+                                           "participant identity mismatch");
+                // Include tombstones: historical identities cannot change
+                // participant even when their latest state is deleted.
+                if (preserves_source_ownership &&
+                    target_partitions[row] != participant)
+                  preserves_source_ownership = false;
+                if (state != "active" && state != "deleted")
+                  throw std::runtime_error("checkpoint row state is invalid");
+                if (checkpoint_index == 0) {
+                  if (sequence != 0 || state != "active")
+                    throw std::runtime_error(
+                        "FULL checkpoint entry is invalid");
+                } else if (!(previous_watermarks[participant] < sequence &&
+                             sequence <= watermark)) {
+                  throw std::runtime_error("checkpoint mutation sequence is "
+                                           "outside its participant cut");
+                }
+                identities.append(
+                    {key, checkpoint_index, source, source_row, sequence,
+                     checkpoint::CheckpointEntryRecord::kNoPayload,
+                     uint64_t(state == "deleted"), dim, participant});
+                if (sequence != 0)
+                  sequences.append({checkpoint_index, participant, sequence});
+                source_row = checkpoint::checked_sum(source_row, 1);
+              }
             }
           },
           storage_options, columns);
     }
-    previous_watermarks = participant_watermarks[checkpoint];
+    previous_watermarks = participant_watermarks[checkpoint_index];
   }
+  checkpoint::reduce_checkpoint_entries(
+      identities, [](const checkpoint::CheckpointEntryRecord &) {});
+  checkpoint::validate_unique_records(
+      sequences, "checkpoint participant mutation sequence is duplicated");
+  return preserves_source_ownership;
 }
 
-struct CheckpointWinner {
-  size_t source;
-  uint64_t sequence;
-  bool deleted;
-};
-using CheckpointWinners =
-    ankerl::unordered_dense::map<std::pair<uint32_t, uint64_t>,
-                                 CheckpointWinner>;
+namespace {
 
-CheckpointWinners select_checkpoint_winners(
-    std::span<const std::string> source_uris, uint64_t version,
-    std::optional<uint32_t> participant_index, std::string_view key_dtype,
-    const LanceStorageOptions &storage_options) {
-  CheckpointWinners winners;
-  const char *const columns[] = {"dim",
-                                 "key",
-                                 "row_state",
-                                 "mutation_sequence",
-                                 "source_participant_index",
-                                 nullptr};
-  for (size_t source = 0; source < source_uris.size(); ++source) {
+struct EntryPartitionTarget {
+  pro::proxy<ops::PartitionerFacade> &partitioner;
+  uint32_t partition_id;
+};
+
+std::string_view binary_text(std::span<const std::byte> bytes) {
+  return bytes.empty()
+             ? std::string_view{}
+             : std::string_view(reinterpret_cast<const char *>(bytes.data()),
+                                bytes.size());
+}
+
+checkpoint::NativeEntryScanStatistics read_checkpoint_winner_payloads(
+    std::span<const std::string> uris, uint64_t version,
+    const EntryPartitionTarget *target, std::string_view key_dtype,
+    NativeEntryBatchVisitor visitor, bool load_optimizer_state,
+    const LanceStorageOptions &storage_options,
+    std::optional<uint32_t> source_participant_index) {
+  if (!visitor)
+    throw std::invalid_argument("native Lance entry visitor is empty");
+  const auto key_type = parse_key_dtype(key_dtype);
+  checkpoint::NativeEntryScanStatistics statistics;
+  checkpoint::EntryPayloadSpool payloads(load_optimizer_state);
+  checkpoint::ExternalSortedRecords<checkpoint::CheckpointEntryRecord>
+      identities;
+  checkpoint::ExternalSortedRecords<uint64_t> selected_offsets;
+  std::array<bool, CheckpointStreamPolicy::kScanBatchRows> mask;
+  std::array<const char *, lance_layout::kEntryColumns.size() + 1> columns{};
+  size_t column_count = 0;
+  for (const auto &column : lance_layout::kEntryColumns) {
+    const std::string_view name(column.name);
+    if (name == "physical_page_id" || name == "page_slot" ||
+        (!load_optimizer_state &&
+         (name.starts_with("optimizer_state_") || name == "step")))
+      continue;
+    columns[column_count++] = column.name;
+  }
+  for (size_t source = 0; source < uris.size(); ++source) {
+    uint64_t source_row = 0;
     scan_dataset(
-        source_uris[source], version,
+        uris[source], version,
         [&](const ArrowSchema &schema, ArrowArrayStream &stream) {
           require_schema_key_dtype(schema, key_dtype);
-          const size_t dim_col = find_column_index(schema, "dim");
-          const size_t key_col = find_column_index(schema, "key");
-          const size_t state_col = find_column_index(schema, "row_state");
-          const size_t participant_col =
-              find_column_index(schema, "source_participant_index");
-          const size_t mutation =
-              find_column_index(schema, "mutation_sequence");
-          for (;;) {
-            ArrowArray array{};
-            if (stream.get_next(&stream, &array) != 0)
-              throw std::runtime_error(
-                  "checkpoint compact identity scan failed");
-            if (!array.release)
-              break;
-            try {
-              for (int64_t row = 0; row < array.length; ++row) {
-                if (participant_index &&
-                    fixed_value<uint32_t>(
-                        arrow_array_field(array, participant_col), row) !=
-                        *participant_index)
-                  throw std::runtime_error(
-                      "checkpoint compact participant mismatch");
-                const auto identity = std::pair{
-                    fixed_value<uint32_t>(arrow_array_field(array, dim_col),
-                                          row),
-                    read_polymorphic_key(arrow_array_field(array, key_col),
-                                         arrow_schema_field(schema, key_col),
-                                         row)};
-                const uint64_t sequence = fixed_value<uint64_t>(
-                    arrow_array_field(array, mutation), row);
-                const auto state =
-                    binary_string(arrow_array_field(array, state_col), row);
-                if (state != "active" && state != "deleted")
-                  throw std::runtime_error(
-                      "checkpoint compact row state is invalid");
-                const auto previous = winners.find(identity);
-                if (previous != winners.end() &&
-                    (previous->second.source == source ||
-                     sequence <= previous->second.sequence))
-                  throw std::runtime_error(
-                      "checkpoint compact mutation sequence is duplicate or "
-                      "retrograde");
-                winners.insert_or_assign(
-                    identity,
-                    CheckpointWinner{source, sequence, state == "deleted"});
+          const auto col =
+              resolve_entry_scan_indices(schema, load_optimizer_state);
+          dispatch_key_type(key_type, [&]<typename KeyT>() {
+            for (;;) {
+              ArrowArrayGuard batch;
+              if (stream.get_next(&stream, batch.get()) != 0)
+                throw std::runtime_error(
+                    "checkpoint source payload scan failed");
+              if (!batch->release)
+                break;
+              CheckpointStreamPolicy::validate_scan_batch_rows(batch->length);
+              if (batch->length == 0)
+                continue;
+              ArrowRecordBatchView view(batch.get(), &schema);
+              const auto keys = view.fixed<KeyT>(col.key);
+              const auto dimensions = view.fixed<uint32_t>(col.dim);
+              const auto participants =
+                  view.fixed<uint32_t>(col.source_participant_index);
+              const auto mutations =
+                  view.fixed<uint64_t>(col.mutation_sequence);
+              const auto states = view.binary(col.row_state);
+              const auto values = view.binary(col.embedding_values);
+              const auto value_dtypes = view.binary(col.embedding_dtype);
+              const auto sequences = view.fixed<uint64_t>(col.sequence);
+              const auto scores = view.fixed<uint64_t>(col.score);
+              std::optional<BinaryColumnView> optimizer_values,
+                  optimizer_dtypes;
+              std::span<const uint32_t> optimizer_strides, steps;
+              if (load_optimizer_state) {
+                optimizer_values = view.binary(col.optimizer_state_values);
+                optimizer_dtypes = view.binary(col.optimizer_state_dtype);
+                optimizer_strides =
+                    view.fixed<uint32_t>(col.optimizer_state_stride);
+                steps = view.fixed<uint32_t>(col.step);
               }
-            } catch (...) {
-              array.release(&array);
-              throw;
+              if (target)
+                target->partitioner->filter_span(
+                    keys, target->partition_id,
+                    std::span<bool>(mask.data(), batch->length));
+              for (int64_t row = 0; row < batch->length; ++row) {
+                if (source_participant_index &&
+                    participants[row] != *source_participant_index)
+                  throw std::runtime_error(
+                      "checkpoint source participant mismatch");
+                const auto state = binary_text(states.row(row));
+                if (state != "active" && state != "deleted")
+                  throw std::runtime_error("checkpoint row state is invalid");
+                uint64_t payload_offset =
+                    checkpoint::CheckpointEntryRecord::kNoPayload;
+                if (state == "active" && (!target || mask[row])) {
+                  const auto embedding = values.row(row);
+                  const auto optimizer = load_optimizer_state
+                                             ? optimizer_values->row(row)
+                                             : std::span<const std::byte>{};
+                  if (!std::in_range<uint32_t>(embedding.size()) ||
+                      !std::in_range<uint32_t>(optimizer.size()))
+                    throw std::overflow_error(
+                        "checkpoint row payload size overflows");
+                  const checkpoint::EntryPayloadHeader header{
+                      static_cast<uint64_t>(keys[row]),
+                      scores[row],
+                      sequences[row],
+                      dimensions[row],
+                      load_optimizer_state ? optimizer_strides[row] : 0,
+                      load_optimizer_state ? steps[row] : 0,
+                      static_cast<uint32_t>(embedding.size()),
+                      static_cast<uint32_t>(optimizer.size()),
+                      checkpoint::payload_dtype_code(
+                          binary_text(value_dtypes.row(row))),
+                      load_optimizer_state
+                          ? checkpoint::payload_dtype_code(
+                                binary_text(optimizer_dtypes->row(row)))
+                          : checkpoint::kNoPayloadDtype};
+                  payload_offset =
+                      payloads.append(header, embedding, optimizer);
+                }
+                // Every historical row reaches reconciliation, even when its
+                // payload is not requested or its latest state is a tombstone.
+                identities.append({static_cast<uint64_t>(keys[row]), source,
+                                   source, source_row, mutations[row],
+                                   payload_offset, uint64_t(state == "deleted"),
+                                   dimensions[row], participants[row]});
+                source_row = checkpoint::checked_sum(source_row, 1);
+              }
             }
-            array.release(&array);
-          }
+          });
         },
-        storage_options, columns);
+        storage_options, columns.data());
+    statistics.sources_scanned =
+        checkpoint::checked_sum(statistics.sources_scanned, 1);
+    statistics.rows_scanned =
+        checkpoint::checked_sum(statistics.rows_scanned, source_row);
   }
-  return winners;
+  payloads.seal();
+  checkpoint::reduce_checkpoint_entries(
+      identities, [&](const checkpoint::CheckpointEntryRecord &winner) {
+        if (!winner.deleted &&
+            winner.payload_offset !=
+                checkpoint::CheckpointEntryRecord::kNoPayload)
+          selected_offsets.append(winner.payload_offset);
+      });
+  payloads.consume_selected(selected_offsets, std::move(visitor));
+  statistics.identity_sort = identities.statistics();
+  statistics.selection_sort = selected_offsets.statistics();
+  statistics.payload = payloads.statistics();
+  return statistics;
 }
+
+} // namespace
 
 NativeFragmentArtifact compact_native_checkpoint(
     std::string_view target_uri, std::span<const std::string> source_uris,
@@ -2437,20 +2142,24 @@ NativeFragmentArtifact compact_native_checkpoint(
     std::string_view schema_digest, bool include_page_images,
     uint32_t entries_per_page, std::string_view page_dataset_uri,
     const LanceStorageOptions &storage_options) {
-  const auto winners = select_checkpoint_winners(
-      source_uris, 0, participant_index, key_dtype, storage_options);
   const bool has_score = score_policy != "none";
   NativeFragmentWriter writer;
-  writer.begin_fragment(
-      target_uri, participant_index, dimensions, embedding_dtype,
-      optimizer_dtype, score_policy, key_dtype, schema_digest, has_score,
-      include_page_images, entries_per_page, page_dataset_uri);
-  std::unordered_map<uint32_t, uint64_t> next_page;
+  bool writer_started = false;
+  auto start_writer = [&] {
+    if (writer_started)
+      return;
+    writer.begin_fragment(
+        target_uri, participant_index, dimensions, embedding_dtype,
+        optimizer_dtype, score_policy, key_dtype, schema_digest, has_score,
+        include_page_images, entries_per_page, page_dataset_uri);
+    writer_started = true;
+  };
   struct PageBatch {
     std::vector<uint64_t> keys, sequences, scores;
     std::vector<uint32_t> slots, steps;
     std::vector<std::byte> values, optimizer;
     std::optional<uint32_t> optimizer_stride;
+    uint64_t next_page = 0;
   };
   std::map<uint32_t, PageBatch> pages;
   auto flush_page = [&](uint32_t dim, PageBatch &page) {
@@ -2458,13 +2167,14 @@ NativeFragmentArtifact compact_native_checkpoint(
       return;
     const size_t row_bytes = dim * dtype_itemsize(embedding_dtype);
     writer.write_page_image(
-        dim, next_page[dim]++,
+        dim, page.next_page,
         static_cast<uint32_t>(
             storage::PageGeometry::aligned_slot_stride(row_bytes)),
         row_bytes, page.slots, page.keys, page.sequences, page.values,
         page.scores, page.optimizer, *page.optimizer_stride,
         optimizer_dtype.empty() ? 0 : dtype_itemsize(optimizer_dtype),
         page.steps);
+    page.next_page = checkpoint::checked_sum(page.next_page, 1);
     page.keys.clear();
     page.sequences.clear();
     page.scores.clear();
@@ -2473,247 +2183,72 @@ NativeFragmentArtifact compact_native_checkpoint(
     page.values.clear();
     page.optimizer.clear();
   };
-  for (size_t source = 0; source < source_uris.size(); ++source) {
-    scan_dataset(
-        source_uris[source], 0,
-        [&](const ArrowSchema &schema, ArrowArrayStream &stream) {
-          const auto col = resolve_entry_scan_indices(schema);
-          const auto sequence_col = find_column_index(schema, "sequence");
-          for (;;) {
-            ArrowArray array{};
-            if (stream.get_next(&stream, &array) != 0)
-              throw std::runtime_error(
-                  "checkpoint compact payload scan failed");
-            if (!array.release)
-              break;
-            try {
-              for (int64_t row = 0; row < array.length; ++row) {
-                const uint32_t dim = fixed_value<uint32_t>(
-                    arrow_array_field(array, col.dim), row);
-                const uint64_t key = read_polymorphic_key(
-                    arrow_array_field(array, col.key),
-                    arrow_schema_field(schema, col.key), row);
-                const auto &winner = winners.at({dim, key});
-                if (winner.source != source || winner.deleted)
-                  continue;
-                if (std::find(dimensions.begin(), dimensions.end(), dim) ==
-                    dimensions.end())
-                  throw std::runtime_error(
-                      "checkpoint compact dimension is invalid");
-                const auto values = binary_value(
-                    arrow_array_field(array, col.embedding_values), row);
-                const auto optimizer = binary_value(
-                    arrow_array_field(array, col.optimizer_state_values), row);
-                const uint32_t stride = fixed_value<uint32_t>(
-                    arrow_array_field(array, col.optimizer_state_stride), row);
-                if (values.size() != dim * dtype_itemsize(embedding_dtype) ||
-                    optimizer.size() !=
-                        stride * (optimizer_dtype.empty()
-                                      ? 0
-                                      : dtype_itemsize(optimizer_dtype)))
-                  throw std::runtime_error(
-                      "checkpoint compact payload shape mismatch");
-                auto &page = pages[dim];
-                if (page.optimizer_stride.has_value() &&
-                    *page.optimizer_stride != stride)
-                  throw std::runtime_error(
-                      "checkpoint compact optimizer strides differ");
-                page.optimizer_stride = stride;
-                page.slots.push_back(static_cast<uint32_t>(page.keys.size()));
-                page.keys.push_back(key);
-                page.sequences.push_back(fixed_value<uint64_t>(
-                    arrow_array_field(array, sequence_col), row));
-                page.values.insert(page.values.end(), values.begin(),
-                                   values.end());
-                if (has_score)
-                  page.scores.push_back(fixed_value<uint64_t>(
-                      arrow_array_field(array, col.score), row));
-                page.optimizer.insert(page.optimizer.end(), optimizer.begin(),
-                                      optimizer.end());
-                if (stride)
-                  page.steps.push_back(fixed_value<uint32_t>(
-                      arrow_array_field(array, col.step), row));
-                if (page.keys.size() == entries_per_page)
-                  flush_page(dim, page);
-              }
-            } catch (...) {
-              array.release(&array);
-              throw;
-            }
-            array.release(&array);
-          }
-        },
-        storage_options);
-  }
+  read_checkpoint_winner_payloads(
+      source_uris, 0, nullptr, key_dtype,
+      [&](const NativeEntryBatch &batch) {
+        if (batch.embedding_dtype != embedding_dtype ||
+            batch.optimizer_dtype != optimizer_dtype)
+          throw std::runtime_error("checkpoint compact payload dtype mismatch");
+        for (size_t row = 0; row < batch.keys.size(); ++row) {
+          const uint32_t dim = batch.dimensions[row];
+          if (std::find(dimensions.begin(), dimensions.end(), dim) ==
+              dimensions.end())
+            throw std::runtime_error("checkpoint compact dimension is invalid");
+          auto &page = pages[dim];
+          const uint32_t stride = batch.optimizer_strides[row];
+          if (page.optimizer_stride && *page.optimizer_stride != stride)
+            throw std::runtime_error(
+                "checkpoint compact optimizer strides differ");
+          // This invariant survives every page flush and every source boundary.
+          page.optimizer_stride = stride;
+        }
+        start_writer();
+        for (size_t row = 0; row < batch.keys.size(); ++row) {
+          const uint32_t dim = batch.dimensions[row];
+          auto &page = pages[dim];
+          page.slots.push_back(static_cast<uint32_t>(page.keys.size()));
+          page.keys.push_back(batch.keys[row]);
+          page.sequences.push_back(batch.sequences[row]);
+          const size_t value_begin = batch.embedding_offsets[row];
+          const size_t value_end = batch.embedding_offsets[row + 1];
+          page.values.insert(page.values.end(),
+                             batch.embedding_values.begin() + value_begin,
+                             batch.embedding_values.begin() + value_end);
+          if (has_score)
+            page.scores.push_back(batch.scores[row]);
+          const size_t optimizer_begin = batch.optimizer_offsets[row];
+          const size_t optimizer_end = batch.optimizer_offsets[row + 1];
+          if (optimizer_begin != optimizer_end)
+            page.optimizer.insert(
+                page.optimizer.end(),
+                batch.optimizer_values.begin() + optimizer_begin,
+                batch.optimizer_values.begin() + optimizer_end);
+          if (batch.optimizer_strides[row] != 0)
+            page.steps.push_back(batch.steps[row]);
+          if (page.keys.size() == entries_per_page)
+            flush_page(dim, page);
+        }
+        return true;
+      },
+      true, storage_options, participant_index);
+  start_writer();
   for (auto &[dim, page] : pages)
     flush_page(dim, page);
   return writer.finalize();
 }
 
-void scan_native_partition_entries(
-    std::string_view uri, uint64_t version,
-    pro::proxy<se::ops::PartitionerFacade> &partitioner, uint32_t partition_id,
-    std::string_view key_dtype, NativeEntryBatchVisitor visitor,
-    bool load_optimizer_state, const LanceStorageOptions &storage_options,
-    std::optional<uint32_t> source_participant_index,
-    const std::function<bool(uint32_t, uint64_t)> &select_entry) {
-  if (!partitioner.has_value())
-    throw std::invalid_argument("native Lance partitioner is null");
-  if (!visitor)
-    throw std::invalid_argument("native Lance entry visitor is empty");
-  (void)parse_key_dtype(key_dtype);
-  scan_dataset(
-      uri, version,
-      [&](const ArrowSchema &schema, ArrowArrayStream &stream) {
-        require_schema_key_dtype(schema, key_dtype);
-        const auto col = resolve_entry_scan_indices(schema);
-        for (;;) {
-          ArrowArray batch_array{};
-          if (stream.get_next(&stream, &batch_array) != 0)
-            throw std::runtime_error(
-                "native Lance restore entry batch read failed");
-          if (!batch_array.release)
-            break;
-
-          const int64_t batch_len = batch_array.length;
-          if (batch_len == 0) {
-            batch_array.release(&batch_array);
-            continue;
-          }
-
-          const auto *key_col = arrow_array_field(batch_array, col.key);
-          const auto *key_schema = arrow_schema_field(schema, col.key);
-
-          std::unique_ptr<bool[]> mask(new bool[batch_len]);
-          std::span<bool> mask_span(mask.get(), batch_len);
-
-          const char fmt =
-              (key_schema && key_schema->format) ? key_schema->format[0] : '\0';
-          switch (fmt) {
-          case 'i': {
-            partitioner->filter_span(ArrowArrayView(key_col).values<int32_t>(),
-                                     partition_id, mask_span);
-            break;
-          }
-          case 'I': {
-            partitioner->filter_span(ArrowArrayView(key_col).values<uint32_t>(),
-                                     partition_id, mask_span);
-            break;
-          }
-          case 'l': {
-            partitioner->filter_span(ArrowArrayView(key_col).values<int64_t>(),
-                                     partition_id, mask_span);
-            break;
-          }
-          case 'L': {
-            partitioner->filter_span(ArrowArrayView(key_col).values<uint64_t>(),
-                                     partition_id, mask_span);
-            break;
-          }
-          default:
-            throw std::invalid_argument(
-                "unsupported Arrow format for key column: " +
-                std::string(key_schema && key_schema->format
-                                ? key_schema->format
-                                : "null"));
-          }
-
-          NativeEntryBatch batch;
-          batch.embedding_offsets.push_back(0);
-          batch.optimizer_offsets.push_back(0);
-          for (int64_t row = 0; row < batch_len; ++row) {
-            if (!mask_span[row] ||
-                binary_string(arrow_array_field(batch_array, col.row_state),
-                              row) != kActiveRowState)
-              continue;
-            if (source_participant_index.has_value() &&
-                fixed_value<uint32_t>(
-                    arrow_array_field(batch_array,
-                                      col.source_participant_index),
-                    row) != *source_participant_index)
-              continue;
-            const uint64_t key =
-                read_polymorphic_key(arrow_array_field(batch_array, col.key),
-                                     arrow_schema_field(schema, col.key), row);
-            const uint32_t dimension = fixed_value<uint32_t>(
-                arrow_array_field(batch_array, col.dim), row);
-            if (select_entry && !select_entry(dimension, key))
-              continue;
-            batch.dimensions.push_back(fixed_value<uint32_t>(
-                arrow_array_field(batch_array, col.dim), row));
-            batch.keys.push_back(key);
-            const auto embedding = binary_value(
-                arrow_array_field(batch_array, col.embedding_values), row);
-            append_binary(batch.embedding_values, batch.embedding_offsets,
-                          embedding);
-            batch.embedding_dtype = binary_string(
-                arrow_array_field(batch_array, col.embedding_dtype), row);
-            if (load_optimizer_state) {
-              const auto optimizer = binary_value(
-                  arrow_array_field(batch_array, col.optimizer_state_values),
-                  row);
-              append_binary(batch.optimizer_values, batch.optimizer_offsets,
-                            optimizer);
-            } else {
-              batch.optimizer_offsets.push_back(
-                  static_cast<uint32_t>(batch.optimizer_values.size()));
-            }
-            batch.optimizer_dtype = binary_string(
-                arrow_array_field(batch_array, col.optimizer_state_dtype), row);
-            batch.optimizer_strides.push_back(fixed_value<uint32_t>(
-                arrow_array_field(batch_array, col.optimizer_state_stride),
-                row));
-            batch.steps.push_back(fixed_value<uint32_t>(
-                arrow_array_field(batch_array, col.step), row));
-            batch.scores.push_back(fixed_value<uint64_t>(
-                arrow_array_field(batch_array, col.score), row));
-          }
-          batch_array.release(&batch_array);
-          if (!batch.keys.empty() && !visitor(batch))
-            break;
-        }
-      },
-      storage_options);
-}
-
-void scan_native_partition_entries(
-    std::string_view uri, uint64_t version, uint64_t partition_count,
-    uint64_t partition_id, std::string_view key_dtype,
-    NativeEntryBatchVisitor visitor, bool load_optimizer_state,
-    const LanceStorageOptions &storage_options,
-    std::optional<uint32_t> source_participant_index) {
-  if (partition_count == 0)
-    throw std::invalid_argument(
-        "native Lance partition count must be positive");
-  if (partition_id >= partition_count)
-    throw std::invalid_argument(
-        "native Lance logical partition is outside logical partition count");
-  auto partitioner = se::ops::PartitionerRegistry::instance().create(
-      se::ops::kModuloPartitionerName, static_cast<uint32_t>(partition_count));
-  scan_native_partition_entries(uri, version, partitioner,
-                                static_cast<uint32_t>(partition_id), key_dtype,
-                                std::move(visitor), load_optimizer_state,
-                                storage_options, source_participant_index);
-}
-
-void scan_native_checkpoint_entries(
+checkpoint::NativeEntryScanStatistics scan_native_checkpoint_entries(
     std::span<const std::string> uris, uint64_t version,
     pro::proxy<se::ops::PartitionerFacade> partitioner, uint32_t partition_id,
     std::string_view key_dtype, NativeEntryBatchVisitor visitor,
     bool load_optimizer_state, const LanceStorageOptions &storage_options,
     std::optional<uint32_t> source_participant_index) {
-  const auto winners = select_checkpoint_winners(
-      uris, version, source_participant_index, key_dtype, storage_options);
-  for (size_t source = 0; source < uris.size(); ++source) {
-    scan_native_partition_entries(
-        uris[source], version, partitioner, partition_id, key_dtype, visitor,
-        load_optimizer_state, storage_options, source_participant_index,
-        [&](uint32_t dim, uint64_t key) {
-          const auto winner = winners.find({dim, key});
-          return winner != winners.end() && winner->second.source == source &&
-                 !winner->second.deleted;
-        });
-  }
+  if (!partitioner.has_value())
+    throw std::invalid_argument("native Lance partitioner is null");
+  const EntryPartitionTarget target{partitioner, partition_id};
+  return read_checkpoint_winner_payloads(
+      uris, version, &target, key_dtype, std::move(visitor),
+      load_optimizer_state, storage_options, source_participant_index);
 }
 
 void scan_native_page_images(std::string_view uri, uint64_t version,
@@ -2730,115 +2265,79 @@ void scan_native_page_images(std::string_view uri, uint64_t version,
       [&](const ArrowSchema &schema, ArrowArrayStream &stream) {
         require_schema_key_dtype(schema, key_dtype);
         const auto col = resolve_page_image_scan_indices(schema);
+        NativePageImageView page;
         for (;;) {
-          ArrowArray batch_array{};
-          if (stream.get_next(&stream, &batch_array) != 0)
+          ArrowArrayGuard batch;
+          if (stream.get_next(&stream, batch.get()) != 0)
             throw std::runtime_error(
                 "native Lance restore page batch read failed");
-          if (!batch_array.release)
+          if (!batch->release)
             break;
-          for (int64_t row = 0; row < batch_array.length; ++row) {
-            if (fixed_value<uint32_t>(
-                    arrow_array_field(batch_array,
-                                      col.source_participant_index),
-                    row) != participant_index ||
-                binary_string(arrow_array_field(batch_array, col.row_state),
-                              row) != kActiveRowState)
+          CheckpointStreamPolicy::validate_scan_batch_rows(
+              batch->length, CheckpointStreamPolicy::kPageImportBatchPages);
+          ArrowRecordBatchView view(batch.get(), &schema);
+          const auto participants =
+              view.fixed<uint32_t>(col.source_participant_index);
+          const auto states = view.binary(col.row_state);
+          for (int64_t row = 0; row < batch->length; ++row) {
+            if (participants[row] != participant_index)
               continue;
-            NativePageImage page;
-            page.entries_per_page = fixed_value<uint32_t>(
-                arrow_array_field(batch_array, col.entries_per_page), row);
-            page.embedding_dim = fixed_value<uint32_t>(
-                arrow_array_field(batch_array, col.embedding_dim), row);
-            page.physical_page_id = fixed_value<uint64_t>(
-                arrow_array_field(batch_array, col.physical_page_id), row);
-            page.page_slot_stride_bytes = fixed_value<uint32_t>(
-                arrow_array_field(batch_array, col.page_slot_stride_bytes),
-                row);
-            page.embedding_dtype = binary_string(
-                arrow_array_field(batch_array, col.embedding_dtype), row);
-            auto copy_binary = [&](size_t col_idx,
-                                   std::vector<std::byte> &out) {
-              const auto bytes =
-                  binary_value(arrow_array_field(batch_array, col_idx), row);
-              out.assign(bytes.begin(), bytes.end());
-            };
-            std::vector<std::byte> slots, keys, sequences, scores, steps;
-            copy_binary(col.slot_ordinals, slots);
-            copy_binary(col.keys, keys);
-            copy_binary(col.sequences, sequences);
-            copy_binary(col.embedding_values, page.values);
-            copy_binary(col.scores, scores);
-            const auto optimizer_bytes = binary_value(
-                arrow_array_field(batch_array, col.optimizer_state_values),
-                row);
-            const auto steps_bytes =
-                binary_value(arrow_array_field(batch_array, col.steps), row);
-            const auto require_fixed_width =
-                [](std::span<const std::byte> bytes, size_t width,
-                   const char *field) {
-                  if (bytes.size() % width != 0)
-                    throw std::runtime_error(
-                        std::string(
-                            "native Lance page image field has a truncated ") +
-                        field);
-                };
-            require_fixed_width(slots, sizeof(uint32_t), "slot_ordinals");
-            require_fixed_width(keys, sizeof(uint64_t), "keys");
-            require_fixed_width(sequences, sizeof(uint64_t), "sequences");
-            require_fixed_width(scores, sizeof(uint64_t), "scores");
-            require_fixed_width(steps_bytes, sizeof(uint32_t), "steps");
-            const size_t key_count = keys.size() / sizeof(uint64_t);
-            if (slots.size() / sizeof(uint32_t) != key_count ||
-                sequences.size() / sizeof(uint64_t) != key_count ||
-                (!scores.empty() &&
-                 scores.size() / sizeof(uint64_t) != key_count) ||
-                (!steps_bytes.empty() &&
-                 steps_bytes.size() / sizeof(uint32_t) != key_count))
+            const auto state = binary_text(states.row(row));
+            if (state != "active" && state != "deleted")
+              throw std::runtime_error(
+                  "native Lance page row state is invalid");
+            if (state == "deleted")
+              continue;
+            page.entries_per_page =
+                view.fixed<uint32_t>(col.entries_per_page)[row];
+            page.embedding_dim = view.fixed<uint32_t>(col.embedding_dim)[row];
+            page.physical_page_id =
+                view.fixed<uint64_t>(col.physical_page_id)[row];
+            page.page_slot_stride_bytes =
+                view.fixed<uint32_t>(col.page_slot_stride_bytes)[row];
+            page.embedding_dtype =
+                binary_text(view.binary(col.embedding_dtype).row(row));
+            const auto slots = view.binary(col.slot_ordinals).row(row);
+            const auto keys = view.binary(col.keys).row(row);
+            const auto sequences = view.binary(col.sequences).row(row);
+            const auto values = view.binary(col.embedding_values).row(row);
+            const auto scores = view.binary(col.scores).row(row);
+            const auto optimizer =
+                view.binary(col.optimizer_state_values).row(row);
+            const auto steps = view.binary(col.steps).row(row);
+            page.checksum = binary_text(view.binary(col.checksum).row(row));
+            if (checksum(slots, keys, sequences, values, scores, optimizer,
+                         steps) != page.checksum)
+              throw std::runtime_error("page image checksum mismatch");
+            copy_native_values(slots, page.slot_ordinals);
+            copy_native_values(keys, page.keys);
+            copy_native_values(sequences, page.sequences);
+            copy_native_values(scores, page.scores);
+            if (steps.size() % sizeof(uint32_t) != 0)
+              throw std::runtime_error("native Lance page steps are truncated");
+            const size_t count = page.keys.size();
+            if (count > page.entries_per_page ||
+                page.slot_ordinals.size() != count ||
+                page.sequences.size() != count ||
+                (!page.scores.empty() && page.scores.size() != count) ||
+                (!steps.empty() && steps.size() / sizeof(uint32_t) != count))
               throw std::runtime_error(
                   "native Lance page image key and payload lengths differ");
-            page.checksum = binary_string(
-                arrow_array_field(batch_array, col.checksum), row);
-            if (checksum(slots, keys, sequences, page.values, scores,
-                         optimizer_bytes, steps_bytes) != page.checksum)
-              throw std::runtime_error("page image checksum mismatch");
+            page.values = values;
             if (load_optimizer_state) {
-              page.optimizer_values.assign(optimizer_bytes.begin(),
-                                           optimizer_bytes.end());
-              steps.assign(steps_bytes.begin(), steps_bytes.end());
+              page.optimizer_values = optimizer;
+              copy_native_values(steps, page.steps);
             }
-            page.slot_ordinals.assign(
-                reinterpret_cast<const uint32_t *>(slots.data()),
-                reinterpret_cast<const uint32_t *>(slots.data() +
-                                                   slots.size()));
-            page.keys.assign(
-                reinterpret_cast<const uint64_t *>(keys.data()),
-                reinterpret_cast<const uint64_t *>(keys.data() + keys.size()));
-            page.sequences.assign(
-                reinterpret_cast<const uint64_t *>(sequences.data()),
-                reinterpret_cast<const uint64_t *>(sequences.data() +
-                                                   sequences.size()));
-            page.scores.assign(
-                reinterpret_cast<const uint64_t *>(scores.data()),
-                reinterpret_cast<const uint64_t *>(scores.data() +
-                                                   scores.size()));
-            page.steps.assign(reinterpret_cast<const uint32_t *>(steps.data()),
-                              reinterpret_cast<const uint32_t *>(steps.data() +
-                                                                 steps.size()));
-            page.optimizer_dtype = binary_string(
-                arrow_array_field(batch_array, col.optimizer_state_dtype), row);
-            page.optimizer_stride = fixed_value<uint32_t>(
-                arrow_array_field(batch_array, col.optimizer_state_stride),
-                row);
-            if (!visitor(std::move(page))) {
-              batch_array.release(&batch_array);
+            page.optimizer_dtype =
+                binary_text(view.binary(col.optimizer_state_dtype).row(row));
+            page.optimizer_stride =
+                view.fixed<uint32_t>(col.optimizer_state_stride)[row];
+            if (!visitor(std::move(page)))
               return;
-            }
           }
-          batch_array.release(&batch_array);
         }
       },
-      storage_options);
+      storage_options, nullptr, CheckpointStreamPolicy::kPageImportBatchPages);
 }
 
 } // namespace se

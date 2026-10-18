@@ -26,14 +26,92 @@ cc_library(
     deps = [
         ":checkpoint_layout_schema",
         ":checkpoint_stream_policy",
+        ":entry_payload_spool",
+        ":external_sort",
+        ":native_entry_restore",
+        ":ordered_checkpoint",
         ":partitioned_checkpoint",
     ],
 )
 
 cc_library(
     name = "checkpoint_stream_policy",
-    hdrs = ["checkpoint_stream_policy.hpp"],
+    hdrs = [
+        "checkpoint_stream_policy.hpp",
+        "checkpoint_stream_statistics.hpp",
+    ],
     visibility = ["//visibility:public"],
+)
+
+cc_library(
+    name = "external_sort",
+    hdrs = ["external_sort.hpp"],
+    visibility = ["//visibility:public"],
+    deps = [":checkpoint_stream_policy"],
+)
+
+cc_test(
+    name = "external_sort_test",
+    srcs = ["external_sort_test.cpp"],
+    deps = [
+        ":checkpoint_test_support",
+        ":external_sort",
+    ],
+)
+
+cc_library(
+    name = "checkpoint_test_support",
+    testonly = True,
+    hdrs = ["checkpoint_test_support.hpp"],
+    visibility = ["//visibility:public"],
+    deps = [":external_sort"],
+)
+
+cc_library(
+    name = "ordered_checkpoint",
+    hdrs = ["ordered_checkpoint.hpp"],
+    visibility = ["//visibility:public"],
+    deps = [":external_sort"],
+)
+
+cc_library(
+    name = "entry_payload_spool",
+    hdrs = ["entry_payload_spool.hpp"],
+    visibility = ["//visibility:public"],
+    deps = [
+        ":external_sort",
+        ":native_entry_restore",
+        "//sparse_embedding/src/common",
+    ],
+)
+
+cc_test(
+    name = "entry_payload_spool_test",
+    srcs = ["entry_payload_spool_test.cpp"],
+    deps = [
+        ":checkpoint_test_support",
+        ":entry_payload_spool",
+    ],
+)
+
+cc_test(
+    name = "ordered_checkpoint_test",
+    srcs = ["ordered_checkpoint_test.cpp"],
+    deps = [
+        ":checkpoint_test_support",
+        ":ordered_checkpoint",
+    ],
+)
+
+cc_library(
+    name = "native_entry_restore",
+    hdrs = [
+        "lance/native_entry_batch.hpp",
+        "lance/native_entry_restore.hpp",
+        "lance/native_payload.hpp",
+    ],
+    visibility = ["//visibility:public"],
+    deps = [":checkpoint_stream_policy"],
 )
 
 cc_test(
@@ -59,19 +137,60 @@ cc_library(
     deps = [
         ":checkpoint_layout_schema",
         ":checkpoint_stream_policy",
+        ":entry_payload_spool",
+        ":external_sort",
+        ":native_entry_restore",
+        ":ordered_checkpoint",
         "//sparse_embedding/src/common",
         "//sparse_embedding/src/interface",
         "//sparse_embedding/src/ops",
         "//sparse_embedding/src/storage/topology:storage_topology",
         "@lance_c",
         "@proxy",
-        "@unordered_dense",
     ],
     alwayslink = True,
+)
+
+cc_library(
+    name = "native_restore",
+    srcs = ["lance/native_restore.cpp"],
+    hdrs = ["lance/native_restore.hpp"],
+    target_compatible_with = select({
+        "//:lance_enabled": [],
+        "//conditions:default": ["@platforms//:incompatible"],
+    }),
+    visibility = ["//visibility:public"],
+    deps = [
+        ":checkpoint_lance",
+        ":native_entry_restore",
+        "//sparse_embedding/src/common",
+        "//sparse_embedding/src/interface",
+    ],
 )
 
 cc_test(
     name = "lance_layout_schema_test",
     srcs = ["lance/layout_schema_test.cpp"],
     deps = [":checkpoint_layout_schema"],
+)
+
+cc_test(
+    name = "native_entry_restore_test",
+    srcs = ["lance/native_entry_restore_test.cpp"],
+    deps = [":native_entry_restore"],
+)
+
+cc_test(
+    name = "native_checkpoint_stream_test",
+    srcs = ["lance/native_checkpoint_stream_test.cpp"],
+    target_compatible_with = select({
+        "//:lance_enabled": [],
+        "//conditions:default": ["@platforms//:incompatible"],
+    }),
+    deps = [
+        ":checkpoint_lance",
+        ":checkpoint_test_support",
+        "//sparse_embedding/src/interface",
+        "//sparse_embedding/src/ops",
+    ],
 )

@@ -11,6 +11,7 @@
 #include "sparse_embedding/src/checkpoint/checkpoint_stream_policy.hpp"
 
 #ifdef SE_ENABLE_LANCE_C
+#include "sparse_embedding/src/checkpoint/lance/native_restore.hpp"
 #include "sparse_embedding/src/checkpoint/lance/native_fragment_writer.hpp"
 #include "sparse_embedding/src/ops/partitioner_registry.hpp"
 #endif
@@ -103,93 +104,6 @@ nb::dict CheckpointOpsImpl<ParamT, OptT>::write_native_fragment(
 }
 
 template <typename ParamT, typename OptT>
-template <typename Scanner>
-void CheckpointOpsImpl<ParamT, OptT>::restore_native_entries_with_scan(
-    EmbeddingStoreWrapper &self, Scanner &&scan, bool load_optimizer_state) {
-  std::vector<se::NativeEntryBatch> transaction_batches;
-  {
-    nb::gil_scoped_release release;
-    scan([&](const se::NativeEntryBatch &batch) {
-      const size_t row_count = batch.keys.size();
-      if (batch.dimensions.size() != row_count ||
-          batch.embedding_offsets.size() != row_count + 1 ||
-          batch.optimizer_offsets.size() != row_count + 1 ||
-          batch.optimizer_strides.size() != row_count ||
-          (!batch.steps.empty() && batch.steps.size() != row_count) ||
-          (!batch.scores.empty() && batch.scores.size() != row_count) ||
-          batch.embedding_offsets.front() != 0 ||
-          batch.optimizer_offsets.front() != 0 ||
-          batch.embedding_offsets.back() > batch.embedding_values.size() ||
-          batch.optimizer_offsets.back() > batch.optimizer_values.size())
-        throw std::runtime_error("native restore entry batch shape is invalid");
-      transaction_batches.push_back(batch);
-      return true;
-    });
-  }
-
-  std::unordered_map<uint32_t, std::vector<size_t>> by_dimension;
-  for (const auto &batch : transaction_batches)
-    for (size_t index = 0; index < batch.keys.size(); ++index)
-      by_dimension[batch.dimensions[index]].push_back(index);
-
-  se::dispatch_key_type(self.key_type_enum_, [&]<typename KeyT>() {
-    for (const auto &[dim, unused] : by_dimension) {
-      (void)unused;
-      std::vector<KeyT> dim_keys;
-      std::vector<ParamT> values;
-      std::vector<uint64_t> scores;
-      std::vector<OptT> optimizer;
-      std::vector<uint32_t> steps;
-      for (const auto &batch : transaction_batches) {
-        for (size_t index = 0; index < batch.keys.size(); ++index) {
-          if (batch.dimensions[index] != dim) continue;
-          dim_keys.push_back(static_cast<KeyT>(batch.keys[index]));
-          const size_t begin = batch.embedding_offsets[index];
-          const size_t end = batch.embedding_offsets[index + 1];
-          if (end - begin != static_cast<size_t>(dim) * sizeof(ParamT))
-            throw std::runtime_error(
-                "native restore embedding payload shape is invalid");
-          const auto *source = reinterpret_cast<const ParamT *>(
-              batch.embedding_values.data() + begin);
-          values.insert(values.end(), source, source + dim);
-          if (!batch.scores.empty()) scores.push_back(batch.scores[index]);
-          const uint32_t stride = batch.optimizer_strides[index];
-          if (load_optimizer_state && stride != 0) {
-            const size_t optimizer_begin = batch.optimizer_offsets[index];
-            const size_t optimizer_end = batch.optimizer_offsets[index + 1];
-            if (optimizer_end - optimizer_begin !=
-                static_cast<size_t>(stride) * sizeof(OptT))
-              throw std::runtime_error(
-                  "native restore optimizer payload shape is invalid");
-            const auto *optimizer_source = reinterpret_cast<const OptT *>(
-                batch.optimizer_values.data() + optimizer_begin);
-            optimizer.insert(optimizer.end(), optimizer_source,
-                             optimizer_source + stride);
-            steps.push_back(batch.steps[index]);
-          }
-        }
-      }
-      std::vector<int64_t> lengths(dim_keys.size(), dim);
-      self.get_store<ParamT, OptT>()->assign(std::span<const KeyT>(dim_keys),
-                                             std::span<const ParamT>(values),
-                                             std::span<const int64_t>(lengths));
-      if (!scores.empty() && self.get_store<ParamT, OptT>()->has_score_policy())
-        self.get_store<ParamT, OptT>()->assign_scores(
-            std::span<const KeyT>(dim_keys), std::span<const uint64_t>(scores));
-      if (!optimizer.empty()) {
-        const size_t key_count = dim_keys.size();
-        if (optimizer.size() % key_count != 0 || steps.size() != key_count)
-          throw std::runtime_error(
-              "native restore optimizer batch shape is invalid");
-        self.get_store<ParamT, OptT>()->assign_opt_states(
-            dim, std::span<const KeyT>(dim_keys),
-            std::span<const OptT>(optimizer), std::span<const uint32_t>(steps));
-      }
-    }
-  });
-}
-
-template <typename ParamT, typename OptT>
 void CheckpointOpsImpl<ParamT, OptT>::restore_native_partition_entries(
     EmbeddingStoreWrapper &self, const std::vector<std::string> &uris,
     uint64_t version, uint64_t partition_count, uint64_t partition_id,
@@ -197,24 +111,19 @@ void CheckpointOpsImpl<ParamT, OptT>::restore_native_partition_entries(
     const std::unordered_map<std::string, std::string> &assignment_parameters,
     const se::LanceStorageOptions &storage_options, bool load_optimizer_state,
     std::optional<uint32_t> source_participant_index) {
-  if (partition_count == 0)
-    throw std::invalid_argument("partition_count must be > 0");
+  const uint32_t native_partition_count =
+      se::ops::checked_partition_count(partition_count);
   if (partition_id >= partition_count)
     throw std::invalid_argument("partition_id is out of range");
 
   auto partitioner = se::ops::PartitionerRegistry::instance().create(
-      assignment_name, static_cast<uint32_t>(partition_count),
-      assignment_parameters);
+      assignment_name, native_partition_count, assignment_parameters);
 
-  restore_native_entries_with_scan(
-      self,
-      [&](se::NativeEntryBatchVisitor visitor) {
-        se::scan_native_checkpoint_entries(
-            uris, version, std::move(partitioner),
-            static_cast<uint32_t>(partition_id), key_dtype, std::move(visitor),
-            load_optimizer_state, storage_options, source_participant_index);
-      },
-      load_optimizer_state);
+  nb::gil_scoped_release release;
+  se::NativeRestore<ParamT, OptT>::entries(
+      self.get_store<ParamT, OptT>(), uris, version, std::move(partitioner),
+      static_cast<uint32_t>(partition_id), key_dtype, load_optimizer_state,
+      storage_options, source_participant_index);
 }
 
 template <typename ParamT, typename OptT>
@@ -223,85 +132,11 @@ void CheckpointOpsImpl<ParamT, OptT>::restore_native_page_images(
     uint64_t version, uint32_t participant_index, const std::string &key_dtype,
     const se::LanceStorageOptions &storage_options, bool load_optimizer_state,
     uint64_t page_layout_generation) {
-  // The generation comes from the checkpoint participant descriptor. It must
-  // be restored together with the page images so later incremental captures
-  // compare against the same physical page layout.
-  if (page_layout_generation == 0)
-    throw std::invalid_argument("page layout generation must be positive");
-  std::vector<se::PageImageImport<ParamT, OptT>> imports;
-  imports.reserve(se::CheckpointStreamPolicy::kPageImportBatchPages);
-  {
-    nb::gil_scoped_release release;
-    for (const auto &uri : uris) {
-      se::scan_native_page_images(
-          uri, version, participant_index, key_dtype,
-          [&](se::NativePageImage &&page) {
-            if (page.entries_per_page !=
-                self.get_store<ParamT, OptT>()->entries_per_page())
-              throw std::invalid_argument(
-                  "page-image geometry does not match store topology");
-            if (page.embedding_dtype != self.value_dtype() ||
-                (load_optimizer_state &&
-                 page.optimizer_dtype != self.optimizer_dtype()))
-              throw std::invalid_argument(
-                  "page-image dtype does not match store");
-            return true;
-          },
-          load_optimizer_state, storage_options);
-    }
-    for (const auto &uri : uris) {
-      se::scan_native_page_images(
-          uri, version, participant_index, key_dtype,
-          [&](se::NativePageImage &&page) {
-            if (page.entries_per_page !=
-                self.get_store<ParamT, OptT>()->entries_per_page())
-              throw std::invalid_argument(
-                  "page-image geometry does not match store topology");
-            if (page.embedding_dtype != self.value_dtype() ||
-                (load_optimizer_state &&
-                 page.optimizer_dtype != self.optimizer_dtype()))
-              throw std::runtime_error(
-                  "native page image dtype does not match store");
-            se::PageImageExport<ParamT, OptT> image{
-                page.physical_page_id,
-                page.embedding_dim,
-                page.page_slot_stride_bytes,
-                std::move(page.slot_ordinals),
-                std::move(page.keys),
-                std::move(page.sequences),
-                {},
-                std::move(page.scores),
-                {},
-                std::move(page.steps)};
-            if (page.values.size() % sizeof(ParamT) != 0 ||
-                (load_optimizer_state &&
-                 page.optimizer_values.size() % sizeof(OptT) != 0))
-              throw std::runtime_error(
-                  "native page image payload has invalid byte size");
-            const auto *values =
-                reinterpret_cast<const ParamT *>(page.values.data());
-            image.values.assign(values,
-                                values + page.values.size() / sizeof(ParamT));
-            if (load_optimizer_state) {
-              const auto *optimizer =
-                  reinterpret_cast<const OptT *>(page.optimizer_values.data());
-              image.optimizer_states.assign(
-                  optimizer,
-                  optimizer + page.optimizer_values.size() / sizeof(OptT));
-            }
-            imports.push_back(se::PageImageImport<ParamT, OptT>{
-                page.embedding_dim, std::move(image)});
-            return true;
-          },
-          load_optimizer_state, storage_options);
-    }
-    // Do not use the plain import entry point here: it would restore values
-    // while leaving the store's page-layout generation unrelated to the
-    // checkpoint being restored.
-    if (!imports.empty())
-      self.get_store<ParamT, OptT>()->import_page_images_with_generation(
-          imports, page_layout_generation);
-  }
+  const auto optimizer_dtype = self.optimizer_dtype();
+  nb::gil_scoped_release release;
+  se::NativeRestore<ParamT, OptT>::pages(
+      self.get_store<ParamT, OptT>(), uris, version, participant_index, key_dtype,
+      optimizer_dtype, storage_options, load_optimizer_state, page_layout_generation);
 }
 #endif  // SE_ENABLE_LANCE_C
 
@@ -506,4 +341,3 @@ void CheckpointOpsImpl<ParamT, OptT>::assign_opt_state(
 }
 
 }  // namespace se::py::detail
-

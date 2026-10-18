@@ -28,6 +28,7 @@
 #include <cstdint>
 #include <cstdlib>
 #include <cstring>
+#include <exception>
 #include <exec/static_thread_pool.hpp>
 #include <limits>
 #include <map>
@@ -61,6 +62,7 @@
 #include "sparse_embedding/src/backend/hogwild/partition/hogwild_partition_topology.hpp"
 #include "sparse_embedding/src/backend/hogwild/public/hogwild_store_options.hpp"
 #include "sparse_embedding/src/backend/hogwild/store_page_eviction_proxy.hpp"
+#include "sparse_embedding/src/checkpoint/ordered_checkpoint.hpp"
 #include "sparse_embedding/src/common/function.hpp"
 #include "sparse_embedding/src/concurrency/epoch_retirement.hpp"
 #include "sparse_embedding/src/eviction/adaptive_sealed_page_planner.hpp"
@@ -1012,48 +1014,99 @@ private:
     }
   }
 
-  struct InvocationGate {
-    enum class State : uint8_t {
-      kAccepting,
-      kReconfiguring,
-      kClosed,
-    };
+  class InvocationGate {
+    static_assert(std::atomic<size_t>::is_always_lock_free);
+    static constexpr size_t kClosed =
+        size_t{1} << (std::numeric_limits<size_t>::digits - 1);
+    static constexpr size_t kReconfiguring = kClosed >> 1;
+    static constexpr size_t kStateMask = kClosed | kReconfiguring;
+    static constexpr size_t kActiveMask = ~kStateMask;
+    std::atomic<size_t> admission_{0};
 
-    std::atomic<State> state{State::kAccepting};
-    std::atomic<size_t> active{0};
+  public:
+    enum class State : uint8_t { kAccepting, kReconfiguring, kClosed };
+
+    State state() const noexcept {
+      const size_t value = admission_.load(std::memory_order_acquire);
+      if ((value & kClosed) != 0)
+        return State::kClosed;
+      return (value & kReconfiguring) != 0 ? State::kReconfiguring
+                                           : State::kAccepting;
+    }
+
+    size_t enter() {
+      size_t observed = admission_.load(std::memory_order_acquire);
+      for (;;) {
+        if ((observed & kClosed) != 0)
+          throw std::runtime_error("store is not accepting invocations");
+        if ((observed & kReconfiguring) != 0) {
+          admission_.wait(observed, std::memory_order_acquire);
+          observed = admission_.load(std::memory_order_acquire);
+          continue;
+        }
+        if (observed == kActiveMask)
+          throw std::overflow_error("active invocation count overflows");
+        if (admission_.compare_exchange_weak(observed, observed + 1,
+                                             std::memory_order_acq_rel,
+                                             std::memory_order_acquire))
+          return observed + 1;
+      }
+    }
+
+    void leave() noexcept {
+      const size_t previous =
+          admission_.fetch_sub(1, std::memory_order_release);
+      if ((previous & kActiveMask) == 0)
+        std::terminate();
+      if ((previous & kActiveMask) == 1)
+        admission_.notify_all();
+    }
+
+    void wait_until_inactive() noexcept {
+      size_t observed = admission_.load(std::memory_order_acquire);
+      while ((observed & kActiveMask) != 0) {
+        admission_.wait(observed, std::memory_order_acquire);
+        observed = admission_.load(std::memory_order_acquire);
+      }
+    }
 
     void begin_reconfiguration_and_wait() {
-      if (state.load(std::memory_order_acquire) == State::kClosed)
-        throw std::runtime_error("store is in a terminal failure state");
-      state.store(State::kReconfiguring, std::memory_order_release);
-      size_t observed = active.load(std::memory_order_acquire);
-      while (observed != 0) {
-        active.wait(observed, std::memory_order_acquire);
-        observed = active.load(std::memory_order_acquire);
+      size_t observed = admission_.load(std::memory_order_acquire);
+      for (;;) {
+        if ((observed & kClosed) != 0)
+          throw std::runtime_error("store is in a terminal failure state");
+        if ((observed & kReconfiguring) != 0)
+          throw std::logic_error("store reconfiguration is already active");
+        if (admission_.compare_exchange_weak(
+                observed, observed | kReconfiguring, std::memory_order_acq_rel,
+                std::memory_order_acquire))
+          break;
       }
+      wait_until_inactive();
+    }
+
+    void require_quiescence() {
+      if (state() != State::kReconfiguring)
+        throw std::logic_error(
+            "index import requires reconfiguration admission");
+      wait_until_inactive();
     }
 
     void resume_accepting() noexcept {
-      State expected = State::kReconfiguring;
-      state.compare_exchange_strong(expected, State::kAccepting,
-                                    std::memory_order_release,
-                                    std::memory_order_acquire);
-      state.notify_all();
+      size_t expected = kReconfiguring;
+      admission_.compare_exchange_strong(expected, 0, std::memory_order_acq_rel,
+                                         std::memory_order_acquire);
+      admission_.notify_all();
     }
 
     void close_without_wait() noexcept {
-      state.store(State::kClosed, std::memory_order_release);
-      state.notify_all();
+      admission_.fetch_or(kClosed, std::memory_order_acq_rel);
+      admission_.notify_all();
     }
 
     void close_and_wait() noexcept {
-      state.store(State::kClosed, std::memory_order_release);
-      state.notify_all();
-      size_t observed = active.load(std::memory_order_acquire);
-      while (observed != 0) {
-        active.wait(observed, std::memory_order_acquire);
-        observed = active.load(std::memory_order_acquire);
-      }
+      close_without_wait();
+      wait_until_inactive();
     }
   };
 
@@ -1065,49 +1118,21 @@ private:
           storage_(storage != nullptr &&
                            (*storage)->supports_background_page_eviction()
                        ? storage
-                       : nullptr) {
-      size_t observed = gate_->active.load(std::memory_order_acquire);
-      while (true) {
-        const typename InvocationGate::State state =
-            gate_->state.load(std::memory_order_acquire);
-        if (state == InvocationGate::State::kClosed)
-          throw std::runtime_error("store is not accepting invocations");
-        if (state == InvocationGate::State::kReconfiguring) {
-          gate_->state.wait(state, std::memory_order_acquire);
-          observed = gate_->active.load(std::memory_order_acquire);
-          continue;
-        }
-        if (observed == std::numeric_limits<size_t>::max())
-          throw std::overflow_error("active invocation count overflows");
-        if (gate_->active.compare_exchange_weak(observed, observed + 1,
-                                                std::memory_order_acq_rel,
-                                                std::memory_order_acquire)) {
-          if (storage_ != nullptr)
-            (*storage_)->begin_read();
-          if (gate_->state.load(std::memory_order_acquire) !=
-              InvocationGate::State::kAccepting) {
-            if (storage_ != nullptr)
-              (*storage_)->end_read();
-            if (gate_->active.fetch_sub(1, std::memory_order_acq_rel) == 1)
-              gate_->active.notify_all();
-            observed = gate_->active.load(std::memory_order_acquire);
-            continue;
-          }
-          count_ = observed + 1;
-          return;
-        }
+                       : nullptr),
+          count_(gate_->enter()) {
+      try {
+        if (storage_ != nullptr)
+          (*storage_)->begin_read();
+      } catch (...) {
+        gate_->leave();
+        throw;
       }
     }
 
     ~ActiveInvocationGuard() {
       if (storage_ != nullptr)
         (*storage_)->end_read();
-      const size_t previous =
-          gate_->active.fetch_sub(1, std::memory_order_acq_rel);
-      if (previous == 0)
-        std::terminate();
-      if (previous == 1)
-        gate_->active.notify_all();
+      gate_->leave();
     }
 
     ActiveInvocationGuard(const ActiveInvocationGuard &) = delete;
@@ -1118,12 +1143,11 @@ private:
   private:
     InvocationGate *gate_;
     const PageStorage *storage_;
-    size_t count_ = 0;
+    size_t count_;
   };
 
   void ensure_operational() const {
-    if (invocation_gate_.state.load(std::memory_order_acquire) ==
-        InvocationGate::State::kClosed)
+    if (invocation_gate_.state() == InvocationGate::State::kClosed)
       throw std::runtime_error("store is in a terminal failure state");
   }
 
@@ -1142,8 +1166,7 @@ public:
   // accepting operations. Returns false if mark_terminal_failure() was
   // previously invoked or the invocation gate is closed.
   bool is_operational() const noexcept {
-    return invocation_gate_.state.load(std::memory_order_acquire) !=
-           InvocationGate::State::kClosed;
+    return invocation_gate_.state() != InvocationGate::State::kClosed;
   }
 
   class PageReuseState {
@@ -1685,8 +1708,22 @@ public:
       publish_indices_batch_unlocked(keys, indices);
     }
 
+    enum class IndexPublication { kConcurrent, kQuiesced };
+
     void publish_indices_batch_unlocked(std::span<const uint64_t> keys,
                                         std::span<const uint32_t> indices) {
+      update_indices_batch_unlocked<IndexPublication::kConcurrent>(keys,
+                                                                   indices);
+    }
+
+    void import_indices_quiesced(std::span<const uint64_t> keys,
+                                 std::span<const uint32_t> indices) {
+      update_indices_batch_unlocked<IndexPublication::kQuiesced>(keys, indices);
+    }
+
+    template <IndexPublication Publication>
+    void update_indices_batch_unlocked(std::span<const uint64_t> keys,
+                                       std::span<const uint32_t> indices) {
       if (keys.empty() || keys.size() != indices.size())
         throw std::invalid_argument("key shard publication batch is invalid");
       const size_t current_count = count.load(std::memory_order_acquire);
@@ -1697,14 +1734,27 @@ public:
           next_count > reserved_keys
               ? compute_next_capacity(reserved_keys, next_count)
               : reserved_keys;
-      auto next = clone_bundle_unlocked(next_reserved);
+      if constexpr (Publication == IndexPublication::kQuiesced)
+        checkpoint_owner.invocation_gate_.require_quiescence();
+      std::unique_ptr<MapBundle> replacement;
+      MapBundle *next;
+      if constexpr (Publication == IndexPublication::kQuiesced) {
+        if (next_reserved != reserved_keys)
+          expand(next_reserved);
+        next = writer_bundle_unlocked();
+      } else {
+        replacement = clone_bundle_unlocked(next_reserved);
+        next = replacement.get();
+      }
       std::vector<CheckpointMutationRecord *> records(keys.size(), nullptr);
       std::vector<uint32_t> allocated_slots(keys.size(), 0);
+      size_t linked_count = 0;
       try {
         for (size_t index = 0; index < keys.size(); ++index) {
           const uint64_t key = keys[index];
           if (next->find(key).has_value())
-            throw std::logic_error("key shard batch contains duplicate key");
+            throw std::invalid_argument(
+                "key shard batch contains duplicate key");
           records[index] =
               checkpoint_owner.allocate_checkpoint_record(dimension, key);
           const uint32_t slot_id = locators->allocate(
@@ -1712,15 +1762,26 @@ public:
               hogwild_internal::CheckpointRecordRef::from(records[index]));
           allocated_slots[index] = slot_id;
           next->insert(key, slot_id);
+          ++linked_count;
         }
-        publish_bundle_unlocked(std::move(next));
+        if constexpr (Publication == IndexPublication::kConcurrent)
+          publish_bundle_unlocked(std::move(replacement));
+        else
+          read_view->generation.fetch_add(1, std::memory_order_acq_rel);
       } catch (...) {
-        for (CheckpointMutationRecord *record : records)
-          if (record != nullptr)
-            checkpoint_owner.discard_unpublished_checkpoint_record(record);
-        for (uint32_t slot_id : allocated_slots)
-          if (slot_id != 0)
-            locators->release_after_epoch(slot_id);
+        size_t first_unpublished = 0;
+        if constexpr (Publication == IndexPublication::kQuiesced) {
+          checkpoint_owner.mark_terminal_failure();
+          first_unpublished = linked_count;
+        }
+        for (size_t index = first_unpublished; index < records.size();
+             ++index) {
+          if (records[index] != nullptr)
+            checkpoint_owner.discard_unpublished_checkpoint_record(
+                records[index]);
+          if (allocated_slots[index] != 0)
+            locators->release_after_epoch(allocated_slots[index]);
+        }
         throw;
       }
       reserved_keys = next_reserved;
@@ -2377,125 +2438,110 @@ public:
       return images;
     }
 
-    void
-    import_page_images(std::span<const PageImageImport<ParamT, OptT>> images) {
-      if (images.empty())
-        throw std::invalid_argument("page-image import requires images");
-      if (arena.allocated_count() != 0 || size() != 0)
-        throw std::logic_error("page-image import requires an empty slot");
+    struct PageImportScratch {
+      std::vector<size_t> offsets, positions;
+      std::vector<uint32_t> rows, indices;
+      std::vector<uint64_t> keys, ordinal_mask;
+    };
 
-      uint64_t maximum_page_id = 0;
-      std::vector<uint64_t> page_ids;
-      page_ids.reserve(images.size());
-      std::unordered_set<uint64_t> imported_keys;
-      std::unordered_set<uint64_t> imported_slots;
-      size_t entry_count = 0;
-      for (const auto &import : images) {
-        const auto &image = import.image;
-        if (import.embedding_dim != dim || image.embedding_dim != dim ||
-            image.page_slot_stride_bytes != arena.data_stride())
-          throw std::invalid_argument("page-image layout does not match slot");
-        const size_t optimizer_state_dim =
-            (optimizer.has_value() && !image.optimizer_states.empty())
-                ? optimizer->state_dim()
-                : 0;
-        const size_t count = hogwild::io::validate_page_image(
-            import, dim, arena.data_stride(), score_policy.enabled(),
-            optimizer_state_dim, arena.entries_per_page());
-        page_ids.push_back(image.physical_page_id);
-        maximum_page_id = std::max(maximum_page_id, image.physical_page_id);
-        for (size_t offset = 0; offset < count; ++offset) {
-          const uint32_t ordinal = image.slot_ordinals[offset];
-          const uint64_t physical_slot =
-              image.physical_page_id * arena.entries_per_page() + ordinal;
-          if (!imported_keys.insert(image.keys[offset]).second)
-            throw std::invalid_argument("page-image import has duplicate key");
-          if (!imported_slots.insert(physical_slot).second)
-            throw std::invalid_argument("page-image import has duplicate slot");
-        }
-        entry_count += count;
-      }
-      std::ranges::sort(page_ids);
-      if (std::ranges::adjacent_find(page_ids) != page_ids.end())
-        throw std::invalid_argument("page-image import has duplicate page ids");
-      if (maximum_page_id >= arena.max_pages())
+    void import_page_image(const PageImageImport<ParamT, OptT> &import,
+                           bool load_optimizer_state,
+                           PageImportScratch &scratch) {
+      const auto &image = import.image;
+      const size_t optimizer_state_dim =
+          load_optimizer_state && optimizer.has_value() ? optimizer->state_dim()
+                                                        : 0;
+      const size_t count = hogwild::io::validate_page_image(
+          import, dim, arena.data_stride(), score_policy.enabled(),
+          optimizer_state_dim, arena.entries_per_page());
+      if (image.physical_page_id >= arena.max_pages())
         throw std::out_of_range("page-image physical page id is out of range");
-
-      for (const auto &import : images) {
-        if (import.image.keys.empty())
-          throw std::invalid_argument(
-              "page-image has no keys for NUMA placement");
-        arena.reserve_exact_page(
-            import.image.physical_page_id,
-            static_cast<uint32_t>(shard_id_for_key(import.image.keys.front())));
-      }
-      for (const auto &import : images) {
-        const auto &image = import.image;
-        for (size_t offset = 0; offset < image.keys.size(); ++offset) {
-          const uint32_t index = static_cast<uint32_t>(
-              image.physical_page_id * arena.entries_per_page() +
-              image.slot_ordinals[offset]);
-          arena.bind_exact(index, static_cast<uint32_t>(
-                                      shard_id_for_key(image.keys[offset])));
-        }
-      }
+      const uint64_t page_end = checkpoint::checked_byte_count(
+          checkpoint::checked_sum(image.physical_page_id, 1),
+          arena.entries_per_page());
       const uint64_t allocation_count =
-          (maximum_page_id + 1) * arena.entries_per_page();
-      if (allocation_count > std::numeric_limits<uint32_t>::max())
+          std::max<uint64_t>(arena.allocated_count(), page_end);
+      if (!std::in_range<uint32_t>(allocation_count))
         throw std::overflow_error("page-image allocation watermark overflows");
+      const uint64_t expected_size = checkpoint::checked_sum(size(), count);
+      constexpr size_t word_bits = std::numeric_limits<uint64_t>::digits;
+      scratch.ordinal_mask.assign(
+          (arena.entries_per_page() + word_bits - 1) / word_bits, 0);
+      scratch.offsets.assign(key_shards.size() + 1, 0);
+      for (size_t row = 0; row < count; ++row) {
+        const uint32_t ordinal = image.slot_ordinals[row];
+        auto &word = scratch.ordinal_mask[ordinal / word_bits];
+        const uint64_t mask = uint64_t{1} << (ordinal % word_bits);
+        if ((word & mask) != 0)
+          throw std::invalid_argument("page-image import has duplicate slot");
+        word |= mask;
+        ++scratch.offsets[shard_id_for_key(image.keys[row]) + 1];
+      }
+      std::partial_sum(scratch.offsets.begin(), scratch.offsets.end(),
+                       scratch.offsets.begin());
+      scratch.positions = scratch.offsets;
+      scratch.rows.resize(count);
+      scratch.keys.resize(count);
+      scratch.indices.resize(count);
+      for (size_t row = 0; row < count; ++row) {
+        const size_t position =
+            scratch.positions[shard_id_for_key(image.keys[row])]++;
+        scratch.rows[position] = row;
+        scratch.keys[position] = image.keys[row];
+        scratch.indices[position] = static_cast<uint32_t>(
+            image.physical_page_id * arena.entries_per_page() +
+            image.slot_ordinals[row]);
+      }
+      arena.reserve_exact_page(
+          image.physical_page_id,
+          static_cast<uint32_t>(shard_id_for_key(image.keys.front())));
       if (optimizer.has_value())
-        optimizer->reserve(static_cast<size_t>(allocation_count));
-
-      for (const auto &import : images) {
-        const auto &image = import.image;
-        for (size_t offset = 0; offset < image.keys.size(); ++offset) {
-          const uint32_t ordinal = image.slot_ordinals[offset];
-          if (ordinal >= arena.entries_per_page())
-            throw std::out_of_range("page-image slot ordinal is out of range");
-          const uint32_t index = static_cast<uint32_t>(
-              image.physical_page_id * arena.entries_per_page() + ordinal);
-          auto &key_shard = shard_for_key(image.keys[offset]);
-          std::unique_lock map_lock(key_shard.writer_mutex);
-          if (key_shard.find_unlocked(image.keys[offset]).has_value())
-            throw std::logic_error("page-image import has duplicate key");
+        optimizer->reserve(allocation_count);
+      for (size_t shard_id = 0; shard_id < key_shards.size(); ++shard_id) {
+        const size_t begin = scratch.offsets[shard_id];
+        const size_t end = scratch.offsets[shard_id + 1];
+        if (begin == end)
+          continue;
+        auto &key_shard = *key_shards[shard_id];
+        std::unique_lock map_lock(key_shard.writer_mutex);
+        key_shard.reserve_new_indices(end - begin);
+        for (size_t position = begin; position < end; ++position) {
+          const size_t row = scratch.rows[position];
+          const uint64_t key = scratch.keys[position];
+          const uint32_t index = scratch.indices[position];
+          if (key_shard.find_unlocked(key).has_value())
+            throw std::invalid_argument("page-image import has duplicate key");
           if (arena.is_live(index))
-            throw std::logic_error("page-image import has duplicate slot");
+            throw std::invalid_argument("page-image import has duplicate slot");
+          arena.bind_exact(index, static_cast<uint32_t>(shard_id));
           if (optimizer.has_value())
             optimizer->allocate(index);
-          arena.publish_owner_exact(
-              index, image.keys[offset],
-              static_cast<uint32_t>(shard_id_for_key(image.keys[offset])),
-              image.seq_counts[offset]);
-          simd::simd_copy(image.values.data() + offset * dim, arena.data(index),
+          arena.publish_owner_exact(index, key, static_cast<uint32_t>(shard_id),
+                                    image.seq_counts[row]);
+          simd::simd_copy(image.values.data() + row * dim, arena.data(index),
                           dim);
           if (score_policy.enabled()) {
-            const uint64_t score =
-                image.scores.empty() ? 0 : image.scores[offset];
+            const uint64_t score = image.scores.empty() ? 0 : image.scores[row];
             std::atomic_ref<uint64_t>(arena.score_raw(index))
                 .store(score, std::memory_order_relaxed);
           }
-          if (optimizer.has_value() && optimizer->state_dim() != 0 &&
-              !image.optimizer_states.empty()) {
-            if (image.optimizer_states.size() !=
-                    image.keys.size() * optimizer->state_dim() ||
-                (!image.steps.empty() &&
-                 image.steps.size() != image.keys.size()))
-              throw std::invalid_argument(
-                  "page-image optimizer state payload is inconsistent");
-            const size_t state_dim = optimizer->state_dim();
+          if (optimizer_state_dim != 0) {
             optimizer->set_state(
                 index, std::span<const OptT>(image.optimizer_states.data() +
-                                                 offset * state_dim,
-                                             state_dim));
-            optimizer->set_step(index, image.steps[offset]);
+                                                 row * optimizer_state_dim,
+                                             optimizer_state_dim));
+            optimizer->set_step(index, image.steps[row]);
           }
-          key_shard.insert_index_unlocked(image.keys[offset], index);
-          arena.mark_live(index, true);
-          key_shard.reserve_new_index();
         }
+        key_shard.import_indices_quiesced(
+            std::span<const uint64_t>(scratch.keys).subspan(begin, end - begin),
+            std::span<const uint32_t>(scratch.indices)
+                .subspan(begin, end - begin));
+        for (size_t position = begin; position < end; ++position)
+          arena.mark_live(scratch.indices[position], true);
       }
       arena.set_allocation_count(static_cast<uint32_t>(allocation_count));
-      if (size() != entry_count)
+      if (size() != expected_size)
         throw std::logic_error("page-image import entry count mismatch");
     }
 
@@ -5141,7 +5187,8 @@ public:
 
   template <typename K>
   std::error_code assign_scores(std::span<const K> keys,
-                                std::span<const uint64_t> scores) {
+                                std::span<const uint64_t> scores,
+                                std::span<const int64_t> row_lengths = {}) {
     ActiveInvocationGuard invocation(invocation_gate_, &storage_);
     se::concurrency::EpochAnnouncement epoch_announcement(true);
     StoreSnapshot *snapshot = snapshot_.load(std::memory_order_acquire);
@@ -5151,19 +5198,39 @@ public:
       throw std::runtime_error("assign_scores requires a score-enabled policy");
     }
     size_t n = keys.size();
+    if (scores.size() != n || (!row_lengths.empty() && row_lengths.size() != n))
+      throw std::invalid_argument("assign_scores row counts differ");
+    for (int64_t dim : row_lengths) {
+      if (dim <= 0)
+        throw std::invalid_argument("assign_scores dimension must be positive");
+      (void)snapshot_slot_for_dim(*snapshot, static_cast<size_t>(dim));
+    }
+    auto assign_slot_score = [&](SlotStore &slot, uint64_t key,
+                                 uint64_t score) {
+      return slot.with_shared_write_entry(
+          key, [&](uint32_t idx,
+                   hogwild_internal::CheckpointRecordRef checkpoint_record) {
+            std::atomic_ref<uint64_t>(slot.arena.score_raw(idx))
+                .store(score, std::memory_order_relaxed);
+            record_checkpoint_mutation(checkpoint_record);
+          });
+    };
     auto do_range = [&](size_t begin, size_t end) {
       se::concurrency::with_epoch([&] {
+        if (!row_lengths.empty()) {
+          for (size_t i = begin; i < end; ++i) {
+            auto &slot = snapshot_slot_for_dim(*snapshot, row_lengths[i]);
+            if (!assign_slot_score(slot, static_cast<uint64_t>(keys[i]),
+                                   scores[i]))
+              throw std::invalid_argument(
+                  "assign_scores key is absent from dimension table");
+          }
+          return;
+        }
         for (size_t i = begin; i < end; ++i) {
           uint64_t key = static_cast<uint64_t>(keys[i]);
-
           for (SlotStore *slot : snapshot->slots) {
-            if (slot->with_shared_write_entry(
-                    key, [&](uint32_t idx, hogwild_internal::CheckpointRecordRef
-                                               checkpoint_record) {
-                      std::atomic_ref<uint64_t>(slot->arena.score_raw(idx))
-                          .store(scores[i], std::memory_order_relaxed);
-                      record_checkpoint_mutation(checkpoint_record);
-                    })) {
+            if (assign_slot_score(*slot, key, scores[i])) {
               break; // Key found and updated, proceed to next key
             }
           }
@@ -5722,6 +5789,26 @@ private:
 
 public:
   bool has_score_policy() const { return score_policy_.enabled(); }
+
+  void
+  validate_optimizer_state_layout(std::span<const uint32_t> dimensions,
+                                  std::span<const uint32_t> strides) const {
+    if (dimensions.size() != strides.size())
+      throw std::invalid_argument(
+          "checkpoint optimizer layout row counts differ");
+    ActiveInvocationGuard invocation(invocation_gate_, &storage_);
+    StoreSnapshot *snapshot = snapshot_.load(std::memory_order_acquire);
+    if (snapshot == nullptr)
+      throw std::runtime_error("store snapshot is unavailable");
+    for (size_t row = 0; row < dimensions.size(); ++row) {
+      const auto &slot = snapshot_slot_for_dim(*snapshot, dimensions[row]);
+      const size_t expected =
+          slot.optimizer.has_value() ? slot.optimizer->state_dim() : 0;
+      if (strides[row] != expected)
+        throw std::invalid_argument(
+            "checkpoint optimizer state layout does not match store");
+    }
+  }
 
   CheckpointCaptureCut capture_checkpoint(
       bool incremental, std::string expected_baseline, bool include_page_images,
@@ -6398,67 +6485,92 @@ public:
         });
   }
 
-  // Import page contents without changing the store's page-layout generation.
-  // Use the generation-aware overload when restoring a checkpoint.
   void
   import_page_images(std::span<const PageImageImport<ParamT, OptT>> images) {
-    import_page_images_impl(images, std::nullopt);
+    import_page_images(page_image_source(images), std::nullopt, true);
   }
 
-  // Restore page contents and the checkpoint's page-layout generation. The
-  // shared implementation validates that the generation is positive and does
-  // not regress, then publishes it only after all page images are imported.
   void import_page_images_with_generation(
       std::span<const PageImageImport<ParamT, OptT>> images,
       uint64_t page_layout_generation) {
-    import_page_images_impl(images, page_layout_generation);
+    import_page_images(page_image_source(images), page_layout_generation, true);
   }
 
-  void import_page_images_impl(
-      std::span<const PageImageImport<ParamT, OptT>> images,
-      std::optional<uint64_t> requested_page_layout_generation) {
-    if (requested_page_layout_generation.has_value()) {
-      const uint64_t generation = *requested_page_layout_generation;
-      if (generation == 0)
+  void import_page_images(PageImageSource<ParamT, OptT> source,
+                          std::optional<uint64_t> requested_generation,
+                          bool load_optimizer_state) {
+    if (!source.has_value())
+      throw std::invalid_argument("page-image source is empty");
+    std::lock_guard control_plane_lock(control_plane_mutex_);
+    ensure_operational();
+    if (requested_generation) {
+      if (*requested_generation == 0)
         throw std::invalid_argument("page layout generation must be positive");
-      if (generation <
+      if (*requested_generation <
           checkpoint_page_layout_generation_.load(std::memory_order_acquire))
         throw std::invalid_argument(
             "page layout generation regresses during restore");
     }
-    std::lock_guard control_plane_lock(control_plane_mutex_);
     [[maybe_unused]] auto retirement_admission =
         retirement_pressure_->control_plane_call();
     invocation_gate_.begin_reconfiguration_and_wait();
     struct InvocationResume {
       InvocationGate &gate;
-
       ~InvocationResume() { gate.resume_accepting(); }
     } invocation_resume{invocation_gate_};
-    {
-      std::lock_guard lock(checkpoint_mutations_mutex_);
-      checkpoint_baseline_.clear();
-      checkpoint_cuts_.clear();
+    for (const auto &slot : slot_storage_) {
+      if (slot->arena.allocated_count() != 0 || slot->size() != 0)
+        throw std::logic_error("page-image import requires empty slots");
     }
-    se::concurrency::with_epoch_reclamation([&] {
-      std::vector<std::vector<PageImageImport<ParamT, OptT>>> by_dimension(
-          dim_to_slot_.size());
-      for (const auto &import : images) {
-        if (import.embedding_dim >= dim_to_slot_.size() ||
-            dim_to_slot_[import.embedding_dim] == nullptr)
-          throw std::invalid_argument(
-              "page-image import dimension has no physical table");
-        by_dimension[import.embedding_dim].push_back(import);
+    bool import_attempted = false;
+    std::exception_ptr import_failure;
+    try {
+      checkpoint::ExternalSortedRecords<checkpoint::ActiveKeyIdentity> pages;
+      typename SlotStore::PageImportScratch scratch;
+      (*source)(pro::make_proxy<FunctionFacade<void(
+                    const PageImageImport<ParamT, OptT>
+                        &)>>([&](const PageImageImport<ParamT, OptT> &import) {
+        if (import_failure)
+          std::rethrow_exception(import_failure);
+        try {
+          if (import.embedding_dim >= dim_to_slot_.size() ||
+              dim_to_slot_[import.embedding_dim] == nullptr)
+            throw std::invalid_argument(
+                "page-image import dimension has no physical table");
+          pages.append({import.embedding_dim, import.image.physical_page_id});
+          import_attempted = true;
+          se::concurrency::with_epoch_reclamation([&] {
+            dim_to_slot_[import.embedding_dim]->import_page_image(
+                import, load_optimizer_state, scratch);
+          });
+        } catch (...) {
+          import_failure = std::current_exception();
+          if (import_attempted)
+            mark_terminal_failure();
+          throw;
+        }
+      }));
+      if (import_failure)
+        std::rethrow_exception(import_failure);
+      checkpoint::validate_unique_records(
+          pages, "page-image import has duplicate page ids");
+      ensure_operational();
+      publish_store_snapshot();
+      {
+        std::lock_guard lock(checkpoint_mutations_mutex_);
+        checkpoint_baseline_.clear();
+        checkpoint_cuts_.clear();
       }
-      for (size_t dim = 0; dim < by_dimension.size(); ++dim) {
-        if (!by_dimension[dim].empty())
-          dim_to_slot_[dim]->import_page_images(by_dimension[dim]);
-      }
-    });
-    if (requested_page_layout_generation.has_value())
-      checkpoint_page_layout_generation_.store(
-          *requested_page_layout_generation, std::memory_order_release);
-    publish_store_snapshot();
+      if (requested_generation)
+        checkpoint_page_layout_generation_.store(*requested_generation,
+                                                 std::memory_order_release);
+    } catch (...) {
+      if (import_attempted)
+        mark_terminal_failure();
+      if (import_failure)
+        std::rethrow_exception(import_failure);
+      throw;
+    }
   }
 
   std::vector<std::shared_ptr<const SealedHotPage<ParamT>>>

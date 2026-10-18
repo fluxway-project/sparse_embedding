@@ -13,18 +13,18 @@ import pytest
 import sparse_embedding as se
 from sparse_embedding.checkpoint import (
     PartitionSpec,
-    ReshardRestore,
+    RestorePlan,
     SparseCheckpoint,
 )
 from sparse_embedding.checkpoint.lance_backend import LocalLanceStorage
 
 
-def _modulo_restore(partition_count: int, partition_id: int) -> ReshardRestore:
-    return ReshardRestore(
+def _modulo_restore(partition_count: int, partition_id: int) -> RestorePlan:
+    return RestorePlan.from_partition(
         PartitionSpec.modulo(),
         partition_count,
         partition_id,
-        "uint64",
+        key_dtype="uint64",
     )
 
 

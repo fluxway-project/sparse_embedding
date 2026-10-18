@@ -3,14 +3,15 @@
 from __future__ import annotations
 
 import math
-from abc import ABC, abstractmethod
 from collections.abc import Mapping, Sequence
-from dataclasses import dataclass
+from dataclasses import KW_ONLY, dataclass
 from datetime import datetime
 from enum import Enum
 from pathlib import Path
 from types import MappingProxyType
-from typing import Any, Protocol
+from typing import Any, Protocol, final, runtime_checkable
+
+from .. import _core
 
 
 def attach_cleanup_errors(
@@ -102,6 +103,26 @@ def _freeze_assignment_value(value: object, path: str, depth: int = 0) -> object
             for index, item in enumerate(value)
         )
     raise TypeError(f"{path} contains an unsupported value")
+
+
+def _thaw_assignment_value(value: object) -> object:
+    if isinstance(value, MappingProxyType):
+        return {key: _thaw_assignment_value(val) for key, val in value.items()}
+    if isinstance(value, tuple):
+        return tuple(_thaw_assignment_value(item) for item in value)
+    if isinstance(value, (int, float, str, bool)) or value is None:
+        return value
+    raise TypeError(f"unsupported frozen assignment value: {type(value).__name__}")
+
+
+def _hash_assignment_value(value: object) -> object:
+    if isinstance(value, MappingProxyType):
+        return tuple(
+            sorted((key, _hash_assignment_value(val)) for key, val in value.items())
+        )
+    if isinstance(value, tuple):
+        return tuple(_hash_assignment_value(item) for item in value)
+    return value
 
 
 class SparseCheckpointError(RuntimeError):
@@ -357,10 +378,14 @@ class IngestionEngine(str, Enum):
     FAST_PAGE_CACHE = "fast_page_cache"
 
 
+@final
 class PartitionSpec:
     """Declarative partition specification serving as Single Source of Truth."""
 
     __slots__ = ("_name", "_parameters")
+
+    def __init_subclass__(cls, **kwargs: object) -> None:
+        raise TypeError("type 'PartitionSpec' is not an acceptable base type")
 
     def __init__(
         self,
@@ -381,23 +406,11 @@ class PartitionSpec:
         if not isinstance(frozen_parameters, Mapping):
             raise TypeError("partition spec parameters must be a mapping")
 
-        _APPROVED_ASSIGNMENTS = {
-            SPARSE_EMBEDDING_MODULO_ASSIGNMENT_NAME,
-            SPARSE_EMBEDDING_HASH_ASSIGNMENT_NAME,
-            SPARSE_EMBEDDING_FAST_RANGE_ASSIGNMENT_NAME,
-        }
-        if name not in _APPROVED_ASSIGNMENTS:
-            try:
-                import sparse_embedding as _se
-
-                if not _se.is_partitioner_registered(name):
-                    raise ValueError(
-                        "sparse assignment is not an owner-approved executable contract"
-                    )
-            except (ImportError, AttributeError):
-                raise ValueError(
-                    "sparse assignment is not an owner-approved executable contract"
-                )
+        # Package initialization loads _core before checkpoint domain types.
+        # Registration owns executable names; factory creation validates their
+        # algorithm-specific parameters when a target count is bound.
+        if not _core.is_partitioner_registered(name):
+            raise ValueError(f"unregistered partition algorithm: {name!r}")
 
         self._name = name
         self._parameters = frozen_parameters
@@ -410,13 +423,14 @@ class PartitionSpec:
     def parameters(self) -> Mapping[str, object]:
         return self._parameters
 
-    @property
-    def sparse_assignment_name(self) -> str:
-        return self._name
+    def __copy__(self) -> PartitionSpec:
+        return self
 
-    @property
-    def sparse_assignment_parameters(self) -> Mapping[str, object]:
-        return self._parameters
+    def __deepcopy__(self, memo: dict[int, Any] | None = None) -> PartitionSpec:
+        return self
+
+    def __reduce__(self) -> tuple[Any, ...]:
+        return (self.__class__, (self._name, _thaw_assignment_value(self._parameters)))
 
     def __eq__(self, other: object) -> bool:
         if isinstance(other, PartitionSpec):
@@ -424,7 +438,7 @@ class PartitionSpec:
         return False
 
     def __hash__(self) -> int:
-        return hash((self._name, tuple(sorted(self._parameters.items()))))
+        return hash((self._name, _hash_assignment_value(self._parameters)))
 
     def __repr__(self) -> str:
         return (
@@ -455,38 +469,53 @@ class PartitionSpec:
         )
 
 
-class RestorePlan(ABC):
-    """Abstract base class for typed checkpoint restore plans."""
+@dataclass(frozen=True, slots=True)
+class PartitionTarget:
+    """Bind one partition algorithm to a concrete restore worker."""
 
-    __slots__ = ()
+    spec: PartitionSpec
+    partition_count: int
+    partition_id: int
 
-    @property
-    @abstractmethod
-    def restore_kind(self) -> str:
-        """Identifier for the canonical topology routing mode."""
-        raise NotImplementedError
+    def __post_init__(self) -> None:
+        if not isinstance(self.spec, PartitionSpec):
+            raise TypeError("spec must be a PartitionSpec")
+        if isinstance(self.partition_count, bool) or not isinstance(
+            self.partition_count, int
+        ):
+            raise TypeError("partition_count must be an integer")
+        if self.partition_count <= 0:
+            raise ValueError("partition_count must be positive")
+        if self.partition_count > (1 << 32) - 1:
+            raise ValueError("partition_count must not exceed UINT32_MAX")
+        if isinstance(self.partition_id, bool) or not isinstance(
+            self.partition_id, int
+        ):
+            raise TypeError("partition_id must be an integer")
+        if not 0 <= self.partition_id < self.partition_count:
+            raise ValueError("partition_id is outside partition_count")
 
-    @abstractmethod
-    def encode(self) -> bytes:
-        """Encode this restore plan into canonical opaque bytes."""
-        raise NotImplementedError
 
-    @classmethod
-    def from_bytes(cls, payload: bytes) -> RestorePlan:
-        """Decode canonical opaque bytes into a concrete RestorePlan."""
-        from .restore_options import _decode_restore_options
+@dataclass(frozen=True, slots=True)
+class RestorePlan:
+    """Restore to one target, with explicit materialization and key dtype.
 
-        return _decode_restore_options(payload)
+    Pass an existing ``PartitionTarget`` directly, or use ``from_partition``
+    to bind a spec. Optional policy arguments are keyword-only in both forms.
+    """
 
-    @classmethod
-    def from_participant(
-        cls,
-        participant: CheckpointParticipant,
-        *,
-        key_dtype: str = "uint64",
-        engine: IngestionEngine = IngestionEngine.RECONSTRUCT_ENTRIES,
-    ) -> RankRestore:
-        return RankRestore(participant, engine=engine, key_dtype=key_dtype)
+    target: PartitionTarget
+    _: KW_ONLY
+    engine: IngestionEngine = IngestionEngine.RECONSTRUCT_ENTRIES
+    key_dtype: str = "uint64"
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.target, PartitionTarget):
+            raise TypeError("target must be a PartitionTarget")
+        if not isinstance(self.engine, IngestionEngine):
+            raise TypeError("engine must be an IngestionEngine")
+        if self.key_dtype not in SUPPORTED_KEY_DTYPES:
+            raise ValueError(f"unsupported key dtype: {self.key_dtype}")
 
     @classmethod
     def from_partition(
@@ -497,217 +526,18 @@ class RestorePlan(ABC):
         *,
         key_dtype: str = "uint64",
         engine: IngestionEngine = IngestionEngine.RECONSTRUCT_ENTRIES,
-    ) -> ReshardRestore:
-        return ReshardRestore(
-            spec,
-            partition_count,
-            partition_id,
-            key_dtype,
-            engine=engine,
-        )
-
-    @classmethod
-    def from_topology(
-        cls,
-        *,
-        saved_participant_count: int | None,
-        participant: CheckpointParticipant,
-        spec: PartitionSpec,
-        key_dtype: str = "uint64",
-        engine: IngestionEngine = IngestionEngine.RECONSTRUCT_ENTRIES,
     ) -> RestorePlan:
-        """Select rank restore only when the saved and current topologies match."""
-        if not isinstance(spec, PartitionSpec):
-            raise TypeError("spec must be a PartitionSpec")
-        if not isinstance(participant, CheckpointParticipant):
-            raise TypeError("participant must be a CheckpointParticipant")
-        if saved_participant_count is not None:
-            if (
-                isinstance(saved_participant_count, bool)
-                or not isinstance(saved_participant_count, int)
-                or saved_participant_count <= 0
-            ):
-                raise ValueError("saved_participant_count must be positive")
-        if saved_participant_count == participant.participant_count:
-            return cls.from_participant(
-                participant,
-                key_dtype=key_dtype,
-                engine=engine,
-            )
-        return cls.from_partition(
-            spec,
-            participant.participant_count,
-            participant.participant_index,
+        return cls(
+            PartitionTarget(spec, partition_count, partition_id),
             key_dtype=key_dtype,
             engine=engine,
         )
 
-    decode = from_bytes
-    rank = from_participant
-    reshard = from_partition
+    @classmethod
+    def from_bytes(cls, payload: bytes) -> RestorePlan:
+        from .restore_options import _decode_restore_options
 
-
-class RankRestore(RestorePlan):
-    """Rank-preserving topology restore with a selectable ingestion engine."""
-
-    __slots__ = ("_key_dtype", "_participant", "_engine")
-
-    def __init__(
-        self,
-        participant: CheckpointParticipant,
-        engine: IngestionEngine = IngestionEngine.RECONSTRUCT_ENTRIES,
-        key_dtype: str = "uint64",
-    ) -> None:
-        if not isinstance(participant, CheckpointParticipant):
-            raise TypeError(
-                f"participant must be a CheckpointParticipant; got {type(participant).__name__}"
-            )
-        if not isinstance(engine, IngestionEngine):
-            raise TypeError("engine must be an IngestionEngine")
-        if key_dtype not in SUPPORTED_KEY_DTYPES:
-            raise ValueError(f"unsupported key dtype: {key_dtype}")
-
-        self._participant = participant
-        self._engine = engine
-        self._key_dtype = key_dtype
-
-    @property
-    def restore_kind(self) -> str:
-        return "rank"
-
-    @property
-    def participant(self) -> CheckpointParticipant:
-        return self._participant
-
-    @property
-    def engine(self) -> IngestionEngine:
-        return self._engine
-
-    @property
-    def key_dtype(self) -> str:
-        return self._key_dtype
-
-    def __eq__(self, other: object) -> bool:
-        if isinstance(other, RankRestore):
-            return (
-                self._participant == other._participant
-                and self._engine == other._engine
-                and self._key_dtype == other._key_dtype
-            )
-        return False
-
-    def __hash__(self) -> int:
-        return hash((self._participant, self._engine, self._key_dtype))
-
-    def __repr__(self) -> str:
-        return (
-            f"RankRestore(participant={self._participant!r}, "
-            f"engine={self._engine!r}, key_dtype={self._key_dtype!r})"
-        )
-
-    def encode(self) -> bytes:
-        from .restore_options import encode_restore_options
-
-        return encode_restore_options(self)
-
-
-class ReshardRestore(RestorePlan):
-    """M:N partition-reshard topology restore using canonical entry reconstruction."""
-
-    __slots__ = (
-        "_engine",
-        "_key_dtype",
-        "_partition_count",
-        "_partition_id",
-        "_spec",
-    )
-
-    def __init__(
-        self,
-        spec: PartitionSpec,
-        partition_count: int,
-        partition_id: int,
-        key_dtype: str = "uint64",
-        *,
-        engine: IngestionEngine = IngestionEngine.RECONSTRUCT_ENTRIES,
-    ) -> None:
-        if not isinstance(spec, PartitionSpec):
-            raise TypeError(f"spec must be a PartitionSpec; got {type(spec).__name__}")
-        if key_dtype not in SUPPORTED_KEY_DTYPES:
-            raise ValueError(f"unsupported key dtype: {key_dtype}")
-        if not isinstance(engine, IngestionEngine):
-            raise TypeError("engine must be an IngestionEngine")
-        if engine is IngestionEngine.FAST_PAGE_CACHE:
-            raise ValueError("FAST_PAGE_CACHE is only valid for rank restore")
-        if isinstance(partition_count, bool) or not isinstance(partition_count, int):
-            raise TypeError("partition_count must be an integer")
-        if partition_count <= 0:
-            raise ValueError("partition_count must be positive")
-        if isinstance(partition_id, bool) or not isinstance(partition_id, int):
-            raise TypeError("partition_id must be an integer")
-        if not 0 <= partition_id < partition_count:
-            raise ValueError("partition_id is outside partition_count")
-
-        self._spec = spec
-        self._engine = engine
-        self._partition_count = partition_count
-        self._partition_id = partition_id
-        self._key_dtype = key_dtype
-
-    @property
-    def restore_kind(self) -> str:
-        return "reshard"
-
-    @property
-    def spec(self) -> PartitionSpec:
-        return self._spec
-
-    @property
-    def engine(self) -> IngestionEngine:
-        return self._engine
-
-    @property
-    def key_dtype(self) -> str:
-        return self._key_dtype
-
-    @property
-    def partition_count(self) -> int:
-        return self._partition_count
-
-    @property
-    def partition_id(self) -> int:
-        return self._partition_id
-
-    def __eq__(self, other: object) -> bool:
-        if isinstance(other, ReshardRestore):
-            return (
-                self._spec == other._spec
-                and self._engine == other._engine
-                and self._key_dtype == other._key_dtype
-                and self._partition_count == other._partition_count
-                and self._partition_id == other._partition_id
-            )
-        return False
-
-    def __hash__(self) -> int:
-        return hash(
-            (
-                self._spec,
-                self._engine,
-                self._key_dtype,
-                self._partition_count,
-                self._partition_id,
-            )
-        )
-
-    def __repr__(self) -> str:
-        return (
-            f"ReshardRestore(spec={self._spec!r}, "
-            f"engine={self._engine!r}, "
-            f"key_dtype={self._key_dtype!r}, "
-            f"partition_count={self._partition_count}, "
-            f"partition_id={self._partition_id})"
-        )
+        return _decode_restore_options(payload)
 
     def encode(self) -> bytes:
         from .restore_options import encode_restore_options
@@ -812,13 +642,31 @@ class CheckpointCleanup(Protocol):
     def release_reference(self, handle: CheckpointHandle) -> None: ...
 
 
+@runtime_checkable
+class CheckpointableStore(Protocol):
+    def checkpoint_requires_full(self) -> bool: ...
+    def initialize_checkpoint_baseline(
+        self, baseline: str, watermark: int, resharded: bool = False
+    ) -> str: ...
+    def advance_checkpoint_baseline(
+        self, watermark: int, baseline: str, capture_id: int, journal_identity: str
+    ) -> None: ...
+    def checkpoint_baseline(self) -> str: ...
+    def checkpoint_restore_is_pristine(self) -> bool: ...
+
+
 class SparseCheckpointProtocol(Protocol):
     def resolve_lineage_head_handle(
         self, checkpoint_name: str
     ) -> CheckpointHandle | None: ...
 
+    def requires_full_checkpoint(self, store: CheckpointableStore) -> bool: ...
+
     def acknowledge_store_mutations(
-        self, store: Any, handle: CheckpointHandle, participant_index: int = 0
+        self,
+        store: CheckpointableStore,
+        handle: CheckpointHandle,
+        participant_index: int = 0,
     ) -> None: ...
 
     def prepare_checkpoint(self, identity: CheckpointSaveIdentity) -> None: ...
@@ -908,3 +756,22 @@ class SparseCheckpointStorage(
         source_path: str,
         target_path: str | None = None,
     ) -> str: ...
+
+
+def resolve_effective_save_mode(
+    configured_mode: CheckpointSaveMode,
+    requires_full: bool,
+    parent_handle: CheckpointHandle | None,
+) -> tuple[CheckpointSaveMode, CheckpointHandle | None]:
+    """Resolve the effective save mode given configured mode and parent/reshard state."""
+    if not isinstance(configured_mode, CheckpointSaveMode):
+        raise TypeError(
+            f"configured_mode must be a CheckpointSaveMode; got {type(configured_mode).__name__}"
+        )
+    if (
+        configured_mode is CheckpointSaveMode.FULL
+        or parent_handle is None
+        or requires_full
+    ):
+        return CheckpointSaveMode.FULL, None
+    return CheckpointSaveMode.INCREMENTAL, parent_handle

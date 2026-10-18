@@ -54,7 +54,10 @@ cc_library(
         "@nanobind",
         "@proxy",
     ] + select({
-        "//:lance_enabled": ["//sparse_embedding/src/checkpoint:checkpoint_lance"],
+        "//:lance_enabled": [
+            "//sparse_embedding/src/checkpoint:checkpoint_lance",
+            "//sparse_embedding/src/checkpoint:native_restore",
+        ],
         "//conditions:default": [],
     }),
     alwayslink = True,

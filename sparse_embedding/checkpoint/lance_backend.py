@@ -12,7 +12,7 @@ import struct
 import threading
 import uuid
 from base64 import urlsafe_b64decode, urlsafe_b64encode
-from collections.abc import Callable, Mapping, Sequence
+from collections.abc import Callable, Collection, Mapping, Sequence
 from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
@@ -34,6 +34,7 @@ from ._lance_workspace import (
 )
 from .base import (
     PUBLISHED_WEIGHT_DESCRIPTOR_FILENAME,
+    CheckpointableStore,
     CheckpointCommitAuthority,
     CheckpointConflictError,
     CheckpointFragment,
@@ -48,8 +49,7 @@ from .base import (
     CommittedCheckpoint,
     IngestionEngine,
     InvalidCheckpointFragment,
-    RankRestore,
-    ReshardRestore,
+    PartitionTarget,
     RestorePlan,
     SparseCheckpointLocator,
     StorageBudgetExceeded,
@@ -356,6 +356,13 @@ class ManifestParticipantRecord:
     page_dataset: str
     page_version: int
     page_layout_generation: int
+
+
+@dataclass(frozen=True, slots=True)
+class _PreparedRestore:
+    chain: tuple[dict[str, Any], ...]
+    preserves_source_ownership: bool
+    page_participant: ManifestParticipantRecord | None
 
 
 @dataclass(frozen=True, slots=True)
@@ -960,7 +967,6 @@ class _LanceCheckpointStorage:
             tuple[str, int, str], ValidatedManifestParticipants
         ] = {}
         self._capture_cleanup: dict[tuple[str, str, int], tuple[Any, int, str]] = {}
-        self._full_checkpoint_required: set[int] = set()
         self._commit_lock_state = threading.local()
         self._exclusive_recovery_owner: int | None = None
 
@@ -968,6 +974,13 @@ class _LanceCheckpointStorage:
         self._manifest_cache_version = None
         self._manifest_cache_rows = None
         self._participant_view_cache.clear()
+
+    def requires_full_checkpoint(self, store: Any) -> bool:
+        if not isinstance(store, CheckpointableStore):
+            raise TypeError(
+                f"store must implement CheckpointableStore; got {type(store).__name__}"
+            )
+        return bool(store.checkpoint_requires_full())
 
     def prepare_checkpoint(self, identity: CheckpointSaveIdentity) -> None:
         self._require_mutation_allowed()
@@ -995,10 +1008,8 @@ class _LanceCheckpointStorage:
             raise TypeError("mode must be a CheckpointSaveMode")
         if mode is CheckpointSaveMode.INCREMENTAL and parent_manifest is None:
             raise ValueError("incremental fragment requires a parent manifest")
-        store_identity = id(store)
-        if (
-            mode is CheckpointSaveMode.INCREMENTAL
-            and store_identity in self._full_checkpoint_required
+        if mode is CheckpointSaveMode.INCREMENTAL and self.requires_full_checkpoint(
+            store
         ):
             raise ValueError(
                 "reshard restore requires the next training checkpoint to be FULL"
@@ -1206,8 +1217,6 @@ class _LanceCheckpointStorage:
                     participant.participant_index,
                 )
             ] = (store, context.capture_id, context.journal_identity)
-            if mode is CheckpointSaveMode.FULL:
-                self._full_checkpoint_required.discard(store_identity)
             return fragment
         except BaseException as primary:
             actions: list[tuple[str, Any]] = []
@@ -1489,8 +1498,11 @@ class _LanceCheckpointStorage:
                     context.parent.checkpoint_version,
                 ),
             )
+            tags_set = set(
+                self._workspace.dataset(SNAPSHOT_MANIFEST_DATASET).tags.list()
+            )
             if (
-                parent["commit_state"] != _COMMITTED
+                not self._is_acknowledged_committed_row(parent, tags_set)
                 or parent["reference_id"] != context.parent_reference_id
             ):
                 raise RuntimeError("incremental parent identity is not committed")
@@ -1690,22 +1702,26 @@ class _LanceCheckpointStorage:
         self._require_mutation_allowed()
         with self._commit_lock():
             retained_committed = False
-            orphaned_locators: list[SparseCheckpointLocator] = []
+            reclaimed_committed = False
             tags = self._workspace.dataset(SNAPSHOT_MANIFEST_DATASET).tags
             attempt = self._attempt_prefix(identity)
             actions: list[tuple[str, Any]] = []
             global_actions = [
                 (
                     "attempt prefix cleanup",
-                    lambda: self._workspace.delete_prefix(attempt, missing_ok=True)
-                    if (not retained_committed and self._workspace.exists(attempt))
-                    else None,
+                    lambda: (
+                        self._workspace.delete_prefix(attempt, missing_ok=True)
+                        if (not retained_committed and self._workspace.exists(attempt))
+                        else None
+                    ),
                 ),
                 (
                     "authority cleanup",
-                    lambda: self._clear_authority(identity)
-                    if not retained_committed
-                    else None,
+                    lambda: (
+                        self._clear_authority(identity)
+                        if not retained_committed
+                        else None
+                    ),
                 ),
                 (
                     "parent head reservations cleanup",
@@ -1748,59 +1764,12 @@ class _LanceCheckpointStorage:
                             if intent not in tags.list():
                                 retained_committed = True
                                 continue
-                            orphaned_locators.append(locator)
-                            page_datasets = [
-                                self._manifest_fragment_descriptor(
-                                    row, participant_index
-                                )["page_dataset"]
-                                for participant_index in range(
-                                    _strict_integer(
-                                        row["participant_count"],
-                                        "participant_count",
-                                        minimum=1,
-                                    )
+                            reclaimed_committed = True
+                            actions.append(
+                                (
+                                    "reclaim orphan committed row",
+                                    lambda r=row: self._reclaim_committed_row(r),
                                 )
-                            ]
-                            actions.extend(
-                                [
-                                    (
-                                        "parent chain reference",
-                                        lambda row=row: self._delete_parent_chain_reference(
-                                            row
-                                        ),
-                                    ),
-                                    (
-                                        "reference tags",
-                                        lambda locator=locator,
-                                        ref=str(
-                                            row["reference_id"]
-                                        ): self._delete_reference_tags(locator, ref),
-                                    ),
-                                    (
-                                        "pending outcome",
-                                        lambda name=identity.checkpoint_name: self._delete_pending_outcome(
-                                            name
-                                        ),
-                                    ),
-                                    (
-                                        "intent tag",
-                                        lambda locator=locator: self._delete_intent_tag(
-                                            identity, locator.checkpoint_version
-                                        ),
-                                    ),
-                                    (
-                                        "page attempt tags",
-                                        lambda pds=page_datasets: self._release_page_attempt_tags(
-                                            identity, pds
-                                        ),
-                                    ),
-                                    (
-                                        "page write intents",
-                                        lambda pds=page_datasets: self._release_page_write_intents(
-                                            identity, pds
-                                        ),
-                                    ),
-                                ]
                             )
                             continue
                         if row["commit_state"] != _PREPARED:
@@ -1841,14 +1810,16 @@ class _LanceCheckpointStorage:
                                 (
                                     "reference tags",
                                     lambda locator=locator,
-                                    ref=str(
-                                        row["reference_id"]
-                                    ): self._delete_reference_tags(locator, ref),
+                                    ref=str(row["reference_id"]): (
+                                        self._delete_reference_tags(locator, ref)
+                                    ),
                                 ),
                                 (
                                     "manifest prepared row",
-                                    lambda version=version: self._delete_prepared_manifest_row(
-                                        identity.checkpoint_name, version
+                                    lambda version=version: (
+                                        self._delete_prepared_manifest_row(
+                                            identity.checkpoint_name, version
+                                        )
                                     ),
                                 ),
                                 (
@@ -1859,21 +1830,13 @@ class _LanceCheckpointStorage:
                                 ),
                                 (
                                     "page write intents",
-                                    lambda pds=page_datasets: self._release_page_write_intents(
-                                        identity, pds
+                                    lambda pds=page_datasets: (
+                                        self._release_page_write_intents(identity, pds)
                                     ),
                                 ),
                             ]
                         )
-                if orphaned_locators:
-                    actions.append(
-                        (
-                            "reclaim orphaned locators",
-                            lambda locs=frozenset(
-                                orphaned_locators
-                            ): self._reclaim_unlocked_for(timedelta(0), locs),
-                        )
-                    )
+                if reclaimed_committed:
                     actions.append(
                         (
                             "reconcile page protection",
@@ -2034,6 +1997,7 @@ class _LanceCheckpointStorage:
         self._ensure_tables()
         self._require_exclusive_recovery()
         self._reconcile_reclaiming()
+        self._reconcile_orphan_commits()
         self._reclaim_unlocked(older_than)
         self._reconcile_page_protection(cleanup=True)
 
@@ -2421,13 +2385,17 @@ class _LanceCheckpointStorage:
                 or self._locator_has_pending_intent(locator)
             ):
                 continue
+            tags_set = set(tags.list())
             latest_version = max(
-                _strict_integer(
-                    candidate["checkpoint_version"], "checkpoint_version", minimum=1
-                )
-                for candidate in rows
-                if candidate["checkpoint_name"] == locator.checkpoint_name
-                and candidate["commit_state"] == _COMMITTED
+                (
+                    _strict_integer(
+                        candidate["checkpoint_version"], "checkpoint_version", minimum=1
+                    )
+                    for candidate in rows
+                    if candidate["checkpoint_name"] == locator.checkpoint_name
+                    and self._is_acknowledged_committed_row(candidate, tags_set)
+                ),
+                default=0,
             )
             has_pending_reclaim = any(
                 tag.startswith("sepending.")
@@ -2445,24 +2413,7 @@ class _LanceCheckpointStorage:
                 created_at = created_at.replace(tzinfo=UTC)
             if now - created_at < older_than:
                 continue
-            roots = self._manifest_fragment_roots(row)
-            reclaim_tag = self._reclaim_pending_tag(locator)
-            if reclaim_tag not in tags.list():
-                tags.create(reclaim_tag, manifest_dataset.version)
-            try:
-                for root in roots.values():
-                    self._workspace.delete_prefix(root)
-            except BaseException as error:
-                raise RuntimeError(
-                    "checkpoint fragment reclaim was partially completed"
-                ) from error
-            self._delete_parent_chain_reference(row)
-            manifest_dataset.delete(
-                f"checkpoint_name = '{self._sql_literal(locator.checkpoint_name)}' "
-                f"AND checkpoint_version = {locator.checkpoint_version}"
-            )
-            if reclaim_tag in tags.list():
-                tags.delete(reclaim_tag)
+            self._reclaim_committed_row(row)
         if self._exclusive_recovery_owner is not None:
             self._reconcile_staging(cleanup=True)
 
@@ -2501,21 +2452,116 @@ class _LanceCheckpointStorage:
                 raise RuntimeError(
                     "checkpoint reclaim marker manifest is not committed"
                 )
-            roots = self._manifest_fragment_roots(manifest)
-            try:
-                for root in roots.values():
-                    if self._workspace.exists(root):
-                        self._workspace.delete_prefix(root)
-            except BaseException as error:
-                raise RuntimeError("checkpoint reclaim recovery was partial") from error
-            self._delete_parent_chain_reference(manifest)
-            self._workspace.dataset(SNAPSHOT_MANIFEST_DATASET).delete(
-                f"checkpoint_name = '{self._sql_literal(locator.checkpoint_name)}' "
-                f"AND checkpoint_version = {locator.checkpoint_version}"
+            self._reclaim_committed_row(manifest)
+
+    def _reclaim_committed_row(self, row: Mapping[str, Any]) -> None:
+        version = _strict_integer(
+            row["checkpoint_version"], "checkpoint_version", minimum=1
+        )
+        locator = SparseCheckpointLocator(str(row["checkpoint_name"]), version)
+        dataset = self._workspace.dataset(SNAPSHOT_MANIFEST_DATASET)
+        tags = dataset.tags
+
+        reclaim_tag = self._reclaim_pending_tag(locator)
+        if reclaim_tag not in tags.list():
+            tags.create(reclaim_tag, dataset.version)
+
+        roots = self._manifest_fragment_roots(dict(row))
+        for root in roots.values():
+            if self._workspace.exists(root):
+                self._workspace.delete_prefix(root)
+
+        self._delete_parent_chain_reference(dict(row))
+        if row["reference_id"]:
+            self._delete_reference_tags(locator, str(row["reference_id"]))
+
+        if bool(row["include_page_images"]):
+            page_datasets = [
+                self._manifest_fragment_descriptor(row, participant_index)[
+                    "page_dataset"
+                ]
+                for participant_index in range(
+                    _strict_integer(
+                        row["participant_count"],
+                        "participant_count",
+                        minimum=1,
+                    )
+                )
+            ]
+            save_identity = CheckpointSaveIdentity(
+                str(row["checkpoint_name"]),
+                str(row["save_attempt"]),
+                CheckpointCommitAuthority(
+                    str(row["authority_scope"]),
+                    _strict_integer(
+                        row["authority_generation"], "authority_generation"
+                    ),
+                    str(row["commit_authority"]),
+                ),
             )
-            self._invalidate_manifest_cache()
-            if tag in tags.list():
-                tags.delete(tag)
+            self._release_page_attempt_tags(save_identity, page_datasets)
+            self._release_page_write_intents(save_identity, page_datasets)
+
+        dataset.delete(
+            f"checkpoint_name = '{self._sql_literal(locator.checkpoint_name)}' "
+            f"AND checkpoint_version = {locator.checkpoint_version}"
+        )
+        self._invalidate_manifest_cache()
+
+        attempt_token = self._token(str(row["save_attempt"]))
+        intent_tag = f"seintent.{attempt_token}.{version}"
+        if intent_tag in tags.list():
+            tags.delete(intent_tag)
+
+        self._delete_pending_outcome(locator.checkpoint_name)
+        committed_tag = self._committed_tag(locator)
+        if committed_tag in tags.list():
+            tags.delete(committed_tag)
+
+        if reclaim_tag in tags.list():
+            tags.delete(reclaim_tag)
+
+    def _reconcile_orphan_commits(self) -> None:
+        dataset = self._workspace.dataset(SNAPSHOT_MANIFEST_DATASET)
+        tags_set = set(dataset.tags.list())
+        rows = self._manifest_rows()
+        for row in rows:
+            if row["commit_state"] != _COMMITTED:
+                continue
+            attempt_token = self._token(str(row["save_attempt"]))
+            version = _strict_integer(
+                row["checkpoint_version"], "checkpoint_version", minimum=1
+            )
+            intent_tag = f"seintent.{attempt_token}.{version}"
+            if intent_tag not in tags_set:
+                continue
+            has_superseding_acknowledged = any(
+                candidate["checkpoint_name"] == row["checkpoint_name"]
+                and _strict_integer(
+                    candidate["checkpoint_version"], "checkpoint_version", minimum=1
+                )
+                >= version
+                and self._is_acknowledged_committed_row(candidate, tags_set)
+                for candidate in rows
+            )
+            scope = str(row["authority_scope"])
+            fence_prefix = f"sefence.{self._token(scope)}."
+            fence_generations = [
+                _serialized_integer(
+                    tag.removeprefix(fence_prefix),
+                    "authority generation",
+                    maximum=(1 << 64) - 1,
+                )
+                for tag in tags_set
+                if tag.startswith(fence_prefix)
+            ]
+            current_fence_gen = max(fence_generations, default=-1)
+            row_gen = _strict_integer(
+                row["authority_generation"], "authority_generation"
+            )
+            is_fenced = current_fence_gen > row_gen
+            if has_superseding_acknowledged or is_fenced:
+                self._reclaim_committed_row(row)
 
     @staticmethod
     def _reclaim_marker_locator(tag: str) -> SparseCheckpointLocator:
@@ -2726,28 +2772,30 @@ class _LanceCheckpointStorage:
             plan = self._decode_restore_plan(restore)
             locator, _ = self._resolve_handle(storage_locator)
             manifest = self._resolve_manifest(locator)
-            chain = self._prepare_restore(
+            prepared = self._prepare_restore(
                 store, manifest, plan, load_optimizer_state=load_optimizer_state
             )
 
             def _restore() -> None:
-                self._restore_validated_record(store, chain, plan, load_optimizer_state)
+                self._restore_entries(store, prepared, plan, load_optimizer_state)
                 if load_optimizer_state:
-                    self._initialize_restore_origin(store, chain, plan)
+                    self._initialize_restore_origin(store, prepared, plan)
 
             self._execute_guarded_restore(store, _restore)
 
     def _initialize_restore_origin(
         self,
         store: Any,
-        chain: Sequence[Mapping[str, Any]],
+        prepared: _PreparedRestore,
         plan: RestorePlan,
     ) -> None:
+        chain = prepared.chain
         if not chain:
             raise RuntimeError("validated restore chain is empty")
         manifest = chain[-1]
-        if isinstance(plan, RankRestore):
-            participant_index = plan.participant.participant_index
+        target = plan.target
+        if prepared.preserves_source_ownership:
+            participant_index = target.partition_id
             participant_rec = self._validated_manifest_participants(
                 manifest
             ).record_for(participant_index)
@@ -2756,18 +2804,20 @@ class _LanceCheckpointStorage:
                 participant_rec.watermark,
             )
             return
-        if isinstance(plan, ReshardRestore):
-            baseline, watermark = self._reshard_restore_origin(chain, plan)
-            store.initialize_checkpoint_baseline(baseline, watermark)
-            self._full_checkpoint_required.add(id(store))
-            return
-        raise TypeError("unsupported restore mode")
+        baseline, watermark = self._target_restore_origin(chain, plan)
+        store.initialize_checkpoint_baseline(baseline, watermark, resharded=True)
 
     @staticmethod
-    def _reshard_restore_origin(
+    def _target_restore_origin(
         chain: Sequence[Mapping[str, Any]],
-        plan: ReshardRestore,
+        plan: RestorePlan,
     ) -> tuple[str, int]:
+        """Start a target baseline when historical source ownership changes.
+
+        Equal participant counts can still change ownership. Keep the complete
+        validated chain and assignment in the origin and continue sequences above
+        every saved participant cut; subsequent saves must start with a FULL baseline.
+        """
         if not chain:
             raise RuntimeError("validated restore chain is empty")
         manifest = chain[-1]
@@ -2780,7 +2830,6 @@ class _LanceCheckpointStorage:
         baseline = _canonical_digest(
             [
                 {
-                    "restore_kind": plan.restore_kind,
                     "manifest_chain": [
                         {
                             "checkpoint_name": str(item["checkpoint_name"]),
@@ -2801,10 +2850,10 @@ class _LanceCheckpointStorage:
                         }
                         for item in chain
                     ],
-                    "assignment_name": plan.spec.name,
-                    "assignment_parameters": dict(plan.spec.parameters),
-                    "partition_count": plan.partition_count,
-                    "partition_id": plan.partition_id,
+                    "assignment_name": plan.target.spec.name,
+                    "assignment_parameters": dict(plan.target.spec.parameters),
+                    "partition_count": plan.target.partition_count,
+                    "partition_id": plan.target.partition_id,
                     "key_dtype": plan.key_dtype,
                 }
             ]
@@ -2863,11 +2912,11 @@ class _LanceCheckpointStorage:
         load_optimizer_state: bool,
     ) -> tuple[dict[str, Any], ...]:
         """Validate and restore a committed manifest chain into an empty target."""
-        chain = self._prepare_restore(
+        prepared = self._prepare_restore(
             store, manifest, plan, load_optimizer_state=load_optimizer_state
         )
-        self._restore_validated_record(store, chain, plan, load_optimizer_state)
-        return chain
+        self._restore_entries(store, prepared, plan, load_optimizer_state)
+        return prepared.chain
 
     def _prepare_restore(
         self,
@@ -2876,7 +2925,7 @@ class _LanceCheckpointStorage:
         plan: RestorePlan,
         *,
         load_optimizer_state: bool,
-    ) -> tuple[dict[str, Any], ...]:
+    ) -> _PreparedRestore:
         """Validate restore inputs before any target mutation is permitted."""
         specification = self._manifest_specification(manifest)
         if manifest["schema_digest"] != _schema_digest(specification):
@@ -2893,10 +2942,7 @@ class _LanceCheckpointStorage:
             raise ValueError(
                 "load_optimizer_state=False requires a target store with optimizer disabled"
             )
-        mode_key_dtype = (
-            plan.key_dtype if isinstance(plan, (RankRestore, ReshardRestore)) else None
-        )
-        if mode_key_dtype != specification.key_dtype:
+        if plan.key_dtype != specification.key_dtype:
             raise ValueError(
                 "restore options sparse ID dtype does not match checkpoint"
             )
@@ -2910,7 +2956,7 @@ class _LanceCheckpointStorage:
         chain = self._manifest_chain(manifest)
         for chain_manifest in chain:
             self._validate_manifest_fragments(chain_manifest)
-        self._validate_chain_entries(chain)
+        preserves_source_ownership = self._validate_chain_entries(chain, plan.target)
         if store.total_size() != 0:
             raise RuntimeError("restore requires an empty target store")
         if not hasattr(store, "checkpoint_restore_is_pristine") or not callable(
@@ -2921,58 +2967,48 @@ class _LanceCheckpointStorage:
             )
         if not store.checkpoint_restore_is_pristine():
             raise RuntimeError("restore requires a pristine checkpoint journal")
-        if isinstance(plan, RankRestore):
-            saved_count = _strict_integer(
-                manifest["participant_count"], "manifest participant_count", minimum=1
+        if not hasattr(_checkpoint_native, "restore_native_partition_entries"):
+            raise RuntimeError(
+                "native checkpoint restore requires a Lance-enabled _core extension"
             )
-            if plan.participant.participant_count != saved_count:
-                raise ValueError("rank restore requires the saved participant topology")
-            if plan.participant.participant_index >= saved_count:
-                raise ValueError("restore participant is outside saved topology")
-            if plan.engine is IngestionEngine.FAST_PAGE_CACHE:
-                participant_rec = self._validated_manifest_participants(
-                    manifest
-                ).record_for(plan.participant.participant_index)
-                if store.entries_per_page != participant_rec.page_capacity:
-                    raise ValueError(
-                        "page-image geometry does not match store topology"
-                    )
-                if not bool(manifest["include_page_images"]):
-                    raise FileNotFoundError(
-                        "checkpoint does not contain page_images cache for rank restore; "
-                        "request IngestionEngine.RECONSTRUCT_ENTRIES to reconstruct from canonical entries"
-                    )
-                if not hasattr(_checkpoint_native, "restore_native_page_images"):
-                    raise RuntimeError(
-                        "native checkpoint restore requires a Lance-enabled _core extension"
-                    )
-            return chain
-        if isinstance(plan, ReshardRestore):
-            if not hasattr(_checkpoint_native, "restore_native_partition_entries"):
+        participant_rec = None
+        if plan.engine is IngestionEngine.FAST_PAGE_CACHE:
+            participant_rec = self._page_restore_participant(
+                manifest, plan.target, preserves_source_ownership
+            )
+            if store.entries_per_page != participant_rec.page_capacity:
+                raise ValueError("page-image geometry does not match store topology")
+            if not bool(manifest["include_page_images"]):
+                raise FileNotFoundError(
+                    "checkpoint does not contain page_images cache for page-image materialization; "
+                    "request IngestionEngine.RECONSTRUCT_ENTRIES to reconstruct from canonical entries"
+                )
+            if not hasattr(_checkpoint_native, "restore_native_page_images"):
                 raise RuntimeError(
                     "native checkpoint restore requires a Lance-enabled _core extension"
                 )
-            if not hasattr(_checkpoint_native, "validate_active_entry_keys"):
-                raise RuntimeError(
-                    "native checkpoint duplicate validation requires a Lance-enabled _core extension"
-                )
-            return chain
-        raise TypeError("unsupported restore mode")
+        return _PreparedRestore(chain, preserves_source_ownership, participant_rec)
 
-    def _restore_validated_record(
+    def _page_restore_participant(
         self,
-        store: Any,
-        chain: Sequence[dict[str, Any]],
-        plan: RestorePlan,
-        load_optimizer_state: bool,
-    ) -> None:
-        if isinstance(plan, RankRestore):
-            self._restore_rank(store, chain, plan, load_optimizer_state)
-            return
-        if isinstance(plan, ReshardRestore):
-            self._restore_reshard(store, chain, plan, load_optimizer_state)
-            return
-        raise TypeError("unsupported restore mode")
+        manifest: Mapping[str, Any],
+        target: PartitionTarget,
+        preserves_source_ownership: bool,
+    ) -> ManifestParticipantRecord:
+        saved_count = _strict_integer(
+            manifest["participant_count"], "manifest participant_count", minimum=1
+        )
+        if target.partition_count != saved_count:
+            raise ValueError(
+                "page-image materialization requires the saved partition topology"
+            )
+        if not preserves_source_ownership:
+            raise ValueError(
+                "page-image materialization requires unchanged source partition ownership"
+            )
+        return self._validated_manifest_participants(manifest).record_for(
+            target.partition_id
+        )
 
     @classmethod
     def _validate_restore_target(
@@ -3025,6 +3061,14 @@ class _LanceCheckpointStorage:
                     tags.delete(name)
                 elif generation > incoming_generation:
                     raise RuntimeError("checkpoint authority tag is ahead of its fence")
+            if name.startswith(
+                f"setransaction.{self._short_token(identity.checkpoint_name)}."
+            ):
+                parts = name.split(".")
+                if len(parts) == 5:
+                    gen = _serialized_integer(parts[2], "authority_generation")
+                    if gen < incoming_generation:
+                        tags.delete(name)
         names = tuple(tags.list())
         authority_tag = self._authority_tag(identity)
         checkpoint_prefix = self._authority_checkpoint_prefix(identity)
@@ -3100,11 +3144,17 @@ class _LanceCheckpointStorage:
         require_reservation: bool = True,
         existing_tags: Sequence[str] | None = None,
     ) -> None:
+        tags_list = (
+            existing_tags
+            if existing_tags is not None
+            else tuple(self._workspace.dataset(SNAPSHOT_MANIFEST_DATASET).tags.list())
+        )
+        tags_set = set(tags_list)
         committed = [
             row
             for row in self._manifest_rows()
             if row["checkpoint_name"] == identity.checkpoint_name
-            and row["commit_state"] == _COMMITTED
+            and self._is_acknowledged_committed_row(row, tags_set)
         ]
         if not committed:
             raise CheckpointConflictError(
@@ -3118,11 +3168,6 @@ class _LanceCheckpointStorage:
             raise CheckpointConflictError(
                 "incremental parent is not the committed lineage head"
             )
-        tags_list = (
-            existing_tags
-            if existing_tags is not None
-            else tuple(self._workspace.dataset(SNAPSHOT_MANIFEST_DATASET).tags.list())
-        )
         prefix = self._parent_head_prefix(parent)
         own = self._parent_head_tag(identity, parent)
         reservations = tuple(tag for tag in tags_list if tag.startswith(prefix))
@@ -3820,6 +3865,8 @@ class _LanceCheckpointStorage:
         if decoded["authority_generation"] != identity.commit_authority.generation:
             if not require_identity:
                 return None
+            if decoded["authority_generation"] < identity.commit_authority.generation:
+                return None
             raise CheckpointConflictError(
                 "durable checkpoint outcome belongs to another authority generation"
             )
@@ -4168,11 +4215,14 @@ class _LanceCheckpointStorage:
             raise ValueError("checkpoint_name must be a non-empty string")
         self._ensure_tables()
         with self._commit_lock():
+            tags_set = set(
+                self._workspace.dataset(SNAPSHOT_MANIFEST_DATASET).tags.list()
+            )
             committed = [
                 row
                 for row in self._manifest_rows()
                 if row["checkpoint_name"] == checkpoint_name
-                and row["commit_state"] == _COMMITTED
+                and self._is_acknowledged_committed_row(row, tags_set)
             ]
             if not committed:
                 return None
@@ -4267,10 +4317,19 @@ class _LanceCheckpointStorage:
         chain.reverse()
         return tuple(chain)
 
-    def _validate_chain_entries(self, chain: Sequence[dict[str, Any]]) -> None:
+    def _validate_chain_entries(
+        self, chain: Sequence[dict[str, Any]], target: PartitionTarget | None = None
+    ) -> bool:
         *_, target_manifest = chain
+        target_options: dict[str, Any] = {}
+        if target is not None:
+            target_options = {
+                "partition_count": target.partition_count,
+                "assignment_name": target.spec.name,
+                "assignment_parameters": dict(target.spec.parameters),
+            }
         try:
-            _checkpoint_native.validate_native_checkpoint_chain(
+            return _checkpoint_native.validate_native_checkpoint_chain(
                 [
                     [
                         self._workspace.uri(f"{root}/{ENTRIES_DATASET}")
@@ -4284,6 +4343,7 @@ class _LanceCheckpointStorage:
                 list(target_manifest["dimensions"]),
                 str(target_manifest["key_dtype"]),
                 dict(self._workspace.storage_options()),
+                **target_options,
             )
         except ValueError as error:
             raise InvalidCheckpointFragment(str(error)) from error
@@ -4783,6 +4843,25 @@ class _LanceCheckpointStorage:
     def _sql_literal(value: str) -> str:
         return value.replace("'", "''")
 
+    def _is_acknowledged_committed_row(
+        self,
+        row: Mapping[str, Any],
+        tags_set: Collection[str],
+    ) -> bool:
+        if row["commit_state"] != _COMMITTED:
+            return False
+        attempt_token = self._token(str(row["save_attempt"]))
+        version = _strict_integer(
+            row["checkpoint_version"], "checkpoint_version", minimum=1
+        )
+        intent_tag = f"seintent.{attempt_token}.{version}"
+        if intent_tag in tags_set:
+            return False
+        locator = SparseCheckpointLocator(str(row["checkpoint_name"]), version)
+        if self._reclaim_pending_tag(locator) in tags_set:
+            return False
+        return True
+
     @classmethod
     def _intent_tag(
         self, identity: CheckpointSaveIdentity, locator: SparseCheckpointLocator
@@ -5006,109 +5085,60 @@ class _LanceCheckpointStorage:
         self._clear_authority(identity)
         return locator
 
-    def _restore_reshard(
+    def _restore_entries(
         self,
         store: Any,
-        chain: Sequence[dict[str, Any]],
-        mode: ReshardRestore,
+        prepared: _PreparedRestore,
+        plan: RestorePlan,
         load_optimizer_state: bool,
     ) -> None:
-        if not hasattr(_checkpoint_native, "restore_native_partition_entries"):
-            raise RuntimeError(
-                "native checkpoint restore requires a Lance-enabled _core extension"
-            )
-        if not hasattr(_checkpoint_native, "validate_active_entry_keys"):
-            raise RuntimeError(
-                "native checkpoint duplicate validation requires a Lance-enabled _core extension"
-            )
-        assignment_name = mode.spec.name
-        assignment_parameters = {
-            str(k): str(v) for k, v in mode.spec.parameters.items()
-        }
-        sources = [
-            self._workspace.uri(f"{root}/{ENTRIES_DATASET}")
-            for manifest in chain
-            for root in self._participant_roots_in_native_order(manifest)
-            if self._workspace.exists(f"{root}/{ENTRIES_DATASET}")
-        ]
-        _checkpoint_native.restore_native_partition_entries(
-            store,
-            sources,
-            0,
-            mode.partition_count,
-            mode.partition_id,
-            mode.key_dtype,
-            None,
-            dict(self._workspace.storage_options()),
-            load_optimizer_state,
-            assignment_name,
-            assignment_parameters,
-        )
-
-    def _restore_rank(
-        self,
-        store: Any,
-        chain: Sequence[dict[str, Any]],
-        mode: RankRestore,
-        load_optimizer_state: bool,
-    ) -> None:
-        *_, manifest = chain
-        if mode.participant.participant_count != _strict_integer(
-            manifest["participant_count"], "participant_count", minimum=1
-        ):
-            raise ValueError("rank restore requires the saved participant topology")
-        if mode.engine == IngestionEngine.FAST_PAGE_CACHE:
-            participant_rec = self._validated_manifest_participants(
-                manifest
-            ).record_for(mode.participant.participant_index)
-            if store.entries_per_page != participant_rec.page_capacity:
-                raise ValueError("page-image geometry does not match store topology")
-            has_page_cache = bool(manifest["include_page_images"])
-            if not has_page_cache:
-                raise FileNotFoundError(
-                    "checkpoint does not contain page_images cache for rank restore; "
-                    "request IngestionEngine.RECONSTRUCT_ENTRIES to reconstruct from canonical entries"
-                )
-            if not hasattr(_checkpoint_native, "restore_native_page_images"):
+        chain = prepared.chain
+        target = plan.target
+        if plan.engine is IngestionEngine.FAST_PAGE_CACHE:
+            participant_rec = prepared.page_participant
+            if participant_rec is None:
                 raise RuntimeError(
-                    "native checkpoint restore requires a Lance-enabled _core extension"
+                    "page-image restore requires a validated page descriptor"
                 )
             page_dataset = participant_rec.page_dataset
             page_version = participant_rec.page_version
-            if page_version <= 0:
-                return
+            page_sources = (
+                [self._workspace.uri(page_dataset)] if page_version > 0 else []
+            )
             _checkpoint_native.restore_native_page_images(
                 store,
-                [self._workspace.uri(page_dataset)],
+                page_sources,
                 page_version,
-                mode.participant.participant_index,
-                mode.key_dtype,
+                target.partition_id,
+                plan.key_dtype,
                 dict(self._workspace.storage_options()),
                 load_optimizer_state,
                 participant_rec.page_layout_generation,
             )
             return
 
-        if mode.engine is not IngestionEngine.RECONSTRUCT_ENTRIES:
-            raise ValueError(f"unsupported rank ingestion engine: {mode.engine!r}")
-
-        sources = []
-        for chain_manifest in chain:
-            root = self._manifest_fragment_root_for_participant(
-                chain_manifest, mode.participant.participant_index
-            )
-            if self._workspace.exists(f"{root}/{ENTRIES_DATASET}"):
-                sources.append(self._workspace.uri(f"{root}/{ENTRIES_DATASET}"))
+        if plan.engine is not IngestionEngine.RECONSTRUCT_ENTRIES:
+            raise ValueError(f"unsupported restore materialization: {plan.engine!r}")
+        sources = [
+            self._workspace.uri(f"{root}/{ENTRIES_DATASET}")
+            for chain_manifest in chain
+            for root in self._participant_roots_in_native_order(chain_manifest)
+            if self._workspace.exists(f"{root}/{ENTRIES_DATASET}")
+        ]
+        assignment_name = target.spec.name
+        assignment_parameters = dict(target.spec.parameters)
         _checkpoint_native.restore_native_partition_entries(
             store,
             sources,
             0,
-            1,
-            0,
-            mode.key_dtype,
-            mode.participant.participant_index,
+            target.partition_count,
+            target.partition_id,
+            plan.key_dtype,
+            None,
             dict(self._workspace.storage_options()),
             load_optimizer_state,
+            assignment_name,
+            assignment_parameters,
         )
 
     @staticmethod

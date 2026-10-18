@@ -317,8 +317,9 @@ int main(int argc, char **argv) {
   require_throws([&] {
     rejected_page_image_store.import_page_images(duplicate_page_image_imports);
   });
-  require(rejected_page_image_store.size() == 0,
-          "rejected page-image import published partial state");
+  require(!rejected_page_image_store.is_operational(),
+          "rejected page-image import reopened a partial target");
+  require_throws([&] { (void)rejected_page_image_store.size(); });
 
   constexpr size_t page_compaction_keys = 4096;
   Store page_compaction_store(

@@ -11,8 +11,7 @@ from sparse_embedding.checkpoint import (
     IngestionEngine,
     LocalLanceStorage,
     PartitionSpec,
-    RankRestore,
-    ReshardRestore,
+    RestorePlan,
     SparseCheckpoint,
     encode_restore_options,
     lance_backend,
@@ -36,6 +35,52 @@ _KEY_CASES = (
 
 def test_native_restore_has_no_untyped_selected_key_entry_point() -> None:
     assert not hasattr(se._core.checkpoint, "restore_native_entries")
+
+
+@pytest.mark.parametrize(
+    ("actual_dtype", "requested_dtype"),
+    [
+        ("int32", "uint64"),
+        ("uint32", "uint64"),
+        ("int64", "uint64"),
+        ("uint64", "int64"),
+    ],
+)
+@pytest.mark.parametrize("operation", ["validate", "restore"])
+def test_direct_native_rejects_physical_key_dtype_mismatch(
+    tmp_path: Path, actual_dtype: str, requested_dtype: str, operation: str
+) -> None:
+    storage = LocalLanceStorage(tmp_path / "checkpoint")
+    source = _store(actual_dtype)
+    _assign(source, np.asarray([0, 1], dtype=actual_dtype))
+    saved = SparseCheckpoint(storage).save_training_checkpoint(source, "native-types")
+    manifest = storage.resolve_checkpoint_manifest(saved.handle)
+    root = storage._manifest_fragment_root_for_participant(manifest, 0)
+    table = lance.dataset(
+        storage._workspace.uri(f"{root}/{ENTRIES_DATASET}")
+    ).to_table()
+    metadata = dict(table.schema.metadata)
+    metadata[b"sparse_embedding.key_dtype"] = requested_dtype.encode()
+    uri = str(tmp_path / "forged-key-type")
+    lance.write_dataset(table.replace_schema_metadata(metadata), uri)
+    target = _store(requested_dtype)
+    with pytest.raises(ValueError, match="schema key dtype"):
+        if operation == "validate":
+            se._core.checkpoint.validate_native_checkpoint_chain(
+                [[uri]],
+                [[0]],
+                [2],
+                requested_dtype,
+                {},
+                partition_count=1,
+                assignment_name=PartitionSpec.fast_range().name,
+            )
+        else:
+            se._core.checkpoint.restore_native_partition_entries(
+                target, [uri], 0, 1, 0, requested_dtype
+            )
+    assert target.is_operational() is True
+    assert target.total_size() == 0
 
 
 def _store(key_dtype: str, *, optimizer: bool = True) -> se.EmbeddingStore:
@@ -67,12 +112,27 @@ def _values(store: se.EmbeddingStore, keys: np.ndarray) -> np.ndarray:
     return np.from_dlpack(values).reshape((-1, 2))
 
 
-def _elastic_options(key_dtype: str, partition_count: int = 1) -> ReshardRestore:
-    return ReshardRestore(
+def _elastic_options(key_dtype: str, partition_count: int = 1) -> RestorePlan:
+    return RestorePlan.from_partition(
         PartitionSpec.modulo(),
         partition_count,
         0,
         key_dtype=key_dtype,
+    )
+
+
+def _target_restore(
+    participant: CheckpointParticipant,
+    *,
+    key_dtype: str = "uint64",
+    engine: IngestionEngine = IngestionEngine.RECONSTRUCT_ENTRIES,
+) -> RestorePlan:
+    return RestorePlan.from_partition(
+        PartitionSpec.modulo(),
+        participant.participant_count,
+        participant.participant_index,
+        key_dtype=key_dtype,
+        engine=engine,
     )
 
 
@@ -102,7 +162,7 @@ def test_four_key_encodings_save_and_restore_physical_and_elastic(
     checkpoint.load_training_checkpoint(
         physical,
         committed.handle,
-        RankRestore(
+        _target_restore(
             CheckpointParticipant(0, 1),
             key_dtype=key_dtype,
         ),
@@ -137,7 +197,7 @@ def test_four_key_encodings_page_image_and_entry_restore_survive_compaction(
     checkpoint.load_training_checkpoint(
         page_restore,
         compacted,
-        RankRestore(
+        _target_restore(
             CheckpointParticipant(0, 1),
             engine=IngestionEngine.FAST_PAGE_CACHE,
             key_dtype=key_dtype,
@@ -147,7 +207,7 @@ def test_four_key_encodings_page_image_and_entry_restore_survive_compaction(
     checkpoint.load_training_checkpoint(
         entry_restore,
         compacted,
-        RankRestore(
+        _target_restore(
             CheckpointParticipant(0, 1),
             key_dtype=key_dtype,
         ),
@@ -261,7 +321,7 @@ def test_key_encoding_corruption_fails_before_target_mutation(
         checkpoint.load_training_checkpoint(
             target,
             committed.handle,
-            RankRestore(
+            _target_restore(
                 CheckpointParticipant(0, 1),
                 key_dtype=key_dtype,
             ),

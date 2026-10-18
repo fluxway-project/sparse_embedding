@@ -46,8 +46,7 @@ from ._version import (
 from .checkpoint.base import (
     IngestionEngine,
     PartitionSpec,
-    RankRestore,
-    ReshardRestore,
+    PartitionTarget,
     RestorePlan,
 )
 from .partitioner import (
@@ -190,13 +189,12 @@ __all__ = [
     "InverseDecayLrPolicy",
     "CosineFrequencyLrPolicy",
     "CustomLutLrPolicy",
-    "ReshardRestore",
+    "PartitionTarget",
     "FastRangePartition",
     "HashPartition",
     "ModuloPartition",
     "PartitionSpec",
     "PartitionStrategy",
-    "RankRestore",
     "IngestionEngine",
     "RestorePlan",
     "create_strategy",

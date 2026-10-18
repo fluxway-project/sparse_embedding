@@ -8,9 +8,6 @@ build --local_resources=cpu=HOST_CPUS
 
 build --cxxopt=-std=c++23
 
-# Enable AVX512_BF16 extension to support bfloat16 at the hardware/compiler level.
-build --copt=-mavx512bf16
-
 # Set default compilation mode to release (opt) for maximum performance out of the box.
 build --compilation_mode=opt
 
