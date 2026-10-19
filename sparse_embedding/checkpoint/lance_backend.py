@@ -21,8 +21,8 @@ from types import MappingProxyType
 from typing import Any, cast
 from urllib.parse import urlparse
 
-import numpy as np
-import pyarrow as pa
+import numpy as np  # pyrefly: ignore[missing-import]
+import pyarrow as pa  # pyrefly: ignore[missing-import]
 
 from sparse_embedding import _core as _native
 
@@ -5143,18 +5143,58 @@ class _LanceCheckpointStorage:
 
     @staticmethod
     def _store_specification(store: Any) -> TableSpecification:
-        dimensions = tuple(
-            _strict_integer(dim, "store dimension", minimum=1)
-            for dim in store.table_dims()
+        """Extract and validate the canonical TableSpecification from an embedding store.
+
+        The store must conform to the Store protocol, providing table_dims(),
+        value_dtype(), optimizer_dtype(), score_policy(), and key_dtype().
+        Dimensions must be a non-empty, strictly ascending sequence of unique positive
+        integers to guarantee deterministic schema digests and external merge sort ordering.
+        """
+        required_methods = (
+            "table_dims",
+            "value_dtype",
+            "optimizer_dtype",
+            "score_policy",
+            "key_dtype",
         )
-        if not dimensions or tuple(sorted(dimensions)) != dimensions:
-            raise ValueError("store dimensions must be a non-empty sorted sequence")
-        if not hasattr(store, "key_dtype") or not callable(store.key_dtype):
-            raise TypeError("store must expose key_dtype()")
+        missing = [
+            method
+            for method in required_methods
+            if not callable(getattr(store, method, None))
+        ]
+        if missing:
+            raise TypeError(
+                f"store object is missing required callable methods: {missing}. "
+                "Ensure your store is an instance of se.EmbeddingStore or implements the Store protocol."
+            )
+
+        raw_dims = store.table_dims()
+        if not raw_dims:
+            raise ValueError(
+                "store dimensions must not be empty. "
+                "Please configure EmbeddingConfig with at least one dimension, e.g., EmbeddingConfig(dims=[128])."
+            )
+
+        dimensions = tuple(
+            _strict_integer(dim, "store dimension", minimum=1) for dim in raw_dims
+        )
+
+        if len(set(dimensions)) != len(dimensions):
+            raise ValueError(
+                f"store dimensions must be unique, but duplicates were found: {dimensions}. "
+                "Please deduplicate dimensions when configuring the store, e.g., EmbeddingConfig(dims=sorted(set(dims)))."
+            )
+
+        if tuple(sorted(dimensions)) != dimensions:
+            raise ValueError(
+                f"store dimensions must be in strictly ascending order, but received: {dimensions}. "
+                f"Please initialize the store with sorted dimensions, e.g., EmbeddingConfig(dims={sorted(dimensions)})."
+            )
+
         return TableSpecification(
             dimensions=dimensions,
             embedding_dtype=store.value_dtype(),
-            optimizer_dtype=store.optimizer_dtype(),
+            optimizer_dtype=store.optimizer_dtype() or None,
             score_policy=store.score_policy(),
             key_dtype=store.key_dtype(),
         )
