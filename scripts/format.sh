@@ -1,40 +1,62 @@
 #!/bin/bash
-# This script formats all source files in the workspace.
-# It should be run from the workspace root, e.g., via `bazel run //:format`.
 set -euo pipefail
 
-if [ -n "${BUILD_WORKSPACE_DIRECTORY:-}" ]; then
-	cd ${BUILD_WORKSPACE_DIRECTORY}
+case "${1:---fix}" in
+  --fix) mode=fix ;;
+  --check) mode=check ;;
+  *) printf 'Usage: bash scripts/format.sh [--fix|--check]\n' >&2; exit 2 ;;
+esac
+if (( $# > 1 )); then
+  printf 'Usage: bash scripts/format.sh [--fix|--check]\n' >&2
+  exit 2
 fi
-echo "Current directory: "$PWD
 
-echo "Searching for files to format in workspace..."
+if [[ -n "${BUILD_WORKSPACE_DIRECTORY:-}" ]]; then
+  cd -- "$BUILD_WORKSPACE_DIRECTORY"
+fi
+workspace="$(git rev-parse --show-toplevel)"
+cd -- "$workspace"
+for tool in clang-format-16 buildifier ruff; do
+  command -v "$tool" > /dev/null
+done
 
-# Find files and format them.
-# -print0 and xargs -0 handle filenames with spaces or other special characters.
-# Exclude bazel-* directories to avoid formatting generated files.
-find . -type d -name "bazel-*" -prune -o -type f \( \
-	-name "*.h" \
-	-o -name "*.cpp" \
-	-o -name "*.hpp" \
-	-o -name "*.cu" \
-	-o -name "*.cuh" \
-	\) -print0 | xargs -0 clang-format-16 -style=file -i
+mkdir -p tmp/format
+file_list="$(mktemp "$PWD/tmp/format/files.XXXXXX")"
+trap 'rm -f -- "$file_list"' EXIT
+git ls-files --cached --others --exclude-standard -z > "$file_list"
 
-find . -type f \( \
-	-name "*.bazel" \
-	-o -name "*.bzl" \
-	-o -name "BUILD" \
-	-o -name "WORKSPACE" \
-	\) -exec buildifier {} \;
+cpp=()
+bazel=()
+python=()
+while IFS= read -r -d '' file; do
+  if [[ ! -f "$file" || -L "$file" ]]; then
+    continue
+  fi
+  case "$file" in
+    *.h|*.c|*.cc|*.cpp|*.hpp|*.cu|*.cuh|*.inl) cpp+=("$file") ;;
+    *.bazel|*.bzl|BUILD|*/BUILD|WORKSPACE|*/WORKSPACE) bazel+=("$file") ;;
+    *.py) python+=("$file") ;;
+  esac
+done < "$file_list"
 
-# Format Python files using ruff
-find . -type d -name "bazel-*" -prune -o \
-       -type d -name "tmp" -prune -o \
-       -type f \( -name "*.py" \) -print0 | xargs -0 ruff format
-
-find . -type d -name "bazel-*" -prune -o \
-       -type d -name "tmp" -prune -o \
-       -type f \( -name "*.py" \) -print0 | xargs -0 ruff check --fix
-
-echo "Formatting complete."
+printf 'Formatting mode: %s; C++: %s, Bazel: %s, Python: %s files\n' \
+  "$mode" "${#cpp[@]}" "${#bazel[@]}" "${#python[@]}"
+if (( ${#cpp[@]} )); then
+  if [[ "$mode" == check ]]; then
+    clang-format-16 -style=file --dry-run --Werror "${cpp[@]}"
+  else
+    clang-format-16 -style=file -i "${cpp[@]}"
+  fi
+fi
+if (( ${#bazel[@]} )); then
+  buildifier "-mode=$mode" "${bazel[@]}"
+fi
+if (( ${#python[@]} )); then
+  if [[ "$mode" == check ]]; then
+    ruff check --select I "${python[@]}"
+    ruff format --check "${python[@]}"
+  else
+    ruff check --select I --fix "${python[@]}"
+    ruff format "${python[@]}"
+  fi
+fi

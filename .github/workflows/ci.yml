@@ -1,0 +1,42 @@
+name: CI
+
+on:
+  pull_request:
+    branches: [main]
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  format:
+    name: Format
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    env:
+      BUILDIFIER_VERSION: v10.1.0
+      BUILDIFIER_SHA256: 31b6a8aa1e5c746696788f428729701770ad91925873d8256cb885c60e12c77e
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v7
+        with:
+          python-version: '3.12'
+      - name: Install format tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install --no-install-recommends -y clang-format-16
+          python -m pip install ruff==0.14.6
+          curl --fail --silent --show-error --location \
+            "https://github.com/bazel-contrib/buildtools/releases/download/$BUILDIFIER_VERSION/buildifier-linux-amd64" \
+            --output "$RUNNER_TEMP/buildifier"
+          printf '%s  %s\n' "$BUILDIFIER_SHA256" "$RUNNER_TEMP/buildifier" | sha256sum --check
+          chmod +x "$RUNNER_TEMP/buildifier"
+          printf '%s\n' "$RUNNER_TEMP" >> "$GITHUB_PATH"
+      - name: Check format
+        run: bash scripts/format.sh --check

@@ -865,7 +865,7 @@ NB_MODULE(_core, m) {
       nb::arg("store"), nb::arg("uris"), nb::arg("version"),
       nb::arg("participant_index"), nb::arg("key_dtype"),
       nb::arg("storage_options") = nb::dict(),
-      nb::arg("load_optimizer_state") = true,
+      nb::arg("load_optimizer_state") = true, nb::kw_only(),
       nb::arg("page_layout_generation"));
   checkpoint.def(
       "validate_native_checkpoint_chain",

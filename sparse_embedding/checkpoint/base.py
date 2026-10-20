@@ -9,7 +9,7 @@ from datetime import datetime
 from enum import Enum
 from pathlib import Path
 from types import MappingProxyType
-from typing import Any, Protocol, final, runtime_checkable
+from typing import Any, Protocol, TypeAlias, final, runtime_checkable
 
 from .. import _core
 
@@ -356,7 +356,7 @@ class SparseCheckpointLocator:
             raise ValueError("checkpoint_version must be a positive integer")
 
 
-type CheckpointHandle = bytes
+CheckpointHandle: TypeAlias = bytes
 
 
 @dataclass(frozen=True, slots=True)

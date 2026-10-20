@@ -2,7 +2,7 @@
 
 [English](README.md)
 
-高性能稀疏嵌入表库（Sparse Embedding Table），面向大规模推荐系统训练，采用 Hogwild! 松弛更新、Slot Directory 读路径、x86 SeqLock 发布和分页存储架构。
+高性能稀疏存储与计算库，适用于大规模稀疏 Embedding（推荐系统）、大规模稀疏 Engram（条件记忆与知识检索）、大规模稀疏 MoE（专家路由与参数存储）以及大规模稀疏 KV Cache（长上下文长尾缓存）等场景。采用 Hogwild! 松弛更新、Slot Directory 读路径、x86 SeqLock 发布和分页存储架构。
 
 ## 核心特性
 

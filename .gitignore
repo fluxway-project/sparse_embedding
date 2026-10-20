@@ -20,6 +20,7 @@ __pycache__/
 *.egg-info/
 dist/
 sparse_embedding/_core.pyi
+sparse_embedding/_core/
 
 # IDE & OS
 .agents/

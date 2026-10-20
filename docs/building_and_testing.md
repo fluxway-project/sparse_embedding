@@ -25,7 +25,7 @@ This document describes the build architecture, packaging contract, and verifica
 - **Setuptools as Distribution Owner**:
   - Serves as the standard PEP 517 build backend for `pip install`, editable installs, and binary wheel creation.
   - Discovers compiled artifacts dynamically by querying `//:native_artifacts` from Bazel, ensuring exact alignment with the active build configuration.
-  - Generates PEP 561 typing markers (`py.typed`) and Nanobind type stubs (`_core.pyi`).
+  - Bundles the PEP 561 marker (`py.typed`) and generates recursive Nanobind stubs (`_core/__init__.pyi` and `_core/checkpoint.pyi`).
   - Strictly isolates test suites from redistributable packages.
 
 ---
@@ -56,7 +56,7 @@ pip install -e .
 SE_BUILD_WITH_LANCE=0 pip install -e .
 
 # Build redistributable binary wheel
-pip wheel . --no-build-isolation
+pip wheel .
 ```
 
 ### Running Tests
@@ -84,10 +84,23 @@ bazel test -c opt //sparse_embedding/...
 
 ---
 
-## 4. Packaging Invariants
+## 4. Source Formatting
+
+Local formatting and CI use the same entry point:
+
+```bash
+bash scripts/format.sh
+bash scripts/format.sh --check
+```
+
+The script selects tracked and non-ignored untracked source files using Git. Build outputs, temporary wheel environments, and ignored dependencies are excluded. It runs clang-format 16 with the repository's LLVM style, buildifier 10.1.0, and Ruff 0.14.6. Ruff sorts imports and formats Python files. Check mode reports differences without rewriting source files. CI pins these tool versions in `.github/workflows/ci.yml`.
+
+---
+
+## 5. Packaging Invariants
 
 All builds enforce the following packaging standards:
 
-1. **Clean Distribution Tree**: Namespace package discovery in `setup.py` strictly excludes `sparse_embedding.tests`, preventing test fixtures and harness code from leaking into release wheels.
-2. **Stale Artifact Invalidation**: `setup.py` cleans destination directories and purges obsolete `.so` files before copying new Bazel build outputs, preventing ABI mismatches across configuration switches.
-3. **Type Safety & Metadata**: The package bundles `py.typed` alongside generated Nanobind `.pyi` stubs, providing full static typing support for downstream consumers.
+1. **Clean release wheels**: `setup.py` excludes `sparse_embedding.tests` so test code and fixtures are not shipped in distribution wheels.
+2. **Isolated wheel builds**: Wheel builds stage and compile C++ libraries (`.so`), type stubs, and version metadata inside a dedicated build directory without modifying or polluting the source tree. Editable installs (`pip install -e .`) continue to support in-place development builds.
+3. **First-class C++ type support**: Release packages bundle `py.typed` and `.pyi` stub files for `_core`. CI automatically verifies stub validity and wheel integrity, ensuring IDE autocomplete and static type checkers work out of the box for downstream users.

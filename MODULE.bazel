@@ -65,7 +65,13 @@ git_override(
 bazel_dep(name = "nanobind", version = "2.12.0")
 
 python = use_extension("@rules_python//python/extensions:python.bzl", "python")
-python.toolchain(python_version = "3.12")
+python.toolchain(python_version = "3.11")
+python.toolchain(
+    is_default = True,
+    python_version = "3.12",
+)
+python.toolchain(python_version = "3.13")
+python.toolchain(python_version = "3.14")
 
 dlpack_deps = use_extension("//third_party/dlpack:extensions.bzl", "dlpack_dep")
 use_repo(dlpack_deps, "dlpack")

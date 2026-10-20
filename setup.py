@@ -46,33 +46,37 @@ def _is_lance_enabled() -> bool:
     raise ValueError(f"Invalid SE_BUILD_WITH_LANCE value: {val!r}")
 
 
-def _sync_version_py() -> None:
-    """Write sparse_embedding/_version.py directly from versions.bzl."""
+def _sync_version_py(build_package_dir: Path) -> None:
+    """Write the built package's version metadata from versions.bzl."""
     content = f'''# Generated from versions.bzl — Single Source of Truth.
 __version__ = "{_VERSIONS["PACKAGE_VERSION"]}"
 __python_requires__ = "{_VERSIONS["PYTHON_REQUIRES"]}"
 __lance_c_version__ = "{_VERSIONS["LANCE_C_VERSION"]}"
 __lance_c_commit__ = "{_VERSIONS["LANCE_C_COMMIT"]}"
 '''
-    version_file = _PKG_DIR / "_version.py"
+    version_file = build_package_dir / "_version.py"
     version_file.write_text(content)
 
 
 def _remove_stale_extension_artifacts(build_package_dir: Path) -> None:
-    if build_package_dir.resolve().is_relative_to(_PKG_DIR):
+    destination = build_package_dir.resolve()
+    source = _PKG_DIR.resolve()
+    if destination.is_relative_to(source):
         raise ValueError("The build destination must be outside the source package")
-    if _PKG_DIR.is_relative_to(build_package_dir.resolve()):
+    if source.is_relative_to(destination):
         raise ValueError("The build destination must not contain the source package")
     if build_package_dir.exists():
         shutil.rmtree(build_package_dir)
-    for candidate in _PKG_DIR.glob("*.so"):
-        candidate.unlink()
 
 
 def _invoke_bazel(with_lance: bool) -> list[Path]:
     target = "//:native_artifacts"
     env = os.environ.copy()
     options = shlex.split(env.pop("BAZEL_COPTS", ""))
+    options.append(
+        "--@rules_python//python/config_settings:python_version="
+        f"{sys.version_info.major}.{sys.version_info.minor}"
+    )
     options.append(f"--//:with_lance={str(with_lance).lower()}")
     execution_root = subprocess.run(
         ["bazel", "info", "execution_root", *options],
@@ -111,26 +115,30 @@ def _invoke_bazel(with_lance: bool) -> list[Path]:
 
 
 def _build_native_artifacts(build_package_dir: Path) -> None:
-    """Compile native libraries via Bazel and copy them into package directory."""
+    """Compile native libraries and generate artifacts in the build package."""
     with_lance = _is_lance_enabled()
-    _sync_version_py()
     print(
         f"[setup.py] Building C++ backend via Bazel (lance={'yes' if with_lance else 'no'})...",
         file=sys.stderr,
     )
     artifacts = _invoke_bazel(with_lance)
-    _remove_stale_extension_artifacts(build_package_dir)
+    build_package_dir.mkdir(parents=True, exist_ok=True)
+    for candidate in build_package_dir.glob("*.so"):
+        candidate.unlink()
     for artifact in artifacts:
-        destination = _PKG_DIR / artifact.name
-        if destination.exists() or destination.is_symlink():
-            destination.unlink()
+        destination = build_package_dir / artifact.name
         shutil.copy2(artifact, destination)
         print(f"[setup.py] Copied {artifact} -> {destination}", file=sys.stderr)
 
+    _sync_version_py(build_package_dir)
+    (build_package_dir / "_core.pyi").unlink(missing_ok=True)
+    native_stubs = build_package_dir / "_core"
+    if native_stubs.exists():
+        shutil.rmtree(native_stubs)
     _generate_extension_stubs(
         extension_name="_core",
-        extension_dir=_PKG_DIR,
-        output_dir=_PKG_DIR,
+        extension_dir=build_package_dir,
+        output_dir=build_package_dir,
     )
 
 
@@ -139,12 +147,7 @@ def _generate_extension_stubs(
     extension_dir: Path,
     output_dir: Path,
 ) -> None:
-    """Generate .pyi stubs from compiled extension binary without importing top-level package.
-
-    Uses nanobind's import-path mechanism to inspect only the binary shared library,
-    ensuring hermetic execution in PEP 517 isolated environments without requiring
-    runtime package dependencies.
-    """
+    """Generate recursive stubs from the staged extension under its package name."""
     print(
         f"[setup.py] Generating type stubs for native extension {extension_name!r}...",
         file=sys.stderr,
@@ -153,14 +156,12 @@ def _generate_extension_stubs(
         subprocess.run(
             [
                 sys.executable,
-                "-m",
-                "nanobind.stubgen",
-                "-P",
-                "-i",
-                str(extension_dir),
-                "-m",
-                extension_name,
-                "-O",
+                str(_PROJECT_DIR / "scripts/generate_native_stubs.py"),
+                "--module",
+                f"{_PKG_DIR.name}.{extension_name}",
+                "--extension",
+                str(extension_dir / f"{extension_name}.so"),
+                "--output-dir",
                 str(output_dir),
             ],
             cwd=_PROJECT_DIR,
@@ -177,17 +178,24 @@ def _generate_extension_stubs(
         print(f"[setup.py] stderr: {e.stderr}", file=sys.stderr)
         raise
     print(
-        f"[setup.py] Successfully generated {extension_name}.pyi",
+        f"[setup.py] Successfully generated recursive {extension_name} stubs",
         file=sys.stderr,
     )
 
 
 class BazelAwareBuildPy(build_py):
-    """Extends build_py to run the Bazel compilation step first."""
+    """Assemble Python and native files in the selected build directory."""
+
+    editable_mode = False
 
     def run(self) -> None:
-        _build_native_artifacts(Path(self.build_lib) / "sparse_embedding")
+        if self.editable_mode:
+            _build_native_artifacts(_PKG_DIR)
+            return
+        build_package_dir = Path(self.build_lib) / "sparse_embedding"
+        _remove_stale_extension_artifacts(build_package_dir)
         super().run()
+        _build_native_artifacts(build_package_dir)
 
 
 class BinaryDistribution(Distribution):
@@ -201,13 +209,22 @@ if __name__ == "__main__":
     setup(
         packages=find_namespace_packages(
             include=["sparse_embedding*"],
-            exclude=["sparse_embedding.tests*"],
+            exclude=["sparse_embedding.tests*", "sparse_embedding._core*"],
         ),
         version=_VERSIONS["PACKAGE_VERSION"],
         python_requires=_VERSIONS["PYTHON_REQUIRES"],
         distclass=BinaryDistribution,
         cmdclass={"build_py": BazelAwareBuildPy},
         include_package_data=False,
-        exclude_package_data={"sparse_embedding": ["tests/*", "tests/**/*"]},
-        package_data={"sparse_embedding": ["*.so", "*.pyi", "py.typed"]},
+        exclude_package_data={
+            "sparse_embedding": [
+                "tests/*",
+                "tests/**/*",
+                "*.so",
+                "_core.pyi",
+                "_core/*",
+                "_core/**/*",
+            ],
+        },
+        package_data={"sparse_embedding": ["py.typed"]},
     )
