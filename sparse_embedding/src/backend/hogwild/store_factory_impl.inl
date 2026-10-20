@@ -1,8 +1,8 @@
 #include "sparse_embedding/src/backend/hogwild/hogwild_embedding_store.hpp"
 #include "sparse_embedding/src/backend/hogwild/public/hogwild_store_options.hpp"
+#include "sparse_embedding/src/backend/hogwild/public/optimizer_construction.hpp"
 #include "sparse_embedding/src/backend/hogwild/public/store_construction.hpp"
 #include "sparse_embedding/src/eviction/score_policy.hpp"
-#include "sparse_embedding/src/backend/hogwild/public/optimizer_construction.hpp"
 
 #include <stdexcept>
 #include <type_traits>
@@ -34,8 +34,7 @@ void make_store(StoreConstructionTarget &target,
   using Store = HogwildEmbeddingStore<uint64_t, ParamT, OptT>;
   *target.store = pro::make_proxy<EmbeddingTableFacade<ParamT, OptT>, Store>(
       std::vector<size_t>(target.dims.begin(), target.dims.end()),
-      std::move(initializer), std::move(optimizer),
-      score_policy,
+      std::move(initializer), std::move(optimizer), score_policy,
       HogwildStoreOptions{
           .thread_budget = thread_budget,
           .storage = std::move(target.storage),
@@ -45,13 +44,13 @@ void make_store(StoreConstructionTarget &target,
       });
 }
 
-}  // namespace se::detail
+} // namespace se::detail
 
-#define SE_DEFINE_STORE_FACTORY(P, O, NAME)                                   \
-  void se::store_factory_##NAME(se::StoreConstructionTarget &target,          \
-                                 se::StoreConstructionRequest request,         \
-                                 size_t thread_budget,                        \
-                                 se::StoreScorePolicy score_policy) {          \
-    se::detail::make_store<P, O>(target, std::move(request), thread_budget,   \
-                                 score_policy);                                 \
+#define SE_DEFINE_STORE_FACTORY(P, O, NAME)                                    \
+  void se::store_factory_##NAME(se::StoreConstructionTarget &target,           \
+                                se::StoreConstructionRequest request,          \
+                                size_t thread_budget,                          \
+                                se::StoreScorePolicy score_policy) {           \
+    se::detail::make_store<P, O>(target, std::move(request), thread_budget,    \
+                                 score_policy);                                \
   }

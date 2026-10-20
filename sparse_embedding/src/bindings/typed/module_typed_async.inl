@@ -4,14 +4,15 @@
 // Implementation of AsyncOpsImpl<ParamT, OptT> methods
 // =============================================================================
 
-#include "sparse_embedding/src/bindings/module_wrapper.hpp"
 #include "sparse_embedding/src/bindings/async_bridge.hpp"
+#include "sparse_embedding/src/bindings/module_wrapper.hpp"
 
 namespace se::py::detail {
 
 template <typename ParamT, typename OptT>
-nb::object AsyncOpsImpl<ParamT, OptT>::async_lookup(
-    EmbeddingStoreWrapper &self, nb::object keys, int64_t dim) {
+nb::object AsyncOpsImpl<ParamT, OptT>::async_lookup(EmbeddingStoreWrapper &self,
+                                                    nb::object keys,
+                                                    int64_t dim) {
   auto [dlm_keys, cap_keys] = se::py::extract_dlpack_tensor(keys);
   size_t n = get_dlm_size(dlm_keys);
   auto kdt = detect_key_dtype(dlm_keys);
@@ -64,8 +65,9 @@ nb::object AsyncOpsImpl<ParamT, OptT>::async_lookup(
 }
 
 template <typename ParamT, typename OptT>
-nb::object AsyncOpsImpl<ParamT, OptT>::async_assign(
-    EmbeddingStoreWrapper &self, nb::object keys, nb::object values) {
+nb::object AsyncOpsImpl<ParamT, OptT>::async_assign(EmbeddingStoreWrapper &self,
+                                                    nb::object keys,
+                                                    nb::object values) {
   auto [dlm_keys, cap_keys] = se::py::extract_dlpack_tensor(keys);
   auto [dlm_values, cap_values] = se::py::extract_dlpack_tensor(values);
   size_t n = get_dlm_size(dlm_keys);
@@ -96,18 +98,17 @@ nb::object AsyncOpsImpl<ParamT, OptT>::async_assign(
   return se::py::async_dispatch(
       self.async_pool_,
       [wrapper_ptr, n, kdt, keys_data, values_data, val_dim,
-       keys_keeper =
-           std::make_shared<se::py::AsyncPyObjectKeeper>(cap_keys),
+       keys_keeper = std::make_shared<se::py::AsyncPyObjectKeeper>(cap_keys),
        values_keeper = std::make_shared<se::py::AsyncPyObjectKeeper>(
            cap_values)]() -> std::error_code {
         auto do_assign = [&](auto ks) -> std::error_code {
-          auto& tls_row_lengths = get_tls_row_lengths();
+          auto &tls_row_lengths = get_tls_row_lengths();
           tls_row_lengths.resize(n);
           fill_uniform_row_lengths(tls_row_lengths, val_dim);
           return wrapper_ptr->get_store<ParamT, OptT>()->assign(
               ks,
-              std::span<const ParamT>(
-                  static_cast<const ParamT *>(values_data), n * val_dim),
+              std::span<const ParamT>(static_cast<const ParamT *>(values_data),
+                                      n * val_dim),
               tls_row_lengths);
         };
         return dispatch_key_span(kdt, keys_data, n, do_assign);
@@ -116,9 +117,8 @@ nb::object AsyncOpsImpl<ParamT, OptT>::async_assign(
         if (!ec)
           future.attr("set_result")(nb::none());
         else
-          future.attr("set_exception")(
-              nb::module_::import_("builtins")
-                  .attr("RuntimeError")(ec.message()));
+          future.attr("set_exception")(nb::module_::import_("builtins")
+                                           .attr("RuntimeError")(ec.message()));
       });
 }
 
@@ -137,8 +137,7 @@ nb::object AsyncOpsImpl<ParamT, OptT>::async_lookup_or_insert(
       self.async_pool_,
       [wrapper_ptr, n, kdt, keys_data, dim,
        keys_keeper = std::make_shared<se::py::AsyncPyObjectKeeper>(
-           cap_keys)]()
-          -> std::pair<DLManagedTensor *, DLManagedTensor *> {
+           cap_keys)]() -> std::pair<DLManagedTensor *, DLManagedTensor *> {
         DLManagedTensor *vals_dlm = nullptr, *lens_dlm = nullptr;
         try {
           auto do_loi = [&](auto ks) {
@@ -147,15 +146,13 @@ nb::object AsyncOpsImpl<ParamT, OptT>::async_lookup_or_insert(
             fill_uniform_row_lengths({row_lengths.get(), n}, dim);
             lens_dlm =
                 se::py::wrap_unique_ptr_as_tensor(std::move(row_lengths), n);
-            auto *lens_out =
-                static_cast<int64_t *>(lens_dlm->dl_tensor.data);
+            auto *lens_out = static_cast<int64_t *>(lens_dlm->dl_tensor.data);
             int64_t vals_shape[] = {static_cast<int64_t>(total)};
             vals_dlm = se::py::create_output_tensor<ParamT>(vals_shape);
             auto vals_span = std::span<ParamT>(
                 static_cast<ParamT *>(vals_dlm->dl_tensor.data), total);
-            auto ec =
-                wrapper_ptr->get_store<ParamT, OptT>()->lookup_or_insert(
-                    ks, vals_span, {lens_out, n});
+            auto ec = wrapper_ptr->get_store<ParamT, OptT>()->lookup_or_insert(
+                ks, vals_span, {lens_out, n});
             if (ec)
               throw std::runtime_error(ec.message());
           };
@@ -172,9 +169,8 @@ nb::object AsyncOpsImpl<ParamT, OptT>::async_lookup_or_insert(
       [](nb::object future,
          std::pair<DLManagedTensor *, DLManagedTensor *> result) {
         auto [v, l] = result;
-        future.attr("set_result")(
-            nb::make_tuple(se::py::wrap_output_tensor(v),
-                           se::py::wrap_output_tensor(l)));
+        future.attr("set_result")(nb::make_tuple(
+            se::py::wrap_output_tensor(v), se::py::wrap_output_tensor(l)));
       });
 }
 
@@ -202,39 +198,39 @@ nb::object AsyncOpsImpl<ParamT, OptT>::async_accumulate_gradients(
   auto kdt = detect_key_dtype(dlm_keys);
   validate_key_dtype(kdt, self.key_type_enum_);
   auto *wrapper_ptr = &self;
-  return dispatch_value_dtype(self.gradient_dtype_code_,
-                             [&]<typename GradT>() -> nb::object {
-    auto grads_span = se::py::dlpack_to_span<const GradT>(dlm_grads);
-    const GradT *grads_data = grads_span.data();
-    const void *keys_data =
-        reinterpret_cast<const char *>(dlm_keys->dl_tensor.data) +
-        dlm_keys->dl_tensor.byte_offset;
-    return se::py::async_dispatch(
-        self.async_pool_,
-        [wrapper_ptr, n, kdt, keys_data, grads_data, dim,
-         keys_keeper =
-             std::make_shared<se::py::AsyncPyObjectKeeper>(cap_keys),
-         grads_keeper = std::make_shared<se::py::AsyncPyObjectKeeper>(
-             cap_grads)]() -> std::error_code {
-          auto do_acc = [&](auto ks) -> std::error_code {
-            auto& tls_row_lengths = get_tls_row_lengths();
-            tls_row_lengths.resize(n);
-            fill_uniform_row_lengths(tls_row_lengths, dim);
-            return wrapper_ptr->get_store<ParamT, OptT>()
-                ->accumulate_gradients(
-                    ks, std::span<const GradT>(grads_data, n * dim),
-                    tls_row_lengths);
-          };
-          return dispatch_key_span(kdt, keys_data, n, do_acc);
-        },
-        [](nb::object future, std::error_code ec) {
-          if (!ec)
-            future.attr("set_result")(nb::none());
-          else
-            future.attr("set_exception")(
-                nb::module_::import_("builtins")
-                  .attr("RuntimeError")(ec.message()));
+  return dispatch_value_dtype(
+      self.gradient_dtype_code_, [&]<typename GradT>() -> nb::object {
+        auto grads_span = se::py::dlpack_to_span<const GradT>(dlm_grads);
+        const GradT *grads_data = grads_span.data();
+        const void *keys_data =
+            reinterpret_cast<const char *>(dlm_keys->dl_tensor.data) +
+            dlm_keys->dl_tensor.byte_offset;
+        return se::py::async_dispatch(
+            self.async_pool_,
+            [wrapper_ptr, n, kdt, keys_data, grads_data, dim,
+             keys_keeper =
+                 std::make_shared<se::py::AsyncPyObjectKeeper>(cap_keys),
+             grads_keeper = std::make_shared<se::py::AsyncPyObjectKeeper>(
+                 cap_grads)]() -> std::error_code {
+              auto do_acc = [&](auto ks) -> std::error_code {
+                auto &tls_row_lengths = get_tls_row_lengths();
+                tls_row_lengths.resize(n);
+                fill_uniform_row_lengths(tls_row_lengths, dim);
+                return wrapper_ptr->get_store<ParamT, OptT>()
+                    ->accumulate_gradients(
+                        ks, std::span<const GradT>(grads_data, n * dim),
+                        tls_row_lengths);
+              };
+              return dispatch_key_span(kdt, keys_data, n, do_acc);
+            },
+            [](nb::object future, std::error_code ec) {
+              if (!ec)
+                future.attr("set_result")(nb::none());
+              else
+                future.attr("set_exception")(
+                    nb::module_::import_("builtins")
+                        .attr("RuntimeError")(ec.message()));
+            });
       });
-  });
 }
 } // namespace se::py::detail

@@ -175,9 +175,8 @@ inline void EmbeddingStoreWrapper::optimizer_step(size_t normalization_steps) {
   if (!optimizer_enabled_)
     throw std::runtime_error("optimizer_step requires optimizer enabled");
   nb::gil_scoped_release release;
-  std::error_code ec = visit_store([&](auto &store) {
-    return store->optimizer_step(normalization_steps);
-  });
+  std::error_code ec = visit_store(
+      [&](auto &store) { return store->optimizer_step(normalization_steps); });
   check_error(ec);
 }
 
@@ -187,9 +186,7 @@ inline void EmbeddingStoreWrapper::erase(nb::object keys) {
   {
     nb::gil_scoped_release release;
     dispatch_on_key(dlm_keys, key_type_enum_, [&](auto ks) {
-      ec = visit_store([&](auto &store) {
-        return store->erase(ks);
-      });
+      ec = visit_store([&](auto &store) { return store->erase(ks); });
     });
   }
   check_error(ec);
@@ -227,9 +224,8 @@ inline void EmbeddingStoreWrapper::assign_scores(nb::object keys,
   {
     nb::gil_scoped_release release;
     dispatch_on_key(dlm_keys, key_type_enum_, [&](auto ks) {
-      ec = visit_store([&](auto &store) {
-        return store->assign_scores(ks, scores_span);
-      });
+      ec = visit_store(
+          [&](auto &store) { return store->assign_scores(ks, scores_span); });
     });
   }
   check_error(ec);
@@ -237,9 +233,8 @@ inline void EmbeddingStoreWrapper::assign_scores(nb::object keys,
 
 inline size_t EmbeddingStoreWrapper::compact_page(size_t dim,
                                                   uint64_t page_id) {
-  return visit_store([&](auto &store) {
-    return store->compact_page(dim, page_id);
-  });
+  return visit_store(
+      [&](auto &store) { return store->compact_page(dim, page_id); });
 }
 
 inline size_t EmbeddingStoreWrapper::promote_hot_keys(size_t dim,
@@ -252,9 +247,8 @@ inline size_t EmbeddingStoreWrapper::promote_hot_keys(size_t dim,
 }
 
 inline size_t EmbeddingStoreWrapper::promoted_hot_page_size(size_t dim) {
-  return visit_store([&](auto &store) {
-    return store->promoted_hot_page_size(dim);
-  });
+  return visit_store(
+      [&](auto &store) { return store->promoted_hot_page_size(dim); });
 }
 
 inline nb::list EmbeddingStoreWrapper::export_page_images() {
@@ -363,8 +357,8 @@ EmbeddingStoreWrapper::async_accumulate_gradients(nb::object keys,
   });
 }
 
-inline nb::object EmbeddingStoreWrapper::async_optimizer_step(
-    size_t normalization_steps) {
+inline nb::object
+EmbeddingStoreWrapper::async_optimizer_step(size_t normalization_steps) {
   if (!optimizer_enabled_)
     throw std::runtime_error("async_optimizer_step requires optimizer enabled");
   auto *wrapper_ptr = this;
@@ -404,8 +398,7 @@ inline nb::object EmbeddingStoreWrapper::async_contains(nb::object keys) {
         try {
           auto do_contains = [&](auto ks) {
             int64_t shape[1] = {static_cast<int64_t>(n)};
-            out_dlm =
-                se::py::create_output_tensor<uint8_t>(std::span(shape));
+            out_dlm = se::py::create_output_tensor<uint8_t>(std::span(shape));
             auto *out = static_cast<uint8_t *>(out_dlm->dl_tensor.data);
             auto ec = wrapper_ptr->visit_store([&](auto &store) {
               return store->contains(ks, std::span<uint8_t>(out, n));
@@ -441,9 +434,8 @@ inline nb::object EmbeddingStoreWrapper::async_erase(nb::object keys) {
        keys_keeper = std::make_shared<se::py::AsyncPyObjectKeeper>(
            cap_keys)]() -> std::error_code {
         auto erase = [&](auto keys_span) {
-          return wrapper_ptr->visit_store([&](auto &store) {
-            return store->erase(keys_span);
-          });
+          return wrapper_ptr->visit_store(
+              [&](auto &store) { return store->erase(keys_span); });
         };
         return dispatch_key_span(kdt, keys_data, n, erase);
       },
@@ -463,9 +455,8 @@ inline nb::object EmbeddingStoreWrapper::async_clear() {
   return se::py::async_dispatch(
       async_pool_,
       [wrapper_ptr]() -> std::error_code {
-        return wrapper_ptr->visit_store([&](auto &store) {
-          return store->clear();
-        });
+        return wrapper_ptr->visit_store(
+            [&](auto &store) { return store->clear(); });
       },
       [](nb::object future, std::error_code ec) {
         if (!ec) {
@@ -495,8 +486,7 @@ EmbeddingStoreWrapper::async_assign_scores(nb::object keys, nb::object scores) {
   return se::py::async_dispatch(
       async_pool_,
       [wrapper_ptr, n, kdt, keys_data, scores_data,
-       keys_keeper =
-           std::make_shared<se::py::AsyncPyObjectKeeper>(cap_keys),
+       keys_keeper = std::make_shared<se::py::AsyncPyObjectKeeper>(cap_keys),
        scores_keeper = std::make_shared<se::py::AsyncPyObjectKeeper>(
            cap_scores)]() -> std::error_code {
         auto scores_span = std::span<const uint64_t>(
@@ -547,9 +537,8 @@ inline void EmbeddingStoreWrapper::assign_opt_state(nb::object keys_obj,
 
 inline nb::list EmbeddingStoreWrapper::checkpoint_mutations() {
   nb::list result;
-  std::vector<CheckpointMutation> mutations = visit_store([](auto &store) {
-    return store->checkpoint_mutations();
-  });
+  std::vector<CheckpointMutation> mutations =
+      visit_store([](auto &store) { return store->checkpoint_mutations(); });
   for (const auto &mutation : mutations) {
     nb::dict row;
     row["dimension"] = mutation.dimension;
@@ -562,15 +551,12 @@ inline nb::list EmbeddingStoreWrapper::checkpoint_mutations() {
 }
 
 inline std::string EmbeddingStoreWrapper::checkpoint_baseline() {
-  return visit_store([](auto &store) {
-    return store->checkpoint_baseline();
-  });
+  return visit_store([](auto &store) { return store->checkpoint_baseline(); });
 }
 
 inline bool EmbeddingStoreWrapper::checkpoint_restore_is_pristine() {
-  return visit_store([](auto &store) {
-    return store->checkpoint_restore_is_pristine();
-  });
+  return visit_store(
+      [](auto &store) { return store->checkpoint_restore_is_pristine(); });
 }
 
 inline std::string EmbeddingStoreWrapper::initialize_checkpoint_baseline(
@@ -583,21 +569,16 @@ inline std::string EmbeddingStoreWrapper::initialize_checkpoint_baseline(
 }
 
 inline void EmbeddingStoreWrapper::mark_terminal_failure() {
-  visit_store([](auto &store) {
-    store->mark_terminal_failure();
-  });
+  visit_store([](auto &store) { store->mark_terminal_failure(); });
 }
 
 inline bool EmbeddingStoreWrapper::is_operational() {
-  return visit_store([](auto &store) {
-    return store->is_operational();
-  });
+  return visit_store([](auto &store) { return store->is_operational(); });
 }
 
 inline uint64_t EmbeddingStoreWrapper::checkpoint_mutation_watermark() {
-  return visit_store([](auto &store) {
-    return store->checkpoint_mutation_watermark();
-  });
+  return visit_store(
+      [](auto &store) { return store->checkpoint_mutation_watermark(); });
 }
 
 inline void EmbeddingStoreWrapper::cancel_checkpoint_capture(
@@ -608,9 +589,7 @@ inline void EmbeddingStoreWrapper::cancel_checkpoint_capture(
 }
 
 inline size_t EmbeddingStoreWrapper::entries_per_page() {
-  return visit_store([](auto &store) {
-    return store->entries_per_page();
-  });
+  return visit_store([](auto &store) { return store->entries_per_page(); });
 }
 
 inline void EmbeddingStoreWrapper::advance_checkpoint_baseline(

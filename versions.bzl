@@ -7,7 +7,7 @@ scripts (setup.py, tests, runtime introspection) without duplication.
 """
 
 PACKAGE_VERSION = "0.1.0"
-PYTHON_REQUIRES = ">=3.12"
+PYTHON_REQUIRES = ">=3.11"
 
 # Lance-C Shared Library
 LANCE_C_VERSION = "0.1.6"

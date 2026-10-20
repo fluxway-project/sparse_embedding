@@ -25,7 +25,7 @@
 - **Setuptools 作为分发与打包单一主体**：
   - 作为标准的 PEP 517 构建后端，处理 `pip install`、editable 开发安装以及二进制 wheel 打包。
   - 动态查询 Bazel 的 `//:native_artifacts` 产物集合，避免硬编码输出路径，确保与当前构建配置严格对齐。
-  - 自动生成 PEP 561 类型标记（`py.typed`）与 Nanobind 类型存根（`_core.pyi`）。
+  - 打包 PEP 561 类型标记（`py.typed`），递归生成 Nanobind 类型存根（`_core/__init__.pyi` 与 `_core/checkpoint.pyi`）。
   - 严格隔离测试代码，防止测试文件泄露至分发包中。
 
 ---
@@ -56,7 +56,7 @@ pip install -e .
 SE_BUILD_WITH_LANCE=0 pip install -e .
 
 # 构建标准的二进制 wheel 分发包
-pip wheel . --no-build-isolation
+pip wheel .
 ```
 
 ### 运行测试
@@ -84,10 +84,23 @@ bazel test -c opt //sparse_embedding/...
 
 ---
 
-## 4. 打包一致性与质量约束
+## 4. 源码格式
+
+本地格式化与 CI 使用同一个入口：
+
+```bash
+bash scripts/format.sh
+bash scripts/format.sh --check
+```
+
+脚本通过 Git 选择已跟踪和未忽略的未跟踪源码，排除构建产物、临时 wheel 环境和已忽略的依赖。C++ 使用 clang-format 16 和仓库的 LLVM 风格，Bazel 使用 buildifier 10.1.0，Python 使用 Ruff 0.14.6 整理 import 并格式化。检查模式只报告差异，不改写源码；CI 在 `.github/workflows/ci.yml` 中固定这些工具版本。
+
+---
+
+## 5. 打包一致性与质量约束
 
 所有构建流程均强制执行以下打包规范：
 
-1. **分发树纯净性**：`setup.py` 中的命名空间包发现严格排除 `sparse_embedding.tests`，避免测试用例与测试数据打入正式 wheel 包。
-2. **失效产物清理**：在复制最新 Bazel 产物前，`setup.py` 会清空目标目录并移除历史残留的 `.so` 库，防止多配置切换时产生 ABI 混杂。
-3. **类型契约完整性**：分发包内同时包含 `py.typed` 标记与自动生成的 `_core.pyi` 存根，为下游使用者提供完整的静态类型推导与 IDE 智能补全。
+1. **发布包不含测试文件**：`setup.py` 会自动排除 `sparse_embedding.tests`，避免测试用例与测试数据被打包进最终的 wheel。
+2. **构建目录完全隔离**：构建 wheel 时仅在独立的临时 build 目录中编译并组装 C++ 库（`.so`）、类型存根和版本信息，绝不污染或修改源码树中的本地文件；使用 editable 模式（`pip install -e .`）时则正常进行就地（in-place）构建。
+3. **自带完整 C++ 类型标注**：随包分发 `py.typed` 以及 `_core` 的 `.pyi` 存根文件，CI 会严格校验类型标注与 wheel 文件的完整性，确保下游用户在编写代码时拥有完整的 IDE 自动补全与类型检查支持。

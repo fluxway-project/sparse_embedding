@@ -2,7 +2,7 @@
 
 [中文](README_zh.md)
 
-High-performance Sparse Embedding Table library for large-scale recommendation system training, using Hogwild-style relaxed updates, a slot-directory read path, x86 SeqLock publication, and paged storage.
+High-performance sparse storage and computation library designed for large-scale sparse Embedding (recommendation systems), large-scale sparse Engram (conditional memory and knowledge retrieval), large-scale sparse MoE (expert routing and parameter storage), and large-scale sparse KV cache (long-context tail caching), using Hogwild-style relaxed updates, a slot-directory read path, x86 SeqLock publication, and paged storage.
 
 ## Core Features
 

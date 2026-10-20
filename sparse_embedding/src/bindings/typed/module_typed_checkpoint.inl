@@ -11,8 +11,8 @@
 #include "sparse_embedding/src/checkpoint/checkpoint_stream_policy.hpp"
 
 #ifdef SE_ENABLE_LANCE_C
-#include "sparse_embedding/src/checkpoint/lance/native_restore.hpp"
 #include "sparse_embedding/src/checkpoint/lance/native_fragment_writer.hpp"
+#include "sparse_embedding/src/checkpoint/lance/native_restore.hpp"
 #include "sparse_embedding/src/ops/partitioner_registry.hpp"
 #endif
 
@@ -45,7 +45,8 @@ nb::dict CheckpointOpsImpl<ParamT, OptT>::write_native_fragment(
         pro::make_proxy<se::FunctionFacade<void(
             std::span<const se::CheckpointMutation>, uint64_t)>>(
             [&](std::span<const se::CheckpointMutation> mutations, uint64_t) {
-              if (!incremental_mode) return;
+              if (!incremental_mode)
+                return;
               writer.set_incremental_mutations(mutations);
             }),
         pro::make_proxy<se::FunctionFacade<bool(
@@ -135,10 +136,11 @@ void CheckpointOpsImpl<ParamT, OptT>::restore_native_page_images(
   const auto optimizer_dtype = self.optimizer_dtype();
   nb::gil_scoped_release release;
   se::NativeRestore<ParamT, OptT>::pages(
-      self.get_store<ParamT, OptT>(), uris, version, participant_index, key_dtype,
-      optimizer_dtype, storage_options, load_optimizer_state, page_layout_generation);
+      self.get_store<ParamT, OptT>(), uris, version, participant_index,
+      key_dtype, optimizer_dtype, storage_options, load_optimizer_state,
+      page_layout_generation);
 }
-#endif  // SE_ENABLE_LANCE_C
+#endif // SE_ENABLE_LANCE_C
 
 template <typename ParamT, typename OptT>
 void CheckpointOpsImpl<ParamT, OptT>::export_batches_dlpack(
@@ -146,14 +148,14 @@ void CheckpointOpsImpl<ParamT, OptT>::export_batches_dlpack(
     bool include_optimizer_state) {
   auto dispatch_key = [&]<typename Fn>(Fn &&fn) {
     switch (self.key_type_enum_) {
-      case KeyDType::kInt32:
-        return fn.template operator()<int32_t>();
-      case KeyDType::kUInt32:
-        return fn.template operator()<uint32_t>();
-      case KeyDType::kInt64:
-        return fn.template operator()<int64_t>();
-      case KeyDType::kUInt64:
-        return fn.template operator()<uint64_t>();
+    case KeyDType::kInt32:
+      return fn.template operator()<int32_t>();
+    case KeyDType::kUInt32:
+      return fn.template operator()<uint32_t>();
+    case KeyDType::kInt64:
+      return fn.template operator()<int64_t>();
+    case KeyDType::kUInt64:
+      return fn.template operator()<uint64_t>();
     }
     throw std::invalid_argument("unsupported key_dtype");
   };
@@ -221,14 +223,14 @@ void CheckpointOpsImpl<ParamT, OptT>::export_batches_arrow(
     bool include_optimizer_state) {
   auto dispatch_key = [&]<typename Fn>(Fn &&fn) {
     switch (self.key_type_enum_) {
-      case KeyDType::kInt32:
-        return fn.template operator()<int32_t>();
-      case KeyDType::kUInt32:
-        return fn.template operator()<uint32_t>();
-      case KeyDType::kInt64:
-        return fn.template operator()<int64_t>();
-      case KeyDType::kUInt64:
-        return fn.template operator()<uint64_t>();
+    case KeyDType::kInt32:
+      return fn.template operator()<int32_t>();
+    case KeyDType::kUInt32:
+      return fn.template operator()<uint32_t>();
+    case KeyDType::kInt64:
+      return fn.template operator()<int64_t>();
+    case KeyDType::kUInt64:
+      return fn.template operator()<uint64_t>();
     }
     throw std::invalid_argument("unsupported key_dtype");
   };
@@ -279,14 +281,14 @@ void CheckpointOpsImpl<ParamT, OptT>::assign_opt_state(
     size_t dimension, nb::object steps_obj) {
   auto dispatch_key = [&]<typename Fn>(Fn &&fn) {
     switch (self.key_type_enum_) {
-      case KeyDType::kInt32:
-        return fn.template operator()<int32_t>();
-      case KeyDType::kUInt32:
-        return fn.template operator()<uint32_t>();
-      case KeyDType::kInt64:
-        return fn.template operator()<int64_t>();
-      case KeyDType::kUInt64:
-        return fn.template operator()<uint64_t>();
+    case KeyDType::kInt32:
+      return fn.template operator()<int32_t>();
+    case KeyDType::kUInt32:
+      return fn.template operator()<uint32_t>();
+    case KeyDType::kInt64:
+      return fn.template operator()<int64_t>();
+    case KeyDType::kUInt64:
+      return fn.template operator()<uint64_t>();
     }
     throw std::invalid_argument("unsupported key_dtype");
   };
@@ -340,4 +342,4 @@ void CheckpointOpsImpl<ParamT, OptT>::assign_opt_state(
   });
 }
 
-}  // namespace se::py::detail
+} // namespace se::py::detail

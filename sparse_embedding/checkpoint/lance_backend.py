@@ -5113,7 +5113,7 @@ class _LanceCheckpointStorage:
                 plan.key_dtype,
                 dict(self._workspace.storage_options()),
                 load_optimizer_state,
-                participant_rec.page_layout_generation,
+                page_layout_generation=participant_rec.page_layout_generation,
             )
             return
 
