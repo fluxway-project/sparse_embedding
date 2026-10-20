@@ -1,0 +1,92 @@
+name: Bug Report
+description: File a bug report to help us improve sparse_embedding
+title: "[Bug]: "
+labels: ["bug", "triage"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for taking the time to report an issue!
+        Before reporting, please verify that the issue has not already been reported by searching existing issues.
+
+  - type: textarea
+    id: description
+    attributes:
+      label: Bug Description
+      description: A clear and concise description of what the bug is.
+      placeholder: Describe the unexpected behavior, error, or crash.
+    validations:
+      required: true
+
+  - type: dropdown
+    id: component
+    attributes:
+      label: Affected Component
+      description: Which area or subsystem does this bug affect?
+      options:
+        - "C++ Core / Storage Engine (Slot Directory, Page Directory, SeqLock)"
+        - "Python Bindings / DLPack Bridge (Nanobind, _core)"
+        - "Checkpointing & Storage (Lance, Gravitino, 2PC)"
+        - "Build & Packaging (Bazel, setup.py, pip, wheel)"
+        - "Optimizers & SIMD (AVX-512, OptimizerExtensionFacade)"
+        - "Partitioning & Routing (PartitionerRegistry, Reference Vectors)"
+        - "Other"
+    validations:
+      required: true
+
+  - type: textarea
+    id: reproduction
+    attributes:
+      label: Minimal Reproducible Example
+      description: |
+        Please provide a self-contained code snippet, minimal reproduction script, or CLI commands to reproduce the issue.
+      placeholder: |
+        ```python
+        import sparse_embedding
+        # Reproducible snippet here
+        ```
+    validations:
+      required: true
+
+  - type: textarea
+    id: expected
+    attributes:
+      label: Expected Behavior
+      description: A clear and concise description of what you expected to happen.
+    validations:
+      required: true
+
+  - type: textarea
+    id: logs
+    attributes:
+      label: Logs and Tracebacks
+      description: Please copy and paste any relevant terminal output, traceback, crash dump, or compiler/linker logs.
+      render: shell
+
+  - type: textarea
+    id: environment
+    attributes:
+      label: Environment Info
+      description: Relevant details about your development and execution environment.
+      value: |
+        - OS & Architecture (e.g., Ubuntu 24.04 x86_64):
+        - CPU Model (and AVX-512 support status):
+        - GCC / Clang Version:
+        - Python Version:
+        - Bazel Version:
+        - `sparse_embedding` Version or Git Commit:
+        - Lance Enabled (`SE_BUILD_WITH_LANCE`):
+      render: markdown
+    validations:
+      required: true
+
+  - type: checkboxes
+    id: checklist
+    attributes:
+      label: Validation Checklist
+      description: Please confirm the following before submitting.
+      options:
+        - label: I have searched existing issues and verified this is not a duplicate.
+          required: true
+        - label: I have provided a minimal reproducible example or actionable stack trace.
+          required: true

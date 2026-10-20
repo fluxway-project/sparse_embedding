@@ -2,7 +2,7 @@
 
 [English](README.md)
 
-高性能稀疏存储与计算库，适用于大规模稀疏 Embedding（推荐系统）、大规模稀疏 Engram（条件记忆与知识检索）、大规模稀疏 MoE（专家路由与参数存储）以及大规模稀疏 KV Cache（长上下文长尾缓存）等场景。采用 Hogwild! 松弛更新、Slot Directory 读路径、x86 SeqLock 发布和分页存储架构。
+高性能稀疏存储与计算库，专为 **PB 级（Petabyte-scale）** 超大规模稀疏 Embedding（工业级推荐系统）、稀疏 Engram（条件记忆与知识检索）、稀疏 MoE（专家路由与参数存储）以及稀疏 KV Cache（长上下文长尾缓存）等场景设计。结合 Python 接口与 C++23 底层引擎，采用 Hogwild! 松弛更新、Slot Directory 读路径、x86 SeqLock 发布和分段物理分页存储架构，高效解决海量参数下的内存爆炸、高并发哈希冲突与 I/O 吞吐瓶颈。
 
 ## 核心特性
 
