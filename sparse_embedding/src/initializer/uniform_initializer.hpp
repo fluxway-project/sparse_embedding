@@ -41,7 +41,7 @@ template <typename ValT> struct UniformInitializer {
       constexpr size_t kChunkSize = 256;
       for (auto [chunk_idx, param_chunk] :
            std::views::enumerate(param | std::views::chunk(kChunkSize))) {
-        float buf[kChunkSize];
+        float buf[kChunkSize]{};
         size_t chunk_size = param_chunk.size();
         se::simd::simd_uniform_init(buf, chunk_size, min_val, max_val,
                                     key + chunk_idx * kChunkSize);

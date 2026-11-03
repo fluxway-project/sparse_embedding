@@ -105,26 +105,32 @@ template <typename T> std::span<T> dlpack_to_span(const DLManagedTensor *dlm) {
   }
 
   DLDataType expected = to_dl_dtype<std::remove_const_t<T>>();
-  if (t.dtype.code != expected.code || t.dtype.bits != expected.bits) {
+  if (t.dtype.code != expected.code || t.dtype.bits != expected.bits ||
+      t.dtype.lanes != expected.lanes) {
     throw std::invalid_argument("dtype mismatch in dlpack_to_span");
-  }
-
-  if (t.strides != nullptr) {
-    int64_t stride = 1;
-    for (int i = t.ndim - 1; i >= 0; --i) {
-      if (t.strides[i] != stride) {
-        throw std::invalid_argument("tensor must be C-contiguous");
-      }
-      stride *= t.shape[i];
-    }
   }
 
   size_t total = 1;
   for (int i = 0; i < t.ndim; ++i)
     total *= static_cast<size_t>(t.shape[i]);
 
+  if (t.strides != nullptr && total != 0) {
+    int64_t stride = 1;
+    for (int i = t.ndim - 1; i >= 0; --i) {
+      if (t.shape[i] != 1 && t.strides[i] != stride) {
+        throw std::invalid_argument("tensor must be C-contiguous");
+      }
+      stride *= t.shape[i];
+    }
+  }
+
+  if (t.data == nullptr && total != 0)
+    throw std::invalid_argument("non-empty tensor must have data");
+
   auto *base =
-      reinterpret_cast<T *>(static_cast<char *>(t.data) + t.byte_offset);
+      t.data == nullptr
+          ? nullptr
+          : reinterpret_cast<T *>(static_cast<char *>(t.data) + t.byte_offset);
   return std::span<T>(base, total);
 }
 

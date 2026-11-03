@@ -35,7 +35,10 @@ cc_library(
         "*.inl",
         "typed/*.inl",
     ]) + ["//sparse_embedding/src/ops:headers"],
-    copts = ["-O0"] + select({
+    copts = [
+        "-O3",
+        "-fvisibility=hidden",
+    ] + select({
         "//:lance_enabled": ["-DSE_ENABLE_LANCE_C"],
         "//conditions:default": [],
     }),
@@ -71,7 +74,10 @@ cc_library(
         "*.inl",
         "typed/*.inl",
     ]) + ["//sparse_embedding/src/ops:headers"],
-    copts = select({
+    copts = [
+        "-O3",
+        "-fvisibility=hidden",
+    ] + select({
         "//:lance_enabled": ["-DSE_ENABLE_LANCE_C"],
         "//conditions:default": [],
     }),

@@ -28,14 +28,24 @@ cc_library(
     visibility = ["//visibility:public"],
     deps = [
         "//sparse_embedding/src/common",
+        "@parlayhash",
         "@proxy",
         "@stdexec",
+        "@unordered_dense",
     ],
 )
 
 cc_test(
     name = "partitioner_registry_test",
     srcs = ["partitioner_registry_test.cpp"],
+    deps = [
+        ":ops",
+    ],
+)
+
+cc_test(
+    name = "unique_ops_test",
+    srcs = ["unique_ops_test.cpp"],
     deps = [
         ":ops",
     ],
