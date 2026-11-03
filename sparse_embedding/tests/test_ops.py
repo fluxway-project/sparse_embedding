@@ -1,6 +1,7 @@
 import asyncio
 
 import numpy as np
+import pytest
 
 import sparse_embedding
 
@@ -16,6 +17,9 @@ def test_async_unique() -> None:
     u_dlm, inv_dlm = asyncio.run(run_unique())
     assert u_dlm is not None
     assert inv_dlm is not None
+    u = np.from_dlpack(u_dlm)
+    inv = np.from_dlpack(inv_dlm)
+    np.testing.assert_array_equal(u[inv], keys)
 
 
 def test_async_unique_all_flags() -> None:
@@ -36,6 +40,18 @@ def test_async_unique_all_flags() -> None:
     assert first_dlm is not None
     assert counts_dlm is not None
 
+    u = np.from_dlpack(u_dlm)
+    inv = np.from_dlpack(inv_dlm)
+    first = np.from_dlpack(first_dlm)
+    counts = np.from_dlpack(counts_dlm)
+
+    np.testing.assert_array_equal(u[inv], keys)
+    for idx, first_idx in enumerate(first):
+        assert keys[first_idx] == u[idx]
+        assert np.where(keys == u[idx])[0][0] == first_idx
+    for idx, count in enumerate(counts):
+        assert np.sum(keys == u[idx]) == count
+
 
 def test_async_unique_int32() -> None:
     keys = np.array([10, 20, 10, 30], dtype=np.int32)
@@ -53,6 +69,87 @@ def test_async_unique_int32() -> None:
     assert u_dlm is not None
     assert first_dlm is not None
     assert counts_dlm is not None
+
+    u = np.from_dlpack(u_dlm)
+    first = np.from_dlpack(first_dlm)
+    counts = np.from_dlpack(counts_dlm)
+    for idx, first_idx in enumerate(first):
+        assert keys[first_idx] == u[idx]
+        assert np.where(keys == u[idx])[0][0] == first_idx
+    for idx, count in enumerate(counts):
+        assert np.sum(keys == u[idx]) == count
+
+
+def test_async_unique_multithreaded_large() -> None:
+    np.random.seed(42)
+    for dtype in [np.int32, np.uint32, np.int64, np.uint64]:
+        keys = np.random.randint(0, 5000, size=50000, dtype=dtype)
+        for num_threads in (0, 1, 2, 4, 8):
+
+            async def run_unique():
+                fut = sparse_embedding.async_unique(
+                    keys,
+                    return_inverse=True,
+                    return_first_indices=True,
+                    return_counts=True,
+                    num_threads=num_threads,
+                )
+                return await fut
+
+            u_dlm, inv_dlm, first_dlm, counts_dlm = asyncio.run(run_unique())
+            u = np.from_dlpack(u_dlm)
+            inv = np.from_dlpack(inv_dlm)
+            first = np.from_dlpack(first_dlm)
+            counts = np.from_dlpack(counts_dlm)
+
+            # 1. Exact reconstruction of input
+            np.testing.assert_array_equal(u[inv], keys)
+            expected_keys, expected_first, expected_counts = np.unique(
+                keys, return_index=True, return_counts=True
+            )
+            np.testing.assert_array_equal(np.sort(u), expected_keys)
+            positions = np.searchsorted(expected_keys, u)
+            np.testing.assert_array_equal(first, expected_first[positions])
+            np.testing.assert_array_equal(counts, expected_counts[positions])
+
+
+@pytest.mark.parametrize(
+    "keys",
+    [
+        np.array([[1, 2]], dtype=np.int64),
+        np.arange(10, dtype=np.int64)[::2],
+    ],
+)
+def test_async_unique_rejects_unsupported_layout(keys: np.ndarray) -> None:
+    with pytest.raises(ValueError):
+        sparse_embedding.async_unique(keys)
+
+
+@pytest.mark.parametrize("dtype", [np.int32, np.uint32, np.int64, np.uint64])
+def test_async_unique_empty(dtype: type) -> None:
+    keys = np.empty(0, dtype=dtype)
+
+    async def run_unique():
+        return await sparse_embedding.async_unique(
+            keys, return_first_indices=True, return_counts=True, num_threads=2
+        )
+
+    for output in asyncio.run(run_unique()):
+        assert np.from_dlpack(output).size == 0
+
+
+@pytest.mark.parametrize("dtype", [np.int32, np.uint32, np.int64, np.uint64])
+def test_async_unique_singleton_strided(dtype: type) -> None:
+    keys = np.arange(2, dtype=dtype)[::2]
+    assert keys.flags.c_contiguous
+
+    async def run_unique():
+        return await sparse_embedding.async_unique(keys)
+
+    unique_dlm, inverse_dlm = asyncio.run(run_unique())
+    unique = np.from_dlpack(unique_dlm)
+    inverse = np.from_dlpack(inverse_dlm)
+    np.testing.assert_array_equal(unique[inverse], keys)
 
 
 def test_partitioners() -> None:

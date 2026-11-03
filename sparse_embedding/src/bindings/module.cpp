@@ -40,7 +40,7 @@
 #include "sparse_embedding/src/ops/parallel_partitioner.hpp"
 #include "sparse_embedding/src/ops/partitioner.hpp"
 #include "sparse_embedding/src/ops/partitioner_registry.hpp"
-#include "sparse_embedding/src/ops/tensor_ops.hpp"
+#include "sparse_embedding/src/ops/unique_ops.hpp"
 #ifdef SE_ENABLE_LANCE_C
 #include "sparse_embedding/src/bindings/module_checkpoint_methods.inl"
 #include "sparse_embedding/src/checkpoint/lance/native_fragment_writer.hpp"
@@ -959,15 +959,20 @@ NB_MODULE(_core, m) {
   m.def(
       "async_unique",
       [](nb::object keys, bool return_inverse, bool return_first_indices,
-         bool return_counts) -> nb::object {
+         bool return_counts, size_t num_threads) -> nb::object {
         auto [dlm_keys, cap_keys] = se::py::extract_dlpack_tensor(keys);
-        size_t n = get_dlm_size(dlm_keys);
+        const auto &tensor = dlm_keys->dl_tensor;
+        if (tensor.ndim != 1 || tensor.shape[0] < 0)
+          throw std::invalid_argument("async_unique requires a 1D tensor");
+        const size_t n = static_cast<size_t>(tensor.shape[0]);
+        se::ops::validate_unique_input_size(n);
         auto kdt = detect_key_dtype(dlm_keys);
-        const void *keys_data =
-            reinterpret_cast<const char *>(dlm_keys->dl_tensor.data) +
-            dlm_keys->dl_tensor.byte_offset;
+        const void *keys_data = se::dispatch_key_type(kdt, [&]<typename T>() {
+          return static_cast<const void *>(
+              se::py::dlpack_to_span<const T>(dlm_keys).data());
+        });
 
-        static exec::static_thread_pool global_pool(
+        static exec::static_thread_pool unique_dispatch_pool(
             std::max(1u, std::thread::hardware_concurrency()));
 
         struct ResultWrapper {
@@ -981,9 +986,9 @@ NB_MODULE(_core, m) {
         };
 
         return se::py::async_dispatch(
-            global_pool,
+            unique_dispatch_pool,
             [n, kdt, keys_data, return_inverse, return_first_indices,
-             return_counts,
+             return_counts, num_threads,
              keys_keeper = std::make_shared<se::py::AsyncPyObjectKeeper>(
                  cap_keys)]() -> ResultWrapper {
               ResultWrapper wrap;
@@ -1010,7 +1015,8 @@ NB_MODULE(_core, m) {
                 auto span =
                     std::span<const T>(static_cast<const T *>(keys_data), n);
                 auto res = se::ops::unique_keys_inverse(
-                    span, return_first_indices, return_counts);
+                    span, return_first_indices, return_counts, num_threads,
+                    return_inverse);
                 process_res(res);
               };
 
@@ -1042,9 +1048,28 @@ NB_MODULE(_core, m) {
       },
       nb::arg("keys"), nb::arg("return_inverse") = true,
       nb::arg("return_first_indices") = false, nb::arg("return_counts") = false,
+      nb::arg("num_threads") = 0,
       nb::sig("def async_unique(keys: object, return_inverse: bool = True, "
               "return_first_indices: bool = False, return_counts: bool = "
-              "False) -> typing.Awaitable[typing.Any]"));
+              "False, num_threads: int = 0) -> typing.Awaitable[typing.Any]"),
+      "Asynchronously compute unique elements and metadata for a 1D "
+      "C-contiguous CPU tensor.\n\n"
+      "API Contract & Invariants:\n"
+      "- unique_keys: 1D tensor of unique elements. The elements are "
+      "unordered\n"
+      "  (in parallel execution, partition hash order is used; order may vary "
+      "with num_threads).\n"
+      "- inverse_indices: 1D int32 tensor of length len(keys). Guarantees "
+      "exact reconstruction:\n"
+      "  unique_keys[inverse_indices[i]] == keys[i] for all i.\n"
+      "- first_indices: 1D int32 tensor of length len(unique_keys) if "
+      "requested, containing the\n"
+      "  0-based index of the first appearance of unique_keys[u] in keys.\n"
+      "- counts: 1D int32 tensor of length len(unique_keys) if requested, "
+      "containing the exact\n"
+      "  number of occurrences of unique_keys[u] in keys.\n"
+      "- num_threads: Thread budget (0 = default performance sweet spot, e.g. "
+      "24 cores).\n");
 
   m.def("wake_fd", []() { return se::py::GetPythonWakeManager().fd(); });
   m.def("drain_wake_queue", []() { se::py::GetPythonWakeManager().Drain(); });
