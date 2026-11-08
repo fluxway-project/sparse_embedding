@@ -48,18 +48,14 @@ bazel run -c opt //benchmarks:embedding_store_benchmark -- \
   --threads=16 --numa-aware-sharding --skip-pressure
 ```
 
-可显式控制 dispatch：
-
-```bash
-bazel run -c opt //benchmarks:embedding_store_benchmark -- \
-  --threads=16 --operation-physical-workers=16 \
-  --operation-memory-parallelism=16 --forward-prefetch-distance=16 \
-  --numa-aware-sharding --skip-pressure
-```
-
 `--numa-aware-sharding` 同时启用 execution 和 memory NUMA locality。worker 绑定
 物理 CPU，arena page 按 shard 固定到对应 NUMA node。小 payload 会跳过额外 NUMA 分桶，
 避免调度成本超过 locality 收益。
+
+默认组合模式的 `embedding_store_benchmark` 在计时前预生成 power-law 批次，只计时
+`forward_lookup`。扩展门槛使用检测到的同一 NUMA 节点放置内存和被测 worker，并在
+forward 计时期间把协调线程绑定到同节点的独立 CPU。允许运行的 CPU 拓扑不足时直接报错；
+`--threads=N` 模式不执行组合扩展门槛。
 
 ## 代表性性能结果
 
@@ -84,30 +80,56 @@ batch、128 个并发调用方和最多 128 个内部 worker。
 
 | 线程数 | Forward 吞吐 |
 |---:|---:|
-| 1 | 13.40 Mops/s |
-| 2 | 20.25 Mops/s |
-| 4 | 34.37 Mops/s |
-| 8 | **44.46 Mops/s** |
-| 16 | 35.69 Mops/s |
-| 24 | 34.21 Mops/s |
-| 32 | 36.56 Mops/s |
-| 64 | 31.38 Mops/s |
+| 1 | 14.61 Mops/s |
+| 2 | 27.04 Mops/s |
+| 4 | 43.11 Mops/s |
+| 8 | **50.39 Mops/s** |
+| 16 | 45.74 Mops/s |
+| 24 | 40.11 Mops/s |
+| 32 | 39.57 Mops/s |
+| 64 | 37.42 Mops/s |
 
 默认 memory-work 与 row-grain 限制有效 task 数，避免计时路径被 enqueue、steal、completion 和 barrier 成本主导。存储资源调优器 (`StorageResourceTuner`) 会在构造阶段针对目标 workload 形状在候选页大小（4096、8192、16384）间自动评估并缓存最优页几何，同时支持显式指定 `entries_per_page` 实现完全确定性的复现。
 
 调优器采用保守准入机制：只有当候选页大小的中位耗时比基准 4096 profile 至少优化 50% 时才会切换，从而有效抵御系统偶发噪声并保证在大容量或宽维度场景下稳定选择最佳页几何。
 
-本文所有公开基准测试数据均基于受控物理宿主机环境（采用 `taskset -c 0-47` 绑定 48 核心），在排除预热后连续进行 5 次独立基准采样并取中位数作为稳定基线报告。
+Forward、训练和 optimizer 热点表格取 5 次独立进程运行的中位数，使用 `taskset -c 0-47`（48 个允许使用的逻辑 CPU、24 个物理核）。高并发和 compaction 表格取单进程内 5 次样本；混合 lookup/insert 表格取 5 次独立进程运行的中位数。
+
+### 完整存储前向扩展门槛
+
+独立的 `embedding_store_benchmark` workload 使用 dim=128、500,000-key 词表、
+65,536-key power-law 批次和 20 次计时重复。5 次完整默认运行均通过，包含存储压力阶段。
+下表为 5 次运行的吞吐中位数，以及每次运行相对 1 worker 的最低扩展比。
+
+| 原生 worker 数 | Forward 中位吞吐 | 相对 1 worker 的最低比值 | 门槛 |
+|---:|---:|---:|---:|
+| 1 | 4.23 Mops/s | — | — |
+| 2 | 7.86 Mops/s | 1.85× | 1.6× |
+| 4 | 14.51 Mops/s | 3.40× | 2.5× |
+| 8 | **20.06 Mops/s** | **4.72×** | 3.5× |
 
 ### 训练路径
 
 dim=128、65,536 个已存在且唯一的 row、8 workers、进程使用 `taskset -c 0-47`，每次计时 20 次重复。吞吐为 5 次运行中位数：
 
-| 操作 | 吞吐 |
+| 操作 | 吞吐 | 带宽 |
 |---|---:|---:|
-| `assign` | **20.00 Mops/s** |
-| `accumulate_gradients`（含必需 step） | **5.68 Mops/s** |
-| `optimizer_step` | **11.80 Mops/s** |
+| `assign` | **13.43 Mops/s** | 6.40 GiB/s |
+| `accumulate_gradients`（含必需 step） | **2.92 Mops/s** | 1.39 GiB/s |
+| `optimizer_step` | **14.63 Mops/s** | 6.98 GiB/s |
+
+热点 optimizer-only profile 使用相同 dim 和进程亲和性、200 次计时重复、单个原生
+`optimizer_step()` 调用者；各结果为 5 次独立运行的中位数。65,536-key 组是单独的
+对照 workload，不替代上表 20 次重复的训练路径结果。
+
+| 唯一 key 数 | 原生 worker 数 | Optimizer 吞吐 |
+|---:|---:|---:|
+| 4,096 | 1 | 3.99 Mops/s |
+| 4,096 | 8 | **17.89 Mops/s** |
+| 4,096 | 16 | 16.46 Mops/s |
+| 65,536 | 1 | 2.32 Mops/s |
+| 65,536 | 8 | **13.43 Mops/s** |
+| 65,536 | 16 | 10.13 Mops/s |
 
 批级 optimizer profile 与下表使用不同 workload。比较 assign、梯度累积和 optimizer step
 时请使用 `training_path_profile`；比较存储和 compaction 时请使用本文末尾的 benchmark 命令。
@@ -153,17 +175,17 @@ fallback。
 
 | threads | lookup median/p95/p99 (Mops/s) | insert median/p95/p99 (Mops/s) |
 |---:|---:|---:|
-| 1 | 10.87 / 11.78 / 11.78 | 0.045 / 0.051 / 0.051 |
-| 16 | 65.61 / 67.01 / 67.01 | 0.319 / 0.354 / 0.354 |
-| 64 | **77.15 / 84.11 / 84.11** | **0.566 / 0.592 / 0.592** |
+| 1 | 15.38 / 15.52 / 15.52 | 0.092 / 0.093 / 0.093 |
+| 16 | 60.74 / 68.57 / 68.57 | 0.339 / 0.355 / 0.355 |
+| 64 | **80.42 / 86.77 / 86.77** | **0.528 / 0.559 / 0.559** |
 
 混合 lookup/insert：同一 dim、warm keys、batch，64 轮；16/64 总线程各半，Auto storage
 memory=1 GiB、spill=2 GiB。
 
 | 总线程 | lookup/insert 线程 | lookup / insert (Mops/s) | lookup/insert p99 (ns) |
 |---:|---:|---:|---:|
-| 16 | 8 / 8 | 47.93 / 0.343 | 210,386 / 51,778,919 |
-| 64 | 32 / 32 | **60.76 / 0.382** | 697,452 / 161,216,723 |
+| 16 | 8 / 8 | 48.44 / 0.338 | 191,635 / 61,571,904 |
+| 64 | 32 / 32 | **57.71 / 0.412** | 695,113 / 141,594,266 |
 
 compaction 扩展：`dim=128`、64 shards、每 source worker 4 pages；使用自动校准页几何
 （本机为每页 4096 entries）、`store_threads=64`，固定工作量，1/2/4/8/16 workers，
@@ -171,11 +193,11 @@ compaction 扩展：`dim=128`、64 shards、每 source worker 4 pages；使用�
 
 | workers | relocated keys/s |
 |---:|---:|
-| 1 | 1.04 M |
-| 2 | 1.99 M |
-| 4 | 3.54 M |
-| 8 | 6.77 M |
-| 16 | **10.02 M** |
+| 1 | 1.94 M |
+| 2 | 3.83 M |
+| 4 | 7.12 M |
+| 8 | 10.59 M |
+| 16 | **12.04 M** |
 
 未预分配 destination 时，计时阶段还包含目标页分配，因此结果通常更低。对应可执行目标
 为 `high_concurrency_lookup_insert_benchmark`、`mixed_lookup_insert_concurrency_benchmark`

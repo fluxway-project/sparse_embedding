@@ -6,6 +6,7 @@
 
 #include <algorithm>
 #include <array>
+#include <cerrno>
 #include <chrono>
 #include <cstdint>
 #include <filesystem>
@@ -17,8 +18,13 @@
 #include <span>
 #include <string>
 #include <string_view>
+#include <system_error>
 #include <thread>
 #include <vector>
+
+#include <numaif.h>
+#include <pthread.h>
+#include <sched.h>
 
 #include "sparse_embedding/src/backend/hogwild/hogwild_embedding_store.hpp"
 #include "sparse_embedding/src/common/function.hpp"
@@ -38,6 +44,33 @@ static constexpr size_t kBatchSize =
     65'536; // batch size (typical training step)
 static constexpr size_t kHotRatio =
     10; // top-10% keys get 80% traffic (power-law)
+static constexpr std::array<std::pair<size_t, double>, 3>
+    kForwardScalingTargets{{{2, 1.6}, {4, 2.5}, {8, 3.5}}};
+
+std::pair<int, int> bind_forward_gate_memory() {
+  const int node =
+      NumaTopology::node_for_cpu(ThreadAffinity::cpu_for_worker(0));
+  for (size_t worker = 1; worker < kForwardScalingTargets.back().first;
+       ++worker) {
+    if (NumaTopology::node_for_cpu(ThreadAffinity::cpu_for_worker(worker)) !=
+        node)
+      throw std::runtime_error("forward scaling workers span NUMA nodes");
+  }
+  const int coordinator_cpu =
+      ThreadAffinity::cpu_for_worker(kForwardScalingTargets.back().first);
+  if (NumaTopology::node_for_cpu(coordinator_cpu) != node)
+    throw std::runtime_error("forward scaling has no local coordinator CPU");
+  constexpr size_t kWordBits = std::numeric_limits<unsigned long>::digits;
+  const size_t node_index = static_cast<size_t>(node);
+  const unsigned long mask_bits =
+      static_cast<unsigned long>(NumaTopology::node_ids().back()) + 1;
+  std::vector<unsigned long> mask((mask_bits - 1) / kWordBits + 1);
+  mask[node_index / kWordBits] = 1UL << (node_index % kWordBits);
+  if (set_mempolicy(MPOL_BIND, mask.data(), mask_bits + 1) != 0)
+    throw std::system_error(errno, std::generic_category(),
+                            "forward scaling memory bind failed");
+  return {node, coordinator_cpu};
+}
 
 // ============================================================================
 // Dummy SGD optimizer
@@ -171,22 +204,6 @@ size_t parse_positive_size(std::string_view value, std::string_view name) {
   return static_cast<size_t>(parsed);
 }
 
-size_t parse_nonnegative_size(std::string_view value, std::string_view name) {
-  if (value.empty())
-    throw std::invalid_argument(std::string(name) + " is empty");
-  size_t parsed = 0;
-  for (char character : value) {
-    if (character < '0' || character > '9')
-      throw std::invalid_argument(std::string(name) + " is not numeric");
-    if (parsed > (std::numeric_limits<size_t>::max() -
-                  static_cast<size_t>(character - '0')) /
-                     10)
-      throw std::overflow_error(std::string(name) + " overflows");
-    parsed = parsed * 10 + static_cast<size_t>(character - '0');
-  }
-  return parsed;
-}
-
 void run_storage_pressure_benchmark() {
   print_header("Storage pressure: LFU background eviction");
   se::StorageOptions options;
@@ -271,21 +288,12 @@ int main(int argc, char **argv) {
     return 0;
   }
   std::optional<size_t> only_threads;
-  std::optional<OperationDispatchConfig> operation_dispatch_config;
-  std::optional<size_t> configured_physical_workers;
-  std::optional<size_t> configured_memory_parallelism;
-  std::optional<size_t> configured_prefetch_distance;
   bool run_pressure = true;
   bool bind_affinity = false;
   bool numa_aware_sharding = false;
   for (int arg_index = 1; arg_index < argc; ++arg_index) {
     const std::string_view arg(argv[arg_index]);
     constexpr std::string_view threads_prefix = "--threads=";
-    constexpr std::string_view physical_prefix =
-        "--operation-physical-workers=";
-    constexpr std::string_view memory_prefix =
-        "--operation-memory-parallelism=";
-    constexpr std::string_view prefetch_prefix = "--forward-prefetch-distance=";
     if (arg == "--skip-pressure") {
       run_pressure = false;
     } else if (arg == "--bind-affinity") {
@@ -295,38 +303,18 @@ int main(int argc, char **argv) {
     } else if (starts_with(arg, threads_prefix)) {
       only_threads =
           parse_positive_size(arg.substr(threads_prefix.size()), "threads");
-    } else if (starts_with(arg, physical_prefix)) {
-      configured_physical_workers = parse_positive_size(
-          arg.substr(physical_prefix.size()), "operation physical workers");
-    } else if (starts_with(arg, memory_prefix)) {
-      configured_memory_parallelism = parse_positive_size(
-          arg.substr(memory_prefix.size()), "operation memory parallelism");
-    } else if (starts_with(arg, prefetch_prefix)) {
-      configured_prefetch_distance = parse_nonnegative_size(
-          arg.substr(prefetch_prefix.size()), "forward prefetch distance");
     } else {
       throw std::invalid_argument("unknown benchmark argument: " +
                                   std::string(arg));
     }
   }
-  if (configured_memory_parallelism.has_value() &&
-      !configured_physical_workers.has_value()) {
-    throw std::invalid_argument(
-        "operation memory parallelism requires physical worker topology");
-  }
-  if (configured_physical_workers.has_value()) {
-    operation_dispatch_config = OperationDispatchConfig{
-        *configured_physical_workers,
-        configured_memory_parallelism.value_or(*configured_physical_workers),
-        OperationDispatchConfig::kDefaultMinimumBytesPerThread, bind_affinity,
-        configured_prefetch_distance.value_or(16)};
-  }
-  if (numa_aware_sharding && !operation_dispatch_config.has_value()) {
-    operation_dispatch_config = OperationDispatchConfig{
-        std::max<size_t>(1, std::thread::hardware_concurrency()),
-        std::max<size_t>(1, std::thread::hardware_concurrency()),
-        OperationDispatchConfig::kDefaultMinimumBytesPerThread, true,
-        configured_prefetch_distance.value_or(16)};
+  std::optional<int> forward_gate_coordinator_cpu;
+  if (!only_threads.has_value() && !numa_aware_sharding) {
+    const auto [memory_node, coordinator_cpu] = bind_forward_gate_memory();
+    forward_gate_coordinator_cpu = coordinator_cpu;
+    bind_affinity = true;
+    std::cout << "  forward_gate_memory_node=" << memory_node
+              << " coordinator_cpu=" << coordinator_cpu << '\n';
   }
   if (bind_affinity) {
     const auto allowed_cpus = ThreadAffinity::allowed_cpus();
@@ -360,17 +348,6 @@ int main(int argc, char **argv) {
       });
 
   for (size_t num_threads : thread_counts) {
-    std::optional<OperationDispatchConfig> store_dispatch_config =
-        operation_dispatch_config;
-    if (bind_affinity && !store_dispatch_config.has_value()) {
-      store_dispatch_config =
-          OperationDispatchConfig{num_threads, num_threads, 1, true};
-    }
-    if (numa_aware_sharding) {
-      store_dispatch_config =
-          OperationDispatchConfig{num_threads, num_threads, 1, true,
-                                  configured_prefetch_distance.value_or(16)};
-    }
     print_header("Threads: " + std::to_string(num_threads));
     std::cout << std::left << std::setw(28) << "Operation" << std::right
               << std::setw(17) << "Throughput" << std::setw(10) << "Bandwidth"
@@ -379,15 +356,15 @@ int main(int argc, char **argv) {
 
     HogwildEmbeddingStore<uint64_t, float, float, NoScorePolicy> store(
         {kDim}, {}, opt_factory, NoScorePolicy{},
-        HogwildStoreOptions{.thread_budget = num_threads,
-                            .locality =
-                                LocalityPolicy{store_dispatch_config.has_value()
-                                                   ? LocalityMode::kNuma
-                                                   : LocalityMode::kAuto,
-                                               numa_aware_sharding
-                                                   ? LocalityMode::kNuma
+        HogwildStoreOptions{
+            .thread_budget = num_threads,
+            .locality =
+                LocalityPolicy{bind_affinity || numa_aware_sharding
+                                   ? LocalityMode::kNuma
+                                   : LocalityMode::kAuto,
+                               numa_aware_sharding ? LocalityMode::kNuma
                                                    : LocalityMode::kAuto},
-                            .storage = create_page_storage()});
+            .storage = create_page_storage()});
     if (store.reserve(kUniqueKeys, kDim))
       throw std::runtime_error("benchmark reserve failed");
 
@@ -401,6 +378,10 @@ int main(int argc, char **argv) {
     std::vector<float> flat_grads(kBatchSize * kDim, 0.001f);
     std::vector<uint8_t> exists_mask(kBatchSize);
     std::vector<uint64_t> mutation_keys;
+    auto gradients_for =
+        [&](const MutationBatch &batch) -> std::span<const float> {
+      return std::span<const float>(flat_grads).first(batch.keys.size() * kDim);
+    };
 
     // ── 1. lookup_or_insert (cold: all new keys) ───────────────────────────
     {
@@ -432,12 +413,32 @@ int main(int argc, char **argv) {
     // ── 2. forward_lookup (warm: keys already inserted) ───────────────────
     {
       size_t reps = 20;
-      timer.start();
-      for (size_t r = 0; r < reps; ++r) {
-        auto b = generate_power_law_batch(kBatchSize, kUniqueKeys, gen);
-        store.forward_lookup<uint64_t>(b, flat_out, row_lengths);
+      std::vector<std::vector<uint64_t>> batches;
+      batches.reserve(reps);
+      for (size_t r = 0; r < reps; ++r)
+        batches.push_back(
+            generate_power_law_batch(kBatchSize, kUniqueKeys, gen));
+      cpu_set_t previous_affinity;
+      if (forward_gate_coordinator_cpu.has_value()) {
+        const int error = pthread_getaffinity_np(
+            pthread_self(), sizeof(previous_affinity), &previous_affinity);
+        if (error != 0)
+          throw std::system_error(error, std::generic_category(),
+                                  "forward scaling affinity query failed");
+        ThreadAffinity::bind_current_thread_to_cpu(
+            *forward_gate_coordinator_cpu);
       }
+      timer.start();
+      for (const auto &batch : batches)
+        store.forward_lookup<uint64_t>(batch, flat_out, row_lengths);
       double ms = timer.elapsed_ms() / reps;
+      if (forward_gate_coordinator_cpu.has_value()) {
+        const int error = pthread_setaffinity_np(
+            pthread_self(), sizeof(previous_affinity), &previous_affinity);
+        if (error != 0)
+          throw std::system_error(error, std::generic_category(),
+                                  "forward scaling affinity restore failed");
+      }
       double mops = kBatchSize / ms / 1e3;
       double gbps = kBatchSize * kDim * sizeof(float) / ms / 1e6;
       print_result({"forward_lookup", mops, gbps});
@@ -469,7 +470,7 @@ int main(int argc, char **argv) {
         operation_count += batch.keys.size();
       timer.start();
       for (const auto &batch : batches)
-        store.accumulate_gradients<uint64_t>(batch.keys, flat_grads,
+        store.accumulate_gradients<uint64_t>(batch.keys, gradients_for(batch),
                                              batch.row_lengths);
       double ms = timer.elapsed_ms() / reps;
       double mops = operation_count / (ms * reps) / 1e3;
@@ -479,24 +480,24 @@ int main(int argc, char **argv) {
 
     // ── 5. optimizer_step ─────────────────────────────────────────────────
     {
-      // Ensure there's something accumulated
       size_t reps = 10;
-      auto batches = make_mutation_batches(reps + 1, gen, mutation_keys);
-      store.accumulate_gradients<uint64_t>(batches.front().keys, flat_grads,
-                                           batches.front().row_lengths);
-      timer.start();
-      for (size_t r = 0; r < reps; ++r) {
-        store.optimizer_step(1);
-        store.accumulate_gradients<uint64_t>(batches[r + 1].keys, flat_grads,
-                                             batches[r + 1].row_lengths);
-      }
-      double ms = timer.elapsed_ms() / reps;
-      // optimizer_step processes the accumulated unique keys (up to kBatchSize)
-      double mops = store.size() / ms / 1e3;
-      double gbps =
-          store.size() * kDim * sizeof(float) * 2 / ms / 1e6; // read+write
-      print_result({"optimizer_step", mops, gbps});
+      auto batches = make_mutation_batches(reps, gen, mutation_keys);
       store.optimizer_step(1);
+      size_t updated_rows = 0;
+      double optimizer_ms = 0.0;
+      for (size_t r = 0; r < reps; ++r) {
+        const auto &batch = batches[r];
+        store.accumulate_gradients<uint64_t>(batch.keys, gradients_for(batch),
+                                             batch.row_lengths);
+        timer.start();
+        store.optimizer_step(1);
+        optimizer_ms += timer.elapsed_ms();
+        updated_rows += batch.keys.size();
+      }
+      double mops = updated_rows / optimizer_ms / 1e3;
+      double gbps =
+          updated_rows * kDim * sizeof(float) * 2 / optimizer_ms / 1e6;
+      print_result({"optimizer_step", mops, gbps});
     }
 
     // ── 6. contains ───────────────────────────────────────────────────────
@@ -546,9 +547,7 @@ int main(int argc, char **argv) {
     if (baseline <= 0.0)
       throw std::runtime_error(
           "single-thread forward throughput is non-positive");
-    for (const auto [threads, minimum_ratio] :
-         std::array<std::pair<size_t, double>, 3>{
-             {{2, 1.6}, {4, 2.5}, {8, 3.5}}}) {
+    for (const auto &[threads, minimum_ratio] : kForwardScalingTargets) {
       const double ratio = forward_for(threads) / baseline;
       std::cout << "forward_scaling_" << threads << "_ratio=" << ratio << '\n';
       if (ratio < minimum_ratio)

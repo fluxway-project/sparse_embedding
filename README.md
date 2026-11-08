@@ -71,14 +71,14 @@ affinity on 48 allowed CPUs.
 
 | Threads | Forward throughput |
 |---:|---:|
-| 1 | 13.40 Mops/s |
-| 2 | 20.25 Mops/s |
-| 4 | 34.37 Mops/s |
-| 8 | **44.46 Mops/s** |
-| 16 | 35.69 Mops/s |
-| 24 | 34.21 Mops/s |
-| 32 | 36.56 Mops/s |
-| 64 | 31.38 Mops/s |
+| 1 | 14.61 Mops/s |
+| 2 | 27.04 Mops/s |
+| 4 | 43.11 Mops/s |
+| 8 | **50.39 Mops/s** |
+| 16 | 45.74 Mops/s |
+| 24 | 40.11 Mops/s |
+| 32 | 39.57 Mops/s |
+| 64 | 37.42 Mops/s |
 
 The performance report contains the complete workload definition, concurrency
 tables, compaction scaling, and reliability validation commands.
@@ -93,8 +93,8 @@ The public pressure contract and validation command are documented in the
 ### Lock-free migration and expansion
 
 Performance references are collected in the [Performance and Reliability Report](docs/performance_and_reliability_report.md):
-The current eight-worker `training_path_profile` reaches 20.00 Mops/s for `assign`,
-5.68 Mops/s for `accumulate_gradients`, and 11.80 Mops/s for `optimizer_step`.
+The current eight-worker `training_path_profile` reaches 13.43 Mops/s for `assign`,
+2.92 Mops/s for `accumulate_gradients`, and 14.63 Mops/s for `optimizer_step`.
 Expansion uses precise per-shard
 budgets instead of equal power-of-two rounding: directory capacity uses a 2.5x probe
 budget rounded to 16, while runtime `MapBundle` capacity grows by 2x below 64K,

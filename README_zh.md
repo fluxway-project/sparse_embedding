@@ -73,14 +73,14 @@ batch、400 次计时 `forward_lookup` 重复，并在 48 个 allowed CPU 上使
 
 | 线程数 | Forward 吞吐 |
 |---:|---:|
-| 1 | 13.40 Mops/s |
-| 2 | 20.25 Mops/s |
-| 4 | 34.37 Mops/s |
-| 8 | **44.46 Mops/s** |
-| 16 | 35.69 Mops/s |
-| 24 | 34.21 Mops/s |
-| 32 | 36.56 Mops/s |
-| 64 | 31.38 Mops/s |
+| 1 | 14.61 Mops/s |
+| 2 | 27.04 Mops/s |
+| 4 | 43.11 Mops/s |
+| 8 | **50.39 Mops/s** |
+| 16 | 45.74 Mops/s |
+| 24 | 40.11 Mops/s |
+| 32 | 39.57 Mops/s |
+| 64 | 37.42 Mops/s |
 
 完整 workload 定义、高并发表格、compaction 扩展和可靠性校验统一维护在性能报告中。
 
@@ -92,7 +92,7 @@ page 按 shard 固定到对应 node。公开 pressure 契约和验证命令统�
 ### 无锁页迁移与扩表
 
 当前八 worker `training_path_profile` 的 `assign`、`accumulate_gradients` 和
-`optimizer_step` 吞吐分别约为 20.00、5.68 和 11.80 Mops/s。
+`optimizer_step` 吞吐分别约为 13.43、2.92 和 14.63 Mops/s。
 扩表使用精确 per-shard 预算，不再统一向上取二次幂：目录采用 2.5× 探测预算并向 16 对齐，
 运行期 `MapBundle` 容量按 `<64K: 2×`、`64K≤capacity<1M: 1.5×`、`≥1M: 1.25×` 增长。
 

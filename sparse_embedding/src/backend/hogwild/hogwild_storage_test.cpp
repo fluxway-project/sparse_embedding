@@ -39,6 +39,67 @@ template <typename Function> void require_throws(Function &&function) {
   throw std::runtime_error("expected operation to throw");
 }
 
+void run_optimizer_commit_batch_regression() {
+  auto storage = se::create_page_storage();
+  const se::SgdConfig config{.lr = 0.01F};
+  auto factory = pro::make_proxy<
+      se::FunctionFacade<se::OptimizerExtension<float, float>(size_t)>>(
+      [storage, config](size_t dim) mutable {
+        using Sgd = se::SgdOptimizer<float, float, se::StaticLearningRate>;
+        return pro::make_proxy<se::OptimizerExtensionFacade<float, float>, Sgd>(
+            dim, config, storage, se::StaticLearningRate{config.lr});
+      });
+  using Store =
+      se::HogwildEmbeddingStore<uint64_t, float, float, se::NoScorePolicy>;
+  Store store({8}, {}, std::move(factory), se::NoScorePolicy{},
+              se::HogwildStoreOptions{
+                  .thread_budget = 8,
+                  .storage = storage,
+                  .storage_tuning = {.entries_per_page = 4096,
+                                     .calibrate_page_geometry = false}});
+  constexpr size_t key_count = 4096;
+  constexpr size_t dimension = 8;
+  constexpr size_t normalization_steps = 2;
+  std::vector<uint64_t> keys(key_count);
+  std::iota(keys.begin(), keys.end(), uint64_t{1});
+  std::vector<int64_t> lengths(key_count, dimension);
+  std::vector<float> values(key_count * dimension);
+  store.lookup_or_insert<uint64_t>(keys, values, lengths);
+  const uint64_t initial_watermark = store.checkpoint_mutation_watermark();
+  store.optimizer_step(1);
+  require(store.checkpoint_mutation_watermark() == initial_watermark,
+          "empty optimizer commit must not advance watermark");
+  const std::vector<float> gradients(values.size(), 1.0F);
+  store.accumulate_gradients<uint64_t>(keys, gradients, lengths);
+  store.optimizer_step(normalization_steps);
+
+  store.lookup<uint64_t>(keys, values, lengths);
+  const float expected_value =
+      -config.lr * 1.0F / static_cast<float>(normalization_steps);
+  require(std::ranges::all_of(values,
+                              [expected_value](float value) {
+                                return std::abs(value - expected_value) <
+                                       1.0e-6F;
+                              }),
+          "batched optimizer commit changed normalized SGD updates");
+  const auto mutations = store.checkpoint_mutations();
+  require(mutations.size() == key_count,
+          "batched optimizer commit lost checkpoint mutations");
+  require(store.checkpoint_mutation_watermark() ==
+              initial_watermark + key_count,
+          "batched optimizer commit reserved the wrong sequence count");
+  std::vector<bool> seen(key_count, false);
+  for (size_t position = 0; position < mutations.size(); ++position) {
+    const auto &mutation = mutations[position];
+    require(mutation.mutation_sequence == initial_watermark + position + 1,
+            "batched optimizer commit produced a sequence gap");
+    require(mutation.key >= 1 && mutation.key <= key_count &&
+                !seen[mutation.key - 1],
+            "batched optimizer commit duplicated a checkpoint key");
+    seen[mutation.key - 1] = true;
+  }
+}
+
 void run_optimizer_step_dim1_regression(std::string_view mode) {
   const bool run_compaction = mode == "all" || mode == "compact";
   const bool run_lookup = mode == "all" || mode == "lookup";
@@ -141,6 +202,7 @@ int main(int argc, char **argv) {
     throw std::invalid_argument("unknown hogwild storage regression");
   }
   run_optimizer_step_dim1_regression("all");
+  run_optimizer_commit_batch_regression();
 
   se::StorageOptions options;
   options.memory_limit_bytes = 0;
