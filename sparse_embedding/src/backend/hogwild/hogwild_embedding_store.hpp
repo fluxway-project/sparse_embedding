@@ -969,10 +969,8 @@ private:
     checkpoint_page_layout_generation_.fetch_add(1, std::memory_order_release);
   }
 
-  void
-  record_checkpoint_mutation(hogwild_internal::CheckpointRecordRef pointer) {
-    CheckpointMutationRecord &record = *record_from_pointer(pointer);
-    const uint64_t sequence = reserve_checkpoint_sequence();
+  void publish_checkpoint_mutation(CheckpointMutationRecord &record,
+                                   uint64_t sequence) {
     if (sequence == 0)
       throw std::overflow_error("checkpoint mutation sequence exhausted");
     uint64_t previous = record.state.load(std::memory_order_acquire);
@@ -986,6 +984,23 @@ private:
     }
     if ((previous & CheckpointMutationRecord::kDeleted) == 0)
       admit_checkpoint_record(record);
+  }
+
+  void
+  record_checkpoint_mutation(hogwild_internal::CheckpointRecordRef pointer) {
+    CheckpointMutationRecord &record = *record_from_pointer(pointer);
+    publish_checkpoint_mutation(record, reserve_checkpoint_sequence());
+  }
+
+  void record_checkpoint_mutations(
+      std::span<const hogwild_internal::CheckpointRecordRef> records) {
+    if (records.empty())
+      return;
+    const uint64_t first_sequence =
+        reserve_checkpoint_sequences(records.size());
+    uint64_t sequence = first_sequence;
+    for (const auto pointer : records)
+      publish_checkpoint_mutation(*record_from_pointer(pointer), sequence++);
   }
 
   void
@@ -2781,9 +2796,10 @@ public:
           });
     }
 
-    template <typename Batch, typename Updated>
+    template <typename Batch, typename OnUpdatedBatch>
     void update_batch(const Batch &batch, uint64_t global_step,
-                      size_t normalization_steps, Updated &&on_updated) {
+                      size_t normalization_steps,
+                      OnUpdatedBatch &&on_batch_updated) {
       if (batch.size() == 0)
         return;
       if (normalization_steps == 0)
@@ -2825,9 +2841,7 @@ public:
               optimizer->update(
                   {std::span<const OptimizerBatchRow<ParamT>>(rows), dim},
                   global_step);
-              for (size_t row = 0; row < batch_positions.size(); ++row)
-                on_updated(batch_view.key(batch_positions[row]),
-                           checkpoint_records[row]);
+              on_batch_updated(checkpoint_records);
             });
         if (!updated)
           handle_optimizer_locator_revalidation_failure(
@@ -2857,9 +2871,7 @@ public:
               optimizer->update(
                   {std::span<const OptimizerBatchRow<ParamT>>(rows), dim},
                   global_step);
-              for (size_t row = 0; row < indices.size(); ++row)
-                on_updated(batch_view.key(begin + row),
-                           checkpoint_records[row]);
+              on_batch_updated(checkpoint_records);
             });
         if (!updated)
           handle_optimizer_locator_revalidation_failure(batch.key(0));
@@ -4793,9 +4805,10 @@ public:
                         batch,
                         slot->global_step.load(std::memory_order_relaxed),
                         normalization_steps,
-                        [&](uint64_t, hogwild_internal::CheckpointRecordRef
-                                          checkpoint_record) {
-                          record_checkpoint_mutation(checkpoint_record);
+                        [&](std::span<
+                            const hogwild_internal::CheckpointRecordRef>
+                                checkpoint_records) {
+                          record_checkpoint_mutations(checkpoint_records);
                         });
                 },
                 normalization_steps);

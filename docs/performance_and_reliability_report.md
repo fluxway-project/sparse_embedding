@@ -55,19 +55,16 @@ bazel run -c opt //benchmarks:embedding_store_benchmark -- \
   --threads=16 --numa-aware-sharding --skip-pressure
 ```
 
-Dispatch can be configured explicitly:
-
-```bash
-bazel run -c opt //benchmarks:embedding_store_benchmark -- \
-  --threads=16 --operation-physical-workers=16 \
-  --operation-memory-parallelism=16 --forward-prefetch-distance=16 \
-  --numa-aware-sharding --skip-pressure
-```
-
 `--numa-aware-sharding` enables both execution and memory NUMA locality. Workers
 bind to physical CPUs, and arena pages are placed by shard on the corresponding
 NUMA node. Small payloads bypass the extra NUMA bucketing pass when dispatch cost
 would exceed locality benefit.
+
+The combined default `embedding_store_benchmark` pre-generates power-law batches
+before timing `forward_lookup`. Its scaling gate binds memory to the NUMA node
+of the measured workers and runs the coordinator on a separate local CPU during
+forward timing. It fails explicitly if the allowed CPUs cannot support this
+placement; `--threads=N` runs do not execute the aggregate scaling gate.
 
 ## Representative performance
 
@@ -95,14 +92,14 @@ power-law batches, 400 timed `forward_lookup` repetitions, process affinity
 
 | Threads | Forward throughput |
 |---:|---:|
-| 1 | 13.40 Mops/s |
-| 2 | 20.25 Mops/s |
-| 4 | 34.37 Mops/s |
-| 8 | **44.46 Mops/s** |
-| 16 | 35.69 Mops/s |
-| 24 | 34.21 Mops/s |
-| 32 | 36.56 Mops/s |
-| 64 | 31.38 Mops/s |
+| 1 | 14.61 Mops/s |
+| 2 | 27.04 Mops/s |
+| 4 | 43.11 Mops/s |
+| 8 | **50.39 Mops/s** |
+| 16 | 45.74 Mops/s |
+| 24 | 40.11 Mops/s |
+| 32 | 39.57 Mops/s |
+| 64 | 37.42 Mops/s |
 
 The default memory-work and row-grain limits bound effective task count, keeping
 enqueue, steal, completion, and barrier costs from dominating the timed path.
@@ -111,7 +108,21 @@ The storage resource tuner (`StorageResourceTuner`) evaluates candidate page geo
 
 The calibration gate requires a candidate to outperform the baseline 4096 profile by at least 50% on median calibration latency before switching; otherwise 4096 is retained. This conservative floor guards against system noise while ensuring optimal geometries are selected under high-density or wide-dimension configurations.
 
-All benchmark metrics in this report represent five-run medians obtained in a controlled environment using `taskset -c 0-47` (48 pinned physical cores) following cold-start warmups. Exact reproduction commands are detailed at the conclusion of this report.
+The forward, training, and optimizer hot-set tables report medians of five independent process runs with `taskset -c 0-47` (48 allowed logical CPUs, 24 physical cores). High-concurrency and compaction tables use five in-process samples; the mixed lookup/insert table uses five independent process runs.
+
+### Full-store forward gate
+
+The separate `embedding_store_benchmark` workload uses dimension 128, a 500,000-key
+vocabulary, 65,536-key power-law batches, and 20 timed repetitions. Five full
+default runs completed, including the storage-pressure phase. The table shows
+five-run median throughput and the lowest same-run scaling ratio.
+
+| Native workers | Forward median | Minimum ratio to 1 worker | Required ratio |
+|---:|---:|---:|---:|
+| 1 | 4.23 Mops/s | — | — |
+| 2 | 7.86 Mops/s | 1.85× | 1.6× |
+| 4 | 14.51 Mops/s | 3.40× | 2.5× |
+| 8 | **20.06 Mops/s** | **4.72×** | 3.5× |
 
 ### Training paths
 
@@ -120,9 +131,23 @@ Dimension 128, 65,536 existing unique rows, eight workers, process affinity
 
 | Operation | Throughput | Bandwidth |
 |---|---:|---:|
-| `assign` | **20.00 Mops/s** | 9.54 GB/s |
-| `accumulate_gradients` (including required step) | **5.68 Mops/s** | 2.71 GB/s |
-| `optimizer_step` | **11.80 Mops/s** | 5.63 GB/s |
+| `assign` | **13.43 Mops/s** | 6.40 GiB/s |
+| `accumulate_gradients` (including required step) | **2.92 Mops/s** | 1.39 GiB/s |
+| `optimizer_step` | **14.63 Mops/s** | 6.98 GiB/s |
+
+The optimizer-only hot-set profile uses the same dimension and process affinity,
+200 timed repetitions, and one native `optimizer_step()` caller. Each value is
+the median of five independent runs; the 65,536-key set is a separate control
+workload, not a replacement for the 20-repetition training-path table.
+
+| Unique keys | Native workers | Optimizer throughput |
+|---:|---:|---:|
+| 4,096 | 1 | 3.99 Mops/s |
+| 4,096 | 8 | **17.89 Mops/s** |
+| 4,096 | 16 | 16.46 Mops/s |
+| 65,536 | 1 | 2.32 Mops/s |
+| 65,536 | 8 | **13.43 Mops/s** |
+| 65,536 | 16 | 10.13 Mops/s |
 
 The batch optimizer profile is a separate workload from the tables below. Use
 `training_path_profile` when comparing assign, gradient accumulation, and
@@ -173,18 +198,18 @@ repetitions per configuration reporting median/p95/p99.
 
 | Threads | Lookup median/p95/p99 (Mops/s) | Insert median/p95/p99 (Mops/s) |
 |---:|---:|---:|
-| 1 | 10.87 / 11.78 / 11.78 | 0.045 / 0.051 / 0.051 |
-| 16 | 65.61 / 67.01 / 67.01 | 0.319 / 0.354 / 0.354 |
-| 64 | **77.15 / 84.11 / 84.11** | **0.566 / 0.592 / 0.592** |
+| 1 | 15.38 / 15.52 / 15.52 | 0.092 / 0.093 / 0.093 |
+| 16 | 60.74 / 68.57 / 68.57 | 0.339 / 0.355 / 0.355 |
+| 64 | **80.42 / 86.77 / 86.77** | **0.528 / 0.559 / 0.559** |
 
 Mixed lookup/insert uses the same dimension, warm keys, and batch for 64 rounds;
 16/64 total threads are split evenly, with Auto storage at 1 GiB memory and
 2 GiB spill limits.
 
 | Total | Lookup/insert threads | Lookup / insert (Mops/s) | Lookup/insert p99 (ns) |
-|---:|---:|---:|---:|---:|
-| 16 | 8 / 8 | 47.93 / 0.343 | 210,386 / 51,778,919 |
-| 64 | 32 / 32 | **60.76 / 0.382** | 697,452 / 161,216,723 |
+|---:|---:|---:|---:|
+| 16 | 8 / 8 | 48.44 / 0.338 | 191,635 / 61,571,904 |
+| 64 | 32 / 32 | **57.71 / 0.412** | 695,113 / 141,594,266 |
 
 Compaction strong scaling uses dimension 128, 64 shards, four pages per source
 worker, the calibrated page geometry (4096 entries per page on this host), 64
@@ -192,11 +217,11 @@ store threads, fixed work, 1/2/4/8/16 workers, reporting the five-sample median.
 
 | Workers | Relocated keys/s |
 |---:|---:|
-| 1 | 1.04 M |
-| 2 | 1.99 M |
-| 4 | 3.54 M |
-| 8 | 6.77 M |
-| 16 | **10.02 M** |
+| 1 | 1.94 M |
+| 2 | 3.83 M |
+| 4 | 7.12 M |
+| 8 | 10.59 M |
+| 16 | **12.04 M** |
 
 Without preallocated destinations, the timed phase also includes destination-page
 allocation, giving slightly lower throughput. Corresponding binaries are
