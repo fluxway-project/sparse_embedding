@@ -17,6 +17,8 @@
 - **Epoch 内存安全**：通过 `epoch::with_epoch` 批次保护并发哈希表读写，避免 ABA 问题
 - **分布式 Lance Checkpoint**：两阶段提交协议，分为控制面 `snapshot_manifest.lance` 与数据面 `entries.lance`。支持 4 种 Arrow 原生整型键（`int32/uint32/int64/uint64`）与 DuckDB 谓词下推；支持可选物理页缓存。
 - **优化器参数选择性加载**：`EmbeddingConfig(enable_optimizer=False)` 创建推理 weight-only store。`checkpoint.load_inference_checkpoint`（或存储层 `load_inference_weights`）仅加载权重。
+- **细粒度优化器内存对齐**：Adam 优化器采用对齐隔离架构，一阶与二阶动量保持 64 字节 AVX-512 SIMD 向量对齐，标量步数计数器采用 4 字节紧凑自然对齐（`OptimizerRowLayout::kNaturalAligned`，每页 16 KiB），高密度容纳于 CPU L2/L3 缓存中，兼顾向量计算吞吐与缓存局部性。
+- **按需变动日志 (Mutation Journal)**：通过 `EmbeddingConfig.enable_mutation_journal` 控制变更数据捕获（CDC）。开启时提供无锁脏键与墓碑追踪以支持增量检查点；纯训练或全量检查点模式下关闭可免除热路径原子序号记账与记录内存开销。
 - **分片注册中心与并行调度 (PartitionerRegistry)**：基于 `pro::proxy<PartitionerFacade>` 支持 `modulo`、`hash`、`fast_range` 及自定义扩展。离线恢复支持 AVX-512 `filter_span`；在线调度（`parallel_partitioner.hpp`）对接 Fluxway `FunctionPartition`。
 - **跨仓参考向量校验 (Reference Vectors)**：提供 `generate_reference_vectors`，验证分布式路由与离线恢复在各键类型下的分区一致性。
 - **驱逐与内存管理**：高效的打分策略（如 LFU），使用线程安全的 `std::atomic_ref` 实现无锁并发状态更新
@@ -61,6 +63,28 @@ Bazel 配置使用 `-std=c++23` 编译 C++ 源码；支持 GCC 13+ 和 Bazel 7+�
 | 工具链 | GCC 13.4、Bazel 7.7、C++23（`-std=c++23`）、`-c opt` |
 | 优化参数 | `-O3 -march=native -mtune=native -mavx512bf16 -fno-strict-aliasing -DNDEBUG`；链接使用 `-flto` |
 | CPU affinity | Slot Directory forward proof 通过 benchmark affinity helper 绑定 worker；允许使用 48 个 CPU |
+
+### 全操作性能基准汇总
+
+基于双路 Intel Xeon Silver 4116（24 物理核、48 逻辑 CPU、125 GiB RAM、`-c opt`）实测的最佳性能数据：
+
+| 操作分类 | 测试负载 / 内核 | 并发度 / 配置规格 | 最佳吞吐 | 内存带宽 |
+|---|---|---|---:|---:|
+| **目录查询 (Find)** | C++ 纯查表微基准 (`hotpath_microbench`) | 64 线程，100K 键规模 | **226.18 Mops/s** | CPU 缓存绑定 |
+| **前向查表 (Forward)** | C++ 槽位目录前向 (`embedding_store_benchmark`) | 8 线程，dim=32，batch=4K | **50.39 Mops/s** | 内存带宽绑定 |
+| **宽表前向查表** | C++ 全功能存储前向 (`embedding_store_benchmark`) | 16 线程，dim=128，batch=65K | **23.55 Mops/s** | **12.06 GB/s** |
+| **就地赋值 (Assign)** | Python 多线程表写入 (`benchmark_embedding_table`) | 32 线程，dim=128，batch=65K | **14.05 Mops/s** | 7.19 GB/s |
+| **就地赋值 (Assign)** | C++ 全功能存储写入 (`embedding_store_benchmark`) | 16 线程，dim=128，batch=65K | **12.81 Mops/s** | **6.56 GB/s** |
+| **优化器更新** | C++ Adam 热点 profile (`training_path_profile`) | 8 workers，dim=128，4K 键 | **17.89 Mops/s** | 8.54 GB/s |
+| **优化器更新** | C++ 全功能存储 Adam (`embedding_store_benchmark`) | 16 线程，dim=128，batch=65K | **12.60 Mops/s** | **12.90 GB/s** |
+| **优化器更新 (低延迟)** | Python Adam step (`benchmark_adam_performance_regression`) | 16 线程，dim=16，batch=65K（p50: 6.39 ms, p99: 6.48 ms） | **10.28 Mops/s** | 工作集缓存绑定 |
+| **梯度累积** | C++ 梯度聚合 (`embedding_store_benchmark`) | 16 线程，dim=128，batch=65K | **4.23 Mops/s** | **2.17 GB/s** |
+| **成员判断 (Contains)** | C++ 键存在性判断 (`embedding_store_benchmark`) | 16 线程，batch=65K | **21.74 Mops/s** | 元数据绑定 |
+| **批量删除 (Erase)** | C++ 批量删除 (`embedding_store_benchmark`) | 16 线程，10% 批次删除 | **3.03 Mops/s** | 分片无锁 |
+| **端到端训练步** | Python 训练完整步 (`benchmark_embedding_table`) | 32 线程，查表+梯度累积+更新 | **2.02 Mops/s** | 端到端计算 |
+| **异步 Zipfian 访问** | Python 异步幂律查表 (`benchmark_async_zipfian`) | 16 workers，skew=1.1，Zipfian 分布 | **11.96 Mops/s** | 异步调度调度器 |
+| **分布式分片路由** | 并行调度器 Lemire fast_range (`parallel_partitioner`) | 8 workers，10M 键 | **1.03 B keys/s** | 向量化路由 |
+| **SIMD 内存切片过滤** | AVX-512 连续切片掩码过滤 (`filter_span`) | 8 workers，Arrow 物理连续内存 | **1.45 B keys/s** | AVX-512 SIMD |
 
 ### Forward scaling
 
@@ -138,6 +162,7 @@ import sparse_embedding
 
 config = sparse_embedding.EmbeddingConfig(
     dims=[128],
+    enable_mutation_journal=True,  # 设为 False 可关闭 CDC 变动追踪以降低内存驻留与热路径记账
     storage_tuning=sparse_embedding.StorageTuningOptions(
         target_capacity_keys=10_000_000,
         memory_budget_bytes=4 << 30,

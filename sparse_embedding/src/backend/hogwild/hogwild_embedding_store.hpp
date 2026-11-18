@@ -861,10 +861,10 @@ private:
         std::numeric_limits<uint64_t>::max();
 
     uint32_t dimension;
+    std::atomic<bool> queued{false};
     uint64_t key;
     const size_t owner_slot;
     std::atomic<uint64_t> state{0};
-    std::atomic<bool> queued{false};
     uint64_t deleted_page_id = kNoPhysicalPage;
     CheckpointMutationRecord *next = nullptr;
 
@@ -872,6 +872,7 @@ private:
                              size_t owner_slot_in)
         : dimension(dimension_in), key(key_in), owner_slot(owner_slot_in) {}
   };
+  static_assert(sizeof(CheckpointMutationRecord) == 48);
 
   struct alignas(64) ShardDirtyHead {
     std::atomic<CheckpointMutationRecord *> head{nullptr};
@@ -879,6 +880,9 @@ private:
 
   CheckpointMutationRecord *allocate_checkpoint_record(uint32_t dimension,
                                                        uint64_t key) {
+    if (!enable_mutation_journal_)
+      throw std::logic_error("allocate_checkpoint_record called while mutation "
+                             "journal is disabled");
     std::lock_guard structure_lock(checkpoint_record_structure_mutex_);
     if (checkpoint_free_record_slots_.capacity() <
         checkpoint_record_storage_.size() + 1)
@@ -988,6 +992,9 @@ private:
 
   void
   record_checkpoint_mutation(hogwild_internal::CheckpointRecordRef pointer) {
+    if (!enable_mutation_journal_)
+      throw std::logic_error("record_checkpoint_mutation called while mutation "
+                             "journal is disabled");
     CheckpointMutationRecord &record = *record_from_pointer(pointer);
     publish_checkpoint_mutation(record, reserve_checkpoint_sequence());
   }
@@ -996,6 +1003,9 @@ private:
       std::span<const hogwild_internal::CheckpointRecordRef> records) {
     if (records.empty())
       return;
+    if (!enable_mutation_journal_)
+      throw std::logic_error("record_checkpoint_mutations called while "
+                             "mutation journal is disabled");
     const uint64_t first_sequence =
         reserve_checkpoint_sequences(records.size());
     uint64_t sequence = first_sequence;
@@ -1007,6 +1017,8 @@ private:
   publish_checkpoint_deletion(hogwild_internal::CheckpointRecordRef pointer,
                               uint64_t reserved_sequence,
                               uint64_t physical_page_id) noexcept {
+    if (!enable_mutation_journal_)
+      std::terminate();
     CheckpointMutationRecord &record = *record_from_pointer(pointer);
     if (reserved_sequence == 0 ||
         reserved_sequence > CheckpointMutationRecord::kMaximumSequence)
@@ -1761,7 +1773,10 @@ public:
         replacement = clone_bundle_unlocked(next_reserved);
         next = replacement.get();
       }
-      std::vector<CheckpointMutationRecord *> records(keys.size(), nullptr);
+      const bool journal_enabled = checkpoint_owner.enable_mutation_journal();
+      std::vector<CheckpointMutationRecord *> records;
+      if (journal_enabled)
+        records.resize(keys.size(), nullptr);
       std::vector<uint32_t> allocated_slots(keys.size(), 0);
       size_t linked_count = 0;
       try {
@@ -1770,11 +1785,15 @@ public:
           if (next->find(key).has_value())
             throw std::invalid_argument(
                 "key shard batch contains duplicate key");
-          records[index] =
-              checkpoint_owner.allocate_checkpoint_record(dimension, key);
-          const uint32_t slot_id = locators->allocate(
-              key, indices[index],
-              hogwild_internal::CheckpointRecordRef::from(records[index]));
+          hogwild_internal::CheckpointRecordRef record_ref{};
+          if (journal_enabled) {
+            records[index] =
+                checkpoint_owner.allocate_checkpoint_record(dimension, key);
+            record_ref =
+                hogwild_internal::CheckpointRecordRef::from(records[index]);
+          }
+          const uint32_t slot_id =
+              locators->allocate(key, indices[index], record_ref);
           allocated_slots[index] = slot_id;
           next->insert(key, slot_id);
           ++linked_count;
@@ -1789,11 +1808,16 @@ public:
           checkpoint_owner.mark_terminal_failure();
           first_unpublished = linked_count;
         }
-        for (size_t index = first_unpublished; index < records.size();
+        if (journal_enabled) {
+          for (size_t index = first_unpublished; index < records.size();
+               ++index) {
+            if (records[index] != nullptr)
+              checkpoint_owner.discard_unpublished_checkpoint_record(
+                  records[index]);
+          }
+        }
+        for (size_t index = first_unpublished; index < allocated_slots.size();
              ++index) {
-          if (records[index] != nullptr)
-            checkpoint_owner.discard_unpublished_checkpoint_record(
-                records[index]);
           if (allocated_slots[index] != 0)
             locators->release_after_epoch(allocated_slots[index]);
         }
@@ -1840,7 +1864,9 @@ public:
       if (removed.empty())
         return 0;
       const uint64_t deletion_sequence_begin =
-          checkpoint_owner.reserve_checkpoint_sequences(removed.size());
+          checkpoint_owner.enable_mutation_journal()
+              ? checkpoint_owner.reserve_checkpoint_sequences(removed.size())
+              : 0;
       const size_t bytes_per_entry = checked_bundle_bytes_add(
           index_retirement_bytes, sizeof(hogwild_internal::LocatorSlot));
       const size_t retirement_bytes =
@@ -2965,7 +2991,8 @@ public:
               {key, *index, shard->locators->checkpoint_record(slot_id)});
         });
       }
-      if (!removed_keys.empty() && sequence_begin == 0)
+      if (!removed_keys.empty() && sequence_begin == 0 &&
+          checkpoint_owner.enable_mutation_journal())
         throw std::logic_error("clear key sequence range is missing");
       for (size_t shard_index = 0; shard_index < key_shards.size();
            ++shard_index)
@@ -4245,6 +4272,7 @@ public:
         background_page_eviction_enabled_(
             score_policy_.enabled() &&
             storage_->supports_background_page_eviction()),
+        enable_mutation_journal_(options.enable_mutation_journal),
         bind_worker_affinity_(storage_topology_.numa_execution()),
         numa_memory_locality_(storage_topology_.numa_memory()),
         telemetry_ring_(1024,
@@ -4342,6 +4370,9 @@ public:
   }
 
   size_t max_dim() const { return max_dim_; }
+  constexpr bool enable_mutation_journal() const noexcept {
+    return enable_mutation_journal_;
+  }
 
   size_t entries_per_page() const noexcept {
     return storage_topology_.entries_per_page();
@@ -4482,7 +4513,9 @@ public:
                 const auto score_result =
                     score_policy_.on_access(&slot.arena.score_raw(index));
                 if (score_result == ScoreAccessResult::kUpdated) {
-                  record_checkpoint_mutation(checkpoint_record);
+                  if (enable_mutation_journal_) {
+                    record_checkpoint_mutation(checkpoint_record);
+                  }
                 } else if (score_result == ScoreAccessResult::kClockExhausted) {
                   mark_terminal_failure();
                   throw std::overflow_error(
@@ -4808,7 +4841,9 @@ public:
                         [&](std::span<
                             const hogwild_internal::CheckpointRecordRef>
                                 checkpoint_records) {
-                          record_checkpoint_mutations(checkpoint_records);
+                          if (enable_mutation_journal_) {
+                            record_checkpoint_mutations(checkpoint_records);
+                          }
                         });
                 },
                 normalization_steps);
@@ -4876,7 +4911,9 @@ public:
                       simd::simd_copy(src, slot.arena.data(index), slot.dim);
                     else
                       std::copy_n(src, slot.dim, slot.arena.data(index));
-                    record_checkpoint_mutation(checkpoint_record);
+                    if (enable_mutation_journal_) {
+                      record_checkpoint_mutation(checkpoint_record);
+                    }
                   }))
             continue;
           auto batch =
@@ -4908,11 +4945,15 @@ public:
                   simd::simd_copy(src, slot.arena.data(index), slot.dim);
                 else
                   std::copy_n(src, slot.dim, slot.arena.data(index));
-                record_checkpoint_mutation(checkpoint_record);
+                if (enable_mutation_journal_) {
+                  record_checkpoint_mutation(checkpoint_record);
+                }
               },
               [&](const typename SlotStore::BatchEntry &entry,
                   hogwild_internal::CheckpointRecordRef checkpoint_record) {
-                record_checkpoint_mutation(checkpoint_record);
+                if (enable_mutation_journal_) {
+                  record_checkpoint_mutation(checkpoint_record);
+                }
               },
               true);
         }
@@ -4972,7 +5013,9 @@ public:
           },
           [&](const typename SlotStore::BatchEntry &entry,
               hogwild_internal::CheckpointRecordRef checkpoint_record) {
-            record_checkpoint_mutation(checkpoint_record);
+            if (enable_mutation_journal_) {
+              record_checkpoint_mutation(checkpoint_record);
+            }
           },
           false, true);
     }
@@ -5047,9 +5090,11 @@ public:
                 [&](uint64_t, uint32_t index,
                     hogwild_internal::CheckpointRecordRef checkpoint_record,
                     uint64_t deletion_sequence) noexcept {
-                  publish_checkpoint_deletion(
-                      checkpoint_record, deletion_sequence,
-                      index >> slot->arena.entries_shift());
+                  if (enable_mutation_journal_) {
+                    publish_checkpoint_deletion(
+                        checkpoint_record, deletion_sequence,
+                        index >> slot->arena.entries_shift());
+                  }
                   slot->arena.mark_live(index, false);
                 });
           }
@@ -5095,8 +5140,11 @@ public:
             [&](uint64_t, uint32_t index,
                 hogwild_internal::CheckpointRecordRef checkpoint_record,
                 uint64_t deletion_sequence) noexcept {
-              publish_checkpoint_deletion(checkpoint_record, deletion_sequence,
-                                          index >> slot.arena.entries_shift());
+              if (enable_mutation_journal_) {
+                publish_checkpoint_deletion(
+                    checkpoint_record, deletion_sequence,
+                    index >> slot.arena.entries_shift());
+              }
               slot.arena.mark_live(index, false);
             });
       }
@@ -5118,7 +5166,9 @@ public:
     for (const auto &slot_ptr : slot_storage_)
       clear_count += slot_ptr->size();
     const uint64_t clear_sequence_begin =
-        clear_count == 0 ? 0 : reserve_checkpoint_sequences(clear_count);
+        (!enable_mutation_journal_ || clear_count == 0)
+            ? 0
+            : reserve_checkpoint_sequences(clear_count);
     size_t clear_sequence_offset = 0;
     for (const auto &slot_ptr : slot_storage_) {
       auto *slot = slot_ptr.get();
@@ -5126,8 +5176,10 @@ public:
           [&](uint64_t, uint32_t index,
               hogwild_internal::CheckpointRecordRef checkpoint_record,
               uint64_t deletion_sequence) noexcept {
-            publish_checkpoint_deletion(checkpoint_record, deletion_sequence,
-                                        index >> slot->arena.entries_shift());
+            if (enable_mutation_journal_) {
+              publish_checkpoint_deletion(checkpoint_record, deletion_sequence,
+                                          index >> slot->arena.entries_shift());
+            }
           },
           clear_sequence_begin + clear_sequence_offset);
       clear_sequence_offset += removed;
@@ -5225,7 +5277,9 @@ public:
                    hogwild_internal::CheckpointRecordRef checkpoint_record) {
             std::atomic_ref<uint64_t>(slot.arena.score_raw(idx))
                 .store(score, std::memory_order_relaxed);
-            record_checkpoint_mutation(checkpoint_record);
+            if (enable_mutation_journal_) {
+              record_checkpoint_mutation(checkpoint_record);
+            }
           });
     };
     auto do_range = [&](size_t begin, size_t end) {
@@ -5704,6 +5758,7 @@ private:
   PageStorage storage_;
   std::shared_ptr<RetirementPressure> retirement_pressure_;
   bool background_page_eviction_enabled_;
+  bool enable_mutation_journal_;
   mutable std::mutex control_plane_mutex_;
   PageEvictionRegistration page_eviction_registration_;
   std::atomic<uint64_t> telemetry_sample_sequence_{0};
@@ -5836,6 +5891,9 @@ public:
       InvocationGate &gate;
       ~InvocationResume() { gate.resume_accepting(); }
     } invocation_resume{invocation_gate_};
+    if (incremental && !enable_mutation_journal_)
+      throw std::runtime_error(
+          "incremental checkpoint requires mutation journal to be enabled");
     if (incremental && (expected_baseline.empty() ||
                         checkpoint_baseline() != expected_baseline))
       throw std::runtime_error(
@@ -5928,6 +5986,9 @@ public:
   }
 
   std::vector<CheckpointMutation> checkpoint_mutations() const {
+    if (!enable_mutation_journal_)
+      throw std::runtime_error(
+          "checkpoint mutation tracking is disabled for this store");
     std::lock_guard control_plane_lock(control_plane_mutex_);
     invocation_gate_.begin_reconfiguration_and_wait();
     struct InvocationResume {
@@ -6340,7 +6401,9 @@ private:
                                                opt_dim));
               if (!steps.empty())
                 slot.optimizer->set_step(index, steps[i]);
-              record_checkpoint_mutation(checkpoint_record);
+              if (enable_mutation_journal_) {
+                record_checkpoint_mutation(checkpoint_record);
+              }
             });
         if (!found)
           throw std::invalid_argument(
@@ -6743,9 +6806,11 @@ public:
               keys, [&](uint64_t key, uint32_t index,
                         hogwild_internal::CheckpointRecordRef checkpoint_record,
                         uint64_t deletion_sequence) noexcept {
-                publish_checkpoint_deletion(
-                    checkpoint_record, deletion_sequence,
-                    index >> slot.arena.entries_shift());
+                if (enable_mutation_journal_) {
+                  publish_checkpoint_deletion(
+                      checkpoint_record, deletion_sequence,
+                      index >> slot.arena.entries_shift());
+                }
                 std::copy_n(slot.arena.data(index), slot.dim,
                             out_evicted_values.data() +
                                 out_evicted_count * slot.dim);

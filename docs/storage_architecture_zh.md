@@ -87,6 +87,19 @@ $$\text{page\_id} = \text{index} \gg \text{entries\_shift}, \quad \text{slot\_of
 3. **第 3 级（哈希目录桶预取）**：计算未来 key 的哈希并提前将目录桶缓存行载入 L1/L2 缓存。
 4. **第 4 级（定位槽与优化器状态预取）**：预取 8 字节对齐的 `LocatorSlot` 及优化器一阶动量（$m$）、二阶动量（$v$）状态行，有效掩盖 LLC Cache Miss 带来的内存停顿。
 
+### 3.5 优化器状态分层内存对齐布局 (`OptimizerRowLayout`)
+
+在现代稀疏优化器（如 Adam）中，优化器状态包含多维浮点动量向量与标量迭代步数计数器。为了彻底消除内存膨胀同时不影响 SIMD 向量化计算，`OptimizerStateArena` 提供了细粒度的行布局对齐策略：
+
+- **`OptimizerRowLayout::kCacheLineAligned` (64 字节对齐跨度)**：
+  - 应用于一阶动量（$m$）与二阶动量（$v$）；
+  - 行跨度向上对齐至 64 字节 (`std::max(sizeof(ParamT) * dim, 64UL)`)，保证 512 位 AVX-512 FMA 向量加载与写回指令执行时绝不发生跨缓存行切分惩罚。
+- **`OptimizerRowLayout::kNaturalAligned` (4 字节紧凑自然对齐)**：
+  - 应用于 Adam 步数计数器（`step_state`），其每行仅为一个标量 `uint32_t`（4 字节）；
+  - 页起始地址保持 64 字节对齐，而页内槽位行跨度严格紧凑为 4 字节 (`sizeof(uint32_t)`)；
+  - **物理页规格**：默认 4,096 槽物理页分配规格仅为 **16 KiB**（$4096 \times 4\text{ B}$）；
+  - **缓存局部性**：单条 64 字节缓存行可容纳 16 个槽位的 step 计数器（256K 活跃槽位仅占 1 MiB 内存，完全装入 CPU L2/L3 缓存），有效消除跨页跳跃与 LLC Cache Miss。
+
 ---
 
 ## 4. 存储分层与自适应硬件调优
@@ -188,7 +201,9 @@ ranks_func = se.partition(keys, partition_count=4, algorithm="sparse_embedding.h
   - 推理实例：配置 `EmbeddingConfig(enable_optimizer=False)` 构建权重专属 Store，杜绝分配优化器状态内存。
 - **目标分区恢复**：`RestorePlan.from_partition` 直接描述当前分区。同一种计划类型同时覆盖相同与变化后的目标拓扑；规范 entries 的路由仍由 native 分片器负责，page-image 加载只通过 `IngestionEngine.FAST_PAGE_CACHE` 选择。
 - **两阶段提交与 Lance 湖仓持久化**：底层通过 `snapshot_manifest.lance`（控制面元数据账本）与 `entries.lance`（数据面物理切片）实现 2PC 原子发布与恢复。
-- **增量检查点与流式合流**：分片变动日志追踪脏数据与删除墓碑，支持无阻塞一致性切片与多版本流式 Compaction。
+- **增量检查点与变动日志 (Mutation Journal)**：
+  - `enable_mutation_journal = True`（默认）：分片变动日志追踪脏数据与删除墓碑，支持无阻塞一致性切片与多版本流式 Compaction。
+  - `enable_mutation_journal = False`：关闭变动追踪与热路径原子序号预留，免除记录结构内存开销；关闭时请求增量保存将抛出 `RuntimeError`，全量快照与恢复功能不受影响。
 
 > 完整的 Lance 检查点存储架构、两阶段提交、增量恢复与 Gravitino 集成规范，请参阅专门文档：[Lance 存储与 Gravitino 集成指南](lance_storage_and_gravitino_zh.md) 及 [增量检查点与流式 Compaction](incremental_checkpoint_zh.md)。
 
@@ -219,6 +234,7 @@ config = se.EmbeddingConfig(
     gradient_dtype="bfloat16",           # 梯度累积类型 (可选)
     gradient_scale=1.0,                  # 梯度缩放系数
     enable_optimizer=True,               # 设为 False 用于纯权重推理 Store
+    enable_mutation_journal=True,        # 设为 False 可关闭 CDC 变动追踪以降低内存驻留与热路径记账
     storage_tuning=se.StorageTuningOptions(
         target_capacity_keys=10_000_000, # 预估键容量
         memory_budget_bytes=4 << 30,     # 内存调优预算

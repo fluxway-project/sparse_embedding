@@ -47,6 +47,7 @@ struct StoreConstructionRequest {
   std::optional<OptimizerConfigVariant> optimizer_config;
   GradientDType gradient_dtype = GradientDType::kFloat32;
   float gradient_scale = 1.0f;
+  bool enable_mutation_journal = true;
 };
 
 struct StoreConstructionTarget {

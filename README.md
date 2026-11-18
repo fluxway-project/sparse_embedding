@@ -14,6 +14,8 @@ High-performance sparse storage and computation library purpose-built for **PB-s
 - **Epoch Memory Safety**: Batch protection for concurrent hash map read/write using `epoch::with_epoch`, avoiding ABA problems.
 - **Distributed Lance Checkpointing**: Two-phase commit protocol separating `snapshot_manifest.lance` (control ledger) and `entries.lance` (worker slices). Supports 4 native Arrow integer key types (`int32`, `uint32`, `int64`, `uint64`) with DuckDB pushdown and optional physical page cache.
 - **Selective Optimizer Loading**: `EmbeddingConfig(enable_optimizer=False)` creates a weight-only inference store. `checkpoint.load_inference_checkpoint` (or storage `load_inference_weights`) restores weights only.
+- **Segregated Optimizer Memory Alignment**: Adam optimizer decouples vector and scalar alignments, maintaining 64-byte AVX-512 SIMD alignment for momentum vectors (`m/v`) while packing scalar step counters with 4-byte natural alignment (`OptimizerRowLayout::kNaturalAligned`) into 16 KiB pages for high CPU L2/L3 cache residency.
+- **Configurable Shard Mutation Journaling**: Shard-local Change Data Capture (CDC) can be enabled or disabled via `EmbeddingConfig.enable_mutation_journal`. When disabled for pure training or FULL-only checkpoints, hot-path sequence accounting and record memory overhead are eliminated; when enabled, it tracks dirty keys and deletion tombstones for incremental checkpointing.
 - **Partitioner Registry and Routing (PartitionerRegistry)**: Built on `pro::proxy<PartitionerFacade>` supporting `modulo`, `hash`, `fast_range`, and dynamic extensions. Offline restore uses AVX-512 `filter_span`; online routing (`parallel_partitioner.hpp`) integrates with Fluxway `FunctionPartition`.
 - **Reference Vector Validation**: Canonical `generate_reference_vectors` validates bit-identical partition mappings between distributed runtimes and offline restore engines across all key types.
 - **Eviction Management**: Memory-efficient scoring policies (e.g., LFU) using thread-safe `std::atomic_ref` for concurrent state updates without locking.
@@ -58,6 +60,28 @@ The Bazel configuration compiles C++ sources with `-std=c++23`; GCC 13+ and Baze
 | Toolchain | GCC 13.4, Bazel 7.7, C++23 (`-std=c++23`), `-c opt` |
 | Optimization flags | `-O3 -march=native -mtune=native -mavx512bf16 -fno-strict-aliasing -DNDEBUG`; link with `-flto` |
 | CPU affinity | Slot-directory forward proof binds workers through the benchmark affinity helper; 48 CPUs were allowed |
+
+### Performance Summary Across Operations
+
+Validated benchmark results across hot-path C++ and Python workloads:
+
+| Operation Category | Target Benchmark / Kernel | Concurrency / Configuration | Best Throughput | Memory Bandwidth |
+|---|---|---|---:|---:|
+| **Directory Lookup** | C++ pure find microbench (`hotpath_microbench`) | 64 threads, 100K keys | **226.18 Mops/s** | CPU cache bound |
+| **Forward Lookup** | C++ slot-directory forward (`embedding_store_benchmark`) | 8 threads, dim=32, batch=4K | **50.39 Mops/s** | Memory bound |
+| **Forward Lookup (Wide)** | C++ full store forward (`embedding_store_benchmark`) | 16 threads, dim=128, batch=65K | **23.55 Mops/s** | **12.06 GB/s** |
+| **In-Place Assign** | Python multi-threaded table assign (`benchmark_embedding_table`) | 32 threads, dim=128, batch=65K | **14.05 Mops/s** | 7.19 GB/s |
+| **In-Place Assign** | C++ full store assign (`embedding_store_benchmark`) | 16 threads, dim=128, batch=65K | **12.81 Mops/s** | **6.56 GB/s** |
+| **Optimizer Step** | C++ Adam hot-set profile (`training_path_profile`) | 8 workers, dim=128, 4K keys | **17.89 Mops/s** | 8.54 GB/s |
+| **Optimizer Step** | C++ full store Adam step (`embedding_store_benchmark`) | 16 threads, dim=128, batch=65K | **12.60 Mops/s** | **12.90 GB/s** |
+| **Optimizer Step (Low Latency)** | Python Adam step (`benchmark_adam_performance_regression`) | 16 threads, dim=16, batch=65K (p50: 6.39 ms, p99: 6.48 ms) | **10.28 Mops/s** | Working set bound |
+| **Gradient Accumulation** | C++ gradient accumulation (`embedding_store_benchmark`) | 16 threads, dim=128, batch=65K | **4.23 Mops/s** | **2.17 GB/s** |
+| **Key Membership** | C++ contains check (`embedding_store_benchmark`) | 16 threads, batch=65K | **21.74 Mops/s** | Metadata bound |
+| **Batch Erase** | C++ batch erase (`embedding_store_benchmark`) | 16 threads, 10% batch | **3.03 Mops/s** | Shard lock-free |
+| **End-to-End Step** | Python full training step (`benchmark_embedding_table`) | 32 threads, lookup + accum + step | **2.02 Mops/s** | E2E compute |
+| **Async Zipfian Access** | Python async Zipfian lookup (`benchmark_async_zipfian`) | 16 workers, skew=1.1, power-law | **11.96 Mops/s** | Async scheduler |
+| **Distributed Routing** | Parallel partitioner Lemire fast_range (`parallel_partitioner`) | 8 workers, 10M keys | **1.03 B keys/s** | Vectorized routing |
+| **SIMD Slice Filter** | AVX-512 slice mask filter (`filter_span`) | 8 workers, Arrow memory slices | **1.45 B keys/s** | AVX-512 SIMD |
 
 ### Forward scaling
 
@@ -150,6 +174,7 @@ import sparse_embedding
 
 config = sparse_embedding.EmbeddingConfig(
     dims=[128],
+    enable_mutation_journal=True,  # Set False to disable CDC tracking for pure training or FULL-only checkpoints
     storage_tuning=sparse_embedding.StorageTuningOptions(
         target_capacity_keys=10_000_000,
         memory_budget_bytes=4 << 30,

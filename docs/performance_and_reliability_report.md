@@ -28,7 +28,12 @@ Page images store slot layout, `seq_count`, parameters, score, optimizer state/s
 SHA-256 checksums. Incremental checkpoints append only changed entries and tombstones; an external coordinator
 performs global commit.
 Inference uses `EmbeddingConfig(enable_optimizer=False)` and `checkpoint.load_inference_checkpoint` (or storage `load_inference_weights`),
-which avoids optimizer-state allocation and loading.
+which avoids optimizer-state allocation and loading. For pure training or FULL-only checkpointing,
+`EmbeddingConfig(enable_mutation_journal=False)` disables CDC change tracking, eliminating hot-path
+sequence counter reservations and record memory overhead. In addition, the Adam optimizer uses
+segregated alignment, maintaining 64-byte AVX-512 SIMD alignment for momentum vectors (`m/v`) while
+packing scalar step counters with 4-byte natural alignment (`OptimizerRowLayout::kNaturalAligned`, 16 KiB per page)
+for high CPU cache residency.
 
 Compaction, hot-key promotion, and page eviction update one authoritative
 directory. Source pages remain readable until epoch safety and are never reused
@@ -153,6 +158,60 @@ The batch optimizer profile is a separate workload from the tables below. Use
 `training_path_profile` when comparing assign, gradient accumulation, and
 optimizer-step implementations; use the benchmark commands in this document
 for storage and compaction comparisons.
+
+### Full-Store Multi-Operation Benchmark (C++ 16 Threads)
+
+Workload configuration: dimension 128, vocabulary 500,000 keys, 65,536-key power-law batches,
+16 native worker threads, and memory-only storage:
+
+| Operation | Throughput | Bandwidth | Concurrency / Bottleneck |
+|---|---:|---:|---|
+| `forward_lookup` | **23.55 Mops/s** | **12.06 GB/s** | Memory bandwidth bound |
+| `assign` | **12.81 Mops/s** | **6.56 GB/s** | Cacheline write bound |
+| `optimizer_step` (Adam) | **12.60 Mops/s** | **12.90 GB/s** | SIMD + memory bus bound |
+| `accumulate_gradients` | **4.23 Mops/s** | **2.17 GB/s** | Per-shard transient arena |
+| `lookup_or_insert` | **1.05 Mops/s** | 0.54 GB/s | Exclusive shard insertion lock |
+| `contains` | **21.74 Mops/s** | — | Directory read path |
+| `erase` (10% batch) | **3.03 Mops/s** | — | Shard tombstone publication |
+
+### Concurrent Python Table Operations and Scaling
+
+Evaluated on `benchmarks/python/benchmark_embedding_table.py` with dimension 128 across 8, 16, and 32 threads:
+
+| Operation | Batch Size | 8 Threads | 16 Threads | 32 Threads | Scaling Trend |
+|---|---:|---:|---:|---:|---|
+| **Assign** | 65,536 | 10.00 MOPS | 11.79 MOPS | **14.05 MOPS** | Linear write scaling |
+| **Assign** | 131,072 | 9.65 MOPS | 11.29 MOPS | **13.69 MOPS** | Cacheline saturated |
+| **Lookup** | 65,536 | 4.65 MOPS | 7.47 MOPS | **9.64 MOPS** | Strong scaling (2.07x) |
+| **Lookup** | 131,072 | 5.44 MOPS | 8.35 MOPS | **9.88 MOPS** | Memory bus saturated |
+| **Insert** | 65,536 | 1.14 MOPS | **1.17 MOPS** | 1.16 MOPS | Shard mutex bound |
+| **End-to-End Step** | 65,536 | 1.53 MOPS | 1.77 MOPS | **1.98 MOPS** | Full training pipeline |
+| **End-to-End Step** | 131,072 | 1.53 MOPS | 1.84 MOPS | **2.02 MOPS** | Full training pipeline |
+
+### Optimizer Memory Layout & Cacheline Locality
+
+Adam optimizer state consists of first-moment momentum ($m$), second-moment velocity ($v$), and step counter ($t$), organized with segregated vector and scalar alignments:
+
+1. **Segregated Alignment Architecture (`OptimizerRowLayout`)**:
+   - Floating-point vectors $m$ and $v$ ($D \times \text{sizeof(float)}$): Aligned to 64 bytes (`kCacheLineAligned`) to ensure 512-bit AVX-512 FMA vectorization executes without unaligned memory access penalties.
+   - Step iteration counter $t$: Scalar `uint32_t` (4 bytes) packed with natural alignment (`kNaturalAligned`), consuming exactly 4 bytes per row with page bounds aligned to 64 bytes.
+2. **Page Specifications**:
+   - Under the default 4,096 entries per page, `step_state` allocates compact **16 KiB** pages ($4096 \times 4\text{ B}$), providing 100% entry storage efficiency.
+3. **Cache Working-Set Density**:
+   - A single 64-byte CPU cacheline holds 16 consecutive step counters.
+   - For a 262,144 active slot capacity, the entire step-state directory occupies only **1 MiB**, residing comfortably within CPU L2/L3 cache and minimizing Last Level Cache (LLC) evictions.
+   - Independent hash-sharded worker threads operate on disjoint physical slot partitions, avoiding concurrent false sharing.
+
+### Mutation Journal Memory & Operational Modes
+
+The `enable_mutation_journal` configuration governs Change Data Capture (CDC) tracking:
+
+| Configuration | Memory Structure | Hotpath Sequence Accounting | Checkpoint Capabilities | Recommended Workload |
+|---|---|---|---|---|
+| `enable_mutation_journal = True` (Default) | Allocates journal mutation records and pointer arrays (~65 B/key RSS) | Active atomic CAS on write paths | FULL + INCREMENTAL checkpoints, tombstone replay | Online incremental backup, streaming delta CDC |
+| `enable_mutation_journal = False` | **Zero journal allocations** | **Zero atomic sequence overhead** | FULL checkpoint only, fast clean restore | Pure training, inference, batch periodic FULL saves |
+
+When disabled, `capture_checkpoint(incremental=True)` or calling `checkpoint_mutations()` raises an explicit `RuntimeError` to prevent silent generation of broken or incomplete deltas, while FULL snapshots, restores, and acknowledgements operate with full integrity.
 
 ### High-concurrency pressure and reliability
 

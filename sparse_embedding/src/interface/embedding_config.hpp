@@ -40,6 +40,7 @@ struct EmbeddingConfig {
   StorageOptions storage;
   storage::StorageTuningOptions storage_tuning;
   bool enable_optimizer = true;
+  bool enable_mutation_journal = true;
 };
 
 } // namespace se

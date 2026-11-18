@@ -96,6 +96,7 @@ void construct_store(EmbeddingStoreWrapper &self, const PyInitializer &init_cfg,
       se::GradientDType::kFloat32, 1.0f};
   request.gradient_dtype = kind.gradient_dtype;
   request.gradient_scale = kind.gradient_scale;
+  request.enable_mutation_journal = emb_cfg.enable_mutation_journal;
   se::create_hogwild_store(kind, std::move(target), std::move(request),
                            thread_budget);
 }
@@ -468,14 +469,15 @@ NB_MODULE(_core, m) {
   nb::class_<se::EmbeddingConfig>(m, "_EmbeddingConfig")
       .def(nb::init<std::vector<size_t>, size_t, std::string, std::string,
                     std::string, float, std::string, se::StorageOptions,
-                    se::storage::StorageTuningOptions, bool>(),
+                    se::storage::StorageTuningOptions, bool, bool>(),
            nb::arg("dims"), nb::arg("thread_budget") = 0,
            nb::arg("value_dtype") = "float32", nb::arg("optimizer_dtype") = "",
            nb::arg("gradient_dtype") = "", nb::arg("gradient_scale") = 1.0f,
            nb::arg("key_dtype") = "int64",
            nb::arg("storage") = se::StorageOptions{},
            nb::arg("storage_tuning") = se::storage::StorageTuningOptions{},
-           nb::arg("enable_optimizer") = true)
+           nb::arg("enable_optimizer") = true,
+           nb::arg("enable_mutation_journal") = true)
       .def_rw("dims", &se::EmbeddingConfig::dims)
       .def_rw("thread_budget", &se::EmbeddingConfig::thread_budget)
       .def_rw("value_dtype", &se::EmbeddingConfig::value_dtype)
@@ -483,6 +485,8 @@ NB_MODULE(_core, m) {
       .def_rw("gradient_dtype", &se::EmbeddingConfig::gradient_dtype)
       .def_rw("gradient_scale", &se::EmbeddingConfig::gradient_scale)
       .def_rw("enable_optimizer", &se::EmbeddingConfig::enable_optimizer)
+      .def_rw("enable_mutation_journal",
+              &se::EmbeddingConfig::enable_mutation_journal)
       .def_rw("key_dtype", &se::EmbeddingConfig::key_dtype)
       .def_rw("storage_tuning", &se::EmbeddingConfig::storage_tuning);
 

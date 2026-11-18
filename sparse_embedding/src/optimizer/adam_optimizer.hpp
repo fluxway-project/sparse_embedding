@@ -23,7 +23,6 @@
 #include <ranges>
 #include <span>
 
-#include "sparse_embedding/src/optimizer/learning_rate.hpp"
 #include "sparse_embedding/src/optimizer/optimizer_config.hpp"
 #include "sparse_embedding/src/optimizer/optimizer_contract.hpp"
 #include "sparse_embedding/src/optimizer/optimizer_state.hpp"
@@ -50,8 +49,9 @@ public:
   explicit AdamOptimizer(size_t dim, const AdamConfig &cfg, PageStorage storage,
                          LearningRateT lr)
       : m_state(dim, storage), v_state(dim, storage),
-        step_state(1, std::move(storage)), config(cfg),
-        learning_rate(std::move(lr)) {
+        step_state(1, std::move(storage), false, 4096,
+                   OptimizerRowLayout::kNaturalAligned),
+        config(cfg), learning_rate(std::move(lr)) {
     bc1_table_[0] = 1.0f;
     bc2_table_[0] = 1.0f;
     for (size_t t = 1; t < kMaxCachedSteps; ++t) {

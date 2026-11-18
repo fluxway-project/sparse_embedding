@@ -13,7 +13,7 @@
 Sparse Embedding 提供原生**增量检查点**与**流式 Compaction** 能力：
 
 - **一致性切片（Consistent Cut）**：捕获阶段暂时阻止并等待竞争中的 store 调用，使用 Epoch 保护内存。native writer 通道有界，慢 I/O 可以通过背压延长捕获时间。
-- **分片原生内存变动日志（Mutation Journaling）**：Shard 本地管理变动条目与单调递增序列号，Forward 前向热路径无任何互斥锁开销与原子写争用。
+- **分片原生内存变动日志（Mutation Journaling）**：Shard 本地管理变动条目与单调递增序列号，Forward 前向热路径无互斥锁开销与原子写争用。支持通过 `EmbeddingConfig.enable_mutation_journal` 按需配置：纯训练或全量检查点模式下关闭可免除热路径原子序号记账与记录内存开销。
 - **Delta 增量物理模式与墓碑追踪**：底层 Lance 列存保存 `mutation_sequence`、`row_state`（`"active"` 与 `"deleted"`）以及可选的淘汰评分 `score`（LFU/LRU）。
 - **原生多版本合流解析**：有界外部排序校验历史 identity 并选出增量链（`FULL` → `INCREMENTAL` → ...）的存活记录。每个 Lance 源的 payload 扫描一次，请求的数据写入临时文件，随后按源顺序回放；只有存活 key 分配目标 slot。
 - **离线/在线流式 Compaction**：与 entries restore 共用合流和 payload 解码，再通过有界 writer 通道输出自包含 `FULL`。临时磁盘随历史数据增长，排序与 batch 的 RAM 上限由 `CheckpointStreamPolicy` 控制。
@@ -57,6 +57,23 @@ Sparse Embedding 提供原生**增量检查点**与**流式 Compaction** 能力�
 - **脏键追踪**：当特征权重或优化器状态在 `assign`、`accumulate_gradients` 或 `optimizer_step` 中被修改时，其定位槽与递增序号即时记录到当前活跃 Journal 中。
 - **删除墓碑记录**：显式删除（`erase`、`erase_dimension`）或基于分数的淘汰清理会生成对应的删除墓碑（Tombstone），确保跨版本删除语义严格保真。
 - **只读热路径零开销**：`forward_lookup` 和 `lookup_or_insert` 命中路径不经过 Journal 互斥锁，也不执行任何原子写计数。
+
+#### 可配置变动日志 (`enable_mutation_journal`)
+
+变动日志默认开启（`EmbeddingConfig(enable_mutation_journal=True)`）。对于不需要增量检查点的场景（例如仅执行纯训练、离线推理、或仅使用周期性全量快照保存），可在建表配置中显式关闭：
+
+```python
+config = se.EmbeddingConfig(
+    dims=[128],
+    enable_mutation_journal=False,  # 显式关闭 CDC 变动追踪
+)
+```
+
+**运行机制与契约保证：**
+1. **零记录内存分配**：关闭日志后完全跳过每个 Key 对应的变动记录结构体与指针数组分配，消除变动追踪产生的内存常驻。
+2. **热路径零原子序号开销**：写路径（`assign`、`optimizer_step`、带分数的访问等）完全跳过原子序列号递增与预留。
+3. **全量快照功能完整**：全量检查点捕获（`save_training_checkpoint(mode=FULL)`）、恢复引擎及确认协议均完备工作且数据 100% 一致。
+4. **强校验快速失败 (Fail-Fast)**：当关闭日志时，任何尝试请求增量检查点（`capture_checkpoint(incremental=True)` 或 `save_training_checkpoint(mode=INCREMENTAL)`）或查询变动历史（`store.checkpoint_mutations()`）的操作均会立即抛出 `RuntimeError("incremental checkpoint requires mutation journal to be enabled")`，严格杜绝产生破损或缺失基线的残缺增量快照。
 
 ### 2.2 两阶段一致性切片协议
 
@@ -160,7 +177,7 @@ committed_inc = checkpoint.save_training_checkpoint(
 print("已提交增量版本:", committed_inc.version_id.decode())
 ```
 
-> **注意**：增量检查点必须与父检查点保持相同的 Lineage 名称（如 `"user_model"`），并且必须指定有效的 `parent_handle`。未提供父句柄时系统将严格抛出 `ValueError`，杜绝悬空版本。
+> **注意**：增量检查点必须与父检查点保持相同的 Lineage 名称（如 `"user_model"`），并且必须指定有效的 `parent_handle`。未提供父句柄时系统将严格抛出 `ValueError`，杜绝悬空版本。若当前 Store 构建时配置了 `enable_mutation_journal=False`，尝试保存增量快照将抛出 `RuntimeError("incremental checkpoint requires mutation journal to be enabled")`。
 
 ### 3.2 从增量链条恢复状态
 

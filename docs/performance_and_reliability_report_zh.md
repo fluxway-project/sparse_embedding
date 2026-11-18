@@ -22,7 +22,7 @@ Lance checkpoint 以规范 `entries` 数据集作为 SSOT，物理 `page_images`
 page image 保存 slot 布局、`seq_count`、参数、score、optimizer state/step 和 SHA-256 checksum。
 增量 checkpoint 只追加变化 entry 与 tombstone，并由外部 coordinator 完成全局提交。
 推理使用 `EmbeddingConfig(enable_optimizer=False)` 与 `checkpoint.load_inference_checkpoint`（或存储层 `load_inference_weights`），
-避免分配和加载优化器状态。
+避免分配和加载优化器状态。对于纯训练或仅全量快照场景，配置 `EmbeddingConfig(enable_mutation_journal=False)` 可关闭 CDC 变动追踪，完全免除热路径原子序号记账与记录内存开销。此外，Adam 优化器采用对齐隔离架构，一阶与二阶动量保持 64 字节 AVX-512 SIMD 向量对齐，标量 step 计数器采用 4 字节自然对齐（`OptimizerRowLayout::kNaturalAligned`，单页 16 KiB 紧凑打包），兼顾向量计算吞吐与 CPU 缓存密度。
 
 Compaction、热 Key 提升和 page eviction 都通过唯一权威目录更新 locator。源 page 在
 epoch 安全前保持可读，不会被重新用作 destination。
@@ -133,6 +133,59 @@ dim=128、65,536 个已存在且唯一的 row、8 workers、进程使用 `taskse
 
 批级 optimizer profile 与下表使用不同 workload。比较 assign、梯度累积和 optimizer step
 时请使用 `training_path_profile`；比较存储和 compaction 时请使用本文末尾的 benchmark 命令。
+
+### 全功能存储多操作基准评测 (C++ 16 线程)
+
+测试配置：维度 128，词表规模 500,000 个键，65,536 大小幂律访问批次，16 个原生工作线程，纯内存存储：
+
+| 操作名称 | 吞吐量 | 内存带宽 | 性能特征 / 瓶颈点 |
+|---|---:|---:|---|
+| `forward_lookup` | **23.55 Mops/s** | **12.06 GB/s** | 内存总线带宽受限 |
+| `assign` | **12.81 Mops/s** | **6.56 GB/s** | 缓存行写回受限 |
+| `optimizer_step` (Adam) | **12.60 Mops/s** | **12.90 GB/s** | SIMD 计算与内存吞吐受限 |
+| `accumulate_gradients` | **4.23 Mops/s** | **2.17 GB/s** | 分片 TransientArena 梯度累加 |
+| `lookup_or_insert` | **1.05 Mops/s** | 0.54 GB/s | 分片独占插入锁受限 |
+| `contains` | **21.74 Mops/s** | — | 槽位目录只读路径 |
+| `erase` (10% 批次) | **3.03 Mops/s** | — | 分片墓碑发布与槽位回收 |
+
+### Python 并发表操作吞吐与横向扩展
+
+基于 `benchmarks/python/benchmark_embedding_table.py` 在维度 128 下评测 8、16、32 线程的扩展表现：
+
+| 操作类型 | 批大小 | 8 线程 | 16 线程 | 32 线程 | 扩展趋势 |
+|---|---:|---:|---:|---:|---|
+| **就地赋值 (Assign)** | 65,536 | 10.00 MOPS | 11.79 MOPS | **14.05 MOPS** | 线性写扩展 |
+| **就地赋值 (Assign)** | 131,072 | 9.65 MOPS | 11.29 MOPS | **13.69 MOPS** | 缓存行写入饱和 |
+| **前向查表 (Lookup)** | 65,536 | 4.65 MOPS | 7.47 MOPS | **9.64 MOPS** | 强线性加速 (2.07x) |
+| **前向查表 (Lookup)** | 131,072 | 5.44 MOPS | 8.35 MOPS | **9.88 MOPS** | 内存带宽打满 |
+| **插入 (Insert)** | 65,536 | 1.14 MOPS | **1.17 MOPS** | 1.16 MOPS | 分片互斥锁上限 |
+| **端到端训练步** | 65,536 | 1.53 MOPS | 1.77 MOPS | **1.98 MOPS** | 查表+聚合+更新完整流水线 |
+| **端到端训练步** | 131,072 | 1.53 MOPS | 1.84 MOPS | **2.02 MOPS** | 查表+聚合+更新完整流水线 |
+
+### 优化器状态对齐架构与 Cacheline 局部性
+
+Adam 优化器状态包含一阶动量 ($m$)、二阶动量 ($v$) 与迭代步数计数器 ($t$)，采用向量与标量分层对齐：
+
+1. **向量与标量分层对齐 (`OptimizerRowLayout`)**：
+   - 浮点向量 $m$ 与 $v$（$D \times \text{sizeof(float)}$）：采用 64 字节对齐（`kCacheLineAligned`），确保 512 位 AVX-512 FMA 向量化指令无未对齐惩罚。
+   - 步数计数器 $t$：标量 `uint32_t`（4 字节）采用自然紧凑对齐（`kNaturalAligned`），行跨度严格为 4 字节，物理页起始地址保持 64 字节对齐。
+2. **物理页内存规格**：
+   - 默认每页 4,096 个槽位时，`step_state` 物理页规格为 **16 KiB**（$4096 \times 4\text{ B}$），槽位内存密度达 100%。
+3. **缓存工作集密度与并发局部性**：
+   - 单条 64 字节缓存行高密度容纳 16 个槽位的 step 计数器。
+   - 在 262,144 个活跃槽位规模下，全表 step 状态工作集仅为 **1 MiB**，可完全驻留于 CPU L2/L3 缓存中，有效消除末级缓存（LLC）驱逐开销。
+   - 在哈希分片架构下，各工作线程访问互不相交的物理槽位区间，避免并发伪共享（False Sharing）。
+
+### 变动日志 (Mutation Journal) 内存与操作模式
+
+`enable_mutation_journal` 配置项控制底层变更数据捕获（CDC）机制：
+
+| 配置选项 | 内存常驻结构 | 热路径原子操作 | 检查点能力支持 | 适用场景 |
+|---|---|---|---|---|
+| `enable_mutation_journal = True` (默认) | 分配变动记录与指针管理数组（约 65 B/key RSS） | 写路径执行原子序号预留 | 全量 (FULL) + 增量 (INCREMENTAL) 检查点 | 在线增量快照、流式 CDC |
+| `enable_mutation_journal = False` | **零变动记录分配** | **无原子序号预留开销** | 仅全量 (FULL) 检查点，零开销快速恢复 | 纯模型训练、推理部署、周期性全量快照 |
+
+当关闭变动日志时，调用 `capture_checkpoint(incremental=True)` 或 `checkpoint_mutations()` 会立即抛出明确的 `RuntimeError`，严格杜绝生成静默损坏或缺失基线的不完整增量；而全量快照、恢复以及确认协议则具备完备的正确性保证。
 
 ### 高并发压力与可靠性
 

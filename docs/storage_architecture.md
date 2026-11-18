@@ -87,6 +87,19 @@ Because sparse feature lookups exhibit irregular and non-contiguous memory acces
 3. **Stage 3 (Directory Hash Buckets)**: Computes future key hashes and prefetches directory hash buckets into CPU cache prior to probing.
 4. **Stage 4 (Locator Slots & Optimizer State)**: Prefetches 8-byte aligned `LocatorSlot` entries and optimizer first/second moment vectors, hiding LLC cache miss latency.
 
+### 3.5 Segregated Optimizer State Memory Layout (`OptimizerRowLayout`)
+
+In modern sparse optimizers such as Adam, optimizer state rows combine multi-element floating-point moment vectors with scalar iteration counters. To eliminate memory bloat without compromising SIMD vectorization throughput, `OptimizerStateArena` supports explicit layout segregation:
+
+- **`OptimizerRowLayout::kCacheLineAligned` (64-Byte Stride)**:
+  - Applied to first-moment momentum ($m$) and second-moment velocity ($v$).
+  - Stride is aligned to 64 bytes (`std::max(sizeof(ParamT) * dim, 64UL)`), ensuring 512-bit AVX-512 FMA vector load/store instructions execute without cacheline split penalties.
+- **`OptimizerRowLayout::kNaturalAligned` (4-Byte Packed Stride)**:
+  - Applied to the Adam step iteration counter (`step_state`), which stores a single scalar `uint32_t` (4 bytes).
+  - Page boundaries retain 64-byte alignment, while the entry stride is tightly packed to 4 bytes (`sizeof(uint32_t)`).
+  - **Page Specifications**: A standard 4,096-slot page allocates a compact **16 KiB** ($4096 \times 4\text{ B}$), maximizing entry storage density.
+  - **Cache Locality**: Packing 16 scalar steps per 64-byte cacheline allows 262,144 active slots to occupy just 1 MiB of memory, residing entirely within CPU L2/L3 cache and minimizing LLC cache misses during high-throughput training updates.
+
 ---
 
 ## 4. Tiered Storage and Hardware Auto-Tuning
@@ -188,7 +201,9 @@ The storage engine coordinates with the persistence subsystem under the followin
   - Inference instances configure `EmbeddingConfig(enable_optimizer=False)` to create weight-only stores, skipping optimizer allocation.
 - **Partition-Target Restoration**: `RestorePlan.from_partition` explicitly describes the current assignment. The same plan type serves identical and changed target topologies; canonical entry routing remains in the native partitioner, while page-image loading is selected only through `IngestionEngine.FAST_PAGE_CACHE`.
 - **Two-Phase Commit and Lance Lakehouse Persistence**: Underlying storage persists state via `snapshot_manifest.lance` (control-plane ledger) and `entries.lance` (data-plane physical slices).
-- **Incremental Checkpointing & Streaming Compaction**: Mutation journaling tracks dirty keys and deletion tombstones during training, enabling non-blocking cuts and native streaming compaction.
+- **Incremental Checkpointing & Mutation Journaling**:
+  - `enable_mutation_journal = True` (default): Shard-local journals record dirty keys and tombstones during training, enabling non-blocking consistent cuts and streaming compaction.
+  - `enable_mutation_journal = False`: Disables mutation tracking and hot-path sequence counter reservations, eliminating journal memory overhead. Attempting incremental capture when disabled raises `RuntimeError`, while FULL snapshot capture and restore remain fully operational.
 
 > For detailed checkpoint architecture, Two-Phase Commit protocols, incremental restoration, and Gravitino integration, refer to [Lance Storage and Gravitino Integration](lance_storage_and_gravitino.md) and [Incremental Checkpointing and Streaming Compaction](incremental_checkpoint.md).
 
@@ -219,6 +234,7 @@ config = se.EmbeddingConfig(
     gradient_dtype="bfloat16",           # Gradient accumulation dtype (optional)
     gradient_scale=1.0,                  # Gradient scaling factor
     enable_optimizer=True,               # False for weight-only inference stores
+    enable_mutation_journal=True,        # False to disable CDC tracking for pure training or FULL-only checkpoints
     storage_tuning=se.StorageTuningOptions(
         target_capacity_keys=10_000_000, # Expected key capacity
         memory_budget_bytes=4 << 30,     # Memory tuning budget

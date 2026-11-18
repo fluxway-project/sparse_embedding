@@ -13,7 +13,7 @@ In large-scale recommendation training, embedding tables frequently contain hund
 Sparse Embedding provides native **Incremental Checkpointing** and **Streaming Compaction**:
 
 - **Consistent Cuts**: Capture quiesces competing store invocations and uses epoch protection. Bounded native writer channels provide backpressure; slow IO can delay capture.
-- **Native In-Memory Mutation Journaling**: Shard-local journals record key-level mutations and monotonic sequence numbers with zero mutex contention on forward lookup hot paths.
+- **Native In-Memory Mutation Journaling**: Shard-local journals record key-level mutations and monotonic sequence numbers with zero mutex contention on forward lookup hot paths. Configurable via `EmbeddingConfig.enable_mutation_journal`: pure training or FULL-only checkpointing workflows can disable the journal to avoid hot-path sequence counter reservations and record memory overhead.
 - **Delta-Chain Schema & Tombstone Tracking**: Physical Lance slices persist `mutation_sequence`, `row_state` (`"active"` vs. `"deleted"`), and optional eviction `score` (LFU/LRU).
 - **Native Multi-Version Reconciliation**: Bounded external sorting validates historical identities and selects surviving records across the delta chain (`FULL` → `INCREMENTAL` → ...). Requested payload is staged during one Lance source pass and replayed in source order; only surviving keys allocate target slots.
 - **Offline / Online Streaming Compaction**: Compaction shares reconciliation and payload decoding with entry restore, while bounded writer channels produce a self-contained `FULL` checkpoint. Temporary disk grows with staged history; sorter and batch RAM follow `CheckpointStreamPolicy`.
@@ -57,6 +57,23 @@ Each shard maintains a lightweight `CheckpointMutationJournal`:
 - **Dirty Key Tracking**: When embedding vectors or optimizer states are modified during `assign`, `accumulate_gradients`, or `optimizer_step`, their slot and monotonic sequence numbers are recorded in the active journal.
 - **Tombstone Recording**: Explicit deletions (`erase`, `erase_dimension`) or score-based evictions emit deletion tombstones, preserving deletion intent across delta boundaries.
 - **Zero Reader Contention**: Read hot paths (`forward_lookup`, `lookup_or_insert` hits) never acquire journal mutexes or increment sequence counters.
+
+#### Configurable Mutation Journaling (`enable_mutation_journal`)
+
+Mutation journaling is enabled by default (`EmbeddingConfig(enable_mutation_journal=True)`). For workflows that do not require incremental checkpointing—such as pure training, inference serving, or workloads utilizing periodic FULL snapshots—journal tracking can be explicitly disabled:
+
+```python
+config = se.EmbeddingConfig(
+    dims=[128],
+    enable_mutation_journal=False,  # Disables CDC mutation journaling
+)
+```
+
+**Operational and Safety Invariants:**
+1. **Zero Record Allocations**: Disabling the journal bypasses the allocation of per-key mutation records and tracking pointer arrays, eliminating change-tracking memory footprint.
+2. **Zero Hot-Path Sequence Accounting**: Hot mutation paths (`assign`, `optimizer_step`, `scored_visit`) bypass atomic sequence counter reservations entirely.
+3. **Full Snapshot Unaffected**: FULL checkpoint captures (`save_training_checkpoint(mode=FULL)`), restore pipelines, and acknowledgements operate normally with complete data fidelity.
+4. **Fail-Fast Error Handling**: Attempting to capture an incremental checkpoint (`capture_checkpoint(incremental=True)` or `save_training_checkpoint(mode=INCREMENTAL)`) or query mutation history (`store.checkpoint_mutations()`) strictly raises an explicit `RuntimeError("incremental checkpoint requires mutation journal to be enabled")`. Silent fallbacks or incomplete delta generation are strictly forbidden.
 
 ### 2.2 Two-Phase Consistent Cut Protocol
 
@@ -160,7 +177,7 @@ committed_inc = checkpoint.save_training_checkpoint(
 print("Committed INCREMENTAL version:", committed_inc.version_id.decode())
 ```
 
-> **Note**: An incremental checkpoint must specify the same lineage name (`"user_model"`) and provide a valid `parent_handle`. Failing to provide a parent handle for incremental mode strictly raises a `ValueError`.
+> **Note**: An incremental checkpoint must specify the same lineage name (`"user_model"`) and provide a valid `parent_handle`. Failing to provide a parent handle for incremental mode strictly raises a `ValueError`. If the store was initialized with `enable_mutation_journal=False`, attempting an incremental checkpoint raises `RuntimeError("incremental checkpoint requires mutation journal to be enabled")`.
 
 ### 3.2 Restoring from Incremental Chains
 
