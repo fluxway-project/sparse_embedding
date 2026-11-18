@@ -86,7 +86,7 @@ public:
       : packed_(packed), readers_(readers) {}
   PackedWriteLock(const PackedWriteLock &) = delete;
   PackedWriteLock &operator=(const PackedWriteLock &) = delete;
-  void lock() noexcept {
+  uint64_t lock() noexcept {
     uint64_t observed = packed_.load(std::memory_order_relaxed);
     while (true) {
       const uint32_t version = static_cast<uint32_t>(observed >> 32);
@@ -101,7 +101,7 @@ public:
                                         std::memory_order_relaxed)) {
         while (readers_.load(std::memory_order_acquire) != 0U)
           cpu_relax();
-        return;
+        return held;
       }
     }
   }
@@ -131,38 +131,6 @@ public:
 
 private:
   PackedWriteLock lock_;
-};
-
-struct PackedWriteTarget {
-  std::atomic<uint64_t> *packed;
-  std::atomic<uint32_t> *readers;
-};
-
-class PackedWriteGuardBatch {
-public:
-  explicit PackedWriteGuardBatch(std::span<const PackedWriteTarget> targets)
-      : targets_(targets), locked_(0) {
-    if (targets_.empty())
-      throw std::invalid_argument("packed write guard batch is empty");
-    for (; locked_ < targets_.size(); ++locked_)
-      PackedWriteLock(*targets_[locked_].packed, *targets_[locked_].readers)
-          .lock();
-  }
-
-  ~PackedWriteGuardBatch() {
-    while (locked_ != 0) {
-      --locked_;
-      PackedWriteLock(*targets_[locked_].packed, *targets_[locked_].readers)
-          .unlock();
-    }
-  }
-
-  PackedWriteGuardBatch(const PackedWriteGuardBatch &) = delete;
-  PackedWriteGuardBatch &operator=(const PackedWriteGuardBatch &) = delete;
-
-private:
-  std::span<const PackedWriteTarget> targets_;
-  size_t locked_;
 };
 
 class PackedReadGuard {

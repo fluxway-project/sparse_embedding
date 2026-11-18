@@ -76,8 +76,12 @@ int main() {
               }),
           "current key read failed after locator reuse");
 
-  const uint32_t batch_a = table.allocate(501, 81, {});
-  const uint32_t batch_b = table.allocate(502, 82, {});
+  using se::hogwild_internal::CheckpointRecordRef;
+  int record_a{}, record_b{};
+  const uint32_t batch_a =
+      table.allocate(501, 81, CheckpointRecordRef::from(&record_a));
+  const uint32_t batch_b =
+      table.allocate(502, 82, CheckpointRecordRef::from(&record_b));
   std::array<uint32_t, 2> batch_slots{batch_b, batch_a};
   std::array<uint32_t, 2> batch_indices{};
   require(table.try_write_batch(batch_slots,
@@ -102,19 +106,65 @@ int main() {
   require(table.try_write_key_batch(
               keyed_batch,
               [&](std::span<const uint32_t> indices,
-                  std::span<const se::hogwild_internal::CheckpointRecordRef>) {
+                  se::hogwild_internal::LockedCheckpointRecords records) {
+                require(records.size() == 2 &&
+                            records[0].opaque_address() == &record_b &&
+                            records[1].opaque_address() == &record_a,
+                        "tracked batch lost caller record order");
                 keyed_indices = {indices[0], indices[1]};
               }),
           "keyed batch locator write failed");
   require(keyed_indices == std::array<uint32_t, 2>{82, 81},
           "keyed batch locator write reordered caller payload");
-  keyed_batch[1].expected_key = 999;
+  // These slots share a low byte. The duplicate is separated in input order.
+  const auto distant = batch_a - 256;
+  const std::array<se::hogwild_internal::SegmentedLocatorTable::KeyedWriteSlot,
+                   3>
+      duplicate_keyed{
+          {{batch_a, 501}, {distant, table.key(distant)}, {batch_a, 501}}};
+  duplicate_rejected = false;
+  try {
+    table.try_write_key_batch(duplicate_keyed, [](auto, auto) {});
+  } catch (const std::invalid_argument &) {
+    duplicate_rejected = true;
+  }
+  require(duplicate_rejected,
+          "keyed batch accepted nonadjacent duplicate slots");
+  se::hogwild_internal::SegmentedLocatorTable untracked(false);
+  const auto left = untracked.allocate(501, 81, {});
+  const auto right = untracked.allocate(502, 82, {});
+  const std::array<se::hogwild_internal::SegmentedLocatorTable::KeyedWriteSlot,
+                   2>
+      untracked_batch{{{right, 502}, {left, 501}}};
+  require(untracked.try_write_key_batch(
+              untracked_batch,
+              [&](std::span<const uint32_t> indices,
+                  se::hogwild_internal::LockedCheckpointRecords records) {
+                require(records.empty(),
+                        "untracked batch materialized record references");
+                require(indices[0] == 82 && indices[1] == 81,
+                        "untracked batch reordered payload");
+              }),
+          "untracked keyed batch failed");
+  keyed_batch[0].expected_key = 999;
   require(
       !table.try_write_key_batch(
-          keyed_batch,
-          [](std::span<const uint32_t>,
-             std::span<const se::hogwild_internal::CheckpointRecordRef>) {}),
+          keyed_batch, [](std::span<const uint32_t>,
+                          se::hogwild_internal::LockedCheckpointRecords) {}),
       "stale keyed batch write succeeded");
+  keyed_batch[0].expected_key = 502;
+  struct VisitorFailed {};
+  bool visitor_failed = false;
+  try {
+    table.try_write_key_batch(keyed_batch,
+                              [](auto, auto) { throw VisitorFailed{}; });
+  } catch (const VisitorFailed &) {
+    visitor_failed = true;
+  }
+  require(
+      visitor_failed &&
+          table.try_write_key_batch(keyed_batch, [](auto, auto) {}),
+      "keyed batch did not release locks after validation or visitor failure");
 
   uint32_t retired_index = 0;
   require(table.retire_current(
@@ -152,6 +202,25 @@ int main() {
   require(!table.release_after_epoch(permanent),
           "near-wrap locator was made reusable");
 
+  const uint32_t contested = table.allocate(209, 90, {});
+  std::latch visiting(1);
+  unsigned visits = 0;
+  auto waiting_writer = std::async(std::launch::async, [&] {
+    visiting.wait();
+    return table.try_write(contested, [](uint32_t, std::atomic<uint64_t> &) {});
+  });
+  require(table.try_read_with_record(
+              contested,
+              [&](uint32_t, auto) {
+                if (++visits == 1) {
+                  visiting.count_down();
+                  while ((table.load_packed(contested) >> 32 & 1U) == 0)
+                    std::this_thread::yield();
+                }
+              }),
+          "guarded visit failed");
+  require(waiting_writer.get() && visits == 1, "guarded visit was replayed");
+
   int old_record = 1, new_record = 2;
   const uint32_t retiring = table.allocate(
       211, 91, se::hogwild_internal::CheckpointRecordRef::from(&old_record));
@@ -188,7 +257,7 @@ int main() {
       211, 92, se::hogwild_internal::CheckpointRecordRef::from(&new_record));
   (void)replacement;
   resume_read.count_down();
-  require(!reader.get(), "retired optimistic read reported success");
+  require(reader.get(), "guarded visit completed before retirement");
   require(retirement.get(), "record-bearing locator retirement failed");
   const uint32_t replacement_after_retirement = table.allocate(
       211, 92, se::hogwild_internal::CheckpointRecordRef::from(&new_record));

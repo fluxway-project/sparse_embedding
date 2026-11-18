@@ -86,6 +86,10 @@ public:
 
   bool enabled() const noexcept { return kind_ != ScorePolicyKind::kNone; }
 
+  bool updates_on_access() const noexcept {
+    return kind_ == ScorePolicyKind::kLfu || kind_ == ScorePolicyKind::kLru;
+  }
+
   ScoreAccessResult on_access(uint64_t *score_ptr) noexcept {
     switch (kind_) {
     case ScorePolicyKind::kNone:

@@ -159,20 +159,51 @@ The batch optimizer profile is a separate workload from the tables below. Use
 optimizer-step implementations; use the benchmark commands in this document
 for storage and compaction comparisons.
 
-### Full-Store Multi-Operation Benchmark (C++ 16 Threads)
+### NUMA store throughput with 16 workers
 
-Workload configuration: dimension 128, vocabulary 500,000 keys, 65,536-key power-law batches,
-16 native worker threads, and memory-only storage:
+On two Xeon Silver 4116 sockets, 16 workers use CPUs 0–23 with NUMA sharding. Each batch draws 65,536 keys from a power-law workload with a vocabulary of 500,000 and a vector dimension of 128. Mutation rates count the distinct rows processed. The table reports medians across 12 independent processes.
 
-| Operation | Throughput | Bandwidth | Concurrency / Bottleneck |
-|---|---:|---:|---|
-| `forward_lookup` | **23.55 Mops/s** | **12.06 GB/s** | Memory bandwidth bound |
-| `assign` | **12.81 Mops/s** | **6.56 GB/s** | Cacheline write bound |
-| `optimizer_step` (Adam) | **12.60 Mops/s** | **12.90 GB/s** | SIMD + memory bus bound |
-| `accumulate_gradients` | **4.23 Mops/s** | **2.17 GB/s** | Per-shard transient arena |
-| `lookup_or_insert` | **1.05 Mops/s** | 0.54 GB/s | Exclusive shard insertion lock |
-| `contains` | **21.74 Mops/s** | — | Directory read path |
-| `erase` (10% batch) | **3.03 Mops/s** | — | Shard tombstone publication |
+| Operation | Throughput (Mops/s) |
+|---|---:|
+| `lookup_or_insert` | 1.02 |
+| `forward_lookup` | 11.365 |
+| `assign` | 32.76 |
+| `accumulate_gradients` | 4.25 |
+| `optimizer_step` | 20.065 |
+| `contains` | 22.295 |
+| `erase` (10% batch) | 5.26 |
+
+### Python training under LFU storage pressure
+
+Each batch has 4,096 keys of dimension 16. The store uses SGD and LFU, a four-thread budget, CPUs 0–11, a 256 KiB memory limit and a 1 GiB spill limit. Each process times five batches after warmup. The columns report the medians across 12 processes of per-process median throughput and p95 batch latency.
+
+| Operation | Throughput (Mops/s) | Batch p95 (ms) |
+|---|---:|---:|
+| Async lookup | 14.95 | 0.2825 |
+| Async assign | 9.195 | 0.454 |
+| Async SGD step | 6.426 | 0.6405 |
+| Synchronous training step | 1.724 | 2.3885 |
+
+### Arena owner metadata throughput
+
+Eight workers on CPUs 0–7 make 32 passes over 262,144 slots. Each process reports the median of five samples. The table gives the median across 12 processes. The combined operation counts publishing an owner and clearing its live flag as one slot operation.
+
+| Mode | Billion slots/s |
+|---|---:|
+| `publish` | 1.999 |
+| `clear` | 3.47 |
+| `publish_clear` | 1.408 |
+
+Run these workloads from the repository root with the Python extension installed.
+
+```bash
+bazel build -c opt //benchmarks:embedding_store_benchmark //benchmarks:page_compaction_owner_benchmark
+taskset -c 0-23 bazel-bin/benchmarks/embedding_store_benchmark --threads=16 --numa-aware-sharding --bind-affinity --skip-pressure
+taskset -c 0-11 python3 benchmarks/python/benchmark_e2e.py
+for mode in publish clear publish_clear; do
+  taskset -c 0-7 bazel-bin/benchmarks/page_compaction_owner_benchmark "$mode" 8
+done
+```
 
 ### Concurrent Python Table Operations and Scaling
 
@@ -199,8 +230,8 @@ Adam optimizer state consists of first-moment momentum ($m$), second-moment velo
    - Under the default 4,096 entries per page, `step_state` allocates compact **16 KiB** pages ($4096 \times 4\text{ B}$), providing 100% entry storage efficiency.
 3. **Cache Working-Set Density**:
    - A single 64-byte CPU cacheline holds 16 consecutive step counters.
-   - For a 262,144 active slot capacity, the entire step-state directory occupies only **1 MiB**, residing comfortably within CPU L2/L3 cache and minimizing Last Level Cache (LLC) evictions.
-   - Independent hash-sharded worker threads operate on disjoint physical slot partitions, avoiding concurrent false sharing.
+   - At a capacity of 262,144 slots the step counters occupy **1 MiB**.
+   - Threads updating adjacent slots can still share a cache line.
 
 ### Mutation Journal Memory & Operational Modes
 
@@ -209,7 +240,7 @@ The `enable_mutation_journal` configuration governs Change Data Capture (CDC) tr
 | Configuration | Memory Structure | Hotpath Sequence Accounting | Checkpoint Capabilities | Recommended Workload |
 |---|---|---|---|---|
 | `enable_mutation_journal = True` (Default) | Allocates journal mutation records and pointer arrays (~65 B/key RSS) | Active atomic CAS on write paths | FULL + INCREMENTAL checkpoints, tombstone replay | Online incremental backup, streaming delta CDC |
-| `enable_mutation_journal = False` | **Zero journal allocations** | **Zero atomic sequence overhead** | FULL checkpoint only, fast clean restore | Pure training, inference, batch periodic FULL saves |
+| `enable_mutation_journal = False` | No per-key records or dirty-list heads | **Zero atomic sequence overhead** | FULL checkpoint and restore | Pure training, inference, batch periodic FULL saves |
 
 When disabled, `capture_checkpoint(incremental=True)` or calling `checkpoint_mutations()` raises an explicit `RuntimeError` to prevent silent generation of broken or incomplete deltas, while FULL snapshots, restores, and acknowledgements operate with full integrity.
 
@@ -240,7 +271,7 @@ runtime insert exceeds the reserved budget, growth uses these exact factors:
 
 | Layer | Expansion rule |
 |---|---|
-| Directory bucket budget | `ceil(2.5 * key_capacity)`, rounded up to 16; use the smaller `ceil_pow2(4 * key_capacity)` when it fits |
+| Directory bucket count | A shard with reserved capacity `C > 0` uses `4 × bit_floor(C)` buckets. An empty reservation uses 2 buckets. |
 | `MapBundle` runtime capacity | 2x below 64K; 1.5x for `64K <= capacity < 1M`; 1.25x at or above 1M |
 | Shard budget | `reserve(keys_count, dim)` distributes exactly; `reserve_per_shard(counts, dim)` uses caller-provided per-shard budgets |
 
@@ -308,6 +339,8 @@ TSAN, and ASAN/UBSAN suites are release validation requirements; exception
 handling must not replace signal detection.
 
 ## Public validation
+
+Validation covers 45 native test targets and 479 Python tests. The restore benchmark exercises empty results, entry restore with one or four threads, and single-thread page-image restore on datasets of 16,384, 65,536 and 262,144 rows. Each configuration returned the expected row count.
 
 ```bash
 bazel test -c opt --test_output=errors //sparse_embedding/...

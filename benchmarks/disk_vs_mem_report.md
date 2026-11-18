@@ -43,7 +43,7 @@ so the table compares data-path behavior rather than resizing overhead.
 
 ---
 
-**Script Location:** The benchmark script used to generate this report can be found at [`python/benchmark_disk_vs_mem.py`](python/benchmark_disk_vs_mem.py).
+**Script Location:** The benchmark script used to generate this report can be found at [`benchmarks/python/benchmark_disk_vs_mem.py`](python/benchmark_disk_vs_mem.py).
 **To reproduce:**
 ```bash
 python benchmarks/python/benchmark_disk_vs_mem.py --num_keys 10000000 --batch_size 8192 --concurrency 128 --iterations 1

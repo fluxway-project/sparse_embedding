@@ -54,9 +54,9 @@ Sparse Embedding provides native **Incremental Checkpointing** and **Streaming C
 ### 2.1 In-Memory Mutation Journaling
 
 Each shard maintains a lightweight `CheckpointMutationJournal`:
-- **Dirty Key Tracking**: When embedding vectors or optimizer states are modified during `assign`, `accumulate_gradients`, or `optimizer_step`, their slot and monotonic sequence numbers are recorded in the active journal.
+- **Dirty Key Tracking**: When embedding vectors or optimizer states are modified during `assign`, `accumulate_gradients`, or `optimizer_step`, the journal records the affected key incarnation. For existing rows, each assign worker reserves one sequence range for the writes it completed. Capture waits for active invocations, including publication of completed writes if a later row fails.
 - **Tombstone Recording**: Explicit deletions (`erase`, `erase_dimension`) or score-based evictions emit deletion tombstones, preserving deletion intent across delta boundaries.
-- **Zero Reader Contention**: Read hot paths (`forward_lookup`, `lookup_or_insert` hits) never acquire journal mutexes or increment sequence counters.
+- **Lookup scores**: Forward reads with no score or a manual score do not publish journal mutations. LFU/LRU reads can change the score. Each worker journals the scores it updated with a single sequence reservation.
 
 #### Configurable Mutation Journaling (`enable_mutation_journal`)
 
@@ -70,10 +70,10 @@ config = se.EmbeddingConfig(
 ```
 
 **Operational and Safety Invariants:**
-1. **Zero Record Allocations**: Disabling the journal bypasses the allocation of per-key mutation records and tracking pointer arrays, eliminating change-tracking memory footprint.
+1. **Zero Record Allocations**: Disabling the journal skips per-key mutation records, dirty-list heads and the optimizer batch record array. Each locator retains its pointer field.
 2. **Zero Hot-Path Sequence Accounting**: Hot mutation paths (`assign`, `optimizer_step`, `scored_visit`) bypass atomic sequence counter reservations entirely.
 3. **Full Snapshot Unaffected**: FULL checkpoint captures (`save_training_checkpoint(mode=FULL)`), restore pipelines, and acknowledgements operate normally with complete data fidelity.
-4. **Fail-Fast Error Handling**: Attempting to capture an incremental checkpoint (`capture_checkpoint(incremental=True)` or `save_training_checkpoint(mode=INCREMENTAL)`) or query mutation history (`store.checkpoint_mutations()`) strictly raises an explicit `RuntimeError("incremental checkpoint requires mutation journal to be enabled")`. Silent fallbacks or incomplete delta generation are strictly forbidden.
+4. **Fail-Fast Error Handling**: Attempting to capture an incremental checkpoint (`capture_checkpoint(incremental=True)` or `save_training_checkpoint(mode=INCREMENTAL)`) raises `RuntimeError("incremental checkpoint requires mutation journal to be enabled")`. Querying mutation history raises `RuntimeError("checkpoint mutation tracking is disabled for this store")`.
 
 ### 2.2 Two-Phase Consistent Cut Protocol
 

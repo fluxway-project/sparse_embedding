@@ -71,7 +71,7 @@ from sparse_embedding.checkpoint import (
 storage = LocalLanceStorage.from_checkpoint_root("/checkpoints/user_embedding")
 checkpoint = SparseCheckpoint(storage)
 
-# 2. Save training checkpoint (default persists canonical entries, saving 50% write bandwidth)
+# 2. Save training checkpoint (default persists canonical entries slices)
 committed = checkpoint.save_training_checkpoint(
     store,
     "user_embedding",

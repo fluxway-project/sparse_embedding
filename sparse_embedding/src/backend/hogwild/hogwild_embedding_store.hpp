@@ -110,17 +110,25 @@ public:
   struct OwnerSnapshot {
     uint64_t key;
     uint64_t seq_count;
-    uint32_t shard_id;
   };
 
   struct OwnerRecord {
+    static constexpr uint64_t kLastSequence =
+        std::numeric_limits<uint64_t>::max() - 1;
     std::atomic<uint64_t> seq_count{0};
     std::atomic<uint64_t> key{0};
-    std::atomic<uint32_t> shard_id{0};
-    std::atomic<bool> live{false};
   };
+  static_assert(sizeof(OwnerRecord) == 2 * sizeof(uint64_t));
 
 private:
+  struct OwnerPage {
+    explicit OwnerPage(size_t count)
+        : records(std::make_unique<OwnerRecord[]>(count)),
+          live(std::make_unique<std::atomic<bool>[]>(count)) {}
+    std::unique_ptr<OwnerRecord[]> records;
+    std::unique_ptr<std::atomic<bool>[]> live;
+  };
+
   enum class PageAllocationPhase : uint8_t {
     kUnallocated,
     kAllocating,
@@ -131,15 +139,21 @@ private:
 
   struct alignas(kCacheLineSize) PageAllocationState {
     std::atomic<uint8_t> phase;
+    std::atomic<OwnerPage *> published_owner{nullptr};
 
     PageAllocationState()
         : phase(static_cast<uint8_t>(PageAllocationPhase::kUnallocated)) {}
   };
 
-  struct PageTable {
-    StablePageDirectory<std::byte> data;
-    StablePageDirectory<uint64_t> score;
+  struct ScorePages {
+    explicit ScorePages(size_t count)
+        : handles(std::make_unique<StoragePage[]>(count)) {}
+    std::unique_ptr<StoragePage[]> handles;
+    std::shared_ptr<StablePageDirectory<uint64_t>> directory =
+        std::make_shared<StablePageDirectory<uint64_t>>();
   };
+
+  using DataPages = StablePageDirectory<std::byte>;
 
   struct ArenaPageState {
     std::unique_ptr<PageAllocationState[]> states;
@@ -164,17 +178,17 @@ public:
       void *page_allocation_context, const storage::StorageTopology &topology)
       : dim_(dim), enable_score_(enable_score), topology_(topology),
         page_geometry_(topology.page_geometry()),
-        pages_(std::make_shared<PageTable>()), storage_(std::move(storage)),
+        pages_(std::make_shared<DataPages>()), score_pages_(make_score_pages()),
+        storage_(std::move(storage)),
         retirement_pressure_(std::move(retirement_pressure)),
         partition_count_(topology.shard_count()),
         numa_aware_pages_(topology.numa_memory()),
         page_cohort_size_(topology.cohort_size()),
         data_pages_(std::make_unique<StoragePage[]>(topology.max_pages())),
-        score_pages_(std::make_unique<StoragePage[]>(topology.max_pages())),
         page_state_(std::make_shared<ArenaPageState>(topology)),
         page_allocation_observer_(page_allocation_observer),
         page_allocation_context_(page_allocation_context),
-        owner_pages_(std::make_unique<std::unique_ptr<OwnerRecord[]>[]>(
+        owner_pages_(std::make_unique<std::unique_ptr<OwnerPage>[]>(
             topology.max_pages())),
         live_words_(
             std::make_unique<std::atomic<uint64_t>[]>(live_word_count())) {
@@ -376,13 +390,15 @@ public:
   }
 
   ValT *data(uint32_t index) const {
-    if (data_page_for(index) == nullptr)
+    auto *page = data_page_for(index);
+    if (page == nullptr)
       throw std::logic_error("embedding arena index belongs to a retired page");
-    return data_trusted(index);
+    return reinterpret_cast<ValT *>(page + slot_for(index) * data_stride_);
   }
 
   ValT *data_trusted(uint32_t index) const noexcept {
-    return reinterpret_cast<ValT *>(data_raw(index));
+    std::byte *page = data_page_for(index);
+    return reinterpret_cast<ValT *>(page + slot_for(index) * data_stride_);
   }
 
   size_t allocated_count() const {
@@ -434,20 +450,22 @@ public:
     using Reclaim = std::decay_t<OnReclaimed>;
     static_assert(noexcept(std::declval<Reclaim &>()()));
     struct DeferredPageRelease {
-      std::shared_ptr<PageTable> page_table;
+      std::shared_ptr<DataPages> page_table;
+      std::shared_ptr<StablePageDirectory<uint64_t>> score_table;
       std::shared_ptr<ArenaPageState> page_state;
       uint64_t page_id;
       StoragePage data;
       StoragePage score;
-      std::unique_ptr<OwnerRecord[]> owner;
+      std::unique_ptr<OwnerPage> owner;
       Reclaim on_reclaimed;
 
       ~DeferredPageRelease() noexcept {
-        page_table->data.publish(page_id, nullptr);
-        page_table->score.publish(page_id, nullptr);
+        page_table->publish(page_id, nullptr);
+        if (score_table)
+          score_table->publish(page_id, nullptr);
         data = StoragePage{};
         score = StoragePage{};
-        owner.reset();
+        owner = {};
         page_state->states[page_id].phase.store(
             page_phase(PageAllocationPhase::kUnallocated),
             std::memory_order_release);
@@ -455,8 +473,9 @@ public:
         on_reclaimed();
       }
     };
-    const size_t retired_bytes = data_pages_[page_id].allocated_size() +
-                                 score_pages_[page_id].allocated_size();
+    const size_t retired_bytes =
+        data_pages_[page_id].allocated_size() +
+        (score_pages_ ? score_pages_->handles[page_id].allocated_size() : 0);
     se::concurrency::EpochRetirement<DeferredPageRelease> release(
         retirement_pressure_, retired_bytes);
     PageAllocationState &state = page_state_->states[page_id];
@@ -466,22 +485,25 @@ public:
             std::memory_order_acq_rel, std::memory_order_acquire)) {
       throw std::logic_error("arena page is not ready for retirement");
     }
-    release.emplace(
-        pages_, page_state_, page_id, std::move(data_pages_[page_id]),
-        std::move(score_pages_[page_id]), std::move(owner_pages_[page_id]),
-        std::forward<OnReclaimed>(on_reclaimed));
-    release.publish();
+    state.published_owner.store(nullptr, std::memory_order_release);
+    release.emplace(pages_, score_pages_ ? score_pages_->directory : nullptr,
+                    page_state_, page_id, std::move(data_pages_[page_id]),
+                    score_pages_ ? std::move(score_pages_->handles[page_id])
+                                 : StoragePage{},
+                    std::move(owner_pages_[page_id]),
+                    std::forward<OnReclaimed>(on_reclaimed));
     state.phase.store(page_phase(PageAllocationPhase::kRetired),
                       std::memory_order_release);
+    release.publish();
   }
 
   void reset() {
-    pages_ = std::make_shared<PageTable>();
+    pages_ = std::make_shared<DataPages>();
+    score_pages_ = make_score_pages();
     page_state_ = std::make_shared<ArenaPageState>(topology_);
     for (size_t i = 0; i < max_pages(); ++i) {
       data_pages_[i] = StoragePage{};
-      score_pages_[i] = StoragePage{};
-      owner_pages_[i].reset();
+      owner_pages_[i] = {};
     }
     for (size_t i = 0; i < live_word_count(); ++i)
       live_words_[i].store(0, std::memory_order_relaxed);
@@ -493,20 +515,17 @@ public:
 
   void mark_live(uint32_t index, bool live) {
     const uint64_t mask = uint64_t{1} << (index % 64);
-    OwnerRecord &owner =
-        owner_pages_[index >> entries_shift()][index & slot_mask()];
     if (live) {
       live_words_[index / 64].fetch_or(mask, std::memory_order_release);
-      owner.live.store(true, std::memory_order_release);
+      owner_live(index).store(true, std::memory_order_release);
     } else {
-      owner.live.store(false, std::memory_order_release);
+      mark_owner_not_live(index);
       live_words_[index / 64].fetch_and(~mask, std::memory_order_release);
     }
   }
 
   void mark_owner_not_live(uint32_t index) {
-    owner_pages_[index >> entries_shift()][index & slot_mask()].live.store(
-        false, std::memory_order_release);
+    owner_live(index).store(false, std::memory_order_release);
   }
 
   void clear_live_mask(size_t word_index, uint64_t mask) {
@@ -531,53 +550,77 @@ public:
     mark_live(index, false);
   }
 
-  void publish_owner(uint32_t index, uint64_t key, uint32_t shard_id) {
-    OwnerRecord &owner =
-        owner_pages_[index >> entries_shift()][index & slot_mask()];
-    uint64_t seq_count = owner.seq_count.load(std::memory_order_relaxed);
-    if ((seq_count & 1U) != 0)
-      throw std::logic_error("embedding arena owner seq_count is unstable");
-    owner.seq_count.store(seq_count + 1, std::memory_order_release);
-    owner.key.store(key, std::memory_order_relaxed);
-    owner.shard_id.store(shard_id, std::memory_order_relaxed);
-    owner.seq_count.store(seq_count + 2, std::memory_order_release);
+  bool owner_reusable(uint32_t index) const {
+    const OwnerPage *page = published_owner_page(index);
+    return page && page->records[slot_for(index)].seq_count.load(
+                       std::memory_order_relaxed) != OwnerRecord::kLastSequence;
   }
 
-  void publish_owner_exact(uint32_t index, uint64_t key, uint32_t shard_id,
-                           uint64_t seq_count) {
+  void publish_owner(uint32_t index, uint64_t key) {
+    OwnerRecord &owner = owner_record(index);
+    const uint64_t previous = owner.seq_count.load(std::memory_order_relaxed);
+    if (previous == OwnerRecord::kLastSequence)
+      throw std::overflow_error("embedding arena owner sequence exhausted");
+    write_owner(owner, key, previous + 2);
+  }
+
+  void publish_owner_exact(uint32_t index, uint64_t key, uint64_t seq_count) {
     if (seq_count == 0 || (seq_count & 1U) != 0)
       throw std::invalid_argument("page-image owner seq_count is invalid");
-    OwnerRecord &owner =
-        owner_pages_[index >> entries_shift()][index & slot_mask()];
-    if (owner.live.load(std::memory_order_acquire))
+    OwnerRecord &owner = owner_record(index);
+    if (is_live(index))
       throw std::logic_error("page-image owner slot is already live");
-    owner.seq_count.store(seq_count - 1, std::memory_order_release);
-    owner.key.store(key, std::memory_order_relaxed);
-    owner.shard_id.store(shard_id, std::memory_order_relaxed);
-    owner.seq_count.store(seq_count, std::memory_order_release);
+    write_owner(owner, key, seq_count);
   }
 
   std::optional<OwnerSnapshot> owner_snapshot(uint32_t index) const {
-    OwnerRecord &owner =
-        owner_pages_[index >> entries_shift()][index & slot_mask()];
-    if (!is_live(index) || !owner.live.load(std::memory_order_acquire))
+    const OwnerPage *page = published_owner_page(index);
+    if (!page)
       return std::nullopt;
+    const auto slot = slot_for(index);
+    const auto &live = page->live[slot];
+    if (!live.load(std::memory_order_acquire) || !is_live(index))
+      return std::nullopt;
+    const auto &owner = page->records[slot];
     for (size_t attempt = 0; attempt < 8; ++attempt) {
       const uint64_t before = owner.seq_count.load(std::memory_order_acquire);
-      if ((before & 1U) != 0)
-        continue;
-      const uint64_t key = owner.key.load(std::memory_order_relaxed);
-      const uint32_t shard_id = owner.shard_id.load(std::memory_order_relaxed);
+      if (before == 0 || (before & 1U) != 0)
+        return std::nullopt;
+      const uint64_t key = owner.key.load(std::memory_order_acquire);
       const uint64_t after = owner.seq_count.load(std::memory_order_acquire);
-      if (before == after && (after & 1U) == 0 &&
-          owner.live.load(std::memory_order_acquire) && is_live(index))
-        return OwnerSnapshot{key, after, shard_id};
+      if (before == after && live.load(std::memory_order_acquire) &&
+          is_live(index))
+        return OwnerSnapshot{key, after};
     }
     throw std::runtime_error(
         "embedding arena owner snapshot did not stabilize");
   }
 
 private:
+  const OwnerPage *published_owner_page(uint32_t index) const {
+    return page_state_->states[index >> entries_shift()].published_owner.load(
+        std::memory_order_acquire);
+  }
+
+  OwnerRecord &owner_record(uint32_t index) const {
+    return owner_pages_[index >> entries_shift()]->records[slot_for(index)];
+  }
+
+  std::atomic<bool> &owner_live(uint32_t index) const {
+    return owner_pages_[index >> entries_shift()]->live[slot_for(index)];
+  }
+
+  static void write_owner(OwnerRecord &owner, uint64_t key, uint64_t sequence) {
+    owner.seq_count.store(sequence - 1, std::memory_order_relaxed);
+    owner.key.store(key, std::memory_order_release);
+    owner.seq_count.store(sequence, std::memory_order_release);
+  }
+
+  std::unique_ptr<ScorePages> make_score_pages() const {
+    return enable_score_ ? std::make_unique<ScorePages>(topology_.max_pages())
+                         : nullptr;
+  }
+
   uint64_t page_score(size_t page) const {
     size_t first = page * entries_per_page();
     size_t allocated = allocated_count();
@@ -598,19 +641,14 @@ private:
     return total;
   }
 
-  std::byte *data_raw(uint32_t index) const {
-    auto *page = data_page_for(index);
-    if (page == nullptr)
-      throw std::logic_error("embedding arena data page is unavailable");
-    return page + slot_for(index) * data_stride_;
-  }
-
   std::byte *data_page_for(uint32_t index) const noexcept {
-    return pages_->data.load(index >> entries_shift());
+    return pages_->load(index >> entries_shift());
   }
 
   uint64_t *score_page_for(uint32_t index) const noexcept {
-    return pages_->score.load(index >> entries_shift());
+    return score_pages_
+               ? score_pages_->directory->load(index >> entries_shift())
+               : nullptr;
   }
 
   uint32_t slot_for(uint32_t index) const noexcept {
@@ -787,7 +825,7 @@ private:
           [] { return uint64_t{0}; }, PageEvictionMode::kEnabled,
           placement_mode);
     }
-    auto owner_page = std::make_unique<OwnerRecord[]>(entries_per_page());
+    auto owner_page = std::make_unique<OwnerPage>(entries_per_page());
     if (numa_aware_pages_) {
       bind_page_to_numa_node(data_page.data(), data_page.allocated_size(),
                              numa_node);
@@ -798,15 +836,18 @@ private:
     if (page_allocation_observer_ != nullptr)
       page_allocation_observer_(page_allocation_context_, page_id);
     data_pages_[page_id] = std::move(data_page);
-    score_pages_[page_id] = std::move(score_page);
     owner_pages_[page_id] = std::move(owner_page);
-    pages_->data.publish(page_id, data_pages_[page_id].data());
-    pages_->data.advance_count();
+    pages_->publish(page_id, data_pages_[page_id].data());
+    pages_->advance_count();
     if (enable_score_) {
-      pages_->score.publish(
-          page_id, reinterpret_cast<uint64_t *>(score_pages_[page_id].data()));
-      pages_->score.advance_count();
+      auto &scores = *score_pages_;
+      scores.handles[page_id] = std::move(score_page);
+      scores.directory->publish(page_id, reinterpret_cast<uint64_t *>(
+                                             scores.handles[page_id].data()));
+      scores.directory->advance_count();
     }
+    page_state_->states[page_id].published_owner.store(
+        owner_pages_[page_id].get(), std::memory_order_release);
   }
 
   size_t dim_;
@@ -814,18 +855,18 @@ private:
   bool enable_score_;
   storage::StorageTopology topology_;
   storage::PageGeometry page_geometry_;
-  std::shared_ptr<PageTable> pages_;
+  std::shared_ptr<DataPages> pages_;
+  std::unique_ptr<ScorePages> score_pages_;
   PageStorage storage_;
   std::shared_ptr<RetirementPressure> retirement_pressure_;
   size_t partition_count_;
   bool numa_aware_pages_;
   size_t page_cohort_size_;
   std::unique_ptr<StoragePage[]> data_pages_;
-  std::unique_ptr<StoragePage[]> score_pages_;
   std::shared_ptr<ArenaPageState> page_state_;
   PageAllocationObserver page_allocation_observer_;
   void *page_allocation_context_;
-  std::unique_ptr<std::unique_ptr<OwnerRecord[]>[]> owner_pages_;
+  std::unique_ptr<std::unique_ptr<OwnerPage>[]> owner_pages_;
   std::unique_ptr<std::atomic<uint64_t>[]> live_words_;
   std::atomic<uint32_t> next_index_{0};
   std::atomic<size_t> num_pages_{0};
@@ -861,7 +902,6 @@ private:
         std::numeric_limits<uint64_t>::max();
 
     uint32_t dimension;
-    std::atomic<bool> queued{false};
     uint64_t key;
     const size_t owner_slot;
     std::atomic<uint64_t> state{0};
@@ -906,8 +946,7 @@ private:
   void discard_unpublished_checkpoint_record(
       CheckpointMutationRecord *record) noexcept {
     std::lock_guard structure_lock(checkpoint_record_structure_mutex_);
-    if (record->state.load(std::memory_order_relaxed) != 0 ||
-        record->queued.load(std::memory_order_relaxed))
+    if (record->state.load(std::memory_order_relaxed) != 0)
       std::terminate();
     const size_t owner_slot = record->owner_slot;
     checkpoint_record_storage_[owner_slot].reset();
@@ -926,8 +965,6 @@ private:
   }
 
   void admit_checkpoint_record(CheckpointMutationRecord &record) noexcept {
-    if (record.queued.exchange(true, std::memory_order_acq_rel))
-      return;
     auto &head = checkpoint_dirty_heads_[checkpoint_shard(record.key)].head;
     CheckpointMutationRecord *current = head.load(std::memory_order_relaxed);
     do {
@@ -979,15 +1016,14 @@ private:
       throw std::overflow_error("checkpoint mutation sequence exhausted");
     uint64_t previous = record.state.load(std::memory_order_acquire);
     while (previous < sequence) {
-      if ((previous & CheckpointMutationRecord::kDeleted) != 0)
-        return;
       if (record.state.compare_exchange_weak(previous, sequence,
                                              std::memory_order_acq_rel,
-                                             std::memory_order_acquire))
-        break;
+                                             std::memory_order_acquire)) {
+        if (previous == 0)
+          admit_checkpoint_record(record);
+        return;
+      }
     }
-    if ((previous & CheckpointMutationRecord::kDeleted) == 0)
-      admit_checkpoint_record(record);
   }
 
   void
@@ -999,8 +1035,8 @@ private:
     publish_checkpoint_mutation(record, reserve_checkpoint_sequence());
   }
 
-  void record_checkpoint_mutations(
-      std::span<const hogwild_internal::CheckpointRecordRef> records) {
+  template <std::ranges::sized_range Records>
+  void record_checkpoint_mutations(const Records &records) {
     if (records.empty())
       return;
     if (!enable_mutation_journal_)
@@ -1011,6 +1047,24 @@ private:
     uint64_t sequence = first_sequence;
     for (const auto pointer : records)
       publish_checkpoint_mutation(*record_from_pointer(pointer), sequence++);
+  }
+
+  template <typename Visit>
+  void with_checkpoint_batch(size_t capacity, Visit &&visit) {
+    // An incarnation's record survives until quiescent acknowledgement.
+    // Concurrent erase marks it terminal, so a delayed update cannot revive it.
+    std::vector<hogwild_internal::CheckpointRecordRef> completed;
+    completed.reserve(capacity);
+    try {
+      visit([&](hogwild_internal::CheckpointRecordRef record) {
+        if (enable_mutation_journal_)
+          completed.push_back(record);
+      });
+    } catch (...) {
+      record_checkpoint_mutations(completed);
+      throw;
+    }
+    record_checkpoint_mutations(completed);
   }
 
   void
@@ -1035,7 +1089,8 @@ private:
               std::max(reserved_sequence, previous) |
                   CheckpointMutationRecord::kDeleted,
               std::memory_order_acq_rel, std::memory_order_acquire)) {
-        admit_checkpoint_record(record);
+        if (previous == 0)
+          admit_checkpoint_record(record);
         return;
       }
     }
@@ -1508,7 +1563,8 @@ public:
           recycle_state(std::make_shared<RecycleState>(std::move(page_reuse))),
           retirement_pressure(std::move(pressure)),
           index_retirement_bytes(retired_index_bytes),
-          locators(std::make_shared<hogwild_internal::SegmentedLocatorTable>()),
+          locators(std::make_shared<hogwild_internal::SegmentedLocatorTable>(
+              checkpoint_owner_in.enable_mutation_journal())),
           checkpoint_owner(checkpoint_owner_in), dimension(dimension_in) {
       if (!retirement_pressure)
         throw std::invalid_argument("key shard retirement pressure is null");
@@ -1670,14 +1726,16 @@ public:
 
     void reserve_new_index() { reserve_new_indices(1); }
 
-    std::optional<uint32_t> take_recycled_index() {
+    std::optional<uint32_t>
+    take_recycled_index(const EmbeddingArena<ParamT> &arena) {
       if (recycle_state->ready_count.load(std::memory_order_acquire) == 0)
         return std::nullopt;
       std::lock_guard lock(recycle_state->mutex);
       while (!recycle_state->ready_indices.empty()) {
         uint32_t index = recycle_state->ready_indices.back();
         recycle_state->ready_indices.pop_back();
-        if (recycle_state->page_reuse->unavailable(index))
+        if (recycle_state->page_reuse->unavailable(index) ||
+            !arena.owner_reusable(index))
           continue;
         recycle_state->ready_count.store(recycle_state->ready_indices.size(),
                                          std::memory_order_release);
@@ -2124,8 +2182,7 @@ public:
       std::optional<uint64_t> page_id;
       if (!shard.locators->try_read(*slot_id, [&](uint32_t index) {
             const auto owner = arena.owner_snapshot(index);
-            if (owner.has_value() && owner->key == key &&
-                owner->shard_id == shard_id_for_key(key))
+            if (owner.has_value() && owner->key == key)
               page_id = index >> arena.entries_shift();
           }))
         return std::nullopt;
@@ -2197,8 +2254,7 @@ public:
           auto validated = arena.owner_snapshot(current);
           if (!validated.has_value() ||
               validated->seq_count != owner->seq_count ||
-              validated->key != owner->key ||
-              validated->shard_id != owner->shard_id)
+              validated->key != owner->key)
             return;
           snapshot.keys.push_back(owner->key);
           snapshot.seq_counts.push_back(owner->seq_count);
@@ -2260,8 +2316,7 @@ public:
             key_shard.locators->try_read(slot_id, [&](uint32_t index) {
               candidate.reset();
               const auto owner = arena.owner_snapshot(index);
-              if (!owner.has_value() || owner->key != key ||
-                  owner->shard_id != shard_id_for_key(key))
+              if (!owner.has_value() || owner->key != key)
                 return;
 
               candidate = PageSlotEntry{
@@ -2393,8 +2448,7 @@ public:
                     entry.slot_id, [&](uint32_t current_index) {
                       captured = false;
                       const auto owner = arena.owner_snapshot(current_index);
-                      if (!owner.has_value() || owner->key != entry.key ||
-                          owner->shard_id != shard_id_for_key(entry.key))
+                      if (!owner.has_value() || owner->key != entry.key)
                         return;
                       resolved_index = current_index;
                       resolved_slot_ordinal = static_cast<uint32_t>(
@@ -2557,8 +2611,7 @@ public:
           arena.bind_exact(index, static_cast<uint32_t>(shard_id));
           if (optimizer.has_value())
             optimizer->allocate(index);
-          arena.publish_owner_exact(index, key, static_cast<uint32_t>(shard_id),
-                                    image.seq_counts[row]);
+          arena.publish_owner_exact(index, key, image.seq_counts[row]);
           simd::simd_copy(image.values.data() + row * dim, arena.data(index),
                           dim);
           if (score_policy.enabled()) {
@@ -2784,8 +2837,7 @@ public:
       return key_shards[key_shard_id]->locators->try_write_key_batch(
           locator_entries,
           [&](std::span<const uint32_t> indices,
-              std::span<const hogwild_internal::CheckpointRecordRef>
-                  checkpoint_records) {
+              hogwild_internal::LockedCheckpointRecords checkpoint_records) {
             std::forward<Visit>(visit)(batch, positions, indices,
                                        checkpoint_records);
           });
@@ -2815,8 +2867,7 @@ public:
       return key_shards[key_shard_id]->locators->try_write_key_batch(
           locator_entries,
           [&](std::span<const uint32_t> indices,
-              std::span<const hogwild_internal::CheckpointRecordRef>
-                  checkpoint_records) {
+              hogwild_internal::LockedCheckpointRecords checkpoint_records) {
             std::forward<Visit>(visit)(batch, begin, indices,
                                        checkpoint_records);
           });
@@ -2847,8 +2898,7 @@ public:
             batch, positions,
             [&](const auto &batch_view, std::span<const size_t> batch_positions,
                 std::span<const uint32_t> indices,
-                std::span<const hogwild_internal::CheckpointRecordRef>
-                    checkpoint_records) {
+                hogwild_internal::LockedCheckpointRecords checkpoint_records) {
               rows.clear();
               for (size_t row = 0; row < indices.size(); ++row) {
                 ParamT *parameter = arena.data(indices[row]);
@@ -2878,8 +2928,7 @@ public:
             batch, 0, batch.size(),
             [&](const auto &batch_view, size_t begin,
                 std::span<const uint32_t> indices,
-                std::span<const hogwild_internal::CheckpointRecordRef>
-                    checkpoint_records) {
+                hogwild_internal::LockedCheckpointRecords checkpoint_records) {
               rows.clear();
               for (size_t row = 0; row < indices.size(); ++row) {
                 ParamT *parameter = arena.data(indices[row]);
@@ -3228,7 +3277,7 @@ public:
           auto &batch = by_shard[item.shard_id];
           auto &key_shard = *key_shards[item.shard_id];
           uint32_t arena_index;
-          if (auto recycled = key_shard.take_recycled_index()) {
+          if (auto recycled = key_shard.take_recycled_index(arena)) {
             arena_index = *recycled;
             arena.prepare_reused(arena_index);
             if (optimizer.has_value())
@@ -3268,8 +3317,7 @@ public:
                 allocation.recycled = true;
                 continue;
               }
-              arena.publish_owner(allocation.index, allocation.entry.key,
-                                  static_cast<uint32_t>(shard_id));
+              arena.publish_owner(allocation.index, allocation.entry.key);
               initialize(allocation.entry, allocation.index);
               batch.published.push_back(allocation.entry);
               batch.inserted_keys.push_back(allocation.entry.key);
@@ -3443,8 +3491,7 @@ public:
         if (!source.has_value()) {
           with_shared_entry(key, [&](uint32_t index) {
             auto owner = arena.owner_snapshot(index);
-            if (!owner.has_value() || owner->key != key ||
-                owner->shard_id != shard_id_for_key(key)) {
+            if (!owner.has_value() || owner->key != key) {
               throw std::logic_error(
                   "live entry owner does not match key shard");
             }
@@ -3465,7 +3512,6 @@ public:
         }
         auto current_owner = arena.owner_snapshot(current->index);
         if (!current_owner.has_value() || current_owner->key != key ||
-            current_owner->shard_id != shard_id_for_key(key) ||
             current_owner->seq_count != source->second) {
           key_shard.recycle_unpublished_index(destination);
           return false;
@@ -3477,8 +3523,7 @@ public:
         const bool relocated = key_shard.locators->relocate(
             current->slot_id, source->first, destination,
             [&](uint32_t locked_index) {
-              arena.publish_owner(destination, key,
-                                  static_cast<uint32_t>(shard_id_for_key(key)));
+              arena.publish_owner(destination, key);
               simd::simd_copy(arena.data(locked_index), arena.data(destination),
                               dim);
               if (score_policy.enabled()) {
@@ -3521,12 +3566,11 @@ public:
 
     void copy_source_key_to_destination(uint64_t key, uint32_t source_index,
                                         uint32_t destination,
-                                        uint32_t expected_shard_id,
                                         std::span<OptT> optimizer_state) {
 #if defined(PAGE_COMPACTION_DEEP_PROFILE)
       const auto owner_publish_started = std::chrono::steady_clock::now();
 #endif
-      arena.publish_owner(destination, key, expected_shard_id);
+      arena.publish_owner(destination, key);
 #if defined(PAGE_COMPACTION_DEEP_PROFILE)
       page_compaction_profile.owner_publish_ns.fetch_add(
           std::chrono::duration_cast<std::chrono::nanoseconds>(
@@ -3555,7 +3599,7 @@ public:
 
     bool relocate_expected_key_with_locked_shard(
         uint64_t key, uint32_t source_index, uint64_t source_seq_count,
-        uint32_t destination, uint32_t expected_shard_id, KeyShard &key_shard,
+        uint32_t destination, KeyShard &key_shard,
         std::span<OptT> optimizer_state, bool &locator_published) {
 #if defined(PAGE_COMPACTION_DEEP_PROFILE)
       const auto locator_lookup_started = std::chrono::steady_clock::now();
@@ -3586,7 +3630,6 @@ public:
           1, std::memory_order_relaxed);
 #endif
       if (!current_owner.has_value() || current_owner->key != key ||
-          current_owner->shard_id != expected_shard_id ||
           current_owner->seq_count != source_seq_count) {
         return false;
       }
@@ -3599,7 +3642,6 @@ public:
               current->slot_id, source_index, destination,
               [&](uint32_t locked_index) {
                 copy_source_key_to_destination(key, locked_index, destination,
-                                               expected_shard_id,
                                                optimizer_state);
                 arena.mark_live(destination, true);
               }))
@@ -3622,7 +3664,7 @@ public:
       if (!with_shared_entry(key, [](uint32_t) {}))
         return false;
       uint32_t destination;
-      if (auto recycled = key_shard.take_recycled_index()) {
+      if (auto recycled = key_shard.take_recycled_index(arena)) {
         destination = *recycled;
         try {
           arena.prepare_reused(destination);
@@ -3802,21 +3844,17 @@ public:
           auto owner = arena.owner_snapshot(index);
           if (!owner.has_value())
             continue;
-          if (owner->shard_id >= key_shards.size() ||
-              owner->shard_id != shard_id_for_key(owner->key)) {
-            throw std::logic_error(
-                "arena source owner does not match key shard");
-          }
+          const auto owner_shard =
+              static_cast<uint32_t>(shard_id_for_key(owner->key));
           uint32_t &source_shard = source_cohort_shards[source_page_position];
           if (source_shard == std::numeric_limits<uint32_t>::max()) {
-            source_shard = owner->shard_id;
+            source_shard = owner_shard;
           } else if (source_shard / arena.topology().cohort_size() !=
-                     owner->shard_id / arena.topology().cohort_size()) {
+                     owner_shard / arena.topology().cohort_size()) {
             throw std::logic_error(
                 "compaction source page mixes shard cohorts");
           }
-          pending.push_back({owner->key, owner->seq_count, index,
-                             owner->shard_id,
+          pending.push_back({owner->key, owner->seq_count, index, owner_shard,
                              static_cast<uint32_t>(source_page_position), 0});
           if (anchor_count < anchors.size())
             anchors[anchor_count++] = owner->key;
@@ -3907,7 +3945,7 @@ public:
               const PendingKey &entry = pending[pending_index];
               KeyShard &key_shard = *key_shards[entry.shard_id];
               uint32_t destination;
-              if (auto recycled = key_shard.take_recycled_index()) {
+              if (auto recycled = key_shard.take_recycled_index(arena)) {
                 destination = *recycled;
                 try {
                   if (!page_reuse->destination_available(destination))
@@ -3940,7 +3978,7 @@ public:
               for (size_t order_index = order_begin; order_index < order_end;
                    ++order_index) {
                 const size_t pending_index = migration_order[order_index];
-                if (auto recycled = key_shard.take_recycled_index()) {
+                if (auto recycled = key_shard.take_recycled_index(arena)) {
                   const uint32_t destination = *recycled;
                   try {
                     if (!page_reuse->destination_available(destination))
@@ -4033,7 +4071,7 @@ public:
                 try {
                   if (relocate_expected_key_with_locked_shard(
                           entry.key, entry.source_index, entry.seq_count,
-                          destination, entry.shard_id, key_shard,
+                          destination, key_shard,
                           std::span<OptT>(optimizer_state),
                           locator_published)) {
                     ++migrated;
@@ -4273,6 +4311,10 @@ public:
             score_policy_.enabled() &&
             storage_->supports_background_page_eviction()),
         enable_mutation_journal_(options.enable_mutation_journal),
+        checkpoint_dirty_heads_(enable_mutation_journal_
+                                    ? std::make_unique<ShardDirtyHead[]>(
+                                          storage_topology_.shard_count())
+                                    : nullptr),
         bind_worker_affinity_(storage_topology_.numa_execution()),
         numa_memory_locality_(storage_topology_.numa_memory()),
         telemetry_ring_(1024,
@@ -4281,11 +4323,6 @@ public:
                                   ThreadAffinity::cpu_for_worker(num_threads_))
                             : std::nullopt,
                         &write_diagnostic_to_clog) {
-    checkpoint_dirty_heads_ =
-        std::make_unique<ShardDirtyHead[]>(storage_topology_.shard_count());
-    for (size_t shard = 0; shard < storage_topology_.shard_count(); ++shard)
-      checkpoint_dirty_heads_[shard].head.store(nullptr,
-                                                std::memory_order_relaxed);
     bool enable_score = score_policy_.enabled();
 
     if (numa_memory_locality_) {
@@ -4397,13 +4434,22 @@ public:
     size_t n = keys.size();
     thread_local std::vector<size_t> forward_offsets;
     const std::optional<size_t> fixed_dim = fixed_row_length(row_lengths);
+    SlotStore *const fixed_slot =
+        fixed_dim ? &snapshot_slot_for_dim(*snapshot, *fixed_dim) : nullptr;
     if (!fixed_dim.has_value())
       compute_offsets_into(row_lengths, forward_offsets);
     const std::span<const size_t> offsets(forward_offsets);
-    const size_t bytes_per_entry =
-        n == 0                  ? sizeof(ParamT)
-        : fixed_dim.has_value() ? checked_row_payload_bytes(*fixed_dim)
-                                : row_payload_bytes(row_lengths, offsets);
+    size_t bytes_per_entry = n == 0 ? sizeof(ParamT)
+                             : fixed_dim.has_value()
+                                 ? checked_row_payload_bytes(*fixed_dim)
+                                 : row_payload_bytes(row_lengths, offsets);
+    const bool update_score = score_policy_.updates_on_access();
+    if (update_score) {
+      if (bytes_per_entry >
+          std::numeric_limits<size_t>::max() - sizeof(uint64_t))
+        throw std::overflow_error("scored row byte count overflows");
+      bytes_per_entry += sizeof(uint64_t);
+    }
     const size_t logical_worker_count =
         n == 0 ? 1
                : operation_worker_count(HogwildOperation::kForwardLookup, n,
@@ -4442,99 +4488,109 @@ public:
         std::array<uint32_t, CoaccessSketch::kMaximumBatchSample>
             sampled_indices;
         size_t sampled_count = 0;
-        for (size_t position = 0; position < count; ++position) {
-          const size_t i = index_at(position);
-          const bool collects_telemetry =
-              collect_telemetry && i >= telemetry_partition_offset(worker) &&
-              i < telemetry_partition_offset(worker + 1);
-          const size_t prefetch_distance =
-              operation_dispatch_topology_.forward_prefetch_distance;
-          if (prefetch_distance != 0 && position + prefetch_distance < count) {
-            const size_t prefetch_index =
-                index_at(position + prefetch_distance);
-            __builtin_prefetch(&keys[prefetch_index], 0, 1);
-            __builtin_prefetch(&row_lengths[prefetch_index], 0, 1);
-            if (fixed_dim.has_value()) {
-              __builtin_prefetch(
-                  out_flat_values.data() + prefetch_index * *fixed_dim, 1, 1);
-            } else {
-              __builtin_prefetch(&offsets[prefetch_index], 0, 1);
-              __builtin_prefetch(
-                  out_flat_values.data() + offsets[prefetch_index], 1, 1);
-            }
-            const uint64_t prefetch_key =
-                static_cast<uint64_t>(keys[prefetch_index]);
-            const size_t prefetch_dim = fixed_dim.value_or(
-                static_cast<size_t>(row_lengths[prefetch_index]));
-            if (prefetch_dim < snapshot->dim_to_slot.size() &&
-                snapshot->dim_to_slot[prefetch_dim] != nullptr) [[likely]] {
-              auto &prefetch_slot = *snapshot->dim_to_slot[prefetch_dim];
-              const size_t prefetch_hash =
-                  !routed_hashes.empty()
-                      ? routed_hashes[prefetch_index]
-                      : SplitMixHash<uint64_t>{}(prefetch_key);
-              prefetch_slot.prefetch_entry_cacheline(prefetch_key,
-                                                     prefetch_hash);
-            }
-          }
-          uint64_t key = static_cast<uint64_t>(keys[i]);
-          size_t dim = fixed_dim.value_or(static_cast<size_t>(row_lengths[i]));
-          if (dim >= snapshot->dim_to_slot.size() ||
-              snapshot->dim_to_slot[dim] == nullptr) [[unlikely]] {
-            throw std::runtime_error(
-                "invalid dim access: no physical table for dim " +
-                std::to_string(dim));
-          }
-          auto &slot = *snapshot->dim_to_slot[dim];
-          ParamT *out = out_flat_values.data() +
-                        (fixed_dim.has_value() ? i * *fixed_dim : offsets[i]);
-
-          auto copy_and_collect_telemetry = [&](uint32_t index) {
-            const ParamT *src = slot.arena.data_trusted(index);
-            if constexpr (simd::is_simd_supported_v<ParamT>) {
-              simd::simd_copy(src, out, dim);
-            } else {
-              std::copy_n(src, dim, out);
-            }
-            if (collects_telemetry && sampled_count < sampled_keys.size()) {
-              sampled_keys[sampled_count] = key;
-              sampled_slots[sampled_count] = &slot;
-              sampled_indices[sampled_count] = index;
-              ++sampled_count;
-            }
-          };
-          auto read_visit = [&](uint32_t index) {
-            copy_and_collect_telemetry(index);
-          };
-          auto scored_visit =
-              [&](uint32_t index,
-                  hogwild_internal::CheckpointRecordRef checkpoint_record) {
-                copy_and_collect_telemetry(index);
-                const auto score_result =
-                    score_policy_.on_access(&slot.arena.score_raw(index));
-                if (score_result == ScoreAccessResult::kUpdated) {
-                  if (enable_mutation_journal_) {
-                    record_checkpoint_mutation(checkpoint_record);
+        with_checkpoint_batch(
+            update_score && enable_mutation_journal_ ? count : 0,
+            [&](auto &&record_hit) {
+              for (size_t position = 0; position < count; ++position) {
+                const size_t i = index_at(position);
+                const bool collects_telemetry =
+                    collect_telemetry &&
+                    i >= telemetry_partition_offset(worker) &&
+                    i < telemetry_partition_offset(worker + 1);
+                const size_t prefetch_distance =
+                    operation_dispatch_topology_.forward_prefetch_distance;
+                if (prefetch_distance != 0 &&
+                    position + prefetch_distance < count) {
+                  const size_t prefetch_index =
+                      index_at(position + prefetch_distance);
+                  __builtin_prefetch(&keys[prefetch_index], 0, 1);
+                  if (fixed_dim.has_value()) {
+                    __builtin_prefetch(out_flat_values.data() +
+                                           prefetch_index * *fixed_dim,
+                                       1, 1);
+                  } else {
+                    __builtin_prefetch(&offsets[prefetch_index], 0, 1);
+                    __builtin_prefetch(
+                        out_flat_values.data() + offsets[prefetch_index], 1, 1);
                   }
-                } else if (score_result == ScoreAccessResult::kClockExhausted) {
-                  mark_terminal_failure();
-                  throw std::overflow_error(
-                      "LRU logical clock exhausted; store must be recreated");
+                  const uint64_t prefetch_key =
+                      static_cast<uint64_t>(keys[prefetch_index]);
+                  auto *prefetch_slot = fixed_slot;
+                  if (!prefetch_slot) {
+                    const size_t dim =
+                        static_cast<size_t>(row_lengths[prefetch_index]);
+                    if (dim < snapshot->dim_to_slot.size())
+                      prefetch_slot = snapshot->dim_to_slot[dim];
+                  }
+                  if (prefetch_slot) {
+                    const size_t prefetch_hash =
+                        !routed_hashes.empty()
+                            ? routed_hashes[prefetch_index]
+                            : SplitMixHash<uint64_t>{}(prefetch_key);
+                    prefetch_slot->prefetch_entry_cacheline(prefetch_key,
+                                                            prefetch_hash);
+                  }
                 }
-              };
-          const bool found = [&] {
-            const size_t hash = !routed_hashes.empty()
-                                    ? routed_hashes[i]
-                                    : SplitMixHash<uint64_t>{}(key);
-            if (!score_policy_.enabled()) {
-              return slot.with_read_view_entry_hashed(key, hash, read_visit);
-            }
-            return slot.with_shared_write_entry_hashed(key, hash, scored_visit);
-          }();
-          if (!found) {
-            std::fill_n(out, dim, ParamT{0});
-          }
-        }
+                uint64_t key = static_cast<uint64_t>(keys[i]);
+                SlotStore &slot =
+                    fixed_slot
+                        ? *fixed_slot
+                        : snapshot_slot_for_dim(
+                              *snapshot, static_cast<size_t>(row_lengths[i]));
+                const size_t dim = slot.dim;
+                ParamT *out =
+                    out_flat_values.data() +
+                    (fixed_dim.has_value() ? i * *fixed_dim : offsets[i]);
+
+                auto copy_and_collect_telemetry = [&](uint32_t index) {
+                  const ParamT *src = slot.arena.data_trusted(index);
+                  if constexpr (simd::is_simd_supported_v<ParamT>) {
+                    simd::simd_copy(src, out, dim);
+                  } else {
+                    std::copy_n(src, dim, out);
+                  }
+                  if (collects_telemetry &&
+                      sampled_count < sampled_keys.size()) {
+                    sampled_keys[sampled_count] = key;
+                    sampled_slots[sampled_count] = &slot;
+                    sampled_indices[sampled_count] = index;
+                    ++sampled_count;
+                  }
+                };
+                auto read_visit = [&](uint32_t index) {
+                  copy_and_collect_telemetry(index);
+                };
+                auto scored_visit = [&](uint32_t index,
+                                        hogwild_internal::CheckpointRecordRef
+                                            checkpoint_record) {
+                  copy_and_collect_telemetry(index);
+                  const auto score_result =
+                      score_policy_.on_access(&slot.arena.score_raw(index));
+                  if (score_result == ScoreAccessResult::kUpdated) {
+                    record_hit(checkpoint_record);
+                  } else if (score_result ==
+                             ScoreAccessResult::kClockExhausted) {
+                    mark_terminal_failure();
+                    throw std::overflow_error(
+                        "LRU logical clock exhausted; store must be recreated");
+                  }
+                };
+                const bool found = [&] {
+                  const size_t hash = !routed_hashes.empty()
+                                          ? routed_hashes[i]
+                                          : SplitMixHash<uint64_t>{}(key);
+                  if (!update_score) {
+                    return slot.with_read_view_entry_hashed(key, hash,
+                                                            read_visit);
+                  }
+                  return slot.with_shared_write_entry_hashed(key, hash,
+                                                             scored_visit);
+                }();
+                if (!found) {
+                  std::fill_n(out, dim, ParamT{0});
+                }
+              }
+            });
         if (sampled_count == 0)
           return;
         for (size_t sample = 0; sample < sampled_count; ++sample) {
@@ -4838,8 +4894,7 @@ public:
                         batch,
                         slot->global_step.load(std::memory_order_relaxed),
                         normalization_steps,
-                        [&](std::span<
-                            const hogwild_internal::CheckpointRecordRef>
+                        [&](hogwild_internal::LockedCheckpointRecords
                                 checkpoint_records) {
                           if (enable_mutation_journal_) {
                             record_checkpoint_mutations(checkpoint_records);
@@ -4893,58 +4948,45 @@ public:
           std::vector<typename SlotStore::BatchEntry> entries;
         };
         std::vector<MissingBatch> missing_batches;
-        for (size_t i = begin; i < end; ++i) {
-          uint64_t key = static_cast<uint64_t>(keys[i]);
-          const size_t hash = SplitMixHash<uint64_t>{}(key);
-          size_t dim = static_cast<size_t>(row_lengths[i]);
-          if (dim >= snapshot->dim_to_slot.size() ||
-              snapshot->dim_to_slot[dim] == nullptr) [[unlikely]] {
-            throw std::runtime_error("invalid dim access");
-          }
-          auto &slot = *snapshot->dim_to_slot[dim];
-          const ParamT *src = flat_values.data() + offsets[i];
-          if (slot.assign_existing_hashed(
-                  key, hash,
-                  [&](uint32_t index,
-                      hogwild_internal::CheckpointRecordRef checkpoint_record) {
-                    if constexpr (simd::is_simd_supported_v<ParamT>)
-                      simd::simd_copy(src, slot.arena.data(index), slot.dim);
-                    else
-                      std::copy_n(src, slot.dim, slot.arena.data(index));
-                    if (enable_mutation_journal_) {
-                      record_checkpoint_mutation(checkpoint_record);
-                    }
-                  }))
-            continue;
-          auto batch =
-              std::ranges::find(missing_batches, &slot, &MissingBatch::slot);
-          if (batch == missing_batches.end()) {
-            missing_batches.push_back({&slot, {}});
-            batch = std::prev(missing_batches.end());
-          }
-          batch->entries.push_back({key, hash, i});
-        }
+        auto copy_row = [&](SlotStore &slot, size_t position, uint32_t index) {
+          simd::simd_copy(flat_values.data() + offsets[position],
+                          slot.arena.data(index), slot.dim);
+        };
+        with_checkpoint_batch(
+            enable_mutation_journal_ ? end - begin : 0, [&](auto &&record_hit) {
+              for (size_t i = begin; i < end; ++i) {
+                const uint64_t key = static_cast<uint64_t>(keys[i]);
+                const size_t hash = SplitMixHash<uint64_t>{}(key);
+                auto &slot = snapshot_slot_for_dim(
+                    *snapshot, static_cast<size_t>(row_lengths[i]));
+                if (slot.assign_existing_hashed(
+                        key, hash,
+                        [&](uint32_t index,
+                            hogwild_internal::CheckpointRecordRef record) {
+                          copy_row(slot, i, index);
+                          record_hit(record);
+                        }))
+                  continue;
+                auto batch = std::ranges::find(missing_batches, &slot,
+                                               &MissingBatch::slot);
+                if (batch == missing_batches.end()) {
+                  missing_batches.push_back({&slot, {}});
+                  batch = std::prev(missing_batches.end());
+                }
+                batch->entries.push_back({key, hash, i});
+              }
+            });
         for (MissingBatch &batch : missing_batches) {
           SlotStore &slot = *batch.slot;
           slot.find_or_insert_batch(
               batch.entries,
               [&](const typename SlotStore::BatchEntry &entry,
                   uint32_t new_index) {
-                const ParamT *src =
-                    flat_values.data() + offsets[entry.position];
-                if constexpr (simd::is_simd_supported_v<ParamT>)
-                  simd::simd_copy(src, slot.arena.data(new_index), slot.dim);
-                else
-                  std::copy_n(src, slot.dim, slot.arena.data(new_index));
+                copy_row(slot, entry.position, new_index);
               },
               [&](const typename SlotStore::BatchEntry &entry, uint32_t index,
                   hogwild_internal::CheckpointRecordRef checkpoint_record) {
-                const ParamT *src =
-                    flat_values.data() + offsets[entry.position];
-                if constexpr (simd::is_simd_supported_v<ParamT>)
-                  simd::simd_copy(src, slot.arena.data(index), slot.dim);
-                else
-                  std::copy_n(src, slot.dim, slot.arena.data(index));
+                copy_row(slot, entry.position, index);
                 if (enable_mutation_journal_) {
                   record_checkpoint_mutation(checkpoint_record);
                 }
@@ -5758,7 +5800,7 @@ private:
   PageStorage storage_;
   std::shared_ptr<RetirementPressure> retirement_pressure_;
   bool background_page_eviction_enabled_;
-  bool enable_mutation_journal_;
+  const bool enable_mutation_journal_;
   mutable std::mutex control_plane_mutex_;
   PageEvictionRegistration page_eviction_registration_;
   std::atomic<uint64_t> telemetry_sample_sequence_{0};
@@ -5805,14 +5847,18 @@ private:
         deleted_page_ids;
   };
 
+  std::span<ShardDirtyHead> checkpoint_dirty_heads() const noexcept {
+    return {checkpoint_dirty_heads_.get(),
+            enable_mutation_journal_ ? storage_topology_.shard_count() : 0};
+  }
+
   CheckpointMutationCapture checkpoint_mutations_quiesced() const {
     ankerl::unordered_dense::map<std::pair<uint32_t, uint64_t>, size_t>
         winner_indices;
     CheckpointMutationCapture capture;
-    for (size_t shard = 0; shard < storage_topology_.shard_count(); ++shard) {
+    for (const auto &shard : checkpoint_dirty_heads()) {
       for (CheckpointMutationRecord *record =
-               checkpoint_dirty_heads_[shard].head.load(
-                   std::memory_order_acquire);
+               shard.head.load(std::memory_order_acquire);
            record != nullptr; record = record->next) {
         const uint64_t state = record->state.load(std::memory_order_acquire);
         const uint64_t sequence = state & ~CheckpointMutationRecord::kDeleted;
@@ -5883,6 +5929,9 @@ public:
       uint64_t expected_page_layout_generation,
       se::Function<void(std::span<const CheckpointMutation>, uint64_t)> prepare,
       se::Function<bool(size_t, PageImageExport<ParamT, OptT> &&)> visitor) {
+    if (incremental && !enable_mutation_journal_)
+      throw std::runtime_error(
+          "incremental checkpoint requires mutation journal to be enabled");
     std::lock_guard control_plane_lock(control_plane_mutex_);
     [[maybe_unused]] auto retirement_admission =
         retirement_pressure_->control_plane_call();
@@ -5891,9 +5940,6 @@ public:
       InvocationGate &gate;
       ~InvocationResume() { gate.resume_accepting(); }
     } invocation_resume{invocation_gate_};
-    if (incremental && !enable_mutation_journal_)
-      throw std::runtime_error(
-          "incremental checkpoint requires mutation journal to be enabled");
     if (incremental && (expected_baseline.empty() ||
                         checkpoint_baseline() != expected_baseline))
       throw std::runtime_error(
@@ -6033,14 +6079,12 @@ public:
         checkpoint_acknowledged_watermark_ != 0)
       throw std::logic_error("checkpoint baseline initialization requires a "
                              "fresh checkpoint journal");
-    for (size_t shard = 0; shard < storage_topology_.shard_count(); ++shard)
-      checkpoint_dirty_heads_[shard].head.store(nullptr,
-                                                std::memory_order_release);
+    for (auto &shard : checkpoint_dirty_heads())
+      shard.head.store(nullptr, std::memory_order_release);
     for (const auto &record : checkpoint_record_storage_) {
       if (!record)
         continue;
       record->state.store(0, std::memory_order_release);
-      record->queued.store(false, std::memory_order_release);
       record->deleted_page_id = CheckpointMutationRecord::kNoPhysicalPage;
       record->next = nullptr;
     }
@@ -6116,8 +6160,8 @@ public:
       throw std::invalid_argument(
           "checkpoint mutation watermark is in the future");
     checkpoint_free_record_slots_.reserve(checkpoint_record_storage_.size());
-    for (size_t shard = 0; shard < storage_topology_.shard_count(); ++shard) {
-      auto &head = checkpoint_dirty_heads_[shard].head;
+    for (auto &shard : checkpoint_dirty_heads()) {
+      auto &head = shard.head;
       CheckpointMutationRecord *current = head.load(std::memory_order_acquire);
       CheckpointMutationRecord *retained = nullptr;
       while (current != nullptr) {
@@ -6127,13 +6171,12 @@ public:
         if (sequence > watermark) {
           current->next = retained;
           retained = current;
+        } else if ((state & CheckpointMutationRecord::kDeleted) != 0) {
+          const size_t owner_slot = current->owner_slot;
+          checkpoint_record_storage_[owner_slot].reset();
+          checkpoint_free_record_slots_.push_back(owner_slot);
         } else {
-          current->queued.store(false, std::memory_order_release);
-          if ((state & CheckpointMutationRecord::kDeleted) != 0) {
-            const size_t owner_slot = current->owner_slot;
-            checkpoint_record_storage_[owner_slot].reset();
-            checkpoint_free_record_slots_.push_back(owner_slot);
-          }
+          current->state.store(0, std::memory_order_release);
         }
         current = next;
       }

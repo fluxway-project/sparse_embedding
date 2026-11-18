@@ -134,19 +134,51 @@ dim=128、65,536 个已存在且唯一的 row、8 workers、进程使用 `taskse
 批级 optimizer profile 与下表使用不同 workload。比较 assign、梯度累积和 optimizer step
 时请使用 `training_path_profile`；比较存储和 compaction 时请使用本文末尾的 benchmark 命令。
 
-### 全功能存储多操作基准评测 (C++ 16 线程)
+### 16 线程 NUMA 存储吞吐
 
-测试配置：维度 128，词表规模 500,000 个键，65,536 大小幂律访问批次，16 个原生工作线程，纯内存存储：
+双路 Xeon Silver 4116，16 个工作线程绑定在 CPU 0–23，按 NUMA 节点分片。向量维度为 128，词表含 500,000 个键，每批从幂律分布采样 65,536 次。写操作按去重后实际处理的行数计算吞吐。下表取 12 次独立进程运行的中位数。
 
-| 操作名称 | 吞吐量 | 内存带宽 | 性能特征 / 瓶颈点 |
-|---|---:|---:|---|
-| `forward_lookup` | **23.55 Mops/s** | **12.06 GB/s** | 内存总线带宽受限 |
-| `assign` | **12.81 Mops/s** | **6.56 GB/s** | 缓存行写回受限 |
-| `optimizer_step` (Adam) | **12.60 Mops/s** | **12.90 GB/s** | SIMD 计算与内存吞吐受限 |
-| `accumulate_gradients` | **4.23 Mops/s** | **2.17 GB/s** | 分片 TransientArena 梯度累加 |
-| `lookup_or_insert` | **1.05 Mops/s** | 0.54 GB/s | 分片独占插入锁受限 |
-| `contains` | **21.74 Mops/s** | — | 槽位目录只读路径 |
-| `erase` (10% 批次) | **3.03 Mops/s** | — | 分片墓碑发布与槽位回收 |
+| 操作 | 吞吐（Mops/s） |
+|---|---:|
+| `lookup_or_insert` | 1.02 |
+| `forward_lookup` | 11.365 |
+| `assign` | 32.76 |
+| `accumulate_gradients` | 4.25 |
+| `optimizer_step` | 20.065 |
+| `contains` | 22.295 |
+| `erase`（10% 批次） | 5.26 |
+
+### LFU 存储压力下的 Python 训练
+
+每批 4,096 个键，维度为 16，使用 SGD 和 LFU。线程预算为 4，进程绑定 CPU 0–11，内存限额为 256 KiB，spill 限额为 1 GiB。每次运行预热后计时 5 次，表中吞吐与延迟分别取 12 次运行的吞吐中位数和批次 p95 延迟的中位数。
+
+| 操作 | 吞吐（Mops/s） | 批次 p95（ms） |
+|---|---:|---:|
+| 异步查表 | 14.95 | 0.2825 |
+| 异步赋值 | 9.195 | 0.454 |
+| 异步 SGD 更新 | 6.426 | 0.6405 |
+| 同步训练步 | 1.724 | 2.3885 |
+
+### Arena 槽位元数据吞吐
+
+8 个工作线程绑定 CPU 0–7，对 262,144 个槽位遍历 32 次。每次运行取 5 次采样的中位数，下表取 12 次独立运行的中位数。组合操作对每个槽位发布 owner 后清除存活标记，计为一次操作。
+
+| 模式 | 十亿槽位/秒 |
+|---|---:|
+| `publish` | 1.999 |
+| `clear` | 3.47 |
+| `publish_clear` | 1.408 |
+
+在仓库根目录运行以下命令可复现上述负载。Python 环境需安装本项目的扩展。
+
+```bash
+bazel build -c opt //benchmarks:embedding_store_benchmark //benchmarks:page_compaction_owner_benchmark
+taskset -c 0-23 bazel-bin/benchmarks/embedding_store_benchmark --threads=16 --numa-aware-sharding --bind-affinity --skip-pressure
+taskset -c 0-11 python3 benchmarks/python/benchmark_e2e.py
+for mode in publish clear publish_clear; do
+  taskset -c 0-7 bazel-bin/benchmarks/page_compaction_owner_benchmark "$mode" 8
+done
+```
 
 ### Python 并发表操作吞吐与横向扩展
 
@@ -173,8 +205,8 @@ Adam 优化器状态包含一阶动量 ($m$)、二阶动量 ($v$) 与迭代步�
    - 默认每页 4,096 个槽位时，`step_state` 物理页规格为 **16 KiB**（$4096 \times 4\text{ B}$），槽位内存密度达 100%。
 3. **缓存工作集密度与并发局部性**：
    - 单条 64 字节缓存行高密度容纳 16 个槽位的 step 计数器。
-   - 在 262,144 个活跃槽位规模下，全表 step 状态工作集仅为 **1 MiB**，可完全驻留于 CPU L2/L3 缓存中，有效消除末级缓存（LLC）驱逐开销。
-   - 在哈希分片架构下，各工作线程访问互不相交的物理槽位区间，避免并发伪共享（False Sharing）。
+   - 预留 262,144 个槽位时，step 计数器共占 **1 MiB**。
+   - 不同线程更新相邻槽位时仍可能产生伪共享。
 
 ### 变动日志 (Mutation Journal) 内存与操作模式
 
@@ -183,7 +215,7 @@ Adam 优化器状态包含一阶动量 ($m$)、二阶动量 ($v$) 与迭代步�
 | 配置选项 | 内存常驻结构 | 热路径原子操作 | 检查点能力支持 | 适用场景 |
 |---|---|---|---|---|
 | `enable_mutation_journal = True` (默认) | 分配变动记录与指针管理数组（约 65 B/key RSS） | 写路径执行原子序号预留 | 全量 (FULL) + 增量 (INCREMENTAL) 检查点 | 在线增量快照、流式 CDC |
-| `enable_mutation_journal = False` | **零变动记录分配** | **无原子序号预留开销** | 仅全量 (FULL) 检查点，零开销快速恢复 | 纯模型训练、推理部署、周期性全量快照 |
+| `enable_mutation_journal = False` | **零变动记录分配** | **无原子序号预留开销** | 全量 (FULL) 检查点与恢复 | 纯模型训练、推理部署、周期性全量快照 |
 
 当关闭变动日志时，调用 `capture_checkpoint(incremental=True)` 或 `checkpoint_mutations()` 会立即抛出明确的 `RuntimeError`，严格杜绝生成静默损坏或缺失基线的不完整增量；而全量快照、恢复以及确认协议则具备完备的正确性保证。
 
@@ -213,7 +245,7 @@ relocation 不获取 mutex。扩表只发生在 writer/control plane：`reserve`
 
 | 层次 | 扩容规则 |
 |---|---|
-| 目录 bucket 预算 | `ceil(2.5 × key_capacity)`，再向上对齐到 16；若较小的 `ceil_pow2(4 × key_capacity)` 更省则采用它 |
+| 目录桶数 | 分片预留容量 `C > 0` 时使用 `4 × bit_floor(C)` 个桶，容量为零时使用 2 个桶 |
 | `MapBundle` 运行期容量 | `<64K`：2×；`64K≤capacity<1M`：1.5×；`≥1M`：1.25× |
 | shard 预算 | `reserve(keys_count, dim)` 精确按 shard 分摊；`reserve_per_shard(counts, dim)` 使用调用方给出的独立预算 |
 
@@ -221,7 +253,7 @@ relocation 不获取 mutex。扩表只发生在 writer/control plane：`reserve`
 slot 与 arena index 地址保持稳定。bucket/slot/arena 上限或分配失败直接抛异常，不使用
 fallback。
 
-### 最新性能结果
+### 运行时基准评测结果
 
 高并发 lookup/insert：`dim=32`、warm keys=`1<<20`、batch=1024、lookup 64 轮、insert 8
 轮、memory-only 1 GiB、每配置 5 次 median/p95/p99。
@@ -275,6 +307,8 @@ compaction 扩展：`dim=128`、64 shards、每 source worker 4 pages；使用�
 测试、TSAN、ASAN/UBSAN 均应作为发布前验证，不依赖异常捕获替代信号检测。
 
 ## 公开验证
+
+验证覆盖 45 个原生测试目标和 479 项 Python 测试。恢复基准使用 16,384、65,536 和 262,144 行的数据集，覆盖空结果、单线程与四线程条目恢复，以及单线程页镜像恢复。每种配置的恢复行数均与预期一致。
 
 ```bash
 bazel test -c opt --test_output=errors //sparse_embedding/...

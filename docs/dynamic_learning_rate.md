@@ -76,11 +76,11 @@ store.accumulate_gradients(keys, gradients)
 store.optimizer_step(1)
 ```
 
-## Important Notes
+## Constraints
 
-* **Score Policy is Required:** If you specify a dynamic LR policy that depends on scores (like `SqrtDecayLrPolicy`), you **must** also enable a score policy (e.g. `score_policy="lfu"`) in the `EmbeddingStore`. Failing to do so will result in a `ValueError` during initialization.
-* **Training Store Required:** Dynamic learning-rate policies are optimizer operations. Keep `EmbeddingConfig(enable_optimizer=True)` (the default) and provide `optimizer_config`; an optimizer-disabled inference store rejects gradient accumulation and optimizer steps.
-* **Performance:** The dynamic learning rate calculation introduces minimal overhead. The static/dynamic execution paths are resolved via `constexpr` at compile time to ensure zero overhead for static LR configurations, while dynamic LR computations are fully fused with the highly optimized SIMD vectorization updates (like AVX2/AVX-512).
+- **Score Policy Requirement**: Policies reading feature scores (e.g., `SqrtDecayLrPolicy`) require configuring `score_policy` at store creation; omitting it raises an initialization error.
+- **Training Mode**: Dynamic learning rate is an optimizer feature and requires `enable_optimizer=True`.
+- **Implementation**: Static and dynamic paths are resolved via compile-time `constexpr` branching, with dynamic scoring fused into the AVX-512 update kernel.
 
 ## Validation
 

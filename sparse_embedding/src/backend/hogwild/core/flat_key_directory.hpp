@@ -129,35 +129,12 @@ public:
   }
 
   static size_t bucket_count_for_key_capacity(size_t key_capacity) {
-    constexpr size_t kLegacyBucketMultiplier = 4;
-    constexpr size_t kProbeBudgetNumerator = 25;
-    constexpr size_t kProbeBudgetDenominator = 4;
-    constexpr size_t kBucketAlignment = 16;
     if (key_capacity == 0)
       return 2;
     if (key_capacity > maximum_key_capacity())
       throw std::overflow_error("key directory key capacity exceeds range");
 
-    const size_t probe_budget_capacity =
-        (key_capacity * kProbeBudgetNumerator + (kProbeBudgetDenominator - 1)) /
-        kProbeBudgetDenominator;
-    const size_t alignment_remainder = probe_budget_capacity % kBucketAlignment;
-    const size_t aligned_probe_budget_capacity =
-        alignment_remainder == 0
-            ? probe_budget_capacity
-            : checked_add(probe_budget_capacity,
-                          kBucketAlignment - alignment_remainder);
-    if (aligned_probe_budget_capacity > maximum_bucket_count())
-      throw std::overflow_error("key directory aligned capacity exceeds range");
-
-    const size_t legacy_minimum = key_capacity * kLegacyBucketMultiplier;
-    const size_t maximum_power_of_two_capacity =
-        std::bit_floor(maximum_bucket_count());
-    const size_t legacy_capacity =
-        legacy_minimum <= maximum_power_of_two_capacity
-            ? checked_bit_ceil(legacy_minimum)
-            : aligned_probe_budget_capacity;
-    return std::min(aligned_probe_budget_capacity, legacy_capacity);
+    return std::bit_floor(key_capacity) * kBucketsPerCapacityStep;
   }
 
   static constexpr size_t maximum_bucket_count() noexcept {
@@ -165,32 +142,17 @@ public:
   }
 
   static constexpr size_t maximum_key_capacity() noexcept {
-    return ((maximum_bucket_count() - 15) * 4 - 3) / 25;
+    return (std::bit_floor(maximum_bucket_count()) / kBucketsPerCapacityStep) *
+               2 -
+           1;
   }
 
 private:
+  static constexpr size_t kBucketsPerCapacityStep = 4;
   static constexpr size_t kBytesPerBucket = sizeof(uint32_t);
   static constexpr uint32_t kEmptySlot = 0;
   static constexpr uint32_t kTombstoneSlot =
       std::numeric_limits<uint32_t>::max();
-
-  static size_t checked_add(size_t left, size_t right) {
-    if (right > std::numeric_limits<size_t>::max() - left)
-      throw std::overflow_error("key directory capacity addition overflow");
-    return left + right;
-  }
-
-  static size_t checked_bit_ceil(size_t value) {
-    if (value <= 1)
-      return 1;
-    const unsigned width = std::bit_width(value - 1);
-    if (width >= std::numeric_limits<size_t>::digits)
-      throw std::overflow_error("key directory power-of-two capacity overflow");
-    const size_t capacity = size_t{1} << width;
-    if (capacity > maximum_bucket_count())
-      throw std::overflow_error("key directory capacity exceeds byte range");
-    return capacity;
-  }
 
   size_t bucket_position(uint64_t hash) const noexcept {
     if (power_of_two_mask_ != 0)

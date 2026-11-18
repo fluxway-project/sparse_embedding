@@ -10,6 +10,7 @@
 #include <mutex>
 #include <numeric>
 #include <optional>
+#include <ranges>
 #include <span>
 #include <stdexcept>
 #include <vector>
@@ -53,6 +54,16 @@ static_assert(sizeof(LocatorSlot) == 32);
 static_assert(alignof(LocatorSlot) == 8);
 static_assert(std::atomic<uint64_t>::is_always_lock_free);
 
+// The view is consumed inside the batch write guard, while slot identities are
+// stable.
+inline auto locked_checkpoint_records(std::span<LocatorSlot *const> slots) {
+  return slots | std::views::transform([](const LocatorSlot *slot) {
+           return CheckpointRecordRef::from(
+               slot->checkpoint_record.load(std::memory_order_acquire));
+         });
+}
+using LockedCheckpointRecords = decltype(locked_checkpoint_records({}));
+
 class LocatorSequenceExhausted final : public std::runtime_error {
 public:
   LocatorSequenceExhausted()
@@ -67,7 +78,8 @@ public:
   static constexpr uint32_t kRotationSequence =
       std::numeric_limits<uint32_t>::max() - 3U;
 
-  SegmentedLocatorTable() = default;
+  explicit SegmentedLocatorTable(bool collect_records = true)
+      : collect_records_(collect_records) {}
   ~SegmentedLocatorTable() {
     for (auto &segment : segments_)
       delete segment.load(std::memory_order_relaxed);
@@ -259,21 +271,15 @@ public:
     const LocatorSlot *slot = locate(slot_id);
     if (slot == nullptr)
       return false;
-    while (true) {
-      PackedReadGuard guard(slot->packed, slot->readers);
-      const uint64_t before = slot->packed.load(std::memory_order_acquire);
-      const uint32_t encoded = decode_index(before);
-      if (encoded == 0)
-        return false;
-      se::memory::compiler_barrier();
-      std::forward<Read>(read)(
-          decode(encoded),
-          CheckpointRecordRef::from(
-              slot->checkpoint_record.load(std::memory_order_acquire)));
-      se::memory::compiler_barrier();
-      if (before == slot->packed.load(std::memory_order_acquire))
-        return true;
-    }
+    PackedReadGuard guard(slot->packed, slot->readers);
+    const uint64_t before = slot->packed.load(std::memory_order_acquire);
+    const uint32_t encoded = decode_index(before);
+    if (encoded == 0)
+      return false;
+    std::forward<Read>(read)(
+        decode(encoded), CheckpointRecordRef::from(slot->checkpoint_record.load(
+                             std::memory_order_acquire)));
+    return true;
   }
 
   template <typename Read>
@@ -306,21 +312,15 @@ public:
     const LocatorSlot *slot = locate(slot_id);
     if (slot == nullptr)
       return false;
-    while (true) {
-      PackedReadGuard guard(slot->packed, slot->readers);
-      const uint64_t before = slot->packed.load(std::memory_order_acquire);
-      const uint32_t encoded = decode_index(before);
-      if (encoded == 0 || slot->key != expected_key)
-        return false;
-      se::memory::compiler_barrier();
-      std::forward<Read>(read)(
-          decode(encoded),
-          CheckpointRecordRef::from(
-              slot->checkpoint_record.load(std::memory_order_acquire)));
-      se::memory::compiler_barrier();
-      if (before == slot->packed.load(std::memory_order_acquire))
-        return true;
-    }
+    PackedReadGuard guard(slot->packed, slot->readers);
+    const uint64_t before = slot->packed.load(std::memory_order_acquire);
+    const uint32_t encoded = decode_index(before);
+    if (encoded == 0 || slot->key != expected_key)
+      return false;
+    std::forward<Read>(read)(
+        decode(encoded), CheckpointRecordRef::from(slot->checkpoint_record.load(
+                             std::memory_order_acquire)));
+    return true;
   }
 
   template <typename Write>
@@ -423,9 +423,33 @@ private:
     std::vector<size_t> lock_order;
     std::vector<size_t> radix_scratch;
     std::vector<LocatorSlot *> slots;
-    std::vector<se::memory::PackedWriteTarget> targets;
     std::vector<uint32_t> indices;
-    std::vector<CheckpointRecordRef> checkpoint_records;
+  };
+
+  class LockedBatch {
+  public:
+    explicit LockedBatch(KeyedBatchScratch &scratch) noexcept
+        : scratch_(scratch) {}
+    LockedBatch(const LockedBatch &) = delete;
+    LockedBatch &operator=(const LockedBatch &) = delete;
+
+    uint64_t lock(LocatorSlot &slot) noexcept {
+      const uint64_t held =
+          se::memory::PackedWriteLock(slot.packed, slot.readers).lock();
+      scratch_.slots[scratch_.lock_order[locked_++]] = &slot;
+      return held;
+    }
+
+    ~LockedBatch() {
+      while (locked_ != 0) {
+        auto &slot = *scratch_.slots[scratch_.lock_order[--locked_]];
+        se::memory::PackedWriteLock(slot.packed, slot.readers).unlock();
+      }
+    }
+
+  private:
+    KeyedBatchScratch &scratch_;
+    size_t locked_ = 0;
   };
 
   static KeyedBatchScratch &keyed_batch_scratch() {
@@ -438,7 +462,7 @@ public:
   bool try_write_key_batch(std::span<const KeyedWriteSlot> entries,
                            Write &&write) {
     static_assert(std::is_invocable_v<Write, std::span<const uint32_t>,
-                                      std::span<const CheckpointRecordRef>>);
+                                      LockedCheckpointRecords>);
     if (entries.empty())
       throw std::invalid_argument("locator keyed batch is empty");
     KeyedBatchScratch &scratch = keyed_batch_scratch();
@@ -448,7 +472,11 @@ public:
         std::ranges::is_sorted(entries, {}, &KeyedWriteSlot::slot_id);
     if (!already_sorted) {
       scratch.radix_scratch.resize(scratch.lock_order.size());
-      for (unsigned shift = 0; shift < 32; shift += 8) {
+      const auto largest =
+          std::ranges::max_element(entries, {}, &KeyedWriteSlot::slot_id)
+              ->slot_id;
+      for (unsigned shift = 0; shift < 32 && (largest >> shift) != 0;
+           shift += 8) {
         std::array<size_t, 256> counts{};
         for (const size_t position : scratch.lock_order)
           ++counts[(entries[position].slot_id >> shift) & 0xffU];
@@ -473,48 +501,24 @@ public:
     }
 
     scratch.slots.resize(entries.size());
-    scratch.targets.resize(entries.size());
     scratch.indices.resize(entries.size());
-    scratch.checkpoint_records.resize(entries.size());
-    for (size_t lock_position = 0; lock_position < scratch.lock_order.size();
-         ++lock_position) {
-      const size_t position = scratch.lock_order[lock_position];
+    LockedBatch held(scratch);
+    for (const size_t position : scratch.lock_order) {
       const KeyedWriteSlot entry = entries[position];
       LocatorSlot &slot = locate_required(entry.slot_id);
       if (version_of(slot.packed.load(std::memory_order_acquire)) >=
           kRotationSequence)
         throw LocatorSequenceExhausted();
-      scratch.slots[lock_position] = &slot;
-      scratch.targets[lock_position] = {&slot.packed, &slot.readers};
+      const uint32_t encoded = decode_index(held.lock(slot));
+      if (encoded == 0 || slot.key != entry.expected_key)
+        return false;
+      scratch.indices[position] = decode(encoded);
     }
-
-    bool valid = true;
-    {
-      se::memory::PackedWriteGuardBatch guard_batch(scratch.targets);
-      for (size_t lock_position = 0; lock_position < scratch.lock_order.size();
-           ++lock_position) {
-        const size_t position = scratch.lock_order[lock_position];
-        LocatorSlot &slot = *scratch.slots[lock_position];
-        const uint64_t current = slot.packed.load(std::memory_order_acquire);
-        const uint32_t encoded = decode_index(current);
-        if (encoded == 0 || slot.key != entries[position].expected_key) {
-          valid = false;
-          break;
-        }
-        scratch.indices[position] = decode(encoded);
-        scratch.checkpoint_records[position] = CheckpointRecordRef::from(
-            slot.checkpoint_record.load(std::memory_order_acquire));
-      }
-      if (valid)
-        std::forward<Write>(write)(
-            std::span<const uint32_t>(scratch.indices),
-            std::span<const CheckpointRecordRef>(scratch.checkpoint_records));
-    }
-    scratch.slots.clear();
-    scratch.targets.clear();
-    scratch.indices.clear();
-    scratch.checkpoint_records.clear();
-    return valid;
+    const std::span<LocatorSlot *const> slots(scratch.slots);
+    std::forward<Write>(write)(
+        std::span<const uint32_t>(scratch.indices),
+        locked_checkpoint_records(collect_records_ ? slots : slots.first(0)));
+    return true;
   }
 
   template <typename Retire>
@@ -687,6 +691,7 @@ private:
   }
 
   std::array<std::atomic<Segment *>, kMaxSegments> segments_{};
+  const bool collect_records_;
   std::atomic<uint32_t> next_slot_{1};
   std::mutex recycle_mutex_;
   std::vector<uint32_t> recycled_slots_;

@@ -3,6 +3,7 @@ import inspect
 import json
 import pickle
 from concurrent.futures import ThreadPoolExecutor
+from contextlib import closing
 from datetime import timedelta
 from types import MappingProxyType
 
@@ -108,6 +109,28 @@ def handle(committed):
     return committed.handle
 
 
+def test_restored_exhausted_owner_slot_does_not_poison_next_insert():
+    cfg = inference_config()
+    store = se.EmbeddingStore(cfg)
+    old_key = np.array([0], dtype=np.uint64)
+    store.lookup_or_insert(old_key, dim=4)
+    (image,) = store.export_page_images()
+    image["seq_counts"] = [(1 << 64) - 2]
+
+    restored = se.EmbeddingStore(cfg)
+    restored.import_page_images([image])
+    restored.erase(old_key)
+    # Reinsert the same key so the allocator must visit the original shard.
+    restored.lookup_or_insert(old_key, dim=4)
+    (replacement,) = restored.export_page_images()
+    assert replacement["keys"] == [0]
+    assert replacement["seq_counts"] == [2]
+    assert (replacement["physical_page_id"], replacement["slot_ordinals"]) != (
+        image["physical_page_id"],
+        image["slot_ordinals"],
+    )
+
+
 def test_user_facade_roundtrip(tmp_path):
     checkpoint = SparseCheckpoint(LocalLanceStorage(tmp_path / "checkpoint"))
     source = populated_store((1, 2), 3)
@@ -119,6 +142,50 @@ def test_user_facade_roundtrip(tmp_path):
         target_restore(CheckpointParticipant(0, 1)),
     )
     np.testing.assert_allclose(lookup(restored, (1, 2)), 3)
+
+
+@pytest.mark.parametrize(
+    "engine", [IngestionEngine.RECONSTRUCT_ENTRIES, IngestionEngine.FAST_PAGE_CACHE]
+)
+def test_disabled_journal_restores_full_adam_and_rejects_delta(tmp_path, engine):
+    cfg = se.EmbeddingConfig(
+        dims=[4], key_dtype="uint64", thread_budget=2, enable_mutation_journal=False
+    )
+    optimizer = se.Adam(lr=0.01)
+    source = se.EmbeddingStore(cfg, optimizer_config=optimizer)
+    keys = np.array([3, 9], dtype=np.uint64)
+    values = np.arange(8, dtype=np.float32).reshape(2, 4)
+    source.assign(keys, values)
+    source.accumulate_gradients(keys, values + 1)
+    source.optimizer_step(1)
+    with closing(LocalLanceStorage(tmp_path / "checkpoint")) as storage:
+        checkpoint = SparseCheckpoint(storage)
+        parent = checkpoint.save_training_checkpoint(
+            source,
+            "full-only",
+            include_page_images=engine is IngestionEngine.FAST_PAGE_CACHE,
+        )
+        with pytest.raises(
+            RuntimeError, match="incremental checkpoint requires mutation journal"
+        ):
+            checkpoint.save_training_checkpoint(
+                source,
+                "full-only",
+                mode=CheckpointSaveMode.INCREMENTAL,
+                parent_handle=parent.handle,
+            )
+        restored = se.EmbeddingStore(cfg, optimizer_config=optimizer)
+        checkpoint.load_training_checkpoint(
+            restored,
+            parent.handle,
+            target_restore(CheckpointParticipant(0, 1), engine=engine),
+        )
+        for store in (source, restored):
+            with pytest.raises(RuntimeError, match="mutation tracking is disabled"):
+                store.checkpoint_mutations()
+            store.accumulate_gradients(keys, 2 - values)
+            store.optimizer_step(1)
+        np.testing.assert_array_equal(lookup(source, keys), lookup(restored, keys))
 
 
 def test_exclusive_recovery_fences_direct_mutation_entries(tmp_path):

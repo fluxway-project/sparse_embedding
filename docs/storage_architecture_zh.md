@@ -67,16 +67,16 @@ Sparse Embedding 存储引擎自顶向下分为五层：
 
 定位槽管理由 `SegmentedLocatorTable` 负责，由 32 KiB 的固定段组成，每个槽位包含 8 字节对齐的 `{sequence, arena_index}`：
 
-- **乐观读取与原地更新**：Reader 与权重就地更新操作（如 `optimizer_step`、`assign`）通过纯乐观 `try_read` 读取 sequence 与 `arena_index`，经过编译器屏障后直接就地访问物理内存，最后校验 sequence 一致性。热路径上完全无锁且无原子计数修改。
+- **读取与原地更新**：只读 lookup 使用乐观读取并校验槽位序号。更新已有行的 `assign` 和需要更新分数的 lookup 持有 locator 读保护，使所在行在更新期间保持原位。优化器在 locator 批次写保护范围内更新参数。
 - **搬迁感知与 ABA 防护**：当后台 Compaction 迁移物理页修改 `arena_index` 时，通过 CAS 将 sequence 置为奇数，完成数据拷贝后再原子发布新的偶数 sequence 与新地址。并发 Reader 检测到版本变动会自动重试。当 sequence 接近回绕时，目录会自动将该键轮转至新槽位并退休旧槽位。
 
 ### 3.3 两级平坦物理页目录 (`StablePageDirectory`)
 
-物理页目录采用两级紧凑指针目录 `StablePageDirectory<T>`（统一管理数据页、状态页、属主信息与锁），目录常驻 CPU L1 Cache：
+数据页使用分段地址目录。启用分数策略时，arena 另行分配分数页、页句柄和分数地址目录。页号和页内偏移由 arena 索引计算。
 
 $$\text{page\_id} = \text{index} \gg \text{entries\_shift}, \quad \text{slot\_offset} = \text{index} \ \& \ \text{slot\_mask}$$
 
-寻址直接通过单周期无分支位运算完成，彻底消除堆指针多级跳跃。
+每个已分配槽位保存一个 64 位键、一个 64 位 owner 序号和一个独立的原子存活标记。在本报告的 x86-64 平台上，这三项合计每槽 17 字节。扫描线程在 epoch 保护下读取已发布的 owner 页指针。空页退役时，arena 撤下该指针，待已有读者退出 epoch 后释放该页资源。槽位的 owner 序号达到最大偶数后，分配器在复用时跳过该槽位。
 
 ### 3.4 四级软件流水线预取
 
@@ -98,7 +98,7 @@ $$\text{page\_id} = \text{index} \gg \text{entries\_shift}, \quad \text{slot\_of
   - 应用于 Adam 步数计数器（`step_state`），其每行仅为一个标量 `uint32_t`（4 字节）；
   - 页起始地址保持 64 字节对齐，而页内槽位行跨度严格紧凑为 4 字节 (`sizeof(uint32_t)`)；
   - **物理页规格**：默认 4,096 槽物理页分配规格仅为 **16 KiB**（$4096 \times 4\text{ B}$）；
-  - **缓存局部性**：单条 64 字节缓存行可容纳 16 个槽位的 step 计数器（256K 活跃槽位仅占 1 MiB 内存，完全装入 CPU L2/L3 缓存），有效消除跨页跳跃与 LLC Cache Miss。
+  - **缓存局部性**：单条 64 字节缓存行可容纳 16 个槽位的 step 计数器，262,144 个预留槽位的计数器占 1 MiB。
 
 ---
 

@@ -75,11 +75,11 @@ store.accumulate_gradients(keys, gradients)
 store.optimizer_step(1)
 ```
 
-## 重要注意事项
+## 使用约束
 
-* **依赖得分策略 (Score Policy is Required)：**如果你在优化器中指定了需要依赖得分的策略（例如 `SqrtDecayLrPolicy`），你就**必须**在创建 `EmbeddingStore` 时同时启用得分策略（例如 `score_policy="lfu"`）。如果未启用，系统在初始化时会抛出 `ValueError`。
-* **仅适用于训练 Store：**动态学习率策略属于优化器操作。请保持 `EmbeddingConfig(enable_optimizer=True)`（默认值）并提供 `optimizer_config`；禁用 optimizer 的推理 store 调用梯度累积或 optimizer step 会直接抛出异常。
-* **极致性能 (Performance)：**动态学习率引入的额外开销微乎其微。底层的 C++ 实现使用了 `constexpr` 来在编译期决议静态和动态学习率代码路径，确保对于普通的静态学习率没有任何额外开销；而对于动态学习率，其计算逻辑已完全融合到了底层深度优化的 SIMD (如 AVX2/AVX-512) 向量化更新流程中，做到了高效并行计算。
+- **得分策略依赖**：依赖特征得分的策略（如 `SqrtDecayLrPolicy`）要求建表时配置 `score_policy`，未指定时初始化报错。
+- **训练模式限定**：动态学习率为优化器行为，仅在 `enable_optimizer=True` 时生效。
+- **性能实现**：静态与动态学习率分支由 `constexpr` 在编译期决议，动态计算融合于 AVX-512 更新内核。
 
 ## 验证
 

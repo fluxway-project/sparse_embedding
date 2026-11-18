@@ -434,6 +434,40 @@ struct BlockingCheckpointInitializer {
   }
 };
 
+static void test_disabled_incremental_rejects_during_insert() {
+  std::latch initializing(1), resume_insert(1), capturing(1);
+  HogwildEmbeddingStore<uint64_t, float, float, ManualScorePolicy> store(
+      {4},
+      pro::make_proxy<InitializerFacade<float>>(
+          BlockingCheckpointInitializer{&initializing, &resume_insert}),
+      nullptr, ManualScorePolicy{},
+      HogwildStoreOptions{.thread_budget = 2,
+                          .enable_mutation_journal = false});
+  auto insert = std::async(std::launch::async, [&] {
+    std::array<uint64_t, 1> keys{1};
+    std::array<int64_t, 1> lengths{4};
+    std::array<float, 4> output{};
+    store.lookup_or_insert<uint64_t>(keys, output, lengths);
+  });
+  initializing.wait();
+  auto capture = std::async(std::launch::async, [&] {
+    capturing.count_down();
+    try {
+      store.capture_checkpoint(true, "parent", false, 0, nullptr, nullptr);
+    } catch (const std::runtime_error &error) {
+      return std::string_view(error.what()) ==
+             "incremental checkpoint requires mutation journal to be enabled";
+    }
+    return false;
+  });
+  capturing.wait();
+  const auto status = capture.wait_for(std::chrono::seconds(2));
+  resume_insert.count_down();
+  insert.get();
+  CHECK(capture.get());
+  CHECK(status == std::future_status::ready);
+}
+
 static void test_capture_drains_inflight_insert() {
   std::latch initializing(1), resume_insert(1), capturing(1);
   HogwildEmbeddingStore<uint64_t, float, float, ManualScorePolicy> store(
@@ -585,6 +619,31 @@ static void test_journal_identity_and_acknowledgement_lifecycle() {
   CHECK(store.checkpoint_mutations().size() == keys.size());
 }
 
+static void test_assign_journals_completed_rows_on_error() {
+  auto store = make_store<ManualScorePolicy>(4, 1);
+  const std::array<uint64_t, 1> first_key{17};
+  const std::array<int64_t, 1> length{4};
+  const std::array<float, 4> initial{};
+  store.assign<uint64_t>(first_key, initial, length);
+  const auto watermark = store.checkpoint_mutation_watermark();
+  const std::array<uint64_t, 2> keys{17, 23};
+  const std::array<int64_t, 2> lengths{4, 1};
+  const std::array<float, 5> values{1, 2, 3, 4, 5};
+  bool rejected = false;
+  try {
+    store.assign<uint64_t>(keys, values, lengths);
+  } catch (const std::runtime_error &error) {
+    rejected = std::string_view(error.what()).starts_with("invalid dim access");
+  }
+  CHECK(rejected);
+  const auto mutations = store.checkpoint_mutations();
+  CHECK(mutations.size() == 1 && mutations.front().key == first_key.front());
+  CHECK(mutations.front().mutation_sequence > watermark);
+  std::array<float, 4> output{};
+  store.lookup<uint64_t>(first_key, output, length);
+  CHECK(std::ranges::equal(output, std::span(values).first(4)));
+}
+
 static void test_shared_key_score_publication() {
   auto store = make_store<LfuScorePolicy>(4, 4);
   const std::vector<uint64_t> keys{1};
@@ -623,9 +682,11 @@ int main() {
   test_incremental_export();
   test_evict_by_score();
   test_capture_serializes_mutations();
+  test_disabled_incremental_rejects_during_insert();
   test_capture_drains_inflight_insert();
   test_dirty_capture_visits_only_requested_keys();
   test_journal_identity_and_acknowledgement_lifecycle();
+  test_assign_journals_completed_rows_on_error();
   test_shared_key_score_publication();
   std::cout << "=== ALL PASSED ===\n";
   return 0;

@@ -39,6 +39,40 @@ template <typename Function> void require_throws(Function &&function) {
   throw std::runtime_error("expected operation to throw");
 }
 
+void run_owner_page_retirement_regression() {
+  se::StorageOptions options;
+  options.mode = se::StorageMode::kMemoryOnly;
+  auto storage = se::create_page_storage(std::move(options));
+  se::EmbeddingArena<float> arena(1, true, storage,
+                                  storage->stats().retirement_pressure_domain);
+  arena.reserve_entries(4 * arena.entries_per_page());
+  arena.bind_exact(0, 0);
+  arena.publish_owner(0, 17);
+  arena.mark_live(0, true);
+  *arena.data_trusted(0) = 3.0F;
+  std::atomic<bool> reclaimed{false};
+  {
+    se::concurrency::EpochAnnouncement scanner(true);
+    require(arena.page_allocated(0) && arena.owner_snapshot(0)->key == 17,
+            "scanner could not see the published owner");
+    std::thread retire([&] {
+      arena.mark_live(0, false);
+      arena.retire_empty_page(0, [&]() noexcept { reclaimed.store(true); });
+    });
+    retire.join();
+    require(!arena.owner_snapshot(0), "detached page exposed a stale owner");
+    arena.reset();
+    const auto stats = storage->stats();
+    require(!reclaimed.load() && stats.retired_bytes > 0 &&
+                stats.memory_bytes == stats.retired_bytes,
+            "reset retained pages outside the pinned retirement");
+  }
+  se::concurrency::EpochRetirementDomain::request_progress();
+  require(reclaimed.load() && storage->stats().memory_bytes == 0,
+          "retired page was not released after scanner exit");
+  require_throws([&] { (void)arena.data(0); });
+}
+
 void run_optimizer_commit_batch_regression() {
   auto storage = se::create_page_storage();
   const se::SgdConfig config{.lr = 0.01F};
@@ -203,6 +237,7 @@ int main(int argc, char **argv) {
   }
   run_optimizer_step_dim1_regression("all");
   run_optimizer_commit_batch_regression();
+  run_owner_page_retirement_regression();
 
   se::StorageOptions options;
   options.memory_limit_bytes = 0;
@@ -1298,22 +1333,39 @@ int main(int argc, char **argv) {
       8, true, duplicate_storage,
       duplicate_storage->stats().retirement_pressure_domain);
   const uint32_t owner_index = owner_arena.allocate();
-  owner_arena.publish_owner(owner_index, 700, 2);
+  owner_arena.publish_owner(owner_index, 700);
   owner_arena.mark_live(owner_index, true);
   const auto old_owner = owner_arena.owner_snapshot(owner_index);
   require(old_owner.has_value() && old_owner->key == 700 &&
-              old_owner->shard_id == 2,
+              old_owner->seq_count == 2,
           "arena owner metadata was not published");
+  owner_arena.mark_owner_not_live(owner_index);
+  require(owner_arena.is_live(owner_index) &&
+              !owner_arena.owner_snapshot(owner_index),
+          "invalidated owner was visible before bitmap retirement");
   owner_arena.mark_live(owner_index, false);
   require(!owner_arena.owner_snapshot(owner_index).has_value(),
           "retired arena index retained a live owner");
-  owner_arena.publish_owner(owner_index, 701, 3);
+  owner_arena.publish_owner(owner_index, 701);
   owner_arena.mark_live(owner_index, true);
   const auto new_owner = owner_arena.owner_snapshot(owner_index);
   require(new_owner.has_value() && new_owner->key == 701 &&
-              new_owner->shard_id == 3 &&
-              new_owner->seq_count != old_owner->seq_count,
+              new_owner->seq_count == old_owner->seq_count + 2,
           "reused arena index did not invalidate its stale owner record");
+  owner_arena.mark_live(owner_index, false);
+  constexpr uint64_t last_sequence = std::numeric_limits<uint64_t>::max() - 1;
+  owner_arena.publish_owner_exact(owner_index, 702, last_sequence);
+  owner_arena.mark_live(owner_index, true);
+  require(owner_arena.owner_snapshot(owner_index)->seq_count == last_sequence,
+          "page image truncated the owner sequence");
+  owner_arena.mark_live(owner_index, false);
+  bool exhausted = false;
+  try {
+    owner_arena.publish_owner(owner_index, 703);
+  } catch (const std::overflow_error &) {
+    exhausted = true;
+  }
+  require(exhausted, "owner reuse wrapped the last checkpoint sequence");
 
   se::TransientArena<float> transient(8, duplicate_storage);
   transient.get_or_allocate(1);

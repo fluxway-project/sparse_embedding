@@ -6,7 +6,6 @@
 #include <cstdint>
 #include <exception>
 #include <iostream>
-#include <span>
 #include <stdexcept>
 #include <string_view>
 #include <thread>
@@ -74,8 +73,7 @@ double run_once(se::EmbeddingArena<float> &arena, Mode mode, size_t workers) {
         for (size_t repetition = 0; repetition < kRepetitions; ++repetition) {
           for (uint32_t index = begin; index < end; ++index) {
             if (mode == Mode::kPublish || mode == Mode::kPublishClear)
-              arena.publish_owner(index, static_cast<uint64_t>(index) + 1,
-                                  index & 63U);
+              arena.publish_owner(index, static_cast<uint64_t>(index) + 1);
             if (mode == Mode::kClear || mode == Mode::kPublishClear)
               arena.mark_owner_not_live(index);
           }
@@ -116,7 +114,7 @@ int main(int argc, char **argv) {
   se::EmbeddingArena<float> arena(1, false, storage, retirement_pressure);
   arena.reserve_entries(kOwnerCount);
   for (uint32_t index = 0; index < kOwnerCount; ++index) {
-    arena.publish_owner(index, static_cast<uint64_t>(index) + 1, index & 63U);
+    arena.publish_owner(index, static_cast<uint64_t>(index) + 1);
     arena.mark_owner_not_live(index);
   }
   std::vector<double> elapsed;

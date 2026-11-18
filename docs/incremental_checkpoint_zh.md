@@ -54,9 +54,9 @@ Sparse Embedding 提供原生**增量检查点**与**流式 Compaction** 能力�
 ### 2.1 分片内存变动日志 (Mutation Journaling)
 
 每个 Hash 分片维护独立的轻量级 `CheckpointMutationJournal`：
-- **脏键追踪**：当特征权重或优化器状态在 `assign`、`accumulate_gradients` 或 `optimizer_step` 中被修改时，其定位槽与递增序号即时记录到当前活跃 Journal 中。
+- **脏键追踪**：当特征权重或优化器状态在 `assign`、`accumulate_gradients` 或 `optimizer_step` 中被修改时，日志记录对应键的本次生命周期。对已存在的行，每个 assign 工作线程为已完成的写入一次预留一段序号。捕获会等待活动调用退出，即使后续某行失败，之前已完成的写入也会登记。
 - **删除墓碑记录**：显式删除（`erase`、`erase_dimension`）或基于分数的淘汰清理会生成对应的删除墓碑（Tombstone），确保跨版本删除语义严格保真。
-- **只读热路径零开销**：`forward_lookup` 和 `lookup_or_insert` 命中路径不经过 Journal 互斥锁，也不执行任何原子写计数。
+- **前向读取与分数**：无分数或手动分数模式下，前向读取不写变动日志。LFU/LRU 读取可能改变分数；每个工作线程为本批实际更新的分数一次预留日志序号。
 
 #### 可配置变动日志 (`enable_mutation_journal`)
 
@@ -70,10 +70,10 @@ config = se.EmbeddingConfig(
 ```
 
 **运行机制与契约保证：**
-1. **零记录内存分配**：关闭日志后完全跳过每个 Key 对应的变动记录结构体与指针数组分配，消除变动追踪产生的内存常驻。
+1. **零记录内存分配**：关闭日志后不分配逐 key 变更记录、分片脏链表头和优化器批次记录数组。locator 仍保留指针字段。
 2. **热路径零原子序号开销**：写路径（`assign`、`optimizer_step`、带分数的访问等）完全跳过原子序列号递增与预留。
 3. **全量快照功能完整**：全量检查点捕获（`save_training_checkpoint(mode=FULL)`）、恢复引擎及确认协议均完备工作且数据 100% 一致。
-4. **强校验快速失败 (Fail-Fast)**：当关闭日志时，任何尝试请求增量检查点（`capture_checkpoint(incremental=True)` 或 `save_training_checkpoint(mode=INCREMENTAL)`）或查询变动历史（`store.checkpoint_mutations()`）的操作均会立即抛出 `RuntimeError("incremental checkpoint requires mutation journal to be enabled")`，严格杜绝产生破损或缺失基线的残缺增量快照。
+4. **强校验快速失败 (Fail-Fast)**：当关闭日志时，任何尝试请求增量检查点（`capture_checkpoint(incremental=True)` 或 `save_training_checkpoint(mode=INCREMENTAL)`）会抛出 `RuntimeError("incremental checkpoint requires mutation journal to be enabled")`。调用 `store.checkpoint_mutations()` 会抛出 `RuntimeError("checkpoint mutation tracking is disabled for this store")`。
 
 ### 2.2 两阶段一致性切片协议
 
@@ -103,7 +103,7 @@ config = se.EmbeddingConfig(
 
 ### 2.4 物理 Source 分片存储与跨拓扑检查点不变量
 
-增量检查点在数学上定义为基线快照之上的增量变动：$f(\text{Base}) + \Delta$。当集群拓扑变更（如 Worker 数量扩缩容或分片算法更新）导致 Key 所有权发生转移时，拓扑重构后的首个检查点必须保存为 `FULL` 全量检查点，而非 `INCREMENTAL` 增量检查点。
+增量检查点在数学上定义为基线快照之上的增量变动：$f(\text{Base}) + \Delta$。当集群拓扑变更（如 Worker 数量扩缩容或分片算法更新）导致 Key 所有权发生转移时，拓扑调整后的首个检查点必须保存为 `FULL` 全量检查点，而非 `INCREMENTAL` 增量检查点。
 
 #### 1. 物理架构：独立的 Participant 分片存储
 在分布式训练写路径上，为实现零互斥锁争用与无阻塞捕获，分布式 Worker 不会并发写入同一个物理 Lance 表文件。每个训练 Worker 独立维护本地 Shard 的变动日志，并在切片时将变动条目写出至独占的物理子目录：
@@ -133,7 +133,7 @@ _staging/<attempt>/<participant_id>/entries.lance
 └──────────────────────────────────────────────────────────────────────────────────────┘
 ```
 
-拓扑重构后首个检查点强制为 `FULL` 的技术考量：
+拓扑变更后首个检查点强制为 `FULL` 的技术考量：
 1. **分片基线连续性（Base Slice Continuity）**：增量片段仅记录当前步变更的条目。若在新节点接管键后直接保存增量，未在该步被修改的历史键将遗失在增量之外，后续恢复将无法仅依赖新节点的父链还原完整状态，退化为跨节点递归回溯。
 2. **有界读取开销（Bounded Read Amplification）**：若允许多次跨拓扑增量链级联，节点恢复时需扫描历史上所有拓扑结构下的所有碎片，读取复杂度从 $O(N_{\text{checkpoints}})$ 退化为 $O(N_{\text{participants}} \times N_{\text{checkpoints}})$。
 3. **序列号域隔离与墓碑消除（Sequence Domain Isolation & Tombstone Elimination）**：变动序号仅在各 Worker 本地单调递增，无全局物理时钟。跨节点的删除墓碑若直接多源归并，极易因缺乏绝对偏序导致已删除条目被误判或复活。

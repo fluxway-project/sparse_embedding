@@ -67,16 +67,16 @@ The core query resolution path follows: `Key Hash -> Shard ID -> slot_id -> Segm
 
 Slot allocation is managed by `SegmentedLocatorTable`, structured in fixed 32 KiB segments with 8-byte aligned slots storing `{sequence, arena_index}`:
 
-- **Optimistic Reading and In-Place Updates**: Readers and in-place weight updaters (e.g., `optimizer_step`, `assign`) use optimistic `try_read` to load the sequence and `arena_index`, passing compiler barriers to access physical memory in-place before validating sequence consistency. Hot paths are entirely lock-free with zero atomic writes.
+- **Reads and in-place updates**: Read-only lookups validate the locator sequence after reading. Assigning an existing row or updating its access score holds a locator read guard to keep the row in place. The optimizer updates parameters under a batch of locator write locks.
 - **Relocation Awareness and ABA Defense**: When background compaction migrates physical pages and mutates `arena_index`, it flips the sequence from even to odd via CAS, copies payloads, and atomically publishes the new even sequence and address. Concurrent readers detect the version change and retry automatically. As sequences approach wraparound, keys are rotated to fresh slots while permanently retiring old slots.
 
 ### 3.3 Flat Two-Level Page Directory (`StablePageDirectory`)
 
-Physical page management employs a compact two-level pointer directory `StablePageDirectory<T>` (managing data pages, state pages, owners, and locks) resident in CPU L1 cache:
+The arena uses a segmented address directory for data pages. Enabling a score policy also allocates score pages, their handles and a separate score address directory. The arena index determines the page and the offset within it.
 
 $$\text{page\_id} = \text{index} \gg \text{entries\_shift}, \quad \text{slot\_offset} = \text{index} \ \& \ \text{slot\_mask}$$
 
-Addressing is resolved directly through single-cycle branchless bitwise operations, eliminating heap pointer indirection.
+Each allocated slot stores a 64-bit key, a 64-bit owner sequence and a separate atomic live flag. Together these use 17 bytes per slot on the x86-64 benchmark host. Scanners read the published owner page pointer under epoch protection. Retiring an empty page withdraws that pointer and defers release of the page resources until existing readers leave their epochs. The allocator skips slots whose owner sequence has reached the maximum even value.
 
 ### 3.4 Four-Stage Software Pipelined Prefetching
 
@@ -98,7 +98,7 @@ In modern sparse optimizers such as Adam, optimizer state rows combine multi-ele
   - Applied to the Adam step iteration counter (`step_state`), which stores a single scalar `uint32_t` (4 bytes).
   - Page boundaries retain 64-byte alignment, while the entry stride is tightly packed to 4 bytes (`sizeof(uint32_t)`).
   - **Page Specifications**: A standard 4,096-slot page allocates a compact **16 KiB** ($4096 \times 4\text{ B}$), maximizing entry storage density.
-  - **Cache Locality**: Packing 16 scalar steps per 64-byte cacheline allows 262,144 active slots to occupy just 1 MiB of memory, residing entirely within CPU L2/L3 cache and minimizing LLC cache misses during high-throughput training updates.
+  - **Cache Locality**: Packing 16 scalar steps per 64-byte cacheline allows 262,144 reserved step counters to occupy 1 MiB.
 
 ---
 

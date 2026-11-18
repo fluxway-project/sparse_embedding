@@ -91,9 +91,13 @@ int main() {
   require(FlatKeyDirectory::bucket_count_for_key_capacity(0) == 2,
           "zero-key capacity is wrong");
   require(FlatKeyDirectory::bucket_count_for_key_capacity(65'536) == 262'144,
-          "natural power-of-two capacity did not preserve the legacy mask");
-  require(FlatKeyDirectory::bucket_count_for_key_capacity(81'920) == 512'000,
-          "non-power-of-two capacity did not preserve the probe budget");
+          "power-of-two reservation exceeded the load budget");
+  require(FlatKeyDirectory::bucket_count_for_key_capacity(81'920) == 262'144,
+          "directory exceeded the capacity step");
+  require(FlatKeyDirectory::bucket_count_for_key_capacity(131'071) == 262'144 &&
+              FlatKeyDirectory::bucket_count_for_key_capacity(131'072) ==
+                  524'288,
+          "directory load exceeded one half across the capacity step");
   require_throws<std::overflow_error>([] {
     FlatKeyDirectory::bucket_count_for_key_capacity(
         FlatKeyDirectory::maximum_key_capacity() + size_t{1});

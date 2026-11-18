@@ -71,7 +71,7 @@ from sparse_embedding.checkpoint import (
 storage = LocalLanceStorage.from_checkpoint_root("/checkpoints/user_embedding")
 checkpoint = SparseCheckpoint(storage)
 
-# 2. 保存训练检查点 (默认保存规范 entries，节约 50% 写入带宽与磁盘空间)
+# 2. 保存训练检查点 (默认持久化规范 entries 数据切片)
 committed = checkpoint.save_training_checkpoint(
     store,
     "user_embedding",
