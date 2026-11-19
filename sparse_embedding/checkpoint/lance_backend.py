@@ -47,6 +47,7 @@ from .base import (
     CheckpointSaveMode,
     CleanupReservation,
     CommittedCheckpoint,
+    DTypeCastPolicy,
     IngestionEngine,
     InvalidCheckpointFragment,
     PartitionTarget,
@@ -363,6 +364,7 @@ class _PreparedRestore:
     chain: tuple[dict[str, Any], ...]
     preserves_source_ownership: bool
     page_participant: ManifestParticipantRecord | None
+    embedding_dtype_changed: bool
 
 
 @dataclass(frozen=True, slots=True)
@@ -1012,7 +1014,7 @@ class _LanceCheckpointStorage:
             store
         ):
             raise ValueError(
-                "reshard restore requires the next training checkpoint to be FULL"
+                "restore topology or FP16-to-FP32 embedding casting requires the next training checkpoint to be FULL"
             )
         self._require_authority(identity)
         attempt = self._attempt_prefix(identity)
@@ -2802,10 +2804,13 @@ class _LanceCheckpointStorage:
             store.initialize_checkpoint_baseline(
                 self._checkpoint_baseline(manifest, participant_index),
                 participant_rec.watermark,
+                requires_full_checkpoint=prepared.embedding_dtype_changed,
             )
             return
         baseline, watermark = self._target_restore_origin(chain, plan)
-        store.initialize_checkpoint_baseline(baseline, watermark, resharded=True)
+        store.initialize_checkpoint_baseline(
+            baseline, watermark, requires_full_checkpoint=True
+        )
 
     @staticmethod
     def _target_restore_origin(
@@ -2946,9 +2951,16 @@ class _LanceCheckpointStorage:
             raise ValueError(
                 "restore options sparse ID dtype does not match checkpoint"
             )
-        self._validate_restore_target(
-            store, specification, load_optimizer_state=load_optimizer_state
+        embedding_dtype_changed = self._validate_restore_target(
+            store,
+            specification,
+            load_optimizer_state=load_optimizer_state,
+            embedding_cast_policy=plan.embedding_cast_policy,
         )
+        if embedding_dtype_changed and plan.engine is IngestionEngine.FAST_PAGE_CACHE:
+            raise ValueError(
+                "FP16 to FP32 embedding cast requires canonical entry ingestion"
+            )
         if manifest["commit_state"] != _COMMITTED:
             raise LookupError("checkpoint manifest is not committed")
         if manifest["storage_mode"] != _FRAGMENT_STORAGE_MODE:
@@ -2987,7 +2999,9 @@ class _LanceCheckpointStorage:
                 raise RuntimeError(
                     "native checkpoint restore requires a Lance-enabled _core extension"
                 )
-        return _PreparedRestore(chain, preserves_source_ownership, participant_rec)
+        return _PreparedRestore(
+            chain, preserves_source_ownership, participant_rec, embedding_dtype_changed
+        )
 
     def _page_restore_participant(
         self,
@@ -3017,11 +3031,11 @@ class _LanceCheckpointStorage:
         specification: TableSpecification,
         *,
         load_optimizer_state: bool = True,
-    ) -> None:
+        embedding_cast_policy: DTypeCastPolicy,
+    ) -> bool:
         target = cls._store_specification(store)
         if (
             target.dimensions != specification.dimensions
-            or target.embedding_dtype != specification.embedding_dtype
             or target.score_policy != specification.score_policy
             or target.key_dtype != specification.key_dtype
             or (
@@ -3030,6 +3044,23 @@ class _LanceCheckpointStorage:
             )
         ):
             raise ValueError("restore target does not match checkpoint specification")
+        source_dtype = specification.embedding_dtype
+        target_dtype = target.embedding_dtype
+        if source_dtype == target_dtype:
+            return False
+        if embedding_cast_policy is DTypeCastPolicy.EXACT:
+            raise ValueError(
+                f"EXACT requires matching embedding dtypes: {source_dtype} -> {target_dtype}"
+            )
+        if target_dtype != "float32":
+            raise ValueError(
+                f"SAFE rejects lossy embedding cast: {source_dtype} -> {target_dtype}"
+            )
+        if source_dtype != "float16":
+            raise NotImplementedError(
+                f"no native kernel for safe embedding cast: {source_dtype} -> {target_dtype}"
+            )
+        return True
 
     def _ensure_tables(self) -> None:
         self._workspace.ensure_root()
@@ -5139,6 +5170,7 @@ class _LanceCheckpointStorage:
             load_optimizer_state,
             assignment_name,
             assignment_parameters,
+            source_embedding_dtype=chain[-1]["embedding_dtype"],
         )
 
     @staticmethod

@@ -136,7 +136,7 @@ public:
   }
 
   void step(uint32_t idx, std::span<ParamT> param_span,
-            std::span<const ParamT> grad_span,
+            std::span<const float> grad_span,
             [[maybe_unused]] uint64_t global_step, uint64_t score) {
     uint32_t &id_step = *step_state.data(idx);
     id_step++;
@@ -152,7 +152,7 @@ public:
 
     size_t dim = param_span.size();
     ParamT *param = param_span.data();
-    const ParamT *accumulated_grad = grad_span.data();
+    const float *accumulated_grad = grad_span.data();
 
     OptT *m = m_state.data(idx);
     OptT *v = v_state.data(idx);

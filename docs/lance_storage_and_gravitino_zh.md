@@ -59,6 +59,7 @@ import numpy as np
 import sparse_embedding as se
 from sparse_embedding.checkpoint import (
     CheckpointSaveMode,
+    DTypeCastPolicy,
     IngestionEngine,
     LocalLanceStorage,
     PartitionSpec,
@@ -116,22 +117,26 @@ checkpoint.load_training_checkpoint(
 | 恢复策略 | 适用场景 | 底层机制 | 异常与防御策略 |
 |---|---|---|---|
 | **`RestorePlan.from_partition` + `RECONSTRUCT_ENTRIES`** | 同拓扑或变化后的目标拓扑 | 读取规范 `entries.lance`，由 native 层按目标分区过滤 key | 分片算法与目标边界严格校验，契约错误直接抛出 |
-| **`RestorePlan.from_partition` + `FAST_PAGE_CACHE`** | native 证明 source ownership 不变且存在 page images | ownership、几何与 generation 校验后加载目标 participant 的 page image | 缺少缓存、owner/分区数变化或几何不兼容直接抛出 |
+| **`RestorePlan.from_partition` + `FAST_PAGE_CACHE`** | native 校验确认 source owner 不变、存在 page images 且 embedding dtype 一致 | ownership、几何、generation 与 dtype 校验后加载目标 participant 的 page image | 缺少缓存、owner/分区数变化、几何不兼容或实际 FP16 到 FP32 转换直接抛出 |
 
 native partitioner 的分区数量范围为 `1..UINT32_MAX`。chain validation 使用原始
-Arrow key 类型检查目标 assignment，并包含历史 tombstone。只有通过该证明才能复用
-保存 participant 的 baseline；owner 改变后必须先保存 FULL。由于检查点元数据不
-持久化源分片算法名称，此处的证明验证的是整条历史链上的 ownership 等价性。
+Arrow key 类型检查目标 assignment，并包含前序增量链上的删除墓碑。只有校验通过后才能复用
+保存 participant 的 baseline；owner 改变后必须先保存 FULL。默认要求 embedding
+dtype 一致。显式传入 `embedding_cast_policy=DTypeCastPolicy.SAFE` 才允许从 FP16
+规范 entries 恢复到 FP32。使用该策略时，page image 仍要求 embedding dtype 一致。实际转换会保留
+mutation watermark，并要求下一次保存为 FULL；该 FULL 确认后才可继续增量。
+由于检查点元数据不持久化源分片算法名称，此处的校验验证整条增量祖先链上的
+ownership 等价性。
 
 ### 4.2 训练与推理权重隔离及正交恢复矩阵
 
-恢复操作由两个完全正交的维度构成（$2 \times 2$ 笛卡尔积架构）：
+恢复操作由三个独立选择构成：载荷范围、拓扑路由和 embedding dtype 策略：
 - **状态载荷范围（Scope / Payload）**：
   - **训练恢复 (`load_training_checkpoint`)**：完整加载嵌入表权重与优化器动量状态（`load_optimizer_state=True`）。
   - **推理恢复 (`load_inference_checkpoint`)**：仅拉取 Embedding 权重（`load_optimizer_state=False`），要求目标 Store 禁用优化器（`enable_optimizer=False`），避免浪费内存。若对未启用优化器的 Store 请求加载优化器状态，系统直接抛出异常。
 - **拓扑路由策略（RestorePlan）**：
   - 训练与推理**均使用同一个** `RestorePlan`，优化器加载范围仍由独立参数决定。
-  - 推理可在 native 证明 source ownership 不变且 page descriptor 与目标几何匹配时选择 `IngestionEngine.FAST_PAGE_CACHE`。
+  - 推理可在 native 校验确认 source owner 不变且 page descriptor 与目标几何匹配时选择 `IngestionEngine.FAST_PAGE_CACHE`。
 
 ### 4.3 Arrow 原生键类型与算子下推
 
@@ -173,11 +178,11 @@ sample_keys, expected_ranks = generate_reference_vectors(
 
 - **全量保存 (FULL)**：保存当前表中所有存活键值与状态（`CheckpointSaveMode.FULL`）。
 - **增量保存 (INCREMENTAL)**：仅记录上一版本以来的增量变更（Dirty Keys）与删除标记（Tombstone），需指定 `parent_handle`。空增量仅追加控制面 Manifest，不创建冗余数据表。
-- **恢复链处理**：共用的有界外部排序在 entries 目标分配前校验历史 identity 并选出存活 key。源 payload 扫描一次并按源顺序回放；page images 在 store 内流式导入，全部成功后才发布 generation。
+- **恢复链处理**：共用的有界外部排序在 entries 目标分配前校验多版本记录并选出存活 key。源 payload 扫描一次并按源顺序回放；page images 在 store 内流式导入，全部成功后才发布 generation。
 
 ### 5.2 流式压实 (Compaction)
 
-随着增量保存次数增加，历史版本切片增多。系统支持通过流式 Compaction 将增量链条合并为自包含的全量版本：
+随着增量保存次数增加，增量切片链条增长。系统支持通过流式 Compaction 将增量链条合并为自包含的全量版本：
 
 ```python
 # 1. 托管式压实：将增量链合并为全新的自包含 FULL 检查点
@@ -209,8 +214,8 @@ compact_fragments(
 ```
 
 流式合并由 C++ `checkpoint_stream_policy.hpp` 控制扫描批次与有界通道（`BoundedChannel`），
-压实过程不修改输入版本。restore 与 compaction 共用有界的历史记录合流和 payload
-解码。临时磁盘随历史数据增长；最终目标分配和 Lance 缓存与有界临时工作缓冲分开计算。
+压实过程不修改输入版本。restore 与 compaction 共用有界的多版本记录合流和 payload
+解码。临时磁盘随增量链数据规模增长；最终目标分配和 Lance 缓存与有界临时工作缓冲分开计算。
 
 > 关于增量检查点的底层变动日志（Mutation Journaling）、物理 Schema 与一致性切片深度原理，请参见 [增量检查点与流式 Compaction](incremental_checkpoint_zh.md)。
 

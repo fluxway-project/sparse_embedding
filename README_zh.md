@@ -2,7 +2,7 @@
 
 [English](README.md)
 
-高性能稀疏存储与计算库，专为 **PB 级（Petabyte-scale）** 超大规模稀疏 Embedding（工业级推荐系统）、稀疏 Engram（条件记忆与知识检索）、稀疏 MoE（专家路由与参数存储）以及稀疏 KV Cache（长上下文长尾缓存）等场景设计。结合 Python 接口与 C++23 底层引擎，采用 Hogwild! 松弛更新、Slot Directory 读路径、x86 SeqLock 发布和分段物理分页存储架构，高效解决海量参数下的内存爆炸、高并发哈希冲突与 I/O 吞吐瓶颈。
+高性能稀疏存储与计算库，专为 **PB 级（Petabyte-scale）** 超大规模稀疏 Embedding（工业级推荐系统）、稀疏 Engram（条件记忆与知识检索）、稀疏 MoE（专家路由与参数存储）以及稀疏 KV Cache（长上下文长尾缓存）等场景设计。结合 Python 接口与 C++23 底层引擎，采用 Hogwild! 松弛更新、Slot Directory 读路径、x86 SeqLock 发布和分段物理分页存储架构，高效解决海量参数下的内存墙、高并发哈希冲突与 I/O 吞吐瓶颈。
 
 ## 核心特性
 
@@ -19,9 +19,9 @@
 - **优化器参数选择性加载**：`EmbeddingConfig(enable_optimizer=False)` 创建推理 weight-only store。`checkpoint.load_inference_checkpoint`（或存储层 `load_inference_weights`）仅加载权重。
 - **细粒度优化器内存对齐**：Adam 优化器采用对齐隔离架构，一阶与二阶动量保持 64 字节 AVX-512 SIMD 向量对齐，标量步数计数器采用 4 字节紧凑自然对齐（`OptimizerRowLayout::kNaturalAligned`，每页 16 KiB），减少 step 工作集。
 - **按需变动日志 (Mutation Journal)**：通过 `EmbeddingConfig.enable_mutation_journal` 控制变更数据捕获（CDC）。开启时提供无锁脏键与墓碑追踪以支持增量检查点；纯训练或全量检查点模式下关闭可免除热路径原子序号记账与记录内存开销。
-- **分片注册中心与并行调度 (PartitionerRegistry)**：基于 `pro::proxy<PartitionerFacade>` 支持 `modulo`、`hash`、`fast_range` 及自定义扩展。离线恢复支持 AVX-512 `filter_span`；在线调度（`parallel_partitioner.hpp`）对接 Fluxway `FunctionPartition`。
+- **分片注册中心与并行调度 (PartitionerRegistry)**：支持 `modulo`、`hash`、`fast_range` 及自定义算法扩展。离线恢复支持 AVX-512 `filter_span`；在线调度（`parallel_partitioner.hpp`）对接 Fluxway `FunctionPartition`。
 - **跨仓参考向量校验 (Reference Vectors)**：提供 `generate_reference_vectors`，验证分布式路由与离线恢复在各键类型下的分区一致性。
-- **驱逐与内存管理**：高效的打分策略（如 LFU），使用线程安全的 `std::atomic_ref` 实现无锁并发状态更新
+- **驱逐与内存管理**：高效的打分策略（如 LFU），使用原子操作实现无锁并发状态更新
 - **页级冷热数据置换 (Page-Level Hot/Cold Swapping)**：后台线程基于可配置的内存水位线，通过保持虚拟地址稳定的 `MAP_FIXED` 重映射将冷数据页置换至磁盘后备存储。
 
 ## 核心文档
@@ -62,28 +62,28 @@ Bazel 配置使用 `-std=c++23` 编译 C++ 源码；支持 GCC 13+ 和 Bazel 7+�
 | 操作系统 | Ubuntu 24.04.4 LTS，x86-64 |
 | 工具链 | GCC 13.4、Bazel 7.7、C++23（`-std=c++23`）、`-c opt` |
 | 优化参数 | `-O3 -march=native -mtune=native -mavx512bf16 -fno-strict-aliasing -DNDEBUG`；链接使用 `-flto` |
-| CPU affinity | Slot Directory forward proof 通过 benchmark affinity helper 绑定 worker；允许使用 48 个 CPU |
+| CPU affinity | Slot Directory forward 基准测试通过 affinity helper 绑定 worker；允许使用 48 个 CPU |
 
 ### 全操作性能基准汇总
 
-基于双路 Intel Xeon Silver 4116（24 物理核、48 逻辑 CPU、125 GiB RAM、`-c opt`）测得的代表性吞吐：
+标 † 的吞吐取自 2026-11-19 单次 benchmark 运行，线程数见各行。未标记的行保留此前的参考值。多次运行的中位数见[性能报告](docs/performance_and_reliability_report_zh.md)。
 
 | 操作分类 | 测试负载 / 内核 | 并发度 / 配置规格 | 吞吐 | 带宽或测量说明 |
 |---|---|---|---:|---:|
-| **目录查询 (Find)** | C++ 纯查表微基准 (`hotpath_microbench`) | 64 线程，100K 键规模 | **226.18 Mops/s** | CPU 缓存绑定 |
-| **前向查表 (Forward)** | C++ 槽位目录前向 (`embedding_store_benchmark`) | 8 线程，dim=32，batch=4K | **50.39 Mops/s** | 内存带宽绑定 |
-| **宽表前向查表** | C++ 全功能存储前向 (`embedding_store_benchmark`) | 16 线程，NUMA，dim=128，batch=65K | **11.365 Mops/s** | **5.82 GB/s** |
-| **就地赋值 (Assign)** | Python 多线程表写入 (`benchmark_embedding_table`) | 32 线程，dim=128，batch=65K | **14.05 Mops/s** | 7.19 GB/s |
-| **就地赋值 (Assign)** | C++ 全功能存储写入 (`embedding_store_benchmark`) | 16 线程，NUMA，dim=128，batch=65K | **32.76 Mops/s** | **16.775 GB/s** |
-| **优化器更新** | C++ Adam 热点 profile (`training_path_profile`) | 8 workers，dim=128，4K 键 | **17.89 Mops/s** | 8.54 GB/s |
+| **目录查询 (Find)** | C++ 纯查表微基准 (`hotpath_microbench`) | 32 线程，100K 键规模 | **232.25 Mops/s** † | CPU 缓存绑定 |
+| **前向查表 (Forward)** | C++ 槽位目录前向 (`forward_scaling_benchmark`) | 8 线程，dim=32，batch=4K | **52.164 Mops/s** † | 4,096 个打乱顺序的唯一键 |
+| **宽表前向查表** | C++ 全功能存储前向 (`embedding_store_benchmark`) | 16 线程，NUMA 分片关闭，dim=128，batch=65K | **26.26 Mops/s** † | **13.45 GB/s** |
+| **就地赋值 (Assign)** | Python 多线程表写入 (`benchmark_embedding_table`) | 32 线程，dim=128，batch=65K | **31.37 Mops/s** † | 16.06 GB/s（按 FP32 写入量折算） |
+| **就地赋值 (Assign)** | C++ 全功能存储写入 (`embedding_store_benchmark`) | 16 线程，NUMA，dim=128，batch=65K | **33.43 Mops/s** † | **17.11 GB/s** |
+| **优化器更新** | C++ Adam 热点 profile (`training_path_profile`) | 8 workers，dim=128，4K 键 | **17.89 Mops/s** | 8.54 GiB/s |
 | **优化器更新** | C++ 全功能存储 SGD (`embedding_store_benchmark`) | 16 线程，NUMA，dim=128，batch=65K | **20.065 Mops/s** | **20.545 GB/s** |
-| **Adam 训练步骤** | Python 梯度累积与 Adam 更新（[基准](benchmarks/python/benchmark_adam_training_step.py)） | 16 线程，dim=16，batch=65K（p50: 6.39 ms, p99: 6.48 ms） | **10.28 Mops/s** | 未测量 |
-| **梯度累积** | C++ 梯度聚合 (`embedding_store_benchmark`) | 16 线程，NUMA，dim=128，batch=65K | **4.25 Mops/s** | **2.18 GB/s** |
+| **Adam 训练步骤** | Python 梯度累积与 Adam 更新（[基准](benchmarks/python/benchmark_adam_training_step.py)） | 16 线程，dim=16，batch=65K（p50: 6.00 ms, p99: 6.43 ms） | **10.68 Mops/s** † | 未测量 |
+| **梯度累积** | C++ 梯度聚合 (`embedding_store_benchmark`) | 16 线程，NUMA，dim=128，batch=65K | **4.28 Mops/s** † | **2.19 GB/s** |
 | **成员判断 (Contains)** | C++ 键存在性判断 (`embedding_store_benchmark`) | 16 线程，NUMA，batch=65K | **22.295 Mops/s** | 元数据绑定 |
-| **批量删除 (Erase)** | C++ 批量删除 (`embedding_store_benchmark`) | 16 线程，NUMA，10% 批次删除 | **5.26 Mops/s** | 分片无锁 |
+| **批量删除 (Erase)** | C++ 批量删除 (`embedding_store_benchmark`) | 1 线程，10% 批次删除 | **9.70 Mops/s** † | 按重复请求的键数计，不代表实际删除行数 |
 | **端到端训练步** | Python 训练完整步 (`benchmark_embedding_table`) | 32 线程，查表+梯度累积+更新 | **2.02 Mops/s** | 端到端计算 |
 | **LFU 异步查表** | Python 存储压力测试 (`benchmark_e2e`) | 4 线程，dim=16，batch=4,096 | **14.95 Mops/s** | p95 0.2825 ms |
-| **异步 Zipfian 访问** | Python 异步幂律查表 (`benchmark_async_zipfian`) | 16 workers，skew=1.1，Zipfian 分布 | **11.96 Mops/s** | 异步调度 |
+| **异步 Zipfian 访问** | Python 异步幂律查表 (`benchmark_async_zipfian`) | 线程预算 8，dim=128，Zipf 参数 1.2 | **13.36 Mops/s** † | 异步调度 |
 | **分布式分片路由** | 并行调度器 Lemire fast_range (`parallel_partitioner`) | 8 workers，10M 键 | **1.03 B keys/s** | 向量化路由 |
 | **SIMD 内存切片过滤** | AVX-512 连续切片掩码过滤 (`filter_span`) | 8 workers，Arrow 物理连续内存 | **1.45 B keys/s** | AVX-512 SIMD |
 
@@ -98,7 +98,7 @@ Bazel 配置使用 `-std=c++23` 编译 C++ 源码；支持 GCC 13+ 和 Bazel 7+�
 参考 workload 使用 dim=32、4,096-key memory-only table、4,096-key 固定 power-law
 batch、400 次计时 `forward_lookup` 重复，并在 48 个 allowed CPU 上使用物理核 affinity。
 
-| 线程数 | Forward 吞吐 |
+| 线程数 | Forward 吞吐（五次运行中位数） |
 |---:|---:|
 | 1 | 14.61 Mops/s |
 | 2 | 27.04 Mops/s |
@@ -133,9 +133,7 @@ SMT sibling 当成额外内存带宽。lookup-only forward 直接使用 shard `R
 hash。估算 payload 小于 512 KiB 时跳过 NUMA 二次分桶，因为小 batch 的调度成本高于
 locality 收益；更大的 payload 仍使用 node-local routing。API 语义保持不变。
 
-长期存在的 `exec::static_thread_pool` 消除了线程创建/销毁，但每次 `bulk + sync_wait`
-仍需付出 task 入队、唤醒、steal、完成计数和 barrier 成本。空 bulk proof 在 1/2/8/24
-worker 下约为 3.47/21.7/41.6/87.4 微秒。
+长期存在的 `exec::static_thread_pool` 消除了批次调用间的线程创建与销毁开销。
 
 如需复现覆盖全部公开操作的磁盘换页压力测试，可运行
 `small_memory_all_paths_pressure_test`。64 MiB Auto-storage 配置会真实触发 swap-out，
@@ -208,14 +206,14 @@ HogwildEmbeddingStore
 ├── PageStorage                  # 自动探测 RAM 预算与文件映射 spill
 ├── TransientArena[thread_budget]  # Per-shard gradient accumulation (lock-free)
 ├── exec::static_thread_pool     # C++23 stdexec thread pool
-├── PartitionerRegistry (ops)    # 零虚表 proxy 多态分片注册中心 (modulo/hash/fast_range)
+├── PartitionerRegistry (ops)    # 可扩展分片注册中心 (modulo/hash/fast_range)
 ├── ParallelPartitioner          # 1.03B keys/s 多线程分片调度与 AVX-512 掩码过滤
-└── pro::proxy<OptimizerExtensionFacade<ParamT, OptT>> # 批级优化器 seam
+└── OptimizerExtensionFacade<ParamT, OptT> # 批级优化器 seam
 ```
 
 ### 关键设计决策
 
-1. **键值解耦架构（Decoupled KV Storage）**：将传统哈希表的 `Key -> Vector` 拆分为 `Key -> Index`（`parlayhash`）和 `Index -> Vector`（`EmbeddingArena`）两级结构。哈希表仅存储轻量级的整数索引，使嵌入向量的存储保持紧凑、连续且对齐，极大提升了 CPU 缓存命中率与 SIMD 向量化效率。
+1. **键值解耦架构（Decoupled KV Storage）**：采用 `Key -> Index`（`parlayhash`）和 `Index -> Vector`（`EmbeddingArena`）两级结构。哈希表仅存储轻量级整数索引，嵌入向量紧凑连续并保持对齐，提升 CPU 缓存局部性与 SIMD 向量化效率。
 
 2. **分片局部同步（Shard-Local Synchronization）**：ParlayHash 查询使用共享锁；Upsert、删除、重建和内部扩容仅对目标 shard 使用独占锁。其他 shard 继续并发，既避免无同步扩容的正确性问题，也避免全局 Upsert 锁造成的吞吐崩塌。
 
@@ -228,12 +226,12 @@ HogwildEmbeddingStore
 
 ### 训练更新路径
 
-训练路径（`accumulate_gradients()` 后接 `optimizer_step()`）将梯度保存在按
-shard 划分的 `TransientArena` 中。`optimizer_step()` 解析出 shard 批次后只进入一次
+训练路径（`accumulate_gradients()` 后接
+`optimizer_step(normalization_steps=...)`）将梯度保存在按 shard 划分的
+`TransientArena` 中。`gradient_dtype` 独立控制缩放后的梯度累积存储，和
+`value_dtype` 无关；归一化后优化器接收 FP32 梯度，`optimizer_dtype` 控制优化器状态。
+`optimizer_step(normalization_steps=...)` 解析出 shard 批次后只进入一次
 `OptimizerExtensionFacade`，并在释放该批 locator 的锁之前使用完全部参数 span。
-
-优化器扩展分发明确限定在批级。静态分派是同一契约的实现选项，`std::variant` 只用于冷配置，
-不会成为逐行运行时路径。
 
 Mutation API 要求 `(key, dimension)` 行唯一。`lookup_or_insert` 可以归并重复 miss，
 但 `assign`、`accumulate_gradients` 和 `optimizer_step` 的 batch 必须来自已发布 key；

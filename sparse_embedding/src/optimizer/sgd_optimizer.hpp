@@ -70,7 +70,7 @@ public:
   }
 
   void step(uint32_t /*idx*/, std::span<ParamT> param_span,
-            std::span<const ParamT> grad_span, uint64_t /*global_step*/,
+            std::span<const float> grad_span, uint64_t /*global_step*/,
             uint64_t score) {
     float current_lr = learning_rate.compute(score);
     simd::simd_sgd_update(param_span.data(), grad_span.data(), current_lr,

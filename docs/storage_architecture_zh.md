@@ -142,13 +142,13 @@ $$\text{page\_id} = \text{index} \gg \text{entries\_shift}, \quad \text{slot\_of
 
 ## 6. 生命周期管理与 Epoch 反压机制
 
-所有可能被旧并发 Reader 访问的对象（包括 `MapBundle`、`StoreSnapshot`、定位槽与物理页）均统一托管在基于 Epoch 的 `RetirementPressure` 域中：
+所有可能被活跃并发 Reader 访问的对象（包括 `MapBundle`、`StoreSnapshot`、定位槽与物理页）均统一托管在基于 Epoch 的 `RetirementPressure` 域中：
 
 - **三级反压控制**：
   1. **Normal 阶段**（低于 `backpressure_fraction = 0.15`）：系统全速吞吐。
   2. **Backpressure 阶段**（介于 0.15 与 0.25 之间）：写操作与 Compaction 执行有限 CPU pause，放缓写入。
   3. **Circuit 阶段**（达到 `circuit_fraction = 0.25`）：触发熔断保护，拒绝生成新退休对象的控制面修改并直接抛出异常，防止内存暴涨。
-- **安全资源回收**：当确认没有并发 Reader 引用时，旧物理页与元数据方被释放，`retired_bytes` 计数清零。
+- **安全资源回收**：当确认没有并发 Reader 引用时，已退役物理页与元数据方被释放，`retired_bytes` 计数清零。
 
 ---
 
@@ -231,8 +231,8 @@ config = se.EmbeddingConfig(
     key_dtype="uint64",                  # 键数据类型 (支持 int32/uint32/int64/uint64)
     value_dtype="float32",               # 物理值类型
     optimizer_dtype="float32",           # 优化器动量类型 (支持 bf16/fp16/fp32)
-    gradient_dtype="bfloat16",           # 梯度累积类型 (可选)
-    gradient_scale=1.0,                  # 梯度缩放系数
+    gradient_dtype="bfloat16",           # 缩放后梯度累积类型 (可选)
+    gradient_scale=1.0,                  # 存储前将输入梯度除以该系数
     enable_optimizer=True,               # 设为 False 用于纯权重推理 Store
     enable_mutation_journal=True,        # 设为 False 可关闭 CDC 变动追踪以降低内存驻留与热路径记账
     storage_tuning=se.StorageTuningOptions(
@@ -245,6 +245,11 @@ config = se.EmbeddingConfig(
 # 3. 创建 Store 实例
 store = se.EmbeddingStore(config, score_policy="lfu")
 ```
+
+`gradient_dtype` 独立控制 transient 累积 arena，与 `value_dtype` 无关。
+`optimizer_step(normalization_steps=n)` 将存储的累积和乘以
+`gradient_scale / n`，再把归一化后的 FP32 梯度交给优化器；`optimizer_dtype`
+只控制优化器状态。比如 FP16 embedding 表可以使用 FP32 梯度累积和 FP32 Adam 状态。
 
 ---
 

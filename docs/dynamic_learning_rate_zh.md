@@ -7,9 +7,7 @@
 该 API 随仓库 Python package 提供，并使用项目 Bazel toolchain 构建。选择会读取特征得分的
 学习率策略时必须同时配置 score policy；不读取得分的策略可以独立使用。
 
-在大规模稀疏嵌入 (Sparse Embeddings) 中，根据特征（Feature）的访问频率或重要性动态调整学习率是非常有益的。对于高频特征，由于它们会被频繁更新，使用较小的学习率可以避免过度震荡或覆盖信息；而对于长尾（低频）特征，使用相对较大的学习率可以确保它们在有限的样本下充分学习。
-
-Sparse Embedding 提供了一组 **基于特征得分的动态学习率策略 (Score-Based Dynamic Learning Rate Policies)**。这些策略会根据特征当前的得分 (通常由 LFU 或 LRU 评分策略实时维护)，在更新时动态调节每个特征的学习率。
+Sparse Embedding 提供**基于特征得分的动态学习率策略 (Score-Based Dynamic Learning Rate Policies)**，依据 LFU 或 LRU 等评分策略实时维护的访问计数动态调节每个特征的有效学习率。
 
 ## 可用策略 (Available Policies)
 
@@ -45,15 +43,13 @@ embedding_config = se.EmbeddingConfig(
     value_dtype="float32"
 )
 
-# 使用 Adam 优化器，并配置平方根衰减策略 (SqrtDecay)
-# 对于得分为 S 的特征，其实际学习率为：0.01 / sqrt(S)
+# 使用 Adam 优化器，配置平方根衰减策略 (lr = 0.01 / sqrt(score))
 optimizer = se.Adam(
     lr=0.01,
     dynamic_lr_policy=se.SqrtDecayLrPolicy()
 )
 
-# 创建 EmbeddingStore
-# 注意：你必须开启 score_policy（例如 "lfu"），否则动态学习率将无法工作。
+# 创建 EmbeddingStore (配置 score_policy)
 store = se.EmbeddingStore(
     embedding_config=embedding_config,
     initializer_config=se.Zeros(),
@@ -61,17 +57,13 @@ store = se.EmbeddingStore(
     score_policy="lfu"
 )
 
-# 在训练循环中，只要对特征进行了查询 (lookup/lookup_or_insert)，
-# 它们的 LFU 得分就会在后台自动更新。
+# 查表操作自动更新特征访问得分
 keys = np.array([1, 2, 3], dtype=np.int64)
 embeddings, lengths = store.lookup_or_insert(keys, dim=128)
 
-# 计算梯度...
+# 累积梯度并提交优化器更新
 gradients = np.ones((3, 128), dtype=np.float32)
 store.accumulate_gradients(keys, gradients)
-
-# 当调用 optimizer_step() 提交更新时，
-# 引擎将自动根据每个特征最新的 LFU 得分，应用衰减后的学习率！
 store.optimizer_step(1)
 ```
 
@@ -79,7 +71,6 @@ store.optimizer_step(1)
 
 - **得分策略依赖**：依赖特征得分的策略（如 `SqrtDecayLrPolicy`）要求建表时配置 `score_policy`，未指定时初始化报错。
 - **训练模式限定**：动态学习率为优化器行为，仅在 `enable_optimizer=True` 时生效。
-- **性能实现**：静态与动态学习率分支由 `constexpr` 在编译期决议，动态计算融合于 AVX-512 更新内核。
 
 ## 验证
 

@@ -231,8 +231,8 @@ config = se.EmbeddingConfig(
     key_dtype="uint64",                  # Key dtype (int32/uint32/int64/uint64)
     value_dtype="float32",               # Value dtype
     optimizer_dtype="float32",           # Optimizer moment dtype (supports bf16/fp16/fp32)
-    gradient_dtype="bfloat16",           # Gradient accumulation dtype (optional)
-    gradient_scale=1.0,                  # Gradient scaling factor
+    gradient_dtype="bfloat16",           # Scaled gradient accumulation dtype (optional)
+    gradient_scale=1.0,                  # Input gradients are divided by this scale before storage
     enable_optimizer=True,               # False for weight-only inference stores
     enable_mutation_journal=True,        # False to disable CDC tracking for pure training or FULL-only checkpoints
     storage_tuning=se.StorageTuningOptions(
@@ -245,6 +245,13 @@ config = se.EmbeddingConfig(
 # 3. Instantiate store
 store = se.EmbeddingStore(config, score_policy="lfu")
 ```
+
+`gradient_dtype` controls the transient accumulation arena independently of
+`value_dtype`. `optimizer_step(normalization_steps=n)` multiplies the stored
+sum by `gradient_scale / n` and passes normalized FP32 gradients to the
+optimizer. `optimizer_dtype` controls optimizer state; it does not constrain
+gradient accumulation or the embedding value dtype. For example, an FP16
+embedding table can use FP32 gradient accumulation and FP32 Adam state.
 
 ---
 

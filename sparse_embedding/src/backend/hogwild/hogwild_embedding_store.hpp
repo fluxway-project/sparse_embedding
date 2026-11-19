@@ -2001,7 +2001,7 @@ public:
     SealedHotPagePool<ParamT> sealed_pages;
     OptimizerExtension<ParamT, OptT> optimizer;
     std::atomic<uint64_t> optimizer_locator_revalidation_failures{0};
-    std::vector<std::unique_ptr<GradientAccumulator<ParamT>>> transient_shards;
+    std::vector<std::unique_ptr<GradientAccumulator>> transient_shards;
     OptimizerFactory opt_factory;
     std::atomic<uint64_t> global_step{0};
     std::atomic<uint64_t> sealed_page_layout_generation{0};
@@ -2106,9 +2106,8 @@ public:
             static_cast<uint32_t>(d), checkpoint_owner_in));
       }
       for (size_t i = 0; i < transient_shard_count; ++i) {
-        transient_shards.push_back(
-            std::make_unique<GradientAccumulator<ParamT>>(
-                d, storage, enable_score, gradient_dtype, gradient_scale));
+        transient_shards.push_back(std::make_unique<GradientAccumulator>(
+            d, storage, enable_score, gradient_dtype, gradient_scale));
       }
 #if defined(PAGE_COMPACTION_SHARD_PROFILE)
       configure_page_compaction_shard_profile(key_shards.size());
@@ -2910,7 +2909,7 @@ public:
                         : 0;
                 rows.push_back(
                     {indices[row], std::span<ParamT>(parameter, dim),
-                     std::span<const ParamT>(
+                     std::span<const float>(
                          batch_view.gradient(batch_positions[row]), dim),
                      score});
               }
@@ -2939,7 +2938,7 @@ public:
                               .load(std::memory_order_relaxed)
                         : 0;
                 rows.push_back({indices[row], std::span<ParamT>(parameter, dim),
-                                std::span<const ParamT>(
+                                std::span<const float>(
                                     batch_view.gradient(begin + row), dim),
                                 score});
               }
@@ -6127,11 +6126,14 @@ public:
   // incarnation identity and matching cut, updates the live baseline token,
   // advances the acknowledged watermark, and prunes mutation journal records
   // with sequence <= watermark across all shards.
-  void advance_checkpoint_baseline(uint64_t watermark, std::string baseline,
+  bool advance_checkpoint_baseline(uint64_t watermark, std::string baseline,
                                    uint64_t capture_id,
                                    std::string journal_identity) {
     if (baseline.empty())
       throw std::invalid_argument("checkpoint baseline must not be empty");
+    if (capture_id == 0)
+      throw std::invalid_argument(
+          "checkpoint acknowledgement must reference a captured cut");
     std::lock_guard control_plane_lock(control_plane_mutex_);
     invocation_gate_.begin_reconfiguration_and_wait();
     struct InvocationResume {
@@ -6145,7 +6147,7 @@ public:
     if (capture_id == checkpoint_acknowledged_capture_ &&
         baseline == checkpoint_baseline_ &&
         watermark == checkpoint_acknowledged_watermark_)
-      return;
+      return false;
     const auto cut = checkpoint_cuts_.find(capture_id);
     if (capture_id <= checkpoint_acknowledged_capture_ ||
         cut == checkpoint_cuts_.end() || cut->second.watermark != watermark)
@@ -6182,12 +6184,14 @@ public:
       }
       head.store(retained, std::memory_order_release);
     }
+    const bool full_checkpoint = !cut->second.incremental;
     checkpoint_baseline_ = std::move(baseline);
     checkpoint_acknowledged_capture_ = capture_id;
     checkpoint_acknowledged_watermark_ = watermark;
     std::erase_if(checkpoint_cuts_, [capture_id](const auto &cut) {
       return cut.first <= capture_id;
     });
+    return full_checkpoint;
   }
 
   std::vector<size_t> table_dims() const {

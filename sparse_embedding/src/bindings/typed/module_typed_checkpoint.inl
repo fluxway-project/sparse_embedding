@@ -111,7 +111,8 @@ void CheckpointOpsImpl<ParamT, OptT>::restore_native_partition_entries(
     const std::string &key_dtype, const std::string &assignment_name,
     const std::unordered_map<std::string, std::string> &assignment_parameters,
     const se::LanceStorageOptions &storage_options, bool load_optimizer_state,
-    std::optional<uint32_t> source_participant_index) {
+    std::optional<uint32_t> source_participant_index,
+    se::ValueDType source_embedding_dtype) {
   const uint32_t native_partition_count =
       se::ops::checked_partition_count(partition_count);
   if (partition_id >= partition_count)
@@ -124,7 +125,7 @@ void CheckpointOpsImpl<ParamT, OptT>::restore_native_partition_entries(
   se::NativeRestore<ParamT, OptT>::entries(
       self.get_store<ParamT, OptT>(), uris, version, std::move(partitioner),
       static_cast<uint32_t>(partition_id), key_dtype, load_optimizer_state,
-      storage_options, source_participant_index);
+      storage_options, source_participant_index, source_embedding_dtype);
 }
 
 template <typename ParamT, typename OptT>

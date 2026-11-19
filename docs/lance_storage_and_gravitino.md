@@ -59,6 +59,7 @@ import numpy as np
 import sparse_embedding as se
 from sparse_embedding.checkpoint import (
     CheckpointSaveMode,
+    DTypeCastPolicy,
     IngestionEngine,
     LocalLanceStorage,
     PartitionSpec,
@@ -116,18 +117,23 @@ checkpoint.load_training_checkpoint(
 | Restore Strategy | Primary Use Case | Underlying Mechanism | Error & Defense Policy |
 |---|---|---|---|
 | **`RestorePlan.from_partition` with `RECONSTRUCT_ENTRIES`** | Same or changed target topology | Reads canonical `entries.lance`; native code filters keys for the requested target | The assignment and target bounds are validated; invalid contracts raise directly |
-| **`RestorePlan.from_partition` with `FAST_PAGE_CACHE`** | Native-proven unchanged source ownership with page images | Loads the target participant page image after ownership, geometry, and generation checks | Missing cache, changed ownership/count, or incompatible geometry raises directly |
+| **`RestorePlan.from_partition` with `FAST_PAGE_CACHE`** | Native-proven unchanged source ownership with page images and matching embedding dtype | Loads the target participant page image after ownership, geometry, generation, and dtype checks | Missing cache, changed ownership/count, incompatible geometry, or an actual FP16-to-FP32 cast raises directly |
 
 Partition counts are limited to `1..UINT32_MAX` by the native partitioner ABI.
 Chain validation checks the requested assignment with the original Arrow key
-type, including historical tombstones. Only that proof permits reuse of a saved
-participant baseline; changed ownership requires a FULL save next. Because the
-checkpoint metadata does not persist source algorithm names, this ownership proof
-validates identity across the history chain.
+type, including tombstones from prior delta versions. Only valid ownership verification permits reuse of a saved
+participant baseline; changed ownership requires a FULL save next. Embedding dtypes
+must match by default. `embedding_cast_policy=DTypeCastPolicy.SAFE` explicitly permits
+FP16 canonical entries to be restored into FP32. Page images require matching
+embedding dtypes even with this policy. A real FP16-to-FP32 cast preserves the mutation watermark and
+requires the next save to be FULL; after that acknowledged FULL, incrementals may
+continue. Because the checkpoint metadata does not persist source algorithm names,
+this ownership verification validates identity across the delta lineage.
 
 ### 4.2 Training vs. Inference Weight Isolation and Orthogonal Restore Matrix
 
-Restoration operates across two strictly orthogonal dimensions ($2 \times 2$ Cartesian product architecture):
+Restoration operates across three independent choices: payload scope, topology
+routing, and embedding dtype policy:
 - **Payload Scope**:
   - **Training Restore (`load_training_checkpoint`)**: Loads embedding weights and optimizer momentum states (`load_optimizer_state=True`).
   - **Inference Restore (`load_inference_checkpoint`)**: Loads embedding weights only (`load_optimizer_state=False`), requiring the target store to disable optimizer state (`enable_optimizer=False`) to avoid memory waste. Requesting optimizer loading into an optimizer-disabled store raises an exception directly.
@@ -175,7 +181,7 @@ sample_keys, expected_ranks = generate_reference_vectors(
 
 - **FULL Snapshot**: Captures all live keys and optimizer state (`CheckpointSaveMode.FULL`).
 - **INCREMENTAL Snapshot**: Captures only dirty keys and deletion tombstones since the parent checkpoint (`CheckpointSaveMode.INCREMENTAL`, specifying `parent_handle`). Empty deltas append only a manifest record without creating payload datasets.
-- **Restore Resolution**: Shared bounded external ordering validates historical identities and selects survivors before entry allocation. Source payloads are staged once and replayed in source order; page images use one store-owned streaming lifecycle with generation committed after success.
+- **Restore Resolution**: Shared bounded external ordering reconciles multi-version records and selects survivors before entry allocation. Source payloads are staged once and replayed in source order; page images use one store-owned streaming lifecycle with generation committed after success.
 
 ### 5.2 Streaming Compaction
 
@@ -212,8 +218,8 @@ compact_fragments(
 
 Compaction uses native streaming readers and bounded channels configured via
 `checkpoint_stream_policy.hpp`, while source versions remain immutable. Restore
-and compaction share bounded historical reconciliation and payload decoding.
-Scratch disk grows with staged history; final target allocations and Lance caches
+and compaction share bounded multi-version reconciliation and payload decoding.
+Scratch disk scales with staged delta chain data; final target allocations and Lance caches
 are distinct from the bounded temporary working buffers.
 
 > For in-depth architecture, mutation journaling, and schema details, refer to [Incremental Checkpointing and Streaming Compaction](incremental_checkpoint.md).

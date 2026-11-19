@@ -242,7 +242,8 @@ template <typename ParamT, typename OptT> struct CheckpointOpsImpl {
       const std::string &key_dtype, const std::string &assignment_name,
       const std::unordered_map<std::string, std::string> &assignment_parameters,
       const se::LanceStorageOptions &storage_options, bool load_optimizer_state,
-      std::optional<uint32_t> source_participant_index = std::nullopt);
+      std::optional<uint32_t> source_participant_index,
+      se::ValueDType source_embedding_dtype);
   static void restore_native_page_images(
       EmbeddingStoreWrapper &self, const std::vector<std::string> &uris,
       uint64_t version, uint32_t participant_index,
@@ -405,7 +406,8 @@ public:
       const std::string &key_dtype, const std::string &assignment_name,
       const std::unordered_map<std::string, std::string> &assignment_parameters,
       const se::LanceStorageOptions &storage_options, bool load_optimizer_state,
-      std::optional<uint32_t> source_participant_index = std::nullopt);
+      std::optional<uint32_t> source_participant_index,
+      se::ValueDType source_embedding_dtype);
   void restore_native_page_images(
       const std::vector<std::string> &uris, uint64_t version,
       uint32_t participant_index, const std::string &key_dtype,
@@ -423,9 +425,10 @@ public:
   nb::list checkpoint_mutations();
   std::string checkpoint_baseline();
   bool checkpoint_restore_is_pristine();
-  std::string initialize_checkpoint_baseline(const std::string &baseline,
-                                             uint64_t watermark,
-                                             bool resharded = false);
+  std::string
+  initialize_checkpoint_baseline(const std::string &baseline,
+                                 uint64_t watermark,
+                                 bool requires_full_checkpoint = false);
   void mark_terminal_failure();
   bool is_operational();
   uint64_t checkpoint_mutation_watermark();

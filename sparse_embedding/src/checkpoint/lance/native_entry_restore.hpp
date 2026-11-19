@@ -19,8 +19,8 @@ namespace se {
 // is reused, and is bounded by the largest scan batch, never the whole chain.
 // Only optimizer assignment needs dimension grouping; assign accepts mixed
 // row lengths and scores use the same (dimension, key) identity as entries.
-template <typename KeyT, typename ParamT, typename OptT, typename Store,
-          typename Scanner>
+template <typename KeyT, typename ParamT, typename OptT,
+          typename SourceT = ParamT, typename Store, typename Scanner>
 void restore_native_entry_batches(Store &store, Scanner &&scan,
                                   bool load_optimizer_state) {
   std::vector<KeyT> keys, optimizer_keys;
@@ -56,7 +56,7 @@ void restore_native_entry_batches(Store &store, Scanner &&scan,
       const size_t end = batch.embedding_offsets[row + 1];
       if (batch.dimensions[row] == 0 || end < begin ||
           end > batch.embedding_values.size() ||
-          end - begin != size_t(batch.dimensions[row]) * sizeof(ParamT))
+          end - begin != size_t(batch.dimensions[row]) * sizeof(SourceT))
         throw std::runtime_error(
             "native restore embedding payload shape is invalid");
       const size_t optimizer_begin = batch.optimizer_offsets[row];
@@ -89,8 +89,18 @@ void restore_native_entry_batches(Store &store, Scanner &&scan,
       keys[row] = static_cast<KeyT>(batch.keys[row]);
       lengths[row] = batch.dimensions[row];
     }
-    copy_native_values(std::span<const std::byte>(batch.embedding_values),
-                       values);
+    const std::span<const std::byte> payload(batch.embedding_values);
+    if constexpr (std::is_same_v<SourceT, ParamT>) {
+      copy_native_values(payload, values);
+    } else {
+      values.resize(payload.size() / sizeof(SourceT));
+      for (size_t index = 0; index < values.size(); ++index) {
+        SourceT source;
+        std::memcpy(&source, payload.data() + index * sizeof(SourceT),
+                    sizeof(SourceT));
+        values[index] = static_cast<ParamT>(source);
+      }
+    }
     const std::span<const KeyT> key_span(keys);
     const std::span<const int64_t> length_span(lengths);
     if (auto error = store.assign(key_span, std::span<const ParamT>(values),

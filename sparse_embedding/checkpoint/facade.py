@@ -69,7 +69,7 @@ class SparseCheckpoint:
                 )
                 if effective_mode is CheckpointSaveMode.FULL:
                     raise ValueError(
-                        "reshard restore requires the next training checkpoint to be FULL"
+                        "restore topology or FP16-to-FP32 embedding casting requires the next training checkpoint to be FULL"
                     )
             else:
                 raise TypeError("mode must be a CheckpointSaveMode")

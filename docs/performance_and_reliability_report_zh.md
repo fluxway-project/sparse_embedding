@@ -75,6 +75,8 @@ batch、128 个并发调用方和最多 128 个内部 worker。
 
 ### Slot-directory forward scaling
 
+[README 汇总表](../README_zh.md#全操作性能基准汇总)用 † 标记 2026-11-19 的单次运行结果。默认 `forward_scaling_benchmark` 使用 4,096 个打乱顺序的唯一键（dim=32），8 线程前向查表达到 **52.164 Mops/s**；默认 `embedding_store_benchmark` 使用 65,536 个按幂律分布采样的键（dim=128），16 线程达到 **26.26 Mops/s**。后者通过了 2、4、8 worker 的扩展门槛；独立的持续压力 benchmark 在数据校验前失败。下表保留历史多次运行的中位数。
+
 配置为 dim=32、4,096-key memory-only table、4,096-key 固定 power-law batch、400 次
 计时 `forward_lookup` 重复，进程使用 `taskset -c 0-47`，并启用默认自动存储调优。
 

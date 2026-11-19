@@ -15,11 +15,11 @@ Sparse Embedding provides native **Incremental Checkpointing** and **Streaming C
 - **Consistent Cuts**: Capture quiesces competing store invocations and uses epoch protection. Bounded native writer channels provide backpressure; slow IO can delay capture.
 - **Native In-Memory Mutation Journaling**: Shard-local journals record key-level mutations and monotonic sequence numbers with zero mutex contention on forward lookup hot paths. Configurable via `EmbeddingConfig.enable_mutation_journal`: pure training or FULL-only checkpointing workflows can disable the journal to avoid hot-path sequence counter reservations and record memory overhead.
 - **Delta-Chain Schema & Tombstone Tracking**: Physical Lance slices persist `mutation_sequence`, `row_state` (`"active"` vs. `"deleted"`), and optional eviction `score` (LFU/LRU).
-- **Native Multi-Version Reconciliation**: Bounded external sorting validates historical identities and selects surviving records across the delta chain (`FULL` → `INCREMENTAL` → ...). Requested payload is staged during one Lance source pass and replayed in source order; only surviving keys allocate target slots.
-- **Offline / Online Streaming Compaction**: Compaction shares reconciliation and payload decoding with entry restore, while bounded writer channels produce a self-contained `FULL` checkpoint. Temporary disk grows with staged history; sorter and batch RAM follow `CheckpointStreamPolicy`.
+- **Native Multi-Version Reconciliation**: Bounded external sorting validates multi-version identities and selects surviving records across the delta chain (`FULL` → `INCREMENTAL` → ...). Requested payload is staged during one Lance source pass and replayed in source order; only surviving keys allocate target slots.
+- **Offline / Online Streaming Compaction**: Compaction shares reconciliation and payload decoding with entry restore, while bounded writer channels produce a self-contained `FULL` checkpoint. Temporary disk scales with staged delta history; sorter and batch RAM follow `CheckpointStreamPolicy`.
 
-- **Page-Image Restoration Boundaries**: Page-image restoration consumes bounded page scan batches in one store-owned empty-target lifecycle. It is eligible only when native validation proves unchanged source ownership and the target page geometry matches. A changed assignment that moves historical identities requires a `FULL` save after entries restoration, including when the partition count stays the same (see Section 2.4).
-- **Lifecycle & Operational Invariants**: Generation is published after all page imports and checks succeed; a failed import attempt leaves the target terminal before access reopens. Training restore requires the target optimizer's actual state layout; weight-only loading is an explicit scope. Final store memory, sparse physical optimizer capacity, and Lance runtime caches are separate from bounded temporary buffers. Restore includes control-plane and I/O synchronization and is not an entirely lock-free operation.
+- **Page-Image Restoration Boundaries**: Page-image restoration consumes bounded page scan batches in one store-owned empty-target lifecycle. It is eligible only when native validation confirms unchanged source ownership and the target page geometry matches. A changed assignment that shifts key partition ownership requires a `FULL` save after entries restoration, including when the partition count stays the same (see Section 2.4).
+- **Lifecycle & Operational Invariants**: Generation is published after all page imports and checks succeed; a failed import attempt leaves the target terminal before access reopens. Training restore requires the target optimizer's actual state layout; weight-only loading is an explicit scope. Final store memory, sparse physical optimizer capacity, and Lance runtime caches are separate from bounded temporary buffers. Restore coordinates control-plane metadata and I/O pipelines.
 
 ---
 
@@ -127,17 +127,17 @@ Because deltas rely on a deterministic baseline and monotonic sequence numbers w
 │ [Disallowed Cross-Topology INCREMENTAL]      [Enforced Invariant: FULL Baseline]     │
 │   • Worker 3 logs only newly dirtied keys      • Worker 3 materializes full state    │
 │   • Unmodified Key 100 missing from delta      • Key 100 captured in Fragment 3      │
-│   • Future restore must scan all old shards    • Truncates old topological chain     │
-│   • Read explosion + tombstone resurrection    • Enables GC of obsolete fragments    │
+│   • Future restore must scan all prior shards  • Truncates prior topological chain   │
+│   • Read amplification and tombstone risk      • Enables GC of obsolete fragments    │
 │   (❌ Violates consistency & bounds)           (✅ Subsequent saves resume INC)       │
 └──────────────────────────────────────────────────────────────────────────────────────┘
 ```
 
 The invariant enforcing `FULL` checkpointing after topology reconfiguration addresses four core issues:
-1. **Base Slice Continuity**: An incremental fragment contains only entries mutated in the current step. If a worker saves an incremental delta immediately after adopting new keys, historical keys that were not mutated in the subsequent step would be absent from the delta. Reconstructing state would require recursively backtracking into fragments across all predecessor workers.
-2. **Bounded Read Amplification**: Cascading cross-topology deltas would require scanning historical fragments across all prior topologies during recovery, degrading restore time from $O(N_{\text{checkpoints}})$ to $O(N_{\text{participants}} \times N_{\text{checkpoints}})$.
+1. **Base Slice Continuity**: An incremental fragment contains only entries mutated in the current step. If a worker saves an incremental delta immediately after adopting new keys, unmodified existing keys from the base snapshot would be absent from the delta. Reconstructing state would require recursively backtracking into fragments across all predecessor workers.
+2. **Bounded Read Amplification**: Cascading cross-topology deltas would require scanning fragments across all prior topologies during recovery, degrading restore time from $O(N_{\text{checkpoints}})$ to $O(N_{\text{participants}} \times N_{\text{checkpoints}})$.
 3. **Sequence Domain Isolation & Tombstone Elimination**: Sequence numbers are local to each worker journal without a global cluster clock. Cross-node merges across different sequence domains risk misordering deletion tombstones against active keys.
-4. **Lineage Truncation & Safe Garbage Collection**: If incremental chains traversed topology boundaries, storage files from older topologies would remain pinned indefinitely by downstream references. A `FULL` checkpoint serves as a **snapshot consolidation and lineage truncation boundary**, establishing a self-contained baseline for each participant and allowing historical fragments to be reclaimed by storage garbage collection. Subsequent iterations resume lightweight incremental checkpoints against the new baseline.
+4. **Lineage Truncation & Safe Garbage Collection**: If incremental chains traversed topology boundaries, storage files from older topologies would remain pinned indefinitely by downstream references. A `FULL` checkpoint serves as a **snapshot consolidation and lineage truncation boundary**, establishing a self-contained baseline for each participant and allowing predecessor fragments to be reclaimed by storage garbage collection. Subsequent iterations resume lightweight incremental checkpoints against the new baseline.
 
 ---
 
@@ -185,6 +185,7 @@ The restore pipeline validates parent continuity and reconciles multi-version re
 
 ```python
 from sparse_embedding.checkpoint import (
+    DTypeCastPolicy,
     IngestionEngine,
     PartitionSpec,
     RestorePlan,
@@ -215,6 +216,8 @@ reshard_plan = RestorePlan.from_partition(
 elastic_store = se.EmbeddingStore(config)
 checkpoint.load_training_checkpoint(elastic_store, committed_inc.handle, reshard_plan)
 ```
+
+Embedding dtypes must match by default. This implementation supports one explicit cast: pass `embedding_cast_policy=DTypeCastPolicy.SAFE` to `RestorePlan.from_partition` to restore FP16 embeddings into an FP32 store. Native entry ingestion casts the selected rows; page images require identical dtypes. Training restores retain the mutation watermark and require a new FULL checkpoint after an actual cast. Once that FULL is acknowledged, use it as the parent of subsequent incrementals. Optimizer state retains its original dtype.
 
 ### 3.3 Streaming Compaction
 

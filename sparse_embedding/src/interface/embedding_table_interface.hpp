@@ -382,7 +382,7 @@ struct EmbeddingTableBaseFacade : pro //
   ::add_convention<pro::weak_dispatch<MemCheckpointMutationWatermark>,
                    uint64_t() const> //
   ::add_convention<pro::weak_dispatch<MemAdvanceCheckpointBaseline>,
-                   void(uint64_t, std::string, uint64_t, std::string)> //
+                   bool(uint64_t, std::string, uint64_t, std::string)> //
   ::add_convention<pro::weak_dispatch<MemInitializeCheckpointBaseline>,
                    std::string(std::string, uint64_t)> //
   ::add_convention<pro::weak_dispatch<MemCheckpointRestoreIsPristine>,

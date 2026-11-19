@@ -454,19 +454,58 @@ def test_gradient_scale_rejects_invalid_values(gradient_scale):
         )
 
 
-def test_wider_gradient_dtype_rejects_parameter_overflow():
+@pytest.mark.parametrize("scale", [1.0, 8.0])
+def test_fp32_gradient_window_updates_fp16_weights_with_fp32_adam(scale):
     cfg = se.EmbeddingConfig(
-        dims=[1],
+        dims=[3],
         thread_budget=1,
         value_dtype="float16",
         optimizer_dtype="float32",
         gradient_dtype="float32",
+        gradient_scale=scale,
         key_dtype="uint64",
     )
     store = se.EmbeddingStore(
-        cfg, optimizer_config=se.Sgd(lr=1.0), initializer_config=se.Zeros()
+        cfg, optimizer_config=se.Adam(lr=0.25), initializer_config=se.Zeros()
     )
     key = np.array([1], dtype=np.uint64)
+    store.lookup_or_insert(key, dim=3)
+    gradients = np.array(
+        [[1e6, 1e-9, 65504], [2e6, 2e-9, 1], [-1e6, 3e-9, -65504]],
+        dtype=np.float32,
+    )
+    for gradient in gradients:
+        store.accumulate_gradients(key, gradient.reshape(1, 3))
+    store.optimizer_step(normalization_steps=3)
+    mean = gradients.mean(axis=0)
+    (image,) = store.export_page_images()
+    m, v = np.array(image["optimizer_states"]).reshape(2, 3)
+    np.testing.assert_allclose(m, (1 - np.float32(0.9)) * mean, atol=0, rtol=1e-6)
+    np.testing.assert_allclose(v, (1 - np.float32(0.999)) * mean**2, atol=0, rtol=1e-6)
+    assert image["steps"] == [1]
+    expected = (-0.25 * mean / (np.abs(mean) + 1e-8)).astype(np.float16)
+    np.testing.assert_array_equal(image["values"], expected)
+
+
+def test_subnormal_gradient_scale_preserves_normalized_update():
+    config = se.EmbeddingConfig(
+        dims=[1],
+        thread_budget=1,
+        value_dtype="float32",
+        optimizer_dtype="float32",
+        gradient_dtype="float32",
+        gradient_scale=float(np.nextafter(np.float32(0), np.float32(1))),
+        key_dtype="int64",
+    )
+    store = se.EmbeddingStore(
+        config,
+        optimizer_config=se.Sgd(lr=1.0),
+        initializer_config=se.Zeros(),
+    )
+    key = np.array([1], dtype=np.int64)
     store.lookup_or_insert(key, dim=1)
-    with pytest.raises((OverflowError, ValueError), match="gradient"):
-        store.accumulate_gradients(key, np.array([[100000.0]], dtype=np.float32))
+    for _ in range(3):
+        store.accumulate_gradients(key, np.array([[1e-8]], dtype=np.float32))
+    store.optimizer_step(normalization_steps=3)
+    values, _ = store.lookup(key, dim=1)
+    np.testing.assert_allclose(np.from_dlpack(values), [-1e-8], rtol=1e-6)

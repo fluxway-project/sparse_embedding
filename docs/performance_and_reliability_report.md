@@ -79,6 +79,8 @@ benchmark invocation. Mixed lookup/insert results are medians of five
 independent process runs. Throughput is reported in Mops/s or M keys/s; these
 figures are workload references, not cross-machine capacity guarantees.
 
+The [README summary](../README.md#performance-summary-across-operations) marks single-run results from 2026-11-19 with †. For forward lookup, the default `forward_scaling_benchmark` reached **52.164 Mops/s** at 8 threads on a shuffled batch of 4,096 unique keys (dim=32). The default `embedding_store_benchmark` reached **26.26 Mops/s** at 16 threads on 65,536 power-law keys (dim=128). The latter run passed its 2/4/8-worker scaling gates; the separate sustained-pressure benchmark failed before payload verification. The historical medians below retain their original sampling method.
+
 ### Concurrent memory lookup
 
 Configuration: dimension 128, reserved memory-only table, 10,000,000 `int64` keys,

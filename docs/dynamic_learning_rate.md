@@ -8,9 +8,7 @@ This API is available from the Python package built with the repository's
 Bazel toolchain. Use a score policy when the selected learning-rate policy
 reads feature scores; policies that do not read scores can be used without one.
 
-In large-scale sparse embeddings, it is often beneficial to adjust the learning rate dynamically based on the access frequency or importance of each feature. Features that appear frequently might need a smaller learning rate to avoid oscillating or overwriting information, while rare features might need larger updates to learn effectively from limited samples.
-
-Sparse Embedding provides a set of **Score-Based Dynamic Learning Rate Policies** that can adjust the learning rate for each feature based on its score (which is typically updated by a scoring policy like LFU or LRU).
+Sparse Embedding provides **Score-Based Dynamic Learning Rate Policies** that scale the effective learning rate per feature based on access scores maintained by policies such as LFU or LRU.
 
 ## Available Policies
 
@@ -47,14 +45,13 @@ embedding_config = se.EmbeddingConfig(
 )
 
 # Use Adam optimizer with a Square Root Decay policy
-# For a feature with score S, its effective learning rate will be: 0.01 / sqrt(S)
+# Effective learning rate: lr = 0.01 / sqrt(score)
 optimizer = se.Adam(
     lr=0.01,
     dynamic_lr_policy=se.SqrtDecayLrPolicy()
 )
 
 # Create the EmbeddingStore
-# Note: You MUST provide a score_policy (like "lfu") for dynamic LR to work.
 store = se.EmbeddingStore(
     embedding_config=embedding_config,
     initializer_config=se.Zeros(),
@@ -62,17 +59,13 @@ store = se.EmbeddingStore(
     score_policy="lfu"
 )
 
-# During the training loop, whenever features are queried, 
-# their LFU scores will be updated automatically.
+# Feature lookups update access scores automatically
 keys = np.array([1, 2, 3], dtype=np.int64)
 embeddings, lengths = store.lookup_or_insert(keys, dim=128)
 
-# Calculate gradients ...
+# Accumulate gradients and commit optimizer step
 gradients = np.ones((3, 128), dtype=np.float32)
 store.accumulate_gradients(keys, gradients)
-
-# When optimizer_step() is called, 
-# the learning rate will automatically scale based on the LFU score of each feature!
 store.optimizer_step(1)
 ```
 
@@ -80,7 +73,6 @@ store.optimizer_step(1)
 
 - **Score Policy Requirement**: Policies reading feature scores (e.g., `SqrtDecayLrPolicy`) require configuring `score_policy` at store creation; omitting it raises an initialization error.
 - **Training Mode**: Dynamic learning rate is an optimizer feature and requires `enable_optimizer=True`.
-- **Implementation**: Static and dynamic paths are resolved via compile-time `constexpr` branching, with dynamic scoring fused into the AVX-512 update kernel.
 
 ## Validation
 

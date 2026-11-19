@@ -16,9 +16,9 @@ High-performance sparse storage and computation library purpose-built for **PB-s
 - **Selective Optimizer Loading**: `EmbeddingConfig(enable_optimizer=False)` creates a weight-only inference store. `checkpoint.load_inference_checkpoint` (or storage `load_inference_weights`) restores weights only.
 - **Segregated Optimizer Memory Alignment**: Adam optimizer decouples vector and scalar alignments, maintaining 64-byte AVX-512 SIMD alignment for momentum vectors (`m/v`) while packing scalar step counters with 4-byte natural alignment (`OptimizerRowLayout::kNaturalAligned`) into 16 KiB pages to reduce the step working set.
 - **Configurable Shard Mutation Journaling**: Shard-local Change Data Capture (CDC) can be enabled or disabled via `EmbeddingConfig.enable_mutation_journal`. When disabled for pure training or FULL-only checkpoints, hot-path sequence accounting and record memory overhead are eliminated; when enabled, it tracks dirty keys and deletion tombstones for incremental checkpointing.
-- **Partitioner Registry and Routing (PartitionerRegistry)**: Built on `pro::proxy<PartitionerFacade>` supporting `modulo`, `hash`, `fast_range`, and dynamic extensions. Offline restore uses AVX-512 `filter_span`; online routing (`parallel_partitioner.hpp`) integrates with Fluxway `FunctionPartition`.
+- **Partitioner Registry and Routing (PartitionerRegistry)**: Supports `modulo`, `hash`, `fast_range`, and dynamic algorithmic extensions. Offline restore uses AVX-512 `filter_span`; online routing (`parallel_partitioner.hpp`) integrates with Fluxway `FunctionPartition`.
 - **Reference Vector Validation**: Canonical `generate_reference_vectors` validates bit-identical partition mappings between distributed runtimes and offline restore engines across all key types.
-- **Eviction Management**: Memory-efficient scoring policies (e.g., LFU) using thread-safe `std::atomic_ref` for concurrent state updates without locking.
+- **Eviction Management**: Memory-efficient scoring policies (e.g., LFU) using atomic in-place updates for concurrent state tracking without locking.
 - **Page-Level Hot/Cold Swapping**: Background eviction of cold data pages through address-stable `MAP_FIXED` remapping to file-backed storage based on configurable memory watermarks.
 
 ## Documentation
@@ -59,28 +59,28 @@ The Bazel configuration compiles C++ sources with `-std=c++23`; GCC 13+ and Baze
 | OS | Ubuntu 24.04.4 LTS, x86-64 |
 | Toolchain | GCC 13.4, Bazel 7.7, C++23 (`-std=c++23`), `-c opt` |
 | Optimization flags | `-O3 -march=native -mtune=native -mavx512bf16 -fno-strict-aliasing -DNDEBUG`; link with `-flto` |
-| CPU affinity | Slot-directory forward proof binds workers through the benchmark affinity helper; 48 CPUs were allowed |
+| CPU affinity | Slot-directory forward benchmark binds workers through the affinity helper; 48 CPUs were allowed |
 
 ### Performance Summary Across Operations
 
-Validated benchmark results across hot-path C++ and Python workloads:
+Rows marked † report throughput from a single benchmark invocation on 2026-11-19, at the thread count shown. Unmarked rows retain earlier reference results. See the [performance report](docs/performance_and_reliability_report.md) for multi-run medians.
 
 | Operation Category | Target Benchmark / Kernel | Concurrency / Configuration | Throughput | Bandwidth or measurement notes |
 |---|---|---|---:|---:|
-| **Directory Lookup** | C++ pure find microbench (`hotpath_microbench`) | 64 threads, 100K keys | **226.18 Mops/s** | CPU cache bound |
-| **Forward Lookup** | C++ slot-directory forward (`embedding_store_benchmark`) | 8 threads, dim=32, batch=4K | **50.39 Mops/s** | Memory bound |
-| **Forward Lookup (Wide)** | C++ full store forward (`embedding_store_benchmark`) | 16 threads, NUMA, dim=128, batch=65K | **11.365 Mops/s** | **5.82 GB/s** |
-| **In-Place Assign** | Python multi-threaded table assign (`benchmark_embedding_table`) | 32 threads, dim=128, batch=65K | **14.05 Mops/s** | 7.19 GB/s |
-| **In-Place Assign** | C++ full store assign (`embedding_store_benchmark`) | 16 threads, NUMA, dim=128, batch=65K | **32.76 Mops/s** | **16.775 GB/s** |
-| **Optimizer Step** | C++ Adam hot-set profile (`training_path_profile`) | 8 workers, dim=128, 4K keys | **17.89 Mops/s** | 8.54 GB/s |
+| **Directory Lookup** | C++ pure find microbench (`hotpath_microbench`) | 32 threads, 100K keys | **232.25 Mops/s** † | CPU cache bound |
+| **Forward Lookup** | C++ slot-directory forward (`forward_scaling_benchmark`) | 8 threads, dim=32, batch=4K | **52.164 Mops/s** † | 4,096 shuffled unique keys |
+| **Forward Lookup (Wide)** | C++ full store forward (`embedding_store_benchmark`) | 16 threads, NUMA sharding off, dim=128, batch=65K | **26.26 Mops/s** † | **13.45 GB/s** |
+| **In-Place Assign** | Python multi-threaded table assign (`benchmark_embedding_table`) | 32 threads, dim=128, batch=65K | **31.37 Mops/s** † | 16.06 GB/s (FP32 payload) |
+| **In-Place Assign** | C++ full store assign (`embedding_store_benchmark`) | 16 threads, NUMA, dim=128, batch=65K | **33.43 Mops/s** † | **17.11 GB/s** |
+| **Optimizer Step** | C++ Adam hot-set profile (`training_path_profile`) | 8 workers, dim=128, 4K keys | **17.89 Mops/s** | 8.54 GiB/s |
 | **Optimizer Step** | C++ full store SGD step (`embedding_store_benchmark`) | 16 threads, NUMA, dim=128, batch=65K | **20.065 Mops/s** | **20.545 GB/s** |
-| **Adam Training Step** | Python gradient accumulation + Adam commit ([benchmark](benchmarks/python/benchmark_adam_training_step.py)) | 16 threads, dim=16, batch=65K (p50: 6.39 ms, p99: 6.48 ms) | **10.28 Mops/s** | Not measured |
-| **Gradient Accumulation** | C++ gradient accumulation (`embedding_store_benchmark`) | 16 threads, NUMA, dim=128, batch=65K | **4.25 Mops/s** | **2.18 GB/s** |
+| **Adam Training Step** | Python gradient accumulation + Adam commit ([benchmark](benchmarks/python/benchmark_adam_training_step.py)) | 16 threads, dim=16, batch=65K (p50: 6.00 ms, p99: 6.43 ms) | **10.68 Mops/s** † | Not measured |
+| **Gradient Accumulation** | C++ gradient accumulation (`embedding_store_benchmark`) | 16 threads, NUMA, dim=128, batch=65K | **4.28 Mops/s** † | **2.19 GB/s** |
 | **Key Membership** | C++ contains check (`embedding_store_benchmark`) | 16 threads, NUMA, batch=65K | **22.295 Mops/s** | Metadata bound |
-| **Batch Erase** | C++ batch erase (`embedding_store_benchmark`) | 16 threads, NUMA, 10% batch | **5.26 Mops/s** | Shard lock-free |
+| **Batch Erase** | C++ batch erase (`embedding_store_benchmark`) | 1 thread, 10% batch | **9.70 Mops/s** † | Requested keys/s across repeated erases |
 | **End-to-End Step** | Python full training step (`benchmark_embedding_table`) | 32 threads, lookup + accum + step | **2.02 Mops/s** | E2E compute |
 | **Async LFU lookup** | Python storage pressure (`benchmark_e2e`) | 4 threads, dim=16, batch=4,096 | **14.95 Mops/s** | p95 0.2825 ms |
-| **Async Zipfian Access** | Python async Zipfian lookup (`benchmark_async_zipfian`) | 16 workers, skew=1.1, power-law | **11.96 Mops/s** | Async scheduler |
+| **Async Zipfian Access** | Python async Zipfian lookup (`benchmark_async_zipfian`) | 8-thread budget, dim=128, Zipf exponent 1.2 | **13.36 Mops/s** † | Async scheduler |
 | **Distributed Routing** | Parallel partitioner Lemire fast_range (`parallel_partitioner`) | 8 workers, 10M keys | **1.03 B keys/s** | Vectorized routing |
 | **SIMD Slice Filter** | AVX-512 slice mask filter (`filter_span`) | 8 workers, Arrow memory slices | **1.45 B keys/s** | AVX-512 SIMD |
 
@@ -96,7 +96,7 @@ The reference workload uses a dimension-32 memory-only table, 4,096-key fixed
 power-law batches, 400 timed `forward_lookup` repetitions, and physical-core
 affinity on 48 allowed CPUs.
 
-| Threads | Forward throughput |
+| Threads | Forward throughput (five-run median) |
 |---:|---:|
 | 1 | 14.61 Mops/s |
 | 2 | 27.04 Mops/s |
@@ -140,10 +140,7 @@ because dispatch overhead exceeds locality benefit for small batches; larger
 payloads retain node-local routing. High worker counts remain bounded by socket
 bandwidth, while data path and API semantics stay unchanged.
 
-The long-lived `exec::static_thread_pool` removes thread creation/destruction,
-but each `bulk + sync_wait` still pays task enqueue, wakeup, steal, completion,
-and barrier costs. An empty-bulk proof measured about 3.47/21.7/41.6/87.4 µs
-at 1/2/8/24 workers.
+The long-lived `exec::static_thread_pool` avoids thread creation and destruction overhead across batch invocations.
 
 For a reproducible disk-swap pressure check covering every public operation,
 run `small_memory_all_paths_pressure_test`. Its 64 MiB Auto-storage profile
@@ -226,14 +223,14 @@ HogwildEmbeddingStore
 ├── PageStorage                  # Auto-detected RAM budget + file-backed spill
 ├── TransientArena[thread_budget]  # Per-shard gradient accumulation (lock-free)
 ├── exec::static_thread_pool     # C++23 stdexec thread pool
-├── PartitionerRegistry (ops)    # Zero-vtable proxy partitioner registry (modulo/hash/fast_range)
+├── PartitionerRegistry (ops)    # Extensible partitioner registry (modulo/hash/fast_range)
 ├── ParallelPartitioner          # 1.03B keys/s multi-threaded router & AVX-512 mask filter
-└── pro::proxy<OptimizerExtensionFacade<ParamT, OptT>> # Batch optimizer seam
+└── OptimizerExtensionFacade<ParamT, OptT> # Batch optimizer seam
 ```
 
 ### Key Design Decisions
 
-1. **Decoupled Key-Value Storage**: The traditional `Key -> Vector` hash map is split into a two-level structure: `Key -> Index` (`parlayhash`) and `Index -> Vector` (`EmbeddingArena`). The hash table only stores lightweight integer indices, keeping the embedding vectors compactly stored, contiguous, and aligned. This significantly improves CPU cache hit rates and enables efficient SIMD vectorization.
+1. **Decoupled Key-Value Storage**: Uses a two-level structure: `Key -> Index` (`parlayhash`) and `Index -> Vector` (`EmbeddingArena`). The hash table stores lightweight integer indices, keeping embedding vectors compactly stored, contiguous, and aligned for CPU cache locality and SIMD vectorization.
 
 2. **Shard-Local Synchronization**: ParlayHash lookup uses a shared lock; Upsert, erase, rebuild, and internal expansion use an exclusive lock for only the affected shard. Independent shards remain concurrent, avoiding the correctness failure of unsynchronized growth and the throughput collapse of a global Upsert lock.
 
@@ -246,14 +243,13 @@ HogwildEmbeddingStore
 
 ### Training Update Path
 
-The training path (`accumulate_gradients()` followed by `optimizer_step()`)
-keeps gradient accumulation in the per-shard `TransientArena`.
-`optimizer_step()` resolves a shard batch, enters `OptimizerExtensionFacade`
+The training path (`accumulate_gradients()` followed by
+`optimizer_step(normalization_steps=...)`) keeps gradient accumulation in the
+per-shard `TransientArena`. `gradient_dtype` controls scaled accumulation
+storage independently of `value_dtype`; after normalization, the optimizer
+receives FP32 gradients, while `optimizer_dtype` controls its state.
+`optimizer_step(normalization_steps=...)` resolves a shard batch, enters `OptimizerExtensionFacade`
 once, and consumes all parameter spans before releasing the locator batch locks.
-
-Optimizer extension dispatch is deliberately batch-scoped. Static dispatch is
-an implementation option for the same contract, and `std::variant` remains a
-cold configuration mechanism rather than a per-row runtime path.
 
 Mutation APIs require unique `(key, dimension)` rows. `lookup_or_insert` may
 coalesce duplicate misses, but `assign`, `accumulate_gradients`, and
