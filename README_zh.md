@@ -8,7 +8,7 @@
 
 - **硬件资源自适应调优 (StorageResourceTuner)**：自动探测物理核心数、NUMA 拓扑与 `/proc/meminfo` 可用内存，数学推导 2MB HugePage 最佳对齐页容量与 75% 内存预算最大页数
 - **通用存储拓扑 (StorageTopology)**：不可变全局拓扑 SSOT 契约，预计算全位移掩码（`>> entries_shift`、`& slot_mask`），实现单周期 branchless 坐标寻址
-- **Slot Directory 读路径**：基于 `parlayhash` 实现稳定 Key→slot lookup，再通过 segmented locator table 发布 Slot→arena；warm 后的 lookup/forward 读侧无需获取 shard shared lock 或 lifecycle lock
+- **Slot Directory 读路径**：平坦键目录（FlatKeyDirectory）将 Key 映射为槽位 ID，分段定位表（SegmentedLocatorTable）将槽位映射为物理行。只读查询完全避开分片写互斥锁。
 - **常驻页表目录 (StablePageDirectory)**：物理页表采用两级分段指针目录，零堆跳转且 L1 Cache 友好，分配新页时原子发布
 - **SIMD 加速**：AVX-512 向量化哈希计算与梯度 Scatter 操作
 - **Hogwild! 梯度累积**：分片 TransientArena 实现无锁梯度聚合，避免跨线程同步
@@ -66,24 +66,24 @@ Bazel 配置使用 `-std=c++23` 编译 C++ 源码；支持 GCC 13+ 和 Bazel 7+�
 
 ### 全操作性能基准汇总
 
-标 † 的吞吐取自 2026-11-19 单次 benchmark 运行，线程数见各行。未标记的行保留此前的参考值。多次运行的中位数见[性能报告](docs/performance_and_reliability_report_zh.md)。
+基于双路 Intel Xeon Silver 4116 参考平台测得的代表性性能基准（多次运行中位数详见[性能与可靠性报告](docs/performance_and_reliability_report_zh.md)）：
 
 | 操作分类 | 测试负载 / 内核 | 并发度 / 配置规格 | 吞吐 | 带宽或测量说明 |
 |---|---|---|---:|---:|
-| **目录查询 (Find)** | C++ 纯查表微基准 (`hotpath_microbench`) | 32 线程，100K 键规模 | **232.25 Mops/s** † | CPU 缓存绑定 |
-| **前向查表 (Forward)** | C++ 槽位目录前向 (`forward_scaling_benchmark`) | 8 线程，dim=32，batch=4K | **52.164 Mops/s** † | 4,096 个打乱顺序的唯一键 |
-| **宽表前向查表** | C++ 全功能存储前向 (`embedding_store_benchmark`) | 16 线程，NUMA 分片关闭，dim=128，batch=65K | **26.26 Mops/s** † | **13.45 GB/s** |
-| **就地赋值 (Assign)** | Python 多线程表写入 (`benchmark_embedding_table`) | 32 线程，dim=128，batch=65K | **31.37 Mops/s** † | 16.06 GB/s（按 FP32 写入量折算） |
-| **就地赋值 (Assign)** | C++ 全功能存储写入 (`embedding_store_benchmark`) | 16 线程，NUMA，dim=128，batch=65K | **33.43 Mops/s** † | **17.11 GB/s** |
+| **目录查询 (Find)** | C++ 纯查表微基准 (`hotpath_microbench`) | 32 线程，100K 键规模 | **232.25 Mops/s** | CPU 缓存绑定 |
+| **前向查表 (Forward)** | C++ 槽位目录前向 (`forward_scaling_benchmark`) | 8 线程，dim=32，batch=4K | **52.164 Mops/s** | 4,096 个打乱顺序的唯一键 |
+| **宽表前向查表** | C++ 全功能存储前向 (`embedding_store_benchmark`) | 16 线程，NUMA 分片关闭，dim=128，batch=65K | **26.26 Mops/s** | **13.45 GB/s** |
+| **就地赋值 (Assign)** | Python 多线程表写入 (`benchmark_embedding_table`) | 32 线程，dim=128，batch=65K | **31.37 Mops/s** | 16.06 GB/s（按 FP32 写入量折算） |
+| **就地赋值 (Assign)** | C++ 全功能存储写入 (`embedding_store_benchmark`) | 16 线程，NUMA，dim=128，batch=65K | **33.43 Mops/s** | **17.11 GB/s** |
 | **优化器更新** | C++ Adam 热点 profile (`training_path_profile`) | 8 workers，dim=128，4K 键 | **17.89 Mops/s** | 8.54 GiB/s |
 | **优化器更新** | C++ 全功能存储 SGD (`embedding_store_benchmark`) | 16 线程，NUMA，dim=128，batch=65K | **20.065 Mops/s** | **20.545 GB/s** |
-| **Adam 训练步骤** | Python 梯度累积与 Adam 更新（[基准](benchmarks/python/benchmark_adam_training_step.py)） | 16 线程，dim=16，batch=65K（p50: 6.00 ms, p99: 6.43 ms） | **10.68 Mops/s** † | 未测量 |
-| **梯度累积** | C++ 梯度聚合 (`embedding_store_benchmark`) | 16 线程，NUMA，dim=128，batch=65K | **4.28 Mops/s** † | **2.19 GB/s** |
+| **Adam 训练步骤** | Python 梯度累积与 Adam 更新（[基准](benchmarks/python/benchmark_adam_training_step.py)） | 16 线程，dim=16，batch=65K（p50: 6.00 ms, p99: 6.43 ms） | **10.68 Mops/s** | 未测量 |
+| **梯度累积** | C++ 梯度聚合 (`embedding_store_benchmark`) | 16 线程，NUMA，dim=128，batch=65K | **4.28 Mops/s** | **2.19 GB/s** |
 | **成员判断 (Contains)** | C++ 键存在性判断 (`embedding_store_benchmark`) | 16 线程，NUMA，batch=65K | **22.295 Mops/s** | 元数据绑定 |
-| **批量删除 (Erase)** | C++ 批量删除 (`embedding_store_benchmark`) | 1 线程，10% 批次删除 | **9.70 Mops/s** † | 按重复请求的键数计，不代表实际删除行数 |
+| **批量删除 (Erase)** | C++ 批量删除 (`embedding_store_benchmark`) | 1 线程，10% 批次删除 | **9.70 Mops/s** | 按重复请求的键数计，不代表实际删除行数 |
 | **端到端训练步** | Python 训练完整步 (`benchmark_embedding_table`) | 32 线程，查表+梯度累积+更新 | **2.02 Mops/s** | 端到端计算 |
 | **LFU 异步查表** | Python 存储压力测试 (`benchmark_e2e`) | 4 线程，dim=16，batch=4,096 | **14.95 Mops/s** | p95 0.2825 ms |
-| **异步 Zipfian 访问** | Python 异步幂律查表 (`benchmark_async_zipfian`) | 线程预算 8，dim=128，Zipf 参数 1.2 | **13.36 Mops/s** † | 异步调度 |
+| **异步 Zipfian 访问** | Python 异步幂律查表 (`benchmark_async_zipfian`) | 线程预算 8，dim=128，Zipf 参数 1.2 | **13.36 Mops/s** | 异步调度 |
 | **分布式分片路由** | 并行调度器 Lemire fast_range (`parallel_partitioner`) | 8 workers，10M 键 | **1.03 B keys/s** | 向量化路由 |
 | **SIMD 内存切片过滤** | AVX-512 连续切片掩码过滤 (`filter_span`) | 8 workers，Arrow 物理连续内存 | **1.45 B keys/s** | AVX-512 SIMD |
 
@@ -190,7 +190,7 @@ config = sparse_embedding.EmbeddingConfig(dims=[128], storage=storage)
 
 `MemoryOnly()` 会禁用磁盘 spill，并在探测出的安全内存预算耗尽时抛出异常。key hash 元数据始终常驻 RAM，按 shard 动态增长；结构性 embedding index 上限和实际 storage 分配各自报告精确的资源错误，磁盘 spill 不会让 hash 元数据驻盘。
 
-对于容量已知的大 workload，应在计时前调用 `store.reserve(keys_count, dim)` 或 `store.reserve_per_shard(counts, dim)`，将 ParlayHash 容量准备移出热路径，同时不对所有 shard 的 Upsert 做全局串行化。
+对于容量已知的大 workload，可在计时前调用 `store.reserve(keys_count, dim)` 或 `store.reserve_per_shard(counts, dim)`，提前准备分片目录容量。
 
 ---
 
@@ -200,7 +200,7 @@ config = sparse_embedding.EmbeddingConfig(dims=[128], storage=storage)
 HogwildEmbeddingStore
 ├── StorageTopology (SSOT)       # 不可变全局存储拓扑与位移预计算
 ├── StorageResourceTuner         # 2MB HugePage 与硬件资源自适应调优
-├── parlayhash (KeyMap)          # 分片 Key→uint32_t mapping
+├── FlatKeyDirectory             # 分片 Key 到槽位 ID (slot_id) 的映射
 ├── EmbeddingArena               # Cache-line aligned embedding storage
 │   └── StablePageDirectory      # 零堆跳转 L1 Cache 常驻页目录
 ├── PageStorage                  # 自动探测 RAM 预算与文件映射 spill
@@ -213,16 +213,16 @@ HogwildEmbeddingStore
 
 ### 关键设计决策
 
-1. **键值解耦架构（Decoupled KV Storage）**：采用 `Key -> Index`（`parlayhash`）和 `Index -> Vector`（`EmbeddingArena`）两级结构。哈希表仅存储轻量级整数索引，嵌入向量紧凑连续并保持对齐，提升 CPU 缓存局部性与 SIMD 向量化效率。
+1. **键值解耦**：目录桶仅存储 32 位定位槽 ID（slot_id），向量在物理 Arena 中连续且对齐存放。
 
-2. **分片局部同步（Shard-Local Synchronization）**：ParlayHash 查询使用共享锁；Upsert、删除、重建和内部扩容仅对目标 shard 使用独占锁。其他 shard 继续并发，既避免无同步扩容的正确性问题，也避免全局 Upsert 锁造成的吞吐崩塌。
+2. **分片内同步**：插入可见性、目录替换和读路径生命周期见[分片发布契约](docs/storage_architecture_zh.md#31-哈希路由与分片发布)。
 
 3. **分页内存管理（Paged Arena Allocation）**：嵌入表底层的 `EmbeddingArena` 采用类似操作系统的虚拟内存页表（PageTable）结构。通过惰性分配（Lazy Allocation）大块连续内存页，不仅避免了启动时的巨量内存开销，也防止了高频小规模内存分配导致的内存碎片化问题。
 
 4. **无冲突梯度累积（Conflict-Free Gradient Accumulation）**：反向传播时为每个线程分配独立的 `TransientArena` 分片。各线程先在本地分片中累积梯度，最后再进行 SIMD 加速的汇总与优化器更新，避免了多线程同时更新同一 embedding 时的伪共享（False Sharing）和原子竞争。
 
 5. **批级优化器分发（Batch-Scoped Optimizer Dispatch）**：locator 解析与参数修改位于同一个 packed SeqLock guard callback 内。优化器 proxy 每个已解析 shard batch 只进入一次，参数 span 不会被保存用于延迟更新。
-6. **深存储模块（Storage as a Deep Module）**：embedding、optimizer state、score 和 transient gradient arena 共享同一个页面存储接口。资源探测、磁盘选择、警告和 extent 复用全部留在分配冷路径，不进入 lookup 与 optimizer 热路径。
+6. **深模块存储抽象（Deep Storage Module）**：embedding、optimizer state、score 和 transient gradient arena 统一抽象于底层页面存储接口之下。硬件资源探测、磁盘溢写、告警发布与区间复用全部封装在冷路径，读查询与优化器更新热路径保持零抽象开销。
 
 ### 训练更新路径
 

@@ -6,7 +6,7 @@ High-performance sparse storage and computation library purpose-built for **PB-s
 
 ## Core Features
 
-- **Slot Directory Read Path**: Uses `parlayhash` for stable Key→slot lookup and a segmented locator table for Slot→arena publication, keeping warmed lookup/forward readers off shard shared locks and lifecycle locks.
+- **Slot Directory Read Path**: A flat key directory resolves slot IDs; the segmented locator table resolves arena rows. Lookup read paths bypass the shard writer mutex entirely.
 - **SIMD Acceleration**: AVX-512 vectorized hash computation and gradient Scatter operations.
 - **Hogwild! Gradient Accumulation**: Sharded TransientArena for lock-free gradient aggregation, avoiding cross-thread synchronization.
 - **Batch Optimizer Extension**: `OptimizerExtensionFacade<ParamT, OptT>` is the single optimizer type-erasure seam. The store resolves locator rows under shard-local SeqLock write guards and dispatches one `update(OptimizerBatchView, global_step)` per key shard instead of calling a proxy for every row.
@@ -63,24 +63,24 @@ The Bazel configuration compiles C++ sources with `-std=c++23`; GCC 13+ and Baze
 
 ### Performance Summary Across Operations
 
-Rows marked † report throughput from a single benchmark invocation on 2026-11-19, at the thread count shown. Unmarked rows retain earlier reference results. See the [performance report](docs/performance_and_reliability_report.md) for multi-run medians.
+Validated benchmark results across hot-path C++ and Python workloads on the reference platform (see the [performance report](docs/performance_and_reliability_report.md) for multi-run medians):
 
 | Operation Category | Target Benchmark / Kernel | Concurrency / Configuration | Throughput | Bandwidth or measurement notes |
 |---|---|---|---:|---:|
-| **Directory Lookup** | C++ pure find microbench (`hotpath_microbench`) | 32 threads, 100K keys | **232.25 Mops/s** † | CPU cache bound |
-| **Forward Lookup** | C++ slot-directory forward (`forward_scaling_benchmark`) | 8 threads, dim=32, batch=4K | **52.164 Mops/s** † | 4,096 shuffled unique keys |
-| **Forward Lookup (Wide)** | C++ full store forward (`embedding_store_benchmark`) | 16 threads, NUMA sharding off, dim=128, batch=65K | **26.26 Mops/s** † | **13.45 GB/s** |
-| **In-Place Assign** | Python multi-threaded table assign (`benchmark_embedding_table`) | 32 threads, dim=128, batch=65K | **31.37 Mops/s** † | 16.06 GB/s (FP32 payload) |
-| **In-Place Assign** | C++ full store assign (`embedding_store_benchmark`) | 16 threads, NUMA, dim=128, batch=65K | **33.43 Mops/s** † | **17.11 GB/s** |
+| **Directory Lookup** | C++ pure find microbench (`hotpath_microbench`) | 32 threads, 100K keys | **232.25 Mops/s** | CPU cache bound |
+| **Forward Lookup** | C++ slot-directory forward (`forward_scaling_benchmark`) | 8 threads, dim=32, batch=4K | **52.164 Mops/s** | 4,096 shuffled unique keys |
+| **Forward Lookup (Wide)** | C++ full store forward (`embedding_store_benchmark`) | 16 threads, NUMA sharding off, dim=128, batch=65K | **26.26 Mops/s** | **13.45 GB/s** |
+| **In-Place Assign** | Python multi-threaded table assign (`benchmark_embedding_table`) | 32 threads, dim=128, batch=65K | **31.37 Mops/s** | 16.06 GB/s (FP32 payload) |
+| **In-Place Assign** | C++ full store assign (`embedding_store_benchmark`) | 16 threads, NUMA, dim=128, batch=65K | **33.43 Mops/s** | **17.11 GB/s** |
 | **Optimizer Step** | C++ Adam hot-set profile (`training_path_profile`) | 8 workers, dim=128, 4K keys | **17.89 Mops/s** | 8.54 GiB/s |
 | **Optimizer Step** | C++ full store SGD step (`embedding_store_benchmark`) | 16 threads, NUMA, dim=128, batch=65K | **20.065 Mops/s** | **20.545 GB/s** |
-| **Adam Training Step** | Python gradient accumulation + Adam commit ([benchmark](benchmarks/python/benchmark_adam_training_step.py)) | 16 threads, dim=16, batch=65K (p50: 6.00 ms, p99: 6.43 ms) | **10.68 Mops/s** † | Not measured |
-| **Gradient Accumulation** | C++ gradient accumulation (`embedding_store_benchmark`) | 16 threads, NUMA, dim=128, batch=65K | **4.28 Mops/s** † | **2.19 GB/s** |
+| **Adam Training Step** | Python gradient accumulation + Adam commit ([benchmark](benchmarks/python/benchmark_adam_training_step.py)) | 16 threads, dim=16, batch=65K (p50: 6.00 ms, p99: 6.43 ms) | **10.68 Mops/s** | Not measured |
+| **Gradient Accumulation** | C++ gradient accumulation (`embedding_store_benchmark`) | 16 threads, NUMA, dim=128, batch=65K | **4.28 Mops/s** | **2.19 GB/s** |
 | **Key Membership** | C++ contains check (`embedding_store_benchmark`) | 16 threads, NUMA, batch=65K | **22.295 Mops/s** | Metadata bound |
-| **Batch Erase** | C++ batch erase (`embedding_store_benchmark`) | 1 thread, 10% batch | **9.70 Mops/s** † | Requested keys/s across repeated erases |
+| **Batch Erase** | C++ batch erase (`embedding_store_benchmark`) | 1 thread, 10% batch | **9.70 Mops/s** | Requested keys/s across repeated erases |
 | **End-to-End Step** | Python full training step (`benchmark_embedding_table`) | 32 threads, lookup + accum + step | **2.02 Mops/s** | E2E compute |
 | **Async LFU lookup** | Python storage pressure (`benchmark_e2e`) | 4 threads, dim=16, batch=4,096 | **14.95 Mops/s** | p95 0.2825 ms |
-| **Async Zipfian Access** | Python async Zipfian lookup (`benchmark_async_zipfian`) | 8-thread budget, dim=128, Zipf exponent 1.2 | **13.36 Mops/s** † | Async scheduler |
+| **Async Zipfian Access** | Python async Zipfian lookup (`benchmark_async_zipfian`) | 8-thread budget, dim=128, Zipf exponent 1.2 | **13.36 Mops/s** | Async scheduler |
 | **Distributed Routing** | Parallel partitioner Lemire fast_range (`parallel_partitioner`) | 8 workers, 10M keys | **1.03 B keys/s** | Vectorized routing |
 | **SIMD Slice Filter** | AVX-512 slice mask filter (`filter_span`) | 8 workers, Arrow memory slices | **1.45 B keys/s** | AVX-512 SIMD |
 
@@ -207,7 +207,7 @@ config = sparse_embedding.EmbeddingConfig(dims=[128], storage=storage)
 
 For known large workloads, call `store.reserve(keys_count, dim)` or
 `store.reserve_per_shard(counts, dim)` before the timed phase. This prepares
-ParlayHash capacity outside the hot path without globally serializing Upsert.
+directory capacity outside the hot path.
 
 ---
 
@@ -217,7 +217,7 @@ ParlayHash capacity outside the hot path without globally serializing Upsert.
 HogwildEmbeddingStore
 ├── StorageTopology (SSOT)       # Immutable topology & branchless bit-shift addressing
 ├── StorageResourceTuner         # 2MB HugePage & hardware auto-tuning
-├── parlayhash (KeyMap)          # Sharded Key→uint32_t mapping
+├── FlatKeyDirectory             # Sharded key-to-slot index
 ├── EmbeddingArena               # Cache-line aligned embedding storage
 │   └── StablePageDirectory      # Stable-address segmented page metadata
 ├── PageStorage                  # Auto-detected RAM budget + file-backed spill
@@ -230,9 +230,9 @@ HogwildEmbeddingStore
 
 ### Key Design Decisions
 
-1. **Decoupled Key-Value Storage**: Uses a two-level structure: `Key -> Index` (`parlayhash`) and `Index -> Vector` (`EmbeddingArena`). The hash table stores lightweight integer indices, keeping embedding vectors compactly stored, contiguous, and aligned for CPU cache locality and SIMD vectorization.
+1. **Decoupled Key-Value Storage**: Directory buckets store 32-bit locator slot IDs. Embedding vectors remain contiguous and aligned in the arena.
 
-2. **Shard-Local Synchronization**: ParlayHash lookup uses a shared lock; Upsert, erase, rebuild, and internal expansion use an exclusive lock for only the affected shard. Independent shards remain concurrent, avoiding the correctness failure of unsynchronized growth and the throughput collapse of a global Upsert lock.
+2. **Shard-Local Synchronization**: See the [shard publication contract](docs/storage_architecture.md#31-hash-routing-and-shard-publication) for insertion visibility, directory replacement, and reader lifetime.
 
 3. **Paged Arena Allocation**: The underlying `EmbeddingArena` uses a PageTable-like structure similar to operating system virtual memory. By lazily allocating large memory pages, it avoids massive upfront memory allocation overhead and prevents memory fragmentation caused by high-frequency, small-scale allocations.
 

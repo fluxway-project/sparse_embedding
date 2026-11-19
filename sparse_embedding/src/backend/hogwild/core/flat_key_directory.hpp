@@ -1,6 +1,6 @@
 #pragma once
 
-#include <algorithm>
+#include <atomic>
 #include <bit>
 #include <cstddef>
 #include <cstdint>
@@ -12,6 +12,10 @@
 namespace se::hogwild_internal {
 
 class FlatKeyDirectory {
+  using Bucket = std::atomic<uint32_t>;
+  static_assert(Bucket::is_always_lock_free &&
+                sizeof(Bucket) == sizeof(uint32_t));
+
 public:
   static constexpr uint32_t kMaximumSlotId = 0x3FFFFFFFU;
 
@@ -20,14 +24,16 @@ public:
         power_of_two_mask_(
             std::has_single_bit(bucket_count_) ? bucket_count_ - 1 : 0),
         hash_shift_(hash_shift),
-        slots_(std::make_unique<uint32_t[]>(bucket_count_)) {}
+        slots_(std::make_unique<Bucket[]>(bucket_count_)) {}
 
   FlatKeyDirectory(const FlatKeyDirectory &other)
       : bucket_count_(other.bucket_count_),
         power_of_two_mask_(other.power_of_two_mask_),
-        hash_shift_(other.hash_shift_), entry_count_(other.entry_count_),
-        slots_(std::make_unique<uint32_t[]>(other.bucket_count_)) {
-    std::copy_n(other.slots_.get(), bucket_count_, slots_.get());
+        hash_shift_(other.hash_shift_),
+        slots_(std::make_unique<Bucket[]>(other.bucket_count_)) {
+    for (size_t i = 0; i < bucket_count_; ++i)
+      slots_[i].store(other.slots_[i].load(std::memory_order_relaxed),
+                      std::memory_order_relaxed);
   }
 
   FlatKeyDirectory &operator=(const FlatKeyDirectory &) = delete;
@@ -43,16 +49,7 @@ public:
   std::optional<uint32_t>
   find_hashed(uint64_t key, uint64_t hash,
               KeyForSlot &&key_for_slot) const noexcept {
-    size_t position = bucket_position(hash);
-    for (size_t probe = 0; probe < bucket_count_; ++probe) {
-      const uint32_t slot_id = slots_[position];
-      if (slot_id == kEmptySlot)
-        return std::nullopt;
-      if (slot_id != kTombstoneSlot && key_for_slot(slot_id) == key)
-        return slot_id;
-      advance(position);
-    }
-    return std::nullopt;
+    return locate(key, hash, key_for_slot).slot;
   }
 
   template <typename KeyForSlot>
@@ -60,51 +57,31 @@ public:
                      KeyForSlot &&key_for_slot) {
     if (slot_id == 0 || slot_id > kMaximumSlotId)
       throw std::invalid_argument("key directory slot id is invalid");
-    size_t position = bucket_position(hash);
-    size_t first_tombstone = bucket_count_;
-    for (size_t probe = 0; probe < bucket_count_; ++probe) {
-      const uint32_t existing_slot = slots_[position];
-      if (existing_slot != kEmptySlot && existing_slot != kTombstoneSlot) {
-        if (key_for_slot(existing_slot) == key)
-          throw std::logic_error("key directory has a duplicate key");
-      } else if (existing_slot == kTombstoneSlot) {
-        if (first_tombstone == bucket_count_)
-          first_tombstone = position;
-      } else {
-        publish(first_tombstone == bucket_count_ ? position : first_tombstone,
-                slot_id);
-        return;
-      }
-      advance(position);
-    }
-    if (first_tombstone != bucket_count_) {
-      publish(first_tombstone, slot_id);
-      return;
-    }
-    throw std::overflow_error("key directory is full");
+    const Match target = locate(key, hash, key_for_slot);
+    if (target.slot)
+      throw std::logic_error("key directory has a duplicate key");
+    if (target.position == bucket_count_)
+      throw std::overflow_error("key directory is full");
+    slots_[target.position].store(slot_id, std::memory_order_release);
+  }
+
+  void publish_reserved_absent(uint64_t hash, uint32_t slot_id) noexcept {
+    if (!try_publish_absent(hash, slot_id))
+      std::terminate();
   }
 
   template <typename KeyForSlot>
   std::optional<uint32_t> remove_hashed(uint64_t key, uint64_t hash,
                                         KeyForSlot &&key_for_slot) {
-    size_t position = bucket_position(hash);
-    for (size_t probe = 0; probe < bucket_count_; ++probe) {
-      const uint32_t slot_id = slots_[position];
-      if (slot_id == kEmptySlot)
-        return std::nullopt;
-      if (slot_id != kTombstoneSlot && key_for_slot(slot_id) == key) {
-        slots_[position] = kTombstoneSlot;
-        --entry_count_;
-        return slot_id;
-      }
-      advance(position);
-    }
-    return std::nullopt;
+    const auto found = locate(key, hash, key_for_slot);
+    if (found.slot)
+      slots_[found.position].store(kTombstoneSlot, std::memory_order_release);
+    return found.slot;
   }
 
   template <typename Fn> void for_each(Fn &&fn) const {
     for (size_t index = 0; index < bucket_count_; ++index) {
-      const uint32_t slot_id = slots_[index];
+      const uint32_t slot_id = slots_[index].load(std::memory_order_acquire);
       if (slot_id != kEmptySlot && slot_id != kTombstoneSlot)
         fn(slot_id);
     }
@@ -167,16 +144,51 @@ private:
       position = 0;
   }
 
-  void publish(size_t position, uint32_t slot_id) noexcept {
-    slots_[position] = slot_id;
-    ++entry_count_;
+  struct Match {
+    size_t position;
+    std::optional<uint32_t> slot;
+  };
+
+  template <typename KeyForSlot>
+  Match locate(uint64_t key, uint64_t hash,
+               KeyForSlot &key_for_slot) const noexcept {
+    size_t position = bucket_position(hash);
+    size_t first_tombstone = bucket_count_;
+    for (size_t probe = 0; probe < bucket_count_; ++probe) {
+      const auto slot = slots_[position].load(std::memory_order_acquire);
+      if (slot == kEmptySlot)
+        return {first_tombstone == bucket_count_ ? position : first_tombstone,
+                std::nullopt};
+      if (slot == kTombstoneSlot) {
+        if (first_tombstone == bucket_count_)
+          first_tombstone = position;
+        advance(position);
+        continue;
+      }
+      if (key_for_slot(slot) == key)
+        return {position, slot};
+      advance(position);
+    }
+    return {first_tombstone, std::nullopt};
+  }
+
+  bool try_publish_absent(uint64_t hash, uint32_t slot_id) noexcept {
+    size_t position = bucket_position(hash);
+    for (size_t probe = 0; probe < bucket_count_; ++probe) {
+      const auto slot = slots_[position].load(std::memory_order_relaxed);
+      if (slot == kEmptySlot || slot == kTombstoneSlot) {
+        slots_[position].store(slot_id, std::memory_order_release);
+        return true;
+      }
+      advance(position);
+    }
+    return false;
   }
 
   size_t bucket_count_;
   size_t power_of_two_mask_;
   unsigned hash_shift_;
-  size_t entry_count_ = 0;
-  std::unique_ptr<uint32_t[]> slots_;
+  std::unique_ptr<Bucket[]> slots_;
 };
 
 } // namespace se::hogwild_internal

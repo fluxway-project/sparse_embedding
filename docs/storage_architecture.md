@@ -32,7 +32,7 @@ The Sparse Embedding engine is structured into five distinct layers:
                                │
 ┌──────────────────────────────▼──────────────────────────────┐
 │             Concurrent Hash Routing & Locator Layer         │
-│  ParlayHash Shards ──► MapBundle (RCU) ──► SegmentedLocator │
+│  MapBundle ──► FlatKeyDirectory ──► SegmentedLocator         │
 └──────────────────────────────┬──────────────────────────────┘
                                │
 ┌──────────────────────────────▼──────────────────────────────┐
@@ -55,13 +55,13 @@ The Sparse Embedding engine is structured into five distinct layers:
 
 ## 3. Concurrency Model and Lock-Free Queries
 
-### 3.1 Hash Routing and Immutable MapBundle (RCU Publication)
+### 3.1 Hash Routing and Shard Publication
 
 The core query resolution path follows: `Key Hash -> Shard ID -> slot_id -> SegmentedLocatorTable -> arena_index`.
 
-- **Read/Write Decoupling**: Each shard manages an immutable `MapBundle`. Readers acquire-load the current `MapBundle` pointer without taking shared mutexes.
-- **Copy-on-Write and Atomic Publication**: Structural mutations (insert, erase, reserve, slot rotation) clone the active bundle under the affected shard's writer mutex, applying changes and publishing the new bundle via a single atomic exchange. Individual shards grow independently without blocking concurrent operations on other shards.
-- **Zero Secondary Lookups**: Hot/cold tiers and physical pages do not participate in routing decisions. Each lookup requires exactly one directory lookup and one locator read, eliminating secondary hash probes.
+- **Lookup reads** resolve the row through the shard directory and locator under epoch protection. Read paths with a validated thread-local cache hit can skip the directory probe.
+- **Online insertion** rechecks keys under the shard writer mutex. Once rows, locators, and journal sequences are prepared, the writer thread publishes each slot ID in place. Keys within the same batch may become visible progressively. Checkpoint capture waits for active invocations to complete.
+- **Directory replacement** occurs when table resizing changes bucket geometry, a key is erased, or a locator slot rotates. Retired directories are safely reclaimed via epoch protection.
 
 ### 3.2 Locator Slots and Optimistic SeqLocks
 
@@ -142,7 +142,7 @@ To maximize cache hits, the engine implements adaptive utility estimation:
 
 ## 6. Lifecycle Management and Epoch Backpressure
 
-All resources potentially visible to concurrent readers (including `MapBundle`, `StoreSnapshot`, locator slots, and physical pages) are managed within the epoch-backed `RetirementPressure` domain:
+All resources potentially visible to concurrent readers (including replaceable `MapBundle` instances, `StoreSnapshot`, locator slots, and physical pages) are managed within the epoch-backed `RetirementPressure` domain:
 
 - **Three-Tier Backpressure Control**:
   1. **Normal Phase** (below `backpressure_fraction = 0.15`): Full-speed execution.

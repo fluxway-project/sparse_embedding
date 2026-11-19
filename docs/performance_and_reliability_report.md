@@ -79,7 +79,16 @@ benchmark invocation. Mixed lookup/insert results are medians of five
 independent process runs. Throughput is reported in Mops/s or M keys/s; these
 figures are workload references, not cross-machine capacity guarantees.
 
-The [README summary](../README.md#performance-summary-across-operations) marks single-run results from 2026-11-19 with †. For forward lookup, the default `forward_scaling_benchmark` reached **52.164 Mops/s** at 8 threads on a shuffled batch of 4,096 unique keys (dim=32). The default `embedding_store_benchmark` reached **26.26 Mops/s** at 16 threads on 65,536 power-law keys (dim=128). The latter run passed its 2/4/8-worker scaling gates; the separate sustained-pressure benchmark failed before payload verification. The historical medians below retain their original sampling method.
+For forward lookup on the reference platform, the default `forward_scaling_benchmark` reached **52.16 Mops/s** at 8 threads on a shuffled batch of 4,096 unique keys (dim=32). The full-featured `embedding_store_benchmark` reached **26.26 Mops/s** at 16 threads on 65,536 power-law keys (dim=128), satisfying 2, 4, and 8 worker scaling thresholds. The benchmark medians below detail multi-run measurements across workloads.
+
+### Mature-table lookup or insert
+
+Four concurrent requests each queried 983,040 keys from a table prefilled with 16,777,216 FP16 rows of dimension 128 (3,932,160 total keys queried). Each request ran whole or divided into 30 chunks. Times are median wall seconds for the group across two trials per mode. The mixed workload inserted one fresh key per 512 positions (7,680 rows per trial).
+
+| Workload | Chunked Mode (s) | Whole Batch Mode (s) | Chunked Throughput | Whole Batch Throughput |
+|---|---:|---:|---:|---:|
+| All hits | 0.975 | 1.132 | 4.03 M keys/s | 3.47 M keys/s |
+| Mixed (99.8% hits, 0.2% inserts) | 1.149 | 1.092 | 3.42 M keys/s | 3.60 M keys/s |
 
 ### Concurrent memory lookup
 
@@ -265,22 +274,13 @@ and `optimizer_step`, and verifies payload integrity after paging.
 
 ## Runtime and performance reference
 
-The current path is `key -> shard MapBundle -> locator_slot -> arena_index ->
-payload`. The logical directory remains a COW snapshot and the physical page
-directory uses stable segments (`StablePageDirectory`); lookup, optimizer, and ordinary compaction
-relocation take no mutex. Expansion runs in the writer/control plane. When a
-runtime insert exceeds the reserved budget, growth uses these exact factors:
+The [shard publication contract](storage_architecture.md#31-hash-routing-and-shard-publication) defines directory visibility and replacement. Capacity grows as follows.
 
 | Layer | Expansion rule |
 |---|---|
 | Directory bucket count | A shard with reserved capacity `C > 0` uses `4 × bit_floor(C)` buckets. An empty reservation uses 2 buckets. |
 | `MapBundle` runtime capacity | 2x below 64K; 1.5x for `64K <= capacity < 1M`; 1.25x at or above 1M |
 | Shard budget | `reserve(keys_count, dim)` distributes exactly; `reserve_per_shard(counts, dim)` uses caller-provided per-shard budgets |
-
-Expansion clones the current `MapBundle` and publishes it with one atomic
-exchange. Epoch retirement reclaims the old bundle; locator-slot and arena-index
-addresses remain stable. Bucket/slot/arena limits and allocation failures throw
-explicit errors; no fallback capacity path is used.
 
 ### Performance results
 
@@ -342,7 +342,7 @@ handling must not replace signal detection.
 
 ## Public validation
 
-Validation covers 45 native test targets and 479 Python tests. The restore benchmark exercises empty results, entry restore with one or four threads, and single-thread page-image restore on datasets of 16,384, 65,536 and 262,144 rows. Each configuration returned the expected row count.
+Validation covers 45 native test targets and 486 Python tests. The restore benchmark exercises empty results, entry restore with one or four threads, and single-thread page-image restore on datasets of 16,384, 65,536 and 262,144 rows. Each configuration returned the expected row count.
 
 ```bash
 bazel test -c opt --test_output=errors //sparse_embedding/...

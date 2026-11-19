@@ -117,4 +117,18 @@ int main() {
     FlatKeyDirectory oversized(
         FlatKeyDirectory::maximum_bucket_count() + size_t{1}, 6);
   });
+
+  FlatKeyDirectory collisions(4, 0);
+  const auto identity = [](uint32_t slot) noexcept { return slot; };
+  constexpr uint64_t last_bucket = 3;
+  collisions.publish_reserved_absent(last_bucket, 1);
+  collisions.publish_reserved_absent(last_bucket, 2);
+  require(collisions.remove_hashed(1, last_bucket, identity) == 1,
+          "collision chain lost its head");
+  require_throws<std::logic_error>(
+      [&] { collisions.insert_hashed(2, last_bucket, 3, identity); });
+  collisions.publish_reserved_absent(last_bucket, 3);
+  require(collisions.find_hashed(2, last_bucket, identity) == 2 &&
+              collisions.find_hashed(3, last_bucket, identity) == 3,
+          "tombstone reuse broke a wrapped collision chain");
 }

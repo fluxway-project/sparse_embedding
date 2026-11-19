@@ -54,7 +54,7 @@ Sparse Embedding 提供原生**增量检查点**与**流式 Compaction** 能力�
 ### 2.1 分片内存变动日志 (Mutation Journaling)
 
 每个 Hash 分片维护独立的轻量级 `CheckpointMutationJournal`：
-- **脏键追踪**：当特征权重或优化器状态在 `assign`、`accumulate_gradients` 或 `optimizer_step` 中被修改时，日志记录对应键的本次生命周期。对已存在的行，每个 assign 工作线程为已完成的写入一次预留一段序号。捕获会等待活动调用退出，即使后续某行失败，之前已完成的写入也会登记。
+- **脏键追踪**：当特征权重或优化器状态在 `assign`、`accumulate_gradients` 或 `optimizer_step` 中被修改时，日志记录对应键的本次生命周期。`assign` 创建新行时在插入阶段登记一次变更。对已存在的行，每个 assign 工作线程为已完成的写入一次预留一段序号。捕获会等待活动调用退出，即使后续某行失败，之前已完成的写入也会登记。
 - **删除墓碑记录**：显式删除（`erase`、`erase_dimension`）或基于分数的淘汰清理会生成对应的删除墓碑（Tombstone），确保跨版本删除语义严格保真。
 - **前向读取与分数**：无分数或手动分数模式下，前向读取不写变动日志。LFU/LRU 读取可能改变分数；每个工作线程为本批实际更新的分数一次预留日志序号。
 

@@ -110,6 +110,23 @@ def handle(committed):
     return committed.handle
 
 
+def test_assign_new_key_uses_last_journal_sequence():
+    store = se.EmbeddingStore(config())
+    last = np.iinfo(np.int64).max
+    store.initialize_checkpoint_baseline("parent", last - 1)
+    key = np.array([17], dtype=np.uint64)
+    row = np.array([[1, 2, 3, 4]], dtype=np.float32)
+    store.assign(key, row)
+    assert store.checkpoint_mutation_watermark() == last
+    np.testing.assert_array_equal(lookup(store, key), row)
+
+    next_key = key + 1
+    with pytest.raises(OverflowError, match="checkpoint mutation sequence exhausted"):
+        store.assign(next_key, row)
+    assert not np.from_dlpack(store.contains(next_key)).any()
+    assert store.total_size() == 1
+
+
 def test_restored_exhausted_owner_slot_does_not_poison_next_insert():
     cfg = inference_config()
     store = se.EmbeddingStore(cfg)

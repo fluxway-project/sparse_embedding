@@ -12,9 +12,9 @@
 
 Sparse Embedding 采用 **Lance 列式存储** 与 **Apache Gravitino** 协同方案，提供以下核心能力：
 
-- **数据与元数据解耦的双 Lance 架构**：控制面记录事务账本，数据面并发流式落盘，消除多节点写锁竞争与版本爆炸。
+- **数据与元数据解耦的双 Lance 架构**：控制面记录事务账本，数据面并发流式落盘，消除多节点写锁竞争与 Manifest 膨胀。
 - **计算引擎零拷贝下推**：键列直接采用 Arrow 原生定长整型存储，原生支持 DuckDB、DataFusion 及 Lance 计算算子的谓词下推（Predicate Pushdown）。
-- **极速恢复与弹性拓扑**：支持从规范数据精确恢复物理页表；支持结合 SIMD 掩码过滤在集群扩缩容时直接执行逻辑分片重组（Reshard Restore）。
+- **高效恢复与弹性拓扑**：支持从规范数据精确恢复物理页表；支持结合 SIMD 掩码过滤在集群扩缩容时直接执行逻辑分片重组（Reshard Restore）。
 - **Lakehouse 标准元数据治理**：无缝对接 Gravitino 与 Lance REST 服务，实现多租户 Namespace、租约锁机制与统一凭据管理。
 
 ---
@@ -34,7 +34,7 @@ SparseCheckpoint
     │
     └── [数据面物理切片] _staging/<attempt>/<fragment_id>/
             ├── entries.lance      (规范键值与优化器状态切片，唯一真实事实来源)
-            └── page_images.lance  (可选的物理页缓存切片，用于极速导入)
+            └── page_images.lance  (可选的物理页缓存切片，用于加速冷启动恢复)
 ```
 
 ### 事务提交流程与写入隔离

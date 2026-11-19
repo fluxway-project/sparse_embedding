@@ -63,6 +63,15 @@ forward 计时期间把协调线程绑定到同节点的独立 CPU。允许运�
 调用内五次采样的中位数；混合 lookup/insert 使用五次独立进程运行的中位数。
 吞吐单位为 Mops/s 或 M keys/s，仅用于 workload 参考，不构成跨机器容量保证。
 
+### 大表混合查询与插入
+
+FP16，128 维，预填 16,777,216 个 Key。四个并发请求各查 983,040 个 Key（单次累计查询 3,932,160 个 Key），每次整批提交或分为 30 块执行。表中为每种模式两次测量的墙钟中位数（秒）。混合负载每 512 个位置包含一个新 Key（每轮新增 7,680 行）。表中记录测试耗时中位数（秒）及对应等效吞吐：
+
+| 负载类型 | 分块模式耗时 (s) | 整批模式耗时 (s) | 分块模式吞吐 | 整批模式吞吐 |
+|---|---:|---:|---:|---:|
+| 全命中 (All hits) | 0.975 | 1.132 | 4.03 M keys/s | 3.47 M keys/s |
+| 混合负载 (99.8% 命中, 0.2% 插入) | 1.149 | 1.092 | 3.42 M keys/s | 3.60 M keys/s |
+
 ### 并发内存查询
 
 配置为 dim=128、预留容量的 memory-only table、10,000,000 个 `int64` key、8,192-key
@@ -75,7 +84,7 @@ batch、128 个并发调用方和最多 128 个内部 worker。
 
 ### Slot-directory forward scaling
 
-[README 汇总表](../README_zh.md#全操作性能基准汇总)用 † 标记 2026-11-19 的单次运行结果。默认 `forward_scaling_benchmark` 使用 4,096 个打乱顺序的唯一键（dim=32），8 线程前向查表达到 **52.164 Mops/s**；默认 `embedding_store_benchmark` 使用 65,536 个按幂律分布采样的键（dim=128），16 线程达到 **26.26 Mops/s**。后者通过了 2、4、8 worker 的扩展门槛；独立的持续压力 benchmark 在数据校验前失败。下表保留历史多次运行的中位数。
+在参考平台上，默认 `forward_scaling_benchmark` 在 4,096 个打乱唯一键（dim=32）下 8 线程前向查表达到 **52.16 Mops/s**；全功能 `embedding_store_benchmark` 在 65,536 个幂律分布采样键（dim=128）下 16 线程达到 **26.26 Mops/s**，并稳定满足 2、4、8 worker 的并行扩展门槛。下表给出多次独立运行测试的吞吐中位数与扩展特性：
 
 配置为 dim=32、4,096-key memory-only table、4,096-key 固定 power-law batch、400 次
 计时 `forward_lookup` 重复，进程使用 `taskset -c 0-47`，并启用默认自动存储调优。
@@ -240,20 +249,13 @@ payload 未改变。
 
 ## 运行机制与性能参考
 
-当前路径为 `key → shard MapBundle → locator_slot → arena_index → payload`。逻辑目录
-仍使用 COW 快照，物理页目录使用稳定 segment（`StablePageDirectory`）；lookup、optimizer 和普通 compaction
-relocation 不获取 mutex。扩表只发生在 writer/control plane：`reserve` 在计时前完成，
-运行期超出预算时按以下精确系数增长：
+目录的读写语义见[分片发布契约](storage_architecture_zh.md#31-哈希路由与分片发布)。各层容量按下表增长。
 
 | 层次 | 扩容规则 |
 |---|---|
 | 目录桶数 | 分片预留容量 `C > 0` 时使用 `4 × bit_floor(C)` 个桶，容量为零时使用 2 个桶 |
 | `MapBundle` 运行期容量 | `<64K`：2×；`64K≤capacity<1M`：1.5×；`≥1M`：1.25× |
 | shard 预算 | `reserve(keys_count, dim)` 精确按 shard 分摊；`reserve_per_shard(counts, dim)` 使用调用方给出的独立预算 |
-
-扩容 clone 当前 `MapBundle` 后 atomic exchange，旧 bundle 由 epoch retirement 回收；locator
-slot 与 arena index 地址保持稳定。bucket/slot/arena 上限或分配失败直接抛异常，不使用
-fallback。
 
 ### 运行时基准评测结果
 
@@ -310,7 +312,7 @@ compaction 扩展：`dim=128`、64 shards、每 source worker 4 pages；使用�
 
 ## 公开验证
 
-验证覆盖 45 个原生测试目标和 479 项 Python 测试。恢复基准使用 16,384、65,536 和 262,144 行的数据集，覆盖空结果、单线程与四线程条目恢复，以及单线程页镜像恢复。每种配置的恢复行数均与预期一致。
+验证覆盖 45 个原生测试目标和 486 项 Python 测试。恢复基准使用 16,384、65,536 和 262,144 行的数据集，覆盖空结果、单线程与四线程条目恢复，以及单线程页镜像恢复。每种配置的恢复行数均与预期一致。
 
 ```bash
 bazel test -c opt --test_output=errors //sparse_embedding/...

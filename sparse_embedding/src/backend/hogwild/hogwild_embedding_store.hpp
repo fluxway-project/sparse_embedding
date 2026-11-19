@@ -873,11 +873,8 @@ private:
 };
 
 // =============================================================================
-// HogwildEmbeddingStore — Lock-free architecture via ParlayHash
-//
-// ParlayHash (parlay::parlay_unordered_map) provides O(1) lock-free
-// concurrent Key→uint32_t index mapping. EmbeddingArena provides
-// 64-byte aligned contiguous memory for SIMD-friendly dense vectors.
+// HogwildEmbeddingStore resolves keys through FlatKeyDirectory and stores
+// embedding rows in cache-line-aligned arena pages.
 // =============================================================================
 
 template <typename ParamT, typename OptT> class HogwildEmbeddingStoreCore {
@@ -1011,9 +1008,7 @@ private:
   }
 
   void publish_checkpoint_mutation(CheckpointMutationRecord &record,
-                                   uint64_t sequence) {
-    if (sequence == 0)
-      throw std::overflow_error("checkpoint mutation sequence exhausted");
+                                   uint64_t sequence) noexcept {
     uint64_t previous = record.state.load(std::memory_order_acquire);
     while (previous < sequence) {
       if (record.state.compare_exchange_weak(previous, sequence,
@@ -1401,6 +1396,11 @@ public:
                                 });
       }
 
+      void publish_absent(uint64_t key, uint32_t slot_id) noexcept {
+        directory.publish_reserved_absent(SplitMixHash<uint64_t>{}(key),
+                                          slot_id);
+      }
+
       std::optional<uint32_t> remove(uint64_t key) {
         return directory.remove_hashed(
             key, SplitMixHash<uint64_t>{}(key),
@@ -1609,14 +1609,13 @@ public:
 
     std::unique_ptr<MapBundle> clone_bundle_unlocked(size_t capacity) const {
       MapBundle *current = writer_bundle_unlocked();
-      if (capacity == reserved_keys) {
-        auto next = std::make_unique<MapBundle>(*current);
-        return next;
-      }
+      if (capacity == reserved_keys)
+        return std::make_unique<MapBundle>(*current);
       auto next =
           std::make_unique<MapBundle>(capacity, hash_shift_, locators.get());
-      current->for_each(
-          [&](uint64_t key, uint32_t slot_id) { next->insert(key, slot_id); });
+      current->for_each([&](uint64_t key, uint32_t slot_id) {
+        next->publish_absent(key, slot_id);
+      });
       return next;
     }
 
@@ -1677,8 +1676,9 @@ public:
     void expand(size_t target_keys) {
       if (target_keys <= reserved_keys)
         return;
-      auto next = clone_bundle_unlocked(target_keys);
-      publish_bundle_unlocked(std::move(next));
+      if (hogwild_internal::FlatKeyDirectory::bucket_count_for_key_capacity(
+              target_keys) != writer_bundle_unlocked()->directory_capacity())
+        publish_bundle_unlocked(clone_bundle_unlocked(target_keys));
       reserved_keys = target_keys;
     }
 
@@ -1787,101 +1787,76 @@ public:
       return LocatorRef{replacement_slot_id, current->index};
     }
 
-    void insert_index_unlocked(uint64_t key, uint32_t idx) {
-      const std::array<uint64_t, 1> keys{key};
-      const std::array<uint32_t, 1> indices{idx};
-      publish_indices_batch_unlocked(keys, indices);
-    }
-
     enum class IndexPublication { kConcurrent, kQuiesced };
 
-    void publish_indices_batch_unlocked(std::span<const uint64_t> keys,
-                                        std::span<const uint32_t> indices) {
-      update_indices_batch_unlocked<IndexPublication::kConcurrent>(keys,
-                                                                   indices);
-    }
-
-    void import_indices_quiesced(std::span<const uint64_t> keys,
-                                 std::span<const uint32_t> indices) {
-      update_indices_batch_unlocked<IndexPublication::kQuiesced>(keys, indices);
-    }
+    struct IndexEntry {
+      uint64_t key;
+      uint32_t index;
+      uint32_t slot = 0;
+      CheckpointMutationRecord *record = nullptr;
+    };
 
     template <IndexPublication Publication>
-    void update_indices_batch_unlocked(std::span<const uint64_t> keys,
-                                       std::span<const uint32_t> indices) {
-      if (keys.empty() || keys.size() != indices.size())
+    void update_indices_batch_unlocked(std::span<IndexEntry> entries) {
+      if (entries.empty())
         throw std::invalid_argument("key shard publication batch is invalid");
       const size_t current_count = count.load(std::memory_order_acquire);
-      if (keys.size() > std::numeric_limits<size_t>::max() - current_count)
+      if (entries.size() > std::numeric_limits<size_t>::max() - current_count)
         throw std::overflow_error("key shard publication count overflows");
-      const size_t next_count = current_count + keys.size();
-      const size_t next_reserved =
-          next_count > reserved_keys
-              ? compute_next_capacity(reserved_keys, next_count)
-              : reserved_keys;
+      const size_t next_count = current_count + entries.size();
       if constexpr (Publication == IndexPublication::kQuiesced)
         checkpoint_owner.invocation_gate_.require_quiescence();
-      std::unique_ptr<MapBundle> replacement;
-      MapBundle *next;
-      if constexpr (Publication == IndexPublication::kQuiesced) {
-        if (next_reserved != reserved_keys)
-          expand(next_reserved);
-        next = writer_bundle_unlocked();
-      } else {
-        replacement = clone_bundle_unlocked(next_reserved);
-        next = replacement.get();
-      }
+      if (next_count > reserved_keys)
+        expand(compute_next_capacity(reserved_keys, next_count));
+      MapBundle &directory = *writer_bundle_unlocked();
       const bool journal_enabled = checkpoint_owner.enable_mutation_journal();
-      std::vector<CheckpointMutationRecord *> records;
-      if (journal_enabled)
-        records.resize(keys.size(), nullptr);
-      std::vector<uint32_t> allocated_slots(keys.size(), 0);
       size_t linked_count = 0;
+      uint64_t sequence = 0;
       try {
-        for (size_t index = 0; index < keys.size(); ++index) {
-          const uint64_t key = keys[index];
-          if (next->find(key).has_value())
-            throw std::invalid_argument(
-                "key shard batch contains duplicate key");
+        for (auto &entry : entries) {
+          if constexpr (Publication == IndexPublication::kQuiesced) {
+            if (directory.find(entry.key))
+              throw std::invalid_argument(
+                  "key shard batch contains duplicate key");
+          }
           hogwild_internal::CheckpointRecordRef record_ref{};
           if (journal_enabled) {
-            records[index] =
-                checkpoint_owner.allocate_checkpoint_record(dimension, key);
+            entry.record = checkpoint_owner.allocate_checkpoint_record(
+                dimension, entry.key);
             record_ref =
-                hogwild_internal::CheckpointRecordRef::from(records[index]);
+                hogwild_internal::CheckpointRecordRef::from(entry.record);
           }
-          const uint32_t slot_id =
-              locators->allocate(key, indices[index], record_ref);
-          allocated_slots[index] = slot_id;
-          next->insert(key, slot_id);
-          ++linked_count;
+          entry.slot = locators->allocate(entry.key, entry.index, record_ref);
+          if constexpr (Publication == IndexPublication::kQuiesced) {
+            directory.publish_absent(entry.key, entry.slot);
+            ++linked_count;
+          }
         }
         if constexpr (Publication == IndexPublication::kConcurrent)
-          publish_bundle_unlocked(std::move(replacement));
-        else
-          read_view->generation.fetch_add(1, std::memory_order_acq_rel);
+          if (journal_enabled)
+            sequence =
+                checkpoint_owner.reserve_checkpoint_sequences(entries.size());
       } catch (...) {
-        size_t first_unpublished = 0;
-        if constexpr (Publication == IndexPublication::kQuiesced) {
+        if constexpr (Publication == IndexPublication::kQuiesced)
           checkpoint_owner.mark_terminal_failure();
-          first_unpublished = linked_count;
-        }
-        if (journal_enabled) {
-          for (size_t index = first_unpublished; index < records.size();
-               ++index) {
-            if (records[index] != nullptr)
-              checkpoint_owner.discard_unpublished_checkpoint_record(
-                  records[index]);
-          }
-        }
-        for (size_t index = first_unpublished; index < allocated_slots.size();
-             ++index) {
-          if (allocated_slots[index] != 0)
-            locators->release_after_epoch(allocated_slots[index]);
+        for (const auto &entry : entries.subspan(linked_count)) {
+          if (entry.slot)
+            locators->release_after_epoch(entry.slot);
+          if (entry.record)
+            checkpoint_owner.discard_unpublished_checkpoint_record(
+                entry.record);
         }
         throw;
       }
-      reserved_keys = next_reserved;
+      if constexpr (Publication == IndexPublication::kConcurrent) {
+        for (const auto &entry : entries) {
+          if (journal_enabled)
+            checkpoint_owner.publish_checkpoint_mutation(*entry.record,
+                                                         sequence++);
+          directory.publish_absent(entry.key, entry.slot);
+        }
+      }
+      read_view->generation.fetch_add(1, std::memory_order_acq_rel);
       count.store(next_count, std::memory_order_release);
     }
 
@@ -2534,8 +2509,9 @@ public:
 
     struct PageImportScratch {
       std::vector<size_t> offsets, positions;
-      std::vector<uint32_t> rows, indices;
-      std::vector<uint64_t> keys, ordinal_mask;
+      std::vector<uint32_t> rows;
+      std::vector<typename KeyShard::IndexEntry> entries;
+      std::vector<uint64_t> ordinal_mask;
     };
 
     void import_page_image(const PageImageImport<ParamT, OptT> &import,
@@ -2575,16 +2551,16 @@ public:
                        scratch.offsets.begin());
       scratch.positions = scratch.offsets;
       scratch.rows.resize(count);
-      scratch.keys.resize(count);
-      scratch.indices.resize(count);
+      scratch.entries.resize(count);
       for (size_t row = 0; row < count; ++row) {
         const size_t position =
             scratch.positions[shard_id_for_key(image.keys[row])]++;
         scratch.rows[position] = row;
-        scratch.keys[position] = image.keys[row];
-        scratch.indices[position] = static_cast<uint32_t>(
-            image.physical_page_id * arena.entries_per_page() +
-            image.slot_ordinals[row]);
+        scratch.entries[position] = {
+            image.keys[row],
+            static_cast<uint32_t>(image.physical_page_id *
+                                      arena.entries_per_page() +
+                                  image.slot_ordinals[row])};
       }
       arena.reserve_exact_page(
           image.physical_page_id,
@@ -2601,8 +2577,8 @@ public:
         key_shard.reserve_new_indices(end - begin);
         for (size_t position = begin; position < end; ++position) {
           const size_t row = scratch.rows[position];
-          const uint64_t key = scratch.keys[position];
-          const uint32_t index = scratch.indices[position];
+          const uint64_t key = scratch.entries[position].key;
+          const uint32_t index = scratch.entries[position].index;
           if (key_shard.find_unlocked(key).has_value())
             throw std::invalid_argument("page-image import has duplicate key");
           if (arena.is_live(index))
@@ -2626,12 +2602,11 @@ public:
             optimizer->set_step(index, image.steps[row]);
           }
         }
-        key_shard.import_indices_quiesced(
-            std::span<const uint64_t>(scratch.keys).subspan(begin, end - begin),
-            std::span<const uint32_t>(scratch.indices)
-                .subspan(begin, end - begin));
+        key_shard.template update_indices_batch_unlocked<
+            KeyShard::IndexPublication::kQuiesced>(
+            std::span(scratch.entries).subspan(begin, end - begin));
         for (size_t position = begin; position < end; ++position)
-          arena.mark_live(scratch.indices[position], true);
+          arena.mark_live(scratch.entries[position].index, true);
       }
       arena.set_allocation_count(static_cast<uint32_t>(allocation_count));
       if (size() != expected_size)
@@ -3129,11 +3104,9 @@ public:
       size_t position;
     };
 
-    template <typename Initialize, typename Visit, typename Published>
+    template <typename Initialize, typename Visit>
     void find_or_insert_batch(std::span<const BatchEntry> entries,
                               Initialize &&initialize, Visit &&visit,
-                              Published &&on_published,
-                              bool write_existing_payload,
                               bool coalesce_duplicates = false,
                               size_t retry_attempt = 0) {
       if (entries.empty())
@@ -3155,10 +3128,7 @@ public:
         };
         std::vector<AliasEntry> aliases;
         std::vector<BatchEntry> inserted;
-        std::vector<BatchEntry> published;
         std::vector<uint32_t> winner_candidates;
-        std::vector<uint64_t> inserted_keys;
-        std::vector<uint32_t> inserted_indices;
         struct PendingAllocation {
           BatchEntry entry;
           uint32_t index;
@@ -3181,15 +3151,10 @@ public:
         resolved_slots.assign(maximum_position + 1, 0);
       }
       for (ShardBatch &batch : by_shard) {
-        batch.existing.reserve(entries.size() / by_shard.size() + 1);
         batch.candidates.reserve(entries.size() / by_shard.size() + 1);
         batch.aliases.reserve(entries.size() / by_shard.size() + 1);
         batch.inserted.reserve(entries.size() / by_shard.size() + 1);
-        batch.published.reserve(entries.size() / by_shard.size() + 1);
         batch.winner_candidates.reserve(entries.size() / by_shard.size() + 1);
-        batch.inserted_keys.reserve(entries.size() / by_shard.size() + 1);
-        batch.inserted_indices.reserve(entries.size() / by_shard.size() + 1);
-        batch.allocations.reserve(entries.size() / by_shard.size() + 1);
       }
       auto pressure_call = retirement_pressure->writer_call();
       pressure_call.apply();
@@ -3201,6 +3166,8 @@ public:
           ShardBatch &batch = by_shard[shard_id];
           if (batch.candidates.empty())
             continue;
+          if (!coalesce_duplicates)
+            batch.existing.reserve(batch.candidates.size());
           {
             auto &key_shard = *key_shards[shard_id];
             std::unique_lock writer_lock(key_shard.writer_mutex);
@@ -3219,9 +3186,10 @@ public:
                 if (key_shard.locators->requires_rotation(resolved->slot_id))
                   resolved = key_shard.rotate_locator_unlocked(
                       entry.key, resolved->slot_id);
-                batch.existing.push_back({entry, resolved->slot_id});
                 if (coalesce_duplicates)
                   resolved_slots[entry.position] = resolved->slot_id;
+                else
+                  batch.existing.push_back({entry, resolved->slot_id});
                 continue;
               }
               if (!retirement_admission.admitted())
@@ -3261,7 +3229,8 @@ public:
         std::vector<AllocationOrder> allocation_order;
         allocation_order.reserve(entries.size());
         for (size_t shard_id = 0; shard_id < by_shard.size(); ++shard_id) {
-          const ShardBatch &batch = by_shard[shard_id];
+          ShardBatch &batch = by_shard[shard_id];
+          batch.allocations.reserve(batch.winner_candidates.size());
           for (uint32_t winner_order = 0;
                winner_order < batch.winner_candidates.size(); ++winner_order)
             allocation_order.push_back(
@@ -3289,6 +3258,7 @@ public:
               {*item.entry, arena_index, item.winner_order});
         }
 
+        std::vector<typename KeyShard::IndexEntry> new_entries;
         for (size_t shard_id = 0; shard_id < by_shard.size(); ++shard_id) {
           ShardBatch &batch = by_shard[shard_id];
           if (batch.allocations.empty())
@@ -3296,10 +3266,10 @@ public:
           {
             auto &key_shard = *key_shards[shard_id];
             std::unique_lock writer_lock(key_shard.writer_mutex);
-            batch.published.clear();
-            batch.inserted_keys.clear();
-            batch.inserted_indices.clear();
-            batch.winner_slots.assign(batch.winner_candidates.size(), 0);
+            new_entries.clear();
+            new_entries.reserve(batch.allocations.size());
+            if (coalesce_duplicates)
+              batch.winner_slots.resize(batch.winner_candidates.size());
             for (auto &allocation : batch.allocations) {
               auto located = key_shard.find_slot_hashed_unlocked(
                   allocation.entry.key, allocation.entry.hash);
@@ -3308,59 +3278,41 @@ public:
                 if (!index)
                   throw std::logic_error(
                       "key directory references an empty locator slot");
-                batch.existing.push_back({allocation.entry, *located});
-                batch.winner_slots[allocation.winner_order] = *located;
-                if (coalesce_duplicates)
+                if (coalesce_duplicates) {
+                  batch.winner_slots[allocation.winner_order] = *located;
                   resolved_slots[allocation.entry.position] = *located;
+                } else {
+                  batch.existing.push_back({allocation.entry, *located});
+                }
                 key_shard.recycle_unpublished_index(allocation.index);
                 allocation.recycled = true;
                 continue;
               }
               arena.publish_owner(allocation.index, allocation.entry.key);
               initialize(allocation.entry, allocation.index);
-              batch.published.push_back(allocation.entry);
-              batch.inserted_keys.push_back(allocation.entry.key);
-              batch.inserted_indices.push_back(allocation.index);
+              new_entries.push_back({allocation.entry.key, allocation.index});
             }
-            if (!batch.inserted_keys.empty()) {
-              key_shards[shard_id]->publish_indices_batch_unlocked(
-                  batch.inserted_keys, batch.inserted_indices);
+            if (!new_entries.empty()) {
+              key_shard.template update_indices_batch_unlocked<
+                  KeyShard::IndexPublication::kConcurrent>(new_entries);
               for (auto &allocation : batch.allocations)
                 if (!allocation.recycled)
                   allocation.published = true;
-              for (const uint32_t index : batch.inserted_indices)
-                arena.mark_live(index, true);
-              for (const auto &entry : batch.published) {
-                const auto slot_id = key_shard.find_slot_hashed_unlocked(
-                    entry.key, SplitMixHash<uint64_t>{}(entry.key));
-                if (!slot_id.has_value())
-                  throw std::logic_error(
-                      "published key disappeared before checkpoint record");
-                on_published(entry,
-                             key_shard.locators->checkpoint_record(*slot_id));
-              }
+              auto published = new_entries.begin();
               for (auto &allocation : batch.allocations) {
                 if (allocation.recycled)
                   continue;
-                auto slot_id = key_shard.find_slot_hashed_unlocked(
-                    allocation.entry.key, allocation.entry.hash);
-                if (!slot_id)
-                  throw std::logic_error(
-                      "published key disappeared before alias resolution");
-                batch.winner_slots[allocation.winner_order] = *slot_id;
-                batch.existing.push_back({allocation.entry, *slot_id});
-                if (coalesce_duplicates)
-                  resolved_slots[allocation.entry.position] = *slot_id;
+                arena.mark_live(allocation.index, true);
+                if (coalesce_duplicates) {
+                  const auto slot_id = (published++)->slot;
+                  batch.winner_slots[allocation.winner_order] = slot_id;
+                  resolved_slots[allocation.entry.position] = slot_id;
+                }
               }
             }
             for (const auto &alias : batch.aliases)
-              if (coalesce_duplicates)
-                resolved_slots[batch.inserted[alias.candidate_index].position] =
-                    batch.winner_slots[alias.winner_order];
-              else
-                batch.existing.push_back(
-                    {batch.inserted[alias.candidate_index],
-                     batch.winner_slots[alias.winner_order]});
+              resolved_slots[batch.inserted[alias.candidate_index].position] =
+                  batch.winner_slots[alias.winner_order];
           }
         }
       } catch (...) {
@@ -3397,8 +3349,7 @@ public:
         }
         if (!retry_entries.empty())
           find_or_insert_batch(std::span<const BatchEntry>(retry_entries),
-                               initialize, visit, on_published,
-                               write_existing_payload, coalesce_duplicates,
+                               initialize, visit, coalesce_duplicates,
                                retry_attempt + 1);
         return;
       }
@@ -3421,8 +3372,7 @@ public:
       }
       if (!retry_entries.empty())
         find_or_insert_batch(std::span<const BatchEntry>(retry_entries),
-                             initialize, visit, on_published,
-                             write_existing_payload, coalesce_duplicates,
+                             initialize, visit, coalesce_duplicates,
                              retry_attempt + 1);
     }
 
@@ -4419,7 +4369,7 @@ public:
   exec::static_thread_pool &pool() { return pool_; }
 
   // =========================================================================
-  // Forward Pass: Lock-free lookup via ParlayHash
+  // Forward pass: lock-free point lookup through the shard directory.
   // =========================================================================
 
   template <typename K>
@@ -4989,14 +4939,7 @@ public:
                 if (enable_mutation_journal_) {
                   record_checkpoint_mutation(checkpoint_record);
                 }
-              },
-              [&](const typename SlotStore::BatchEntry &entry,
-                  hogwild_internal::CheckpointRecordRef checkpoint_record) {
-                if (enable_mutation_journal_) {
-                  record_checkpoint_mutation(checkpoint_record);
-                }
-              },
-              true);
+              });
         }
       });
     };
@@ -5049,16 +4992,11 @@ public:
           [&](const typename SlotStore::BatchEntry &entry, uint32_t index,
               hogwild_internal::CheckpointRecordRef) {
             const size_t dim = static_cast<size_t>(row_lengths[entry.position]);
-            std::copy_n(slot.arena.data(index), dim,
-                        out_flat_values.data() + offsets[entry.position]);
+            simd::simd_copy(slot.arena.data(index),
+                            out_flat_values.data() + offsets[entry.position],
+                            dim);
           },
-          [&](const typename SlotStore::BatchEntry &entry,
-              hogwild_internal::CheckpointRecordRef checkpoint_record) {
-            if (enable_mutation_journal_) {
-              record_checkpoint_mutation(checkpoint_record);
-            }
-          },
-          false, true);
+          true);
     }
     return {};
   }

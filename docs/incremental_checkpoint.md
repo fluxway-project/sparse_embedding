@@ -54,7 +54,7 @@ Sparse Embedding provides native **Incremental Checkpointing** and **Streaming C
 ### 2.1 In-Memory Mutation Journaling
 
 Each shard maintains a lightweight `CheckpointMutationJournal`:
-- **Dirty Key Tracking**: When embedding vectors or optimizer states are modified during `assign`, `accumulate_gradients`, or `optimizer_step`, the journal records the affected key incarnation. For existing rows, each assign worker reserves one sequence range for the writes it completed. Capture waits for active invocations, including publication of completed writes if a later row fails.
+- **Dirty Key Tracking**: When embedding vectors or optimizer states are modified during `assign`, `accumulate_gradients`, or `optimizer_step`, the journal records the affected key incarnation. An assign that creates a row records one mutation at insertion. For existing rows, each assign worker reserves one sequence range for the writes it completed. Capture waits for active invocations, including publication of completed writes if a later row fails.
 - **Tombstone Recording**: Explicit deletions (`erase`, `erase_dimension`) or score-based evictions emit deletion tombstones, preserving deletion intent across delta boundaries.
 - **Lookup scores**: Forward reads with no score or a manual score do not publish journal mutations. LFU/LRU reads can change the score. Each worker journals the scores it updated with a single sequence reservation.
 

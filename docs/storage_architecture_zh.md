@@ -32,7 +32,7 @@ Sparse Embedding 存储引擎自顶向下分为五层：
                                │
 ┌──────────────────────────────▼──────────────────────────────┐
 │                    并发哈希路由与定位层                     │
-│  ParlayHash Shards ──► MapBundle (RCU) ──► SegmentedLocator │
+│  MapBundle ──► FlatKeyDirectory ──► SegmentedLocator         │
 └──────────────────────────────┬──────────────────────────────┘
                                │
 ┌──────────────────────────────▼──────────────────────────────┐
@@ -55,13 +55,13 @@ Sparse Embedding 存储引擎自顶向下分为五层：
 
 ## 3. 并发模型与无锁查询
 
-### 3.1 哈希路由与不可变 MapBundle (RCU 发布)
+### 3.1 哈希路由与分片发布
 
 查询的核心解析路径为：`Key Hash -> Shard ID -> slot_id -> SegmentedLocatorTable -> arena_index`。
 
-- **读写解耦**：每个 Shard 独立管理一个不可变的 `MapBundle`。Reader 仅通过 acquire-load 获取当前的 `MapBundle` 指针，不获取任何共享互斥锁。
-- **写时复制与原子发布**：结构性修改（插入、删除、扩容、槽位轮转）在对应 Shard 的独立 Writer Mutex 下克隆当前 Bundle 并完成修改，最后通过单个 atomic exchange 完成发布。各 Shard 之间互不阻塞，单 Shard 扩容不会影响其他 Shard 的并发读写。
-- **无二次查找**：冷热分层与物理页不参与路由决策，单次查询只需一次哈希目录查找与一次定位槽读取，杜绝二级哈希二次探测。
+- **只读查询 (Lookup)**：在 Epoch 保护下读取分片键目录和 32 位槽位 ID，再通过 locator 定位物理行。使用线程本地缓存的读路径在验证命中后可跳过目录探测。
+- **在线插入 (Insert)**：`lookup_or_insert` 在分片写互斥锁内复查 Key。写线程准备好新行、locator 和 journal 序号后，逐 key 原位发布槽位 ID。同批次 Key 允许先后可见。Checkpoint 捕获会等待活跃写操作结束。
+- **目录替换 (Directory Replacement)**：扩容改变桶布局、删除或槽位轮转时原子发布新目录，已退役目录通过 Epoch 安全回收。
 
 ### 3.2 定位槽与纯乐观 SeqLock
 
@@ -76,7 +76,7 @@ Sparse Embedding 存储引擎自顶向下分为五层：
 
 $$\text{page\_id} = \text{index} \gg \text{entries\_shift}, \quad \text{slot\_offset} = \text{index} \ \& \ \text{slot\_mask}$$
 
-每个已分配槽位保存一个 64 位键、一个 64 位 owner 序号和一个独立的原子存活标记。在本报告的 x86-64 平台上，这三项合计每槽 17 字节。扫描线程在 epoch 保护下读取已发布的 owner 页指针。空页退役时，arena 撤下该指针，待已有读者退出 epoch 后释放该页资源。槽位的 owner 序号达到最大偶数后，分配器在复用时跳过该槽位。
+每个已分配槽位保存一个 64 位键、一个 64 位 owner 序号和一个独立的原子存活标记。在本报告的 x86-64 平台上，这三项合计每槽 17 字节。扫描线程在 epoch 保护下读取已发布的 owner 页指针。空页退役时，arena 撤下该指针，待已有读线程退出当前 Epoch 后释放该页资源。槽位的 owner 序号达到最大偶数后，分配器在复用时跳过该槽位。
 
 ### 3.4 四级软件流水线预取
 
@@ -142,7 +142,7 @@ $$\text{page\_id} = \text{index} \gg \text{entries\_shift}, \quad \text{slot\_of
 
 ## 6. 生命周期管理与 Epoch 反压机制
 
-所有可能被活跃并发 Reader 访问的对象（包括 `MapBundle`、`StoreSnapshot`、定位槽与物理页）均统一托管在基于 Epoch 的 `RetirementPressure` 域中：
+所有可能被活跃并发 Reader 访问的对象（包括可替换的 `MapBundle`、`StoreSnapshot`、定位槽与物理页）均统一托管在基于 Epoch 的 `RetirementPressure` 域中：
 
 - **三级反压控制**：
   1. **Normal 阶段**（低于 `backpressure_fraction = 0.15`）：系统全速吞吐。
@@ -164,7 +164,7 @@ C++ 核心层通过统一 Facade 管理分片算法工厂：
 
 ### 7.2 向量化切片过滤 (`filter_span`)
 
-在连续 Arrow 键切片上调用 AVX-512 `filter_span` 内核，批量生成字节掩码并提取匹配行索引，供离线恢复或通信调度器极速过滤。
+在连续 Arrow 键切片上调用 AVX-512 `filter_span` 内核，批量生成字节掩码并提取匹配行索引，供离线恢复或通信调度器高速向量化过滤。
 
 ### 7.3 Python 弹性分片策略 (`PartitionStrategy`)
 
