@@ -20,6 +20,45 @@ void require(bool condition, const char *message) {
     throw std::runtime_error(message);
 }
 
+void run_reserved_publication_regression() {
+  auto pages = se::create_page_storage();
+  using Store = se::HogwildEmbeddingStoreCore<float, float>;
+  Store store({4}, {}, nullptr, se::NoScorePolicy{},
+              {.thread_budget = 1, .storage = pages});
+  store.reserve(4096, 4);
+  se::concurrency::EpochRetirementDomain::request_progress();
+  const std::array<uint64_t, 3> keys{7, 9, 7};
+  const std::array<int64_t, 3> lengths{4, 4, 4};
+  std::array<float, 12> output{};
+  {
+    se::concurrency::EpochAnnouncement reader(true);
+    const auto before = pages->stats().retired_bytes;
+    std::thread writer(
+        [&] { store.lookup_or_insert<uint64_t>(keys, output, lengths); });
+    writer.join();
+    require(pages->stats().retired_bytes == before,
+            "reserved insertion retired an index under a pinned reader");
+  }
+  require(store.size() == 2 && store.checkpoint_mutations().size() == 2,
+          "duplicate miss did not share a published key");
+
+  Store exhausted({4}, {}, nullptr, se::NoScorePolicy{}, {.thread_budget = 1});
+  exhausted.initialize_checkpoint_baseline(
+      "exhausted", std::numeric_limits<uint64_t>::max());
+  bool rejected = false;
+  try {
+    exhausted.lookup_or_insert<uint64_t>(keys, output, lengths);
+  } catch (const std::overflow_error &) {
+    rejected = true;
+  }
+  std::array<uint8_t, 3> present{};
+  exhausted.contains<uint64_t>(keys, present);
+  require(rejected && exhausted.size() == 0 &&
+              std::ranges::none_of(present,
+                                   [](uint8_t found) { return found != 0; }),
+          "journal exhaustion exposed a partially published insertion");
+}
+
 void run_concurrent_erase_reinsert_regression() {
   se::StorageOptions options;
   options.memory_limit_bytes = size_t{1} << 30;
@@ -102,6 +141,7 @@ int main(int argc, char **argv) {
     run_concurrent_erase_reinsert_regression();
     return 0;
   }
+  run_reserved_publication_regression();
   run_concurrent_erase_reinsert_regression();
   using Store =
       se::HogwildEmbeddingStore<uint64_t, float, float, se::NoScorePolicy>;

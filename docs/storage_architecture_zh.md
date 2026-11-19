@@ -32,7 +32,7 @@ Sparse Embedding 存储引擎自顶向下分为五层：
                                │
 ┌──────────────────────────────▼──────────────────────────────┐
 │                    并发哈希路由与定位层                     │
-│  ParlayHash Shards ──► MapBundle (RCU) ──► SegmentedLocator │
+│  MapBundle ──► FlatKeyDirectory ──► SegmentedLocator         │
 └──────────────────────────────┬──────────────────────────────┘
                                │
 ┌──────────────────────────────▼──────────────────────────────┐
@@ -55,28 +55,28 @@ Sparse Embedding 存储引擎自顶向下分为五层：
 
 ## 3. 并发模型与无锁查询
 
-### 3.1 哈希路由与不可变 MapBundle (RCU 发布)
+### 3.1 哈希路由与分片发布
 
 查询的核心解析路径为：`Key Hash -> Shard ID -> slot_id -> SegmentedLocatorTable -> arena_index`。
 
-- **读写解耦**：每个 Shard 独立管理一个不可变的 `MapBundle`。Reader 仅通过 acquire-load 获取当前的 `MapBundle` 指针，不获取任何共享互斥锁。
-- **写时复制与原子发布**：结构性修改（插入、删除、扩容、槽位轮转）在对应 Shard 的独立 Writer Mutex 下克隆当前 Bundle 并完成修改，最后通过单个 atomic exchange 完成发布。各 Shard 之间互不阻塞，单 Shard 扩容不会影响其他 Shard 的并发读写。
-- **无二次查找**：冷热分层与物理页不参与路由决策，单次查询只需一次哈希目录查找与一次定位槽读取，杜绝二级哈希二次探测。
+- **只读查询 (Lookup)**：在 Epoch 保护下读取分片键目录和 32 位槽位 ID，再通过 locator 定位物理行。使用线程本地缓存的读路径在验证命中后可跳过目录探测。
+- **在线插入 (Insert)**：`lookup_or_insert` 在分片写互斥锁内复查 Key。写线程准备好新行、locator 和 journal 序号后，逐 key 原位发布槽位 ID。同批次 Key 允许先后可见。Checkpoint 捕获会等待活跃写操作结束。
+- **目录替换 (Directory Replacement)**：扩容改变桶布局、删除或槽位轮转时原子发布新目录，已退役目录通过 Epoch 安全回收。
 
 ### 3.2 定位槽与纯乐观 SeqLock
 
 定位槽管理由 `SegmentedLocatorTable` 负责，由 32 KiB 的固定段组成，每个槽位包含 8 字节对齐的 `{sequence, arena_index}`：
 
-- **乐观读取与原地更新**：Reader 与权重就地更新操作（如 `optimizer_step`、`assign`）通过纯乐观 `try_read` 读取 sequence 与 `arena_index`，经过编译器屏障后直接就地访问物理内存，最后校验 sequence 一致性。热路径上完全无锁且无原子计数修改。
+- **读取与原地更新**：只读 lookup 使用乐观读取并校验槽位序号。更新已有行的 `assign` 和需要更新分数的 lookup 持有 locator 读保护，使所在行在更新期间保持原位。优化器在 locator 批次写保护范围内更新参数。
 - **搬迁感知与 ABA 防护**：当后台 Compaction 迁移物理页修改 `arena_index` 时，通过 CAS 将 sequence 置为奇数，完成数据拷贝后再原子发布新的偶数 sequence 与新地址。并发 Reader 检测到版本变动会自动重试。当 sequence 接近回绕时，目录会自动将该键轮转至新槽位并退休旧槽位。
 
 ### 3.3 两级平坦物理页目录 (`StablePageDirectory`)
 
-物理页目录采用两级紧凑指针目录 `StablePageDirectory<T>`（统一管理数据页、状态页、属主信息与锁），目录常驻 CPU L1 Cache：
+数据页使用分段地址目录。启用分数策略时，arena 另行分配分数页、页句柄和分数地址目录。页号和页内偏移由 arena 索引计算。
 
 $$\text{page\_id} = \text{index} \gg \text{entries\_shift}, \quad \text{slot\_offset} = \text{index} \ \& \ \text{slot\_mask}$$
 
-寻址直接通过单周期无分支位运算完成，彻底消除堆指针多级跳跃。
+每个已分配槽位保存一个 64 位键、一个 64 位 owner 序号和一个独立的原子存活标记。在本报告的 x86-64 平台上，这三项合计每槽 17 字节。扫描线程在 epoch 保护下读取已发布的 owner 页指针。空页退役时，arena 撤下该指针，待已有读线程退出当前 Epoch 后释放该页资源。槽位的 owner 序号达到最大偶数后，分配器在复用时跳过该槽位。
 
 ### 3.4 四级软件流水线预取
 
@@ -86,6 +86,19 @@ $$\text{page\_id} = \text{index} \gg \text{entries\_shift}, \quad \text{slot\_of
 2. **第 2 级（输出缓冲区预取）**：对目标输出内存 `out_flat_values + offset` 发出写意图预取。
 3. **第 3 级（哈希目录桶预取）**：计算未来 key 的哈希并提前将目录桶缓存行载入 L1/L2 缓存。
 4. **第 4 级（定位槽与优化器状态预取）**：预取 8 字节对齐的 `LocatorSlot` 及优化器一阶动量（$m$）、二阶动量（$v$）状态行，有效掩盖 LLC Cache Miss 带来的内存停顿。
+
+### 3.5 优化器状态分层内存对齐布局 (`OptimizerRowLayout`)
+
+在现代稀疏优化器（如 Adam）中，优化器状态包含多维浮点动量向量与标量迭代步数计数器。为了彻底消除内存膨胀同时不影响 SIMD 向量化计算，`OptimizerStateArena` 提供了细粒度的行布局对齐策略：
+
+- **`OptimizerRowLayout::kCacheLineAligned` (64 字节对齐跨度)**：
+  - 应用于一阶动量（$m$）与二阶动量（$v$）；
+  - 行跨度向上对齐至 64 字节 (`std::max(sizeof(ParamT) * dim, 64UL)`)，保证 512 位 AVX-512 FMA 向量加载与写回指令执行时绝不发生跨缓存行切分惩罚。
+- **`OptimizerRowLayout::kNaturalAligned` (4 字节紧凑自然对齐)**：
+  - 应用于 Adam 步数计数器（`step_state`），其每行仅为一个标量 `uint32_t`（4 字节）；
+  - 页起始地址保持 64 字节对齐，而页内槽位行跨度严格紧凑为 4 字节 (`sizeof(uint32_t)`)；
+  - **物理页规格**：默认 4,096 槽物理页分配规格仅为 **16 KiB**（$4096 \times 4\text{ B}$）；
+  - **缓存局部性**：单条 64 字节缓存行可容纳 16 个槽位的 step 计数器，262,144 个预留槽位的计数器占 1 MiB。
 
 ---
 
@@ -129,13 +142,13 @@ $$\text{page\_id} = \text{index} \gg \text{entries\_shift}, \quad \text{slot\_of
 
 ## 6. 生命周期管理与 Epoch 反压机制
 
-所有可能被旧并发 Reader 访问的对象（包括 `MapBundle`、`StoreSnapshot`、定位槽与物理页）均统一托管在基于 Epoch 的 `RetirementPressure` 域中：
+所有可能被活跃并发 Reader 访问的对象（包括可替换的 `MapBundle`、`StoreSnapshot`、定位槽与物理页）均统一托管在基于 Epoch 的 `RetirementPressure` 域中：
 
 - **三级反压控制**：
   1. **Normal 阶段**（低于 `backpressure_fraction = 0.15`）：系统全速吞吐。
   2. **Backpressure 阶段**（介于 0.15 与 0.25 之间）：写操作与 Compaction 执行有限 CPU pause，放缓写入。
   3. **Circuit 阶段**（达到 `circuit_fraction = 0.25`）：触发熔断保护，拒绝生成新退休对象的控制面修改并直接抛出异常，防止内存暴涨。
-- **安全资源回收**：当确认没有并发 Reader 引用时，旧物理页与元数据方被释放，`retired_bytes` 计数清零。
+- **安全资源回收**：当确认没有并发 Reader 引用时，已退役物理页与元数据方被释放，`retired_bytes` 计数清零。
 
 ---
 
@@ -151,7 +164,7 @@ C++ 核心层通过统一 Facade 管理分片算法工厂：
 
 ### 7.2 向量化切片过滤 (`filter_span`)
 
-在连续 Arrow 键切片上调用 AVX-512 `filter_span` 内核，批量生成字节掩码并提取匹配行索引，供离线恢复或通信调度器极速过滤。
+在连续 Arrow 键切片上调用 AVX-512 `filter_span` 内核，批量生成字节掩码并提取匹配行索引，供离线恢复或通信调度器高速向量化过滤。
 
 ### 7.3 Python 弹性分片策略 (`PartitionStrategy`)
 
@@ -188,7 +201,9 @@ ranks_func = se.partition(keys, partition_count=4, algorithm="sparse_embedding.h
   - 推理实例：配置 `EmbeddingConfig(enable_optimizer=False)` 构建权重专属 Store，杜绝分配优化器状态内存。
 - **目标分区恢复**：`RestorePlan.from_partition` 直接描述当前分区。同一种计划类型同时覆盖相同与变化后的目标拓扑；规范 entries 的路由仍由 native 分片器负责，page-image 加载只通过 `IngestionEngine.FAST_PAGE_CACHE` 选择。
 - **两阶段提交与 Lance 湖仓持久化**：底层通过 `snapshot_manifest.lance`（控制面元数据账本）与 `entries.lance`（数据面物理切片）实现 2PC 原子发布与恢复。
-- **增量检查点与流式合流**：分片变动日志追踪脏数据与删除墓碑，支持无阻塞一致性切片与多版本流式 Compaction。
+- **增量检查点与变动日志 (Mutation Journal)**：
+  - `enable_mutation_journal = True`（默认）：分片变动日志追踪脏数据与删除墓碑，支持无阻塞一致性切片与多版本流式 Compaction。
+  - `enable_mutation_journal = False`：关闭变动追踪与热路径原子序号预留，免除记录结构内存开销；关闭时请求增量保存将抛出 `RuntimeError`，全量快照与恢复功能不受影响。
 
 > 完整的 Lance 检查点存储架构、两阶段提交、增量恢复与 Gravitino 集成规范，请参阅专门文档：[Lance 存储与 Gravitino 集成指南](lance_storage_and_gravitino_zh.md) 及 [增量检查点与流式 Compaction](incremental_checkpoint_zh.md)。
 
@@ -216,9 +231,10 @@ config = se.EmbeddingConfig(
     key_dtype="uint64",                  # 键数据类型 (支持 int32/uint32/int64/uint64)
     value_dtype="float32",               # 物理值类型
     optimizer_dtype="float32",           # 优化器动量类型 (支持 bf16/fp16/fp32)
-    gradient_dtype="bfloat16",           # 梯度累积类型 (可选)
-    gradient_scale=1.0,                  # 梯度缩放系数
+    gradient_dtype="bfloat16",           # 缩放后梯度累积类型 (可选)
+    gradient_scale=1.0,                  # 存储前将输入梯度除以该系数
     enable_optimizer=True,               # 设为 False 用于纯权重推理 Store
+    enable_mutation_journal=True,        # 设为 False 可关闭 CDC 变动追踪以降低内存驻留与热路径记账
     storage_tuning=se.StorageTuningOptions(
         target_capacity_keys=10_000_000, # 预估键容量
         memory_budget_bytes=4 << 30,     # 内存调优预算
@@ -229,6 +245,11 @@ config = se.EmbeddingConfig(
 # 3. 创建 Store 实例
 store = se.EmbeddingStore(config, score_policy="lfu")
 ```
+
+`gradient_dtype` 独立控制 transient 累积 arena，与 `value_dtype` 无关。
+`optimizer_step(normalization_steps=n)` 将存储的累积和乘以
+`gradient_scale / n`，再把归一化后的 FP32 梯度交给优化器；`optimizer_dtype`
+只控制优化器状态。比如 FP16 embedding 表可以使用 FP32 梯度累积和 FP32 Adam 状态。
 
 ---
 

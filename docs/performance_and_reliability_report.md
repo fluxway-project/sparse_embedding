@@ -28,7 +28,12 @@ Page images store slot layout, `seq_count`, parameters, score, optimizer state/s
 SHA-256 checksums. Incremental checkpoints append only changed entries and tombstones; an external coordinator
 performs global commit.
 Inference uses `EmbeddingConfig(enable_optimizer=False)` and `checkpoint.load_inference_checkpoint` (or storage `load_inference_weights`),
-which avoids optimizer-state allocation and loading.
+which avoids optimizer-state allocation and loading. For pure training or FULL-only checkpointing,
+`EmbeddingConfig(enable_mutation_journal=False)` disables CDC change tracking, eliminating hot-path
+sequence counter reservations and record memory overhead. In addition, the Adam optimizer uses
+segregated alignment, maintaining 64-byte AVX-512 SIMD alignment for momentum vectors (`m/v`) while
+packing scalar step counters with 4-byte natural alignment (`OptimizerRowLayout::kNaturalAligned`, 16 KiB per page)
+for high CPU cache residency.
 
 Compaction, hot-key promotion, and page eviction update one authoritative
 directory. Source pages remain readable until epoch safety and are never reused
@@ -73,6 +78,17 @@ High-concurrency and compaction results are medians of five samples in one
 benchmark invocation. Mixed lookup/insert results are medians of five
 independent process runs. Throughput is reported in Mops/s or M keys/s; these
 figures are workload references, not cross-machine capacity guarantees.
+
+For forward lookup on the reference platform, the default `forward_scaling_benchmark` reached **52.16 Mops/s** at 8 threads on a shuffled batch of 4,096 unique keys (dim=32). The full-featured `embedding_store_benchmark` reached **26.26 Mops/s** at 16 threads on 65,536 power-law keys (dim=128), satisfying 2, 4, and 8 worker scaling thresholds. The benchmark medians below detail multi-run measurements across workloads.
+
+### Mature-table lookup or insert
+
+Four concurrent requests each queried 983,040 keys from a table prefilled with 16,777,216 FP16 rows of dimension 128 (3,932,160 total keys queried). Each request ran whole or divided into 30 chunks. Times are median wall seconds for the group across two trials per mode. The mixed workload inserted one fresh key per 512 positions (7,680 rows per trial).
+
+| Workload | Chunked Mode (s) | Whole Batch Mode (s) | Chunked Throughput | Whole Batch Throughput |
+|---|---:|---:|---:|---:|
+| All hits | 0.975 | 1.132 | 4.03 M keys/s | 3.47 M keys/s |
+| Mixed (99.8% hits, 0.2% inserts) | 1.149 | 1.092 | 3.42 M keys/s | 3.60 M keys/s |
 
 ### Concurrent memory lookup
 
@@ -154,6 +170,91 @@ The batch optimizer profile is a separate workload from the tables below. Use
 optimizer-step implementations; use the benchmark commands in this document
 for storage and compaction comparisons.
 
+### NUMA store throughput with 16 workers
+
+On two Xeon Silver 4116 sockets, 16 workers use CPUs 0–23 with NUMA sharding. Each batch draws 65,536 keys from a power-law workload with a vocabulary of 500,000 and a vector dimension of 128. Mutation rates count the distinct rows processed. The table reports medians across 12 independent processes.
+
+| Operation | Throughput (Mops/s) |
+|---|---:|
+| `lookup_or_insert` | 1.02 |
+| `forward_lookup` | 11.365 |
+| `assign` | 32.76 |
+| `accumulate_gradients` | 4.25 |
+| `optimizer_step` | 20.065 |
+| `contains` | 22.295 |
+| `erase` (10% batch) | 5.26 |
+
+### Python training under LFU storage pressure
+
+Each batch has 4,096 keys of dimension 16. The store uses SGD and LFU, a four-thread budget, CPUs 0–11, a 256 KiB memory limit and a 1 GiB spill limit. Each process times five batches after warmup. The columns report the medians across 12 processes of per-process median throughput and p95 batch latency.
+
+| Operation | Throughput (Mops/s) | Batch p95 (ms) |
+|---|---:|---:|
+| Async lookup | 14.95 | 0.2825 |
+| Async assign | 9.195 | 0.454 |
+| Async SGD step | 6.426 | 0.6405 |
+| Synchronous training step | 1.724 | 2.3885 |
+
+### Arena owner metadata throughput
+
+Eight workers on CPUs 0–7 make 32 passes over 262,144 slots. Each process reports the median of five samples. The table gives the median across 12 processes. The combined operation counts publishing an owner and clearing its live flag as one slot operation.
+
+| Mode | Billion slots/s |
+|---|---:|
+| `publish` | 1.999 |
+| `clear` | 3.47 |
+| `publish_clear` | 1.408 |
+
+Run these workloads from the repository root with the Python extension installed.
+
+```bash
+bazel build -c opt //benchmarks:embedding_store_benchmark //benchmarks:page_compaction_owner_benchmark
+taskset -c 0-23 bazel-bin/benchmarks/embedding_store_benchmark --threads=16 --numa-aware-sharding --bind-affinity --skip-pressure
+taskset -c 0-11 python3 benchmarks/python/benchmark_e2e.py
+for mode in publish clear publish_clear; do
+  taskset -c 0-7 bazel-bin/benchmarks/page_compaction_owner_benchmark "$mode" 8
+done
+```
+
+### Concurrent Python Table Operations and Scaling
+
+Evaluated on `benchmarks/python/benchmark_embedding_table.py` with dimension 128 across 8, 16, and 32 threads:
+
+| Operation | Batch Size | 8 Threads | 16 Threads | 32 Threads | Scaling Trend |
+|---|---:|---:|---:|---:|---|
+| **Assign** | 65,536 | 10.00 MOPS | 11.79 MOPS | **14.05 MOPS** | Linear write scaling |
+| **Assign** | 131,072 | 9.65 MOPS | 11.29 MOPS | **13.69 MOPS** | Cacheline saturated |
+| **Lookup** | 65,536 | 4.65 MOPS | 7.47 MOPS | **9.64 MOPS** | Strong scaling (2.07x) |
+| **Lookup** | 131,072 | 5.44 MOPS | 8.35 MOPS | **9.88 MOPS** | Memory bus saturated |
+| **Insert** | 65,536 | 1.14 MOPS | **1.17 MOPS** | 1.16 MOPS | Shard mutex bound |
+| **End-to-End Step** | 65,536 | 1.53 MOPS | 1.77 MOPS | **1.98 MOPS** | Full training pipeline |
+| **End-to-End Step** | 131,072 | 1.53 MOPS | 1.84 MOPS | **2.02 MOPS** | Full training pipeline |
+
+### Optimizer Memory Layout & Cacheline Locality
+
+Adam optimizer state consists of first-moment momentum ($m$), second-moment velocity ($v$), and step counter ($t$), organized with segregated vector and scalar alignments:
+
+1. **Segregated Alignment Architecture (`OptimizerRowLayout`)**:
+   - Floating-point vectors $m$ and $v$ ($D \times \text{sizeof(float)}$): Aligned to 64 bytes (`kCacheLineAligned`) to ensure 512-bit AVX-512 FMA vectorization executes without unaligned memory access penalties.
+   - Step iteration counter $t$: Scalar `uint32_t` (4 bytes) packed with natural alignment (`kNaturalAligned`), consuming exactly 4 bytes per row with page bounds aligned to 64 bytes.
+2. **Page Specifications**:
+   - Under the default 4,096 entries per page, `step_state` allocates compact **16 KiB** pages ($4096 \times 4\text{ B}$), providing 100% entry storage efficiency.
+3. **Cache Working-Set Density**:
+   - A single 64-byte CPU cacheline holds 16 consecutive step counters.
+   - At a capacity of 262,144 slots the step counters occupy **1 MiB**.
+   - Threads updating adjacent slots can still share a cache line.
+
+### Mutation Journal Memory & Operational Modes
+
+The `enable_mutation_journal` configuration governs Change Data Capture (CDC) tracking:
+
+| Configuration | Memory Structure | Hotpath Sequence Accounting | Checkpoint Capabilities | Recommended Workload |
+|---|---|---|---|---|
+| `enable_mutation_journal = True` (Default) | Allocates journal mutation records and pointer arrays (~65 B/key RSS) | Active atomic CAS on write paths | FULL + INCREMENTAL checkpoints, tombstone replay | Online incremental backup, streaming delta CDC |
+| `enable_mutation_journal = False` | No per-key records or dirty-list heads | **Zero atomic sequence overhead** | FULL checkpoint and restore | Pure training, inference, batch periodic FULL saves |
+
+When disabled, `capture_checkpoint(incremental=True)` or calling `checkpoint_mutations()` raises an explicit `RuntimeError` to prevent silent generation of broken or incomplete deltas, while FULL snapshots, restores, and acknowledgements operate with full integrity.
+
 ### High-concurrency pressure and reliability
 
 Pressure profile: eight producers, 1,048,576 keys, dimension 8, Auto storage, an
@@ -173,22 +274,13 @@ and `optimizer_step`, and verifies payload integrity after paging.
 
 ## Runtime and performance reference
 
-The current path is `key -> shard MapBundle -> locator_slot -> arena_index ->
-payload`. The logical directory remains a COW snapshot and the physical page
-directory uses stable segments (`StablePageDirectory`); lookup, optimizer, and ordinary compaction
-relocation take no mutex. Expansion runs in the writer/control plane. When a
-runtime insert exceeds the reserved budget, growth uses these exact factors:
+The [shard publication contract](storage_architecture.md#31-hash-routing-and-shard-publication) defines directory visibility and replacement. Capacity grows as follows.
 
 | Layer | Expansion rule |
 |---|---|
-| Directory bucket budget | `ceil(2.5 * key_capacity)`, rounded up to 16; use the smaller `ceil_pow2(4 * key_capacity)` when it fits |
+| Directory bucket count | A shard with reserved capacity `C > 0` uses `4 × bit_floor(C)` buckets. An empty reservation uses 2 buckets. |
 | `MapBundle` runtime capacity | 2x below 64K; 1.5x for `64K <= capacity < 1M`; 1.25x at or above 1M |
 | Shard budget | `reserve(keys_count, dim)` distributes exactly; `reserve_per_shard(counts, dim)` uses caller-provided per-shard budgets |
-
-Expansion clones the current `MapBundle` and publishes it with one atomic
-exchange. Epoch retirement reclaims the old bundle; locator-slot and arena-index
-addresses remain stable. Bucket/slot/arena limits and allocation failures throw
-explicit errors; no fallback capacity path is used.
 
 ### Performance results
 
@@ -249,6 +341,8 @@ TSAN, and ASAN/UBSAN suites are release validation requirements; exception
 handling must not replace signal detection.
 
 ## Public validation
+
+Validation covers 45 native test targets and 486 Python tests. The restore benchmark exercises empty results, entry restore with one or four threads, and single-thread page-image restore on datasets of 16,384, 65,536 and 262,144 rows. Each configuration returned the expected row count.
 
 ```bash
 bazel test -c opt --test_output=errors //sparse_embedding/...

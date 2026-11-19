@@ -3,6 +3,7 @@ import inspect
 import json
 import pickle
 from concurrent.futures import ThreadPoolExecutor
+from contextlib import closing
 from datetime import timedelta
 from types import MappingProxyType
 
@@ -14,6 +15,7 @@ import pytest
 
 import sparse_embedding as se
 from sparse_embedding.checkpoint import (
+    DTypeCastPolicy,
     IngestionEngine,
     PartitionSpec,
     PartitionTarget,
@@ -108,6 +110,45 @@ def handle(committed):
     return committed.handle
 
 
+def test_assign_new_key_uses_last_journal_sequence():
+    store = se.EmbeddingStore(config())
+    last = np.iinfo(np.int64).max
+    store.initialize_checkpoint_baseline("parent", last - 1)
+    key = np.array([17], dtype=np.uint64)
+    row = np.array([[1, 2, 3, 4]], dtype=np.float32)
+    store.assign(key, row)
+    assert store.checkpoint_mutation_watermark() == last
+    np.testing.assert_array_equal(lookup(store, key), row)
+
+    next_key = key + 1
+    with pytest.raises(OverflowError, match="checkpoint mutation sequence exhausted"):
+        store.assign(next_key, row)
+    assert not np.from_dlpack(store.contains(next_key)).any()
+    assert store.total_size() == 1
+
+
+def test_restored_exhausted_owner_slot_does_not_poison_next_insert():
+    cfg = inference_config()
+    store = se.EmbeddingStore(cfg)
+    old_key = np.array([0], dtype=np.uint64)
+    store.lookup_or_insert(old_key, dim=4)
+    (image,) = store.export_page_images()
+    image["seq_counts"] = [(1 << 64) - 2]
+
+    restored = se.EmbeddingStore(cfg)
+    restored.import_page_images([image])
+    restored.erase(old_key)
+    # Reinsert the same key so the allocator must visit the original shard.
+    restored.lookup_or_insert(old_key, dim=4)
+    (replacement,) = restored.export_page_images()
+    assert replacement["keys"] == [0]
+    assert replacement["seq_counts"] == [2]
+    assert (replacement["physical_page_id"], replacement["slot_ordinals"]) != (
+        image["physical_page_id"],
+        image["slot_ordinals"],
+    )
+
+
 def test_user_facade_roundtrip(tmp_path):
     checkpoint = SparseCheckpoint(LocalLanceStorage(tmp_path / "checkpoint"))
     source = populated_store((1, 2), 3)
@@ -119,6 +160,50 @@ def test_user_facade_roundtrip(tmp_path):
         target_restore(CheckpointParticipant(0, 1)),
     )
     np.testing.assert_allclose(lookup(restored, (1, 2)), 3)
+
+
+@pytest.mark.parametrize(
+    "engine", [IngestionEngine.RECONSTRUCT_ENTRIES, IngestionEngine.FAST_PAGE_CACHE]
+)
+def test_disabled_journal_restores_full_adam_and_rejects_delta(tmp_path, engine):
+    cfg = se.EmbeddingConfig(
+        dims=[4], key_dtype="uint64", thread_budget=2, enable_mutation_journal=False
+    )
+    optimizer = se.Adam(lr=0.01)
+    source = se.EmbeddingStore(cfg, optimizer_config=optimizer)
+    keys = np.array([3, 9], dtype=np.uint64)
+    values = np.arange(8, dtype=np.float32).reshape(2, 4)
+    source.assign(keys, values)
+    source.accumulate_gradients(keys, values + 1)
+    source.optimizer_step(1)
+    with closing(LocalLanceStorage(tmp_path / "checkpoint")) as storage:
+        checkpoint = SparseCheckpoint(storage)
+        parent = checkpoint.save_training_checkpoint(
+            source,
+            "full-only",
+            include_page_images=engine is IngestionEngine.FAST_PAGE_CACHE,
+        )
+        with pytest.raises(
+            RuntimeError, match="incremental checkpoint requires mutation journal"
+        ):
+            checkpoint.save_training_checkpoint(
+                source,
+                "full-only",
+                mode=CheckpointSaveMode.INCREMENTAL,
+                parent_handle=parent.handle,
+            )
+        restored = se.EmbeddingStore(cfg, optimizer_config=optimizer)
+        checkpoint.load_training_checkpoint(
+            restored,
+            parent.handle,
+            target_restore(CheckpointParticipant(0, 1), engine=engine),
+        )
+        for store in (source, restored):
+            with pytest.raises(RuntimeError, match="mutation tracking is disabled"):
+                store.checkpoint_mutations()
+            store.accumulate_gradients(keys, 2 - values)
+            store.optimizer_step(1)
+        np.testing.assert_array_equal(lookup(source, keys), lookup(restored, keys))
 
 
 def test_exclusive_recovery_fences_direct_mutation_entries(tmp_path):
@@ -170,6 +255,149 @@ def test_incremental_checkpoint_restores_parent_and_delta(tmp_path):
     assert restored_parent.total_size() == 1
     assert restored_child.total_size() == 2
     np.testing.assert_allclose(lookup(restored_child, (2,)), 2)
+
+
+def test_fp16_to_fp32_cast_policy_preserves_adam_and_rebases_once(tmp_path):
+    storage = LocalLanceStorage(tmp_path / "checkpoint")
+    checkpoint = SparseCheckpoint(storage)
+    cfg = config()
+    cfg.value_dtype = "float16"
+    cfg.optimizer_dtype = "float32"
+    cfg.gradient_dtype = "float32"
+    source = se.EmbeddingStore(cfg, optimizer_config=se.Adam())
+    keys = np.array([2, 3, 4], dtype=np.uint64)
+    source.assign(keys, np.arange(12, dtype=np.float16).reshape(3, 4))
+    source.accumulate_gradients(keys, np.ones((3, 4), dtype=np.float32))
+    source.optimizer_step(1)
+    parent = checkpoint.save_training_checkpoint(source, "weights")
+    source.erase(keys[2:])
+    source.accumulate_gradients(keys[:1], np.full((1, 4), -3, dtype=np.float32))
+    source.optimizer_step(1)
+    delta = checkpoint.save_training_checkpoint(
+        source, "weights", parent_handle=parent.handle
+    )
+    watermark = source.checkpoint_mutation_watermark()
+    cfg.value_dtype = "float32"
+
+    def target():
+        return se.EmbeddingStore(cfg, optimizer_config=se.Adam())
+
+    strict = modulo_restore(1, 0)
+    widened = target()
+    with pytest.raises(ValueError, match="EXACT requires matching embedding dtypes"):
+        checkpoint.load_training_checkpoint(widened, delta.handle, strict)
+    with pytest.raises(ValueError, match="canonical entry ingestion"):
+        checkpoint.load_training_checkpoint(
+            widened,
+            delta.handle,
+            RestorePlan(
+                strict.target,
+                engine=IngestionEngine.FAST_PAGE_CACHE,
+                embedding_cast_policy=DTypeCastPolicy.SAFE,
+            ),
+        )
+    plan = RestorePlan.from_partition(
+        PartitionSpec.modulo(), 1, 0, embedding_cast_policy=DTypeCastPolicy.SAFE
+    )
+    assert RestorePlan.from_bytes(plan.encode()) == plan
+    checkpoint.load_training_checkpoint(widened, delta.handle, plan)
+    assert widened.total_size() == 2
+    np.testing.assert_array_equal(lookup(widened, keys[:2]), lookup(source, keys[:2]))
+
+    def adam_rows(store):
+        return {
+            key: (step, tuple(state))
+            for image in store.export_page_images()
+            for key, step, state in zip(
+                image["keys"],
+                image["steps"],
+                np.asarray(image["optimizer_states"]).reshape(len(image["keys"]), -1),
+                strict=True,
+            )
+        }
+
+    assert adam_rows(widened) == adam_rows(source)
+    partition = target()
+    checkpoint.load_training_checkpoint(
+        partition,
+        delta.handle,
+        RestorePlan.from_partition(
+            PartitionSpec.modulo(),
+            2,
+            0,
+            embedding_cast_policy=DTypeCastPolicy.SAFE,
+        ),
+    )
+    assert set(adam_rows(partition)) == {2}
+    assert partition.checkpoint_mutation_watermark() == watermark
+    assert checkpoint.requires_full_checkpoint(partition)
+    assert widened.checkpoint_mutation_watermark() == watermark
+    assert checkpoint.requires_full_checkpoint(widened)
+    with pytest.raises(
+        ValueError, match="requires the next training checkpoint to be FULL"
+    ):
+        checkpoint.save_training_checkpoint(
+            widened,
+            "weights",
+            mode=CheckpointSaveMode.INCREMENTAL,
+            parent_handle=delta.handle,
+        )
+    full = checkpoint.save_training_checkpoint(
+        widened, "weights", parent_handle=delta.handle
+    )
+    manifest = storage.resolve_checkpoint_manifest(full.handle)
+    assert (manifest["checkpoint_mode"], manifest["embedding_dtype"]) == (
+        "full",
+        "float32",
+    )
+    assert manifest["participant_watermarks"] == [watermark]
+    assert not checkpoint.requires_full_checkpoint(widened)
+    widened.assign(keys[:1], np.full((1, 4), 1.0001, dtype=np.float32))
+    child = checkpoint.save_training_checkpoint(
+        widened, "weights", parent_handle=full.handle
+    )
+    assert (
+        storage.resolve_checkpoint_manifest(child.handle)["checkpoint_mode"]
+        == "incremental"
+    )
+    replayed = target()
+    checkpoint.load_training_checkpoint(replayed, child.handle, plan)
+    assert not checkpoint.requires_full_checkpoint(replayed)
+    np.testing.assert_array_equal(lookup(replayed, keys[:2]), lookup(widened, keys[:2]))
+    assert adam_rows(replayed) == adam_rows(widened)
+
+
+@pytest.mark.parametrize(
+    ("source_dtype", "target_dtype", "target_optimizer", "error_type", "message"),
+    [
+        ("float32", "float16", "float32", ValueError, "SAFE rejects lossy"),
+        ("bfloat16", "float32", "float32", NotImplementedError, "no native kernel"),
+        ("float16", "float32", "float16", ValueError, "does not match checkpoint"),
+    ],
+)
+def test_cast_policy_rejects_other_schema_changes_before_mutation(
+    tmp_path, source_dtype, target_dtype, target_optimizer, error_type, message
+):
+    checkpoint = SparseCheckpoint(LocalLanceStorage(tmp_path / "checkpoint"))
+    cfg = config()
+    cfg.value_dtype = source_dtype
+    cfg.optimizer_dtype = "float32"
+    source = se.EmbeddingStore(cfg)
+    source.lookup_or_insert(np.array([1], dtype=np.uint64), dim=4)
+    saved = checkpoint.save_training_checkpoint(source, "weights")
+    cfg.value_dtype = target_dtype
+    cfg.optimizer_dtype = target_optimizer
+    target = se.EmbeddingStore(cfg)
+    with pytest.raises(error_type, match=message):
+        checkpoint.load_training_checkpoint(
+            target,
+            saved.handle,
+            RestorePlan.from_partition(
+                PartitionSpec.modulo(), 1, 0, embedding_cast_policy=DTypeCastPolicy.SAFE
+            ),
+        )
+    assert target.checkpoint_restore_is_pristine()
+    assert target.total_size() == 0
 
 
 def test_incremental_tombstone_is_dimension_scoped(tmp_path):
@@ -276,6 +504,19 @@ def test_owner_restore_options_are_canonical_and_opaque():
         use_bin_type=True,
     )
     assert noncanonical != encoded
+    explicit_strict = msgpack.packb(
+        dict(
+            sorted(
+                {
+                    **msgpack.unpackb(encoded, raw=False),
+                    "embedding_cast_policy": "exact",
+                }.items()
+            )
+        ),
+        use_bin_type=True,
+    )
+    with pytest.raises(ValueError, match="not a canonical option"):
+        RestorePlan.from_bytes(explicit_strict)
 
 
 @pytest.mark.parametrize("key_dtype", ["int32", "uint32", "int64", "uint64"])
@@ -2094,7 +2335,9 @@ def test_reclaim_recovery_releases_parent_chain_reference(
 
 def test_rejected_native_ack_preserves_resharded_full_requirement():
     store = se.EmbeddingStore(config())
-    store.initialize_checkpoint_baseline("resharded-base", 0, resharded=True)
+    journal_identity = store.initialize_checkpoint_baseline(
+        "resharded-base", 0, requires_full_checkpoint=True
+    )
     baseline = store.checkpoint_baseline()
     assert store.checkpoint_requires_full()
 
@@ -2102,6 +2345,10 @@ def test_rejected_native_ack_preserves_resharded_full_requirement():
         store.advance_checkpoint_baseline(0, "next-base", 999, "other-journal")
 
     assert store.checkpoint_baseline() == baseline
+    assert store.checkpoint_requires_full()
+
+    with pytest.raises(ValueError, match="captured cut"):
+        store.advance_checkpoint_baseline(0, baseline, 0, journal_identity)
     assert store.checkpoint_requires_full()
 
 

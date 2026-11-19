@@ -14,7 +14,7 @@ namespace se {
 template <typename ParamT> struct OptimizerBatchRow {
   uint32_t index = 0;
   std::span<ParamT> parameters;
-  std::span<const ParamT> gradients;
+  std::span<const float> gradients;
   uint64_t score = 0;
 };
 
@@ -84,7 +84,7 @@ struct OptimizerExtensionFacade
           void(uint32_t) const> //
       ::template add_convention<pro::weak_dispatch<OptimizerKernelStep>,
                                 void(uint32_t, std::span<ParamT>,
-                                     std::span<const ParamT>, uint64_t,
+                                     std::span<const float>, uint64_t,
                                      uint64_t)> //
       ::template add_convention<pro::weak_dispatch<OptimizerKernelStateData>,
                                 void(uint32_t, std::span<OptT>) const> //

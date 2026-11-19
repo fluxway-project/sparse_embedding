@@ -13,13 +13,13 @@
 Sparse Embedding 提供原生**增量检查点**与**流式 Compaction** 能力：
 
 - **一致性切片（Consistent Cut）**：捕获阶段暂时阻止并等待竞争中的 store 调用，使用 Epoch 保护内存。native writer 通道有界，慢 I/O 可以通过背压延长捕获时间。
-- **分片原生内存变动日志（Mutation Journaling）**：Shard 本地管理变动条目与单调递增序列号，Forward 前向热路径无任何互斥锁开销与原子写争用。
+- **分片原生内存变动日志（Mutation Journaling）**：Shard 本地管理变动条目与单调递增序列号，Forward 前向热路径无互斥锁开销与原子写争用。支持通过 `EmbeddingConfig.enable_mutation_journal` 按需配置：纯训练或全量检查点模式下关闭可免除热路径原子序号记账与记录内存开销。
 - **Delta 增量物理模式与墓碑追踪**：底层 Lance 列存保存 `mutation_sequence`、`row_state`（`"active"` 与 `"deleted"`）以及可选的淘汰评分 `score`（LFU/LRU）。
-- **原生多版本合流解析**：有界外部排序校验历史 identity 并选出增量链（`FULL` → `INCREMENTAL` → ...）的存活记录。每个 Lance 源的 payload 扫描一次，请求的数据写入临时文件，随后按源顺序回放；只有存活 key 分配目标 slot。
-- **离线/在线流式 Compaction**：与 entries restore 共用合流和 payload 解码，再通过有界 writer 通道输出自包含 `FULL`。临时磁盘随历史数据增长，排序与 batch 的 RAM 上限由 `CheckpointStreamPolicy` 控制。
+- **原生多版本合流解析**：有界外部排序校验多版本记录并选出增量链（`FULL` → `INCREMENTAL` → ...）的存活记录。每个 Lance 源的 payload 扫描一次，请求的数据写入临时文件，随后按源顺序回放；只有存活 key 分配目标 slot。
+- **离线/在线流式 Compaction**：与 entries restore 共用合流和 payload 解码，再通过有界 writer 通道输出自包含 `FULL`。临时磁盘随增量链数据规模增长，排序与 batch 的 RAM 上限由 `CheckpointStreamPolicy` 控制。
 
-- **Page-Image 恢复边界**：page-image 恢复按有界 page batch 扫描，并在 store 内持有一次空目标导入生命周期。只有 native 证明历史 identity 的 source owner 不变且目标 page geometry 匹配时才可使用。目标 assignment 移动历史 identity 后，entries 恢复的下一次保存必须为 `FULL`；分区数量相同也适用（详见 2.4 节）。
-- **生命周期与资源约束**：全部页面和校验成功后才发布 generation；导入尝试失败后，目标在重新开放访问前进入 terminal 状态。训练恢复要求符合目标 optimizer 的实际状态布局；只加载权重是显式 scope。最终目标表、稀疏物理页对应的 optimizer 容量及 Lance 运行时缓存不属于有界临时缓冲。恢复包含控制面和 I/O 同步，不能称为全过程无锁。
+- **Page-Image 恢复边界**：page-image 恢复按有界 page batch 扫描，并在 store 内持有一次空目标导入生命周期。只有 native 校验确认 source owner 不变且目标 page geometry 匹配时才可使用。目标 assignment 导致键归属转移后，entries 恢复的下一次保存必须为 `FULL`；分区数量相同也适用（详见 2.4 节）。
+- **生命周期与资源约束**：全部页面和校验成功后才发布 generation；导入尝试失败后，目标在重新开放访问前进入 terminal 状态。训练恢复要求符合目标 optimizer 的实际状态布局；只加载权重是显式 scope。最终目标表、稀疏物理页对应的 optimizer 容量及 Lance 运行时缓存不属于有界临时缓冲。恢复流程按序编排控制面元数据与 I/O 读写。
 
 ---
 
@@ -54,9 +54,26 @@ Sparse Embedding 提供原生**增量检查点**与**流式 Compaction** 能力�
 ### 2.1 分片内存变动日志 (Mutation Journaling)
 
 每个 Hash 分片维护独立的轻量级 `CheckpointMutationJournal`：
-- **脏键追踪**：当特征权重或优化器状态在 `assign`、`accumulate_gradients` 或 `optimizer_step` 中被修改时，其定位槽与递增序号即时记录到当前活跃 Journal 中。
+- **脏键追踪**：当特征权重或优化器状态在 `assign`、`accumulate_gradients` 或 `optimizer_step` 中被修改时，日志记录对应键的本次生命周期。`assign` 创建新行时在插入阶段登记一次变更。对已存在的行，每个 assign 工作线程为已完成的写入一次预留一段序号。捕获会等待活动调用退出，即使后续某行失败，之前已完成的写入也会登记。
 - **删除墓碑记录**：显式删除（`erase`、`erase_dimension`）或基于分数的淘汰清理会生成对应的删除墓碑（Tombstone），确保跨版本删除语义严格保真。
-- **只读热路径零开销**：`forward_lookup` 和 `lookup_or_insert` 命中路径不经过 Journal 互斥锁，也不执行任何原子写计数。
+- **前向读取与分数**：无分数或手动分数模式下，前向读取不写变动日志。LFU/LRU 读取可能改变分数；每个工作线程为本批实际更新的分数一次预留日志序号。
+
+#### 可配置变动日志 (`enable_mutation_journal`)
+
+变动日志默认开启（`EmbeddingConfig(enable_mutation_journal=True)`）。对于不需要增量检查点的场景（例如仅执行纯训练、离线推理、或仅使用周期性全量快照保存），可在建表配置中显式关闭：
+
+```python
+config = se.EmbeddingConfig(
+    dims=[128],
+    enable_mutation_journal=False,  # 显式关闭 CDC 变动追踪
+)
+```
+
+**运行机制与契约保证：**
+1. **零记录内存分配**：关闭日志后不分配逐 key 变更记录、分片脏链表头和优化器批次记录数组。locator 仍保留指针字段。
+2. **热路径零原子序号开销**：写路径（`assign`、`optimizer_step`、带分数的访问等）完全跳过原子序列号递增与预留。
+3. **全量快照功能完整**：全量检查点捕获（`save_training_checkpoint(mode=FULL)`）、恢复引擎及确认协议均完备工作且数据 100% 一致。
+4. **强校验快速失败 (Fail-Fast)**：当关闭日志时，任何尝试请求增量检查点（`capture_checkpoint(incremental=True)` 或 `save_training_checkpoint(mode=INCREMENTAL)`）会抛出 `RuntimeError("incremental checkpoint requires mutation journal to be enabled")`。调用 `store.checkpoint_mutations()` 会抛出 `RuntimeError("checkpoint mutation tracking is disabled for this store")`。
 
 ### 2.2 两阶段一致性切片协议
 
@@ -86,7 +103,7 @@ Sparse Embedding 提供原生**增量检查点**与**流式 Compaction** 能力�
 
 ### 2.4 物理 Source 分片存储与跨拓扑检查点不变量
 
-增量检查点在数学上定义为基线快照之上的增量变动：$f(\text{Base}) + \Delta$。当集群拓扑变更（如 Worker 数量扩缩容或分片算法更新）导致 Key 所有权发生转移时，拓扑重构后的首个检查点必须保存为 `FULL` 全量检查点，而非 `INCREMENTAL` 增量检查点。
+增量检查点在数学上定义为基线快照之上的增量变动：$f(\text{Base}) + \Delta$。当集群拓扑变更（如 Worker 数量扩缩容或分片算法更新）导致 Key 所有权发生转移时，拓扑调整后的首个检查点必须保存为 `FULL` 全量检查点，而非 `INCREMENTAL` 增量检查点。
 
 #### 1. 物理架构：独立的 Participant 分片存储
 在分布式训练写路径上，为实现零互斥锁争用与无阻塞捕获，分布式 Worker 不会并发写入同一个物理 Lance 表文件。每个训练 Worker 独立维护本地 Shard 的变动日志，并在切片时将变动条目写出至独占的物理子目录：
@@ -96,7 +113,7 @@ _staging/<attempt>/<participant_id>/entries.lance
 全局清单 `snapshot_manifest.lance` 则以轻量级元数据记录这一组离散的物理 Lance 片段（Fragment）。因此，Lance 底层天然是以 Participant（即 source 分片）为独立单元组织的。
 
 #### 2. 跨拓扑不变量与状态物化
-增量检查点依赖于确定性的基线状态与各 Participant 日志内单调递增的变动序号。当拓扑重组导致键归属发生迁移时，必须遵循以下状态规约：
+增量检查点依赖于确定性的基线状态与各 Participant 日志内单调递增的变动序号。当拓扑重组导致键归属发生转移时，必须遵循以下状态规约：
 
 ```text
 ┌──────────────────────────────────────────────────────────────────────────────────────┐
@@ -104,23 +121,23 @@ _staging/<attempt>/<participant_id>/entries.lance
 │  Worker 0 ──► 片段 0 [Key 100 @ seq=10] ─────┐                                       │
 │  Worker 1 ──► 片段 1 [Key 200 @ seq=12]      │                                       │
 │                                              │ 拓扑变更 (2 -> 4 Workers)             │
-│                                              ▼ 恢复路由: Key 100 迁移给 Worker 3     │
+│                                              ▼ 恢复路由: Key 100 转移给 Worker 3     │
 │ 拓扑 2 (4 Workers 训练) ── 拓扑重组后的检查点不变量:                                 │
 │                                                                                      │
 │ [禁止跨拓扑 INCREMENTAL]                     [系统强制规约: FULL 基线物化]           │
 │   • Worker 3 仅记录本步新修改 Key              • Worker 3 立即物化自包含全量         │
 │   • 未修改的 Key 100 遗失在新增量中            • Key 100 完整收录至片段 3            │
-│   • 下次恢复需全量遍历所有历史旧 Worker 碎片   • 彻底切断旧拓扑长链依赖              │
-│   • 读放大爆炸 + 墓碑复活 + 旧数据无法 GC      • 允许安全 GC 回收旧拓扑历史文件      │
-│   (❌ 破坏一致性与有界性能)                    (✅ 后续检查点恢复极速 INCREMENTAL)   │
+│   • 下次恢复需全量遍历所有前序物理分片         • 彻底切断前序拓扑依赖                │
+│   • 读放大显著上升，存在墓碑时序失效风险       • 允许安全 GC 回收前序物理分片        │
+│   (❌ 破坏一致性与有界性能)                    (✅ 后续检查点恢复轻量 INCREMENTAL)   │
 └──────────────────────────────────────────────────────────────────────────────────────┘
 ```
 
-拓扑重构后首个检查点强制为 `FULL` 的技术考量：
-1. **分片基线连续性（Base Slice Continuity）**：增量片段仅记录当前步变更的条目。若在新节点接管键后直接保存增量，未在该步被修改的历史键将遗失在增量之外，后续恢复将无法仅依赖新节点的父链还原完整状态，退化为跨节点递归回溯。
-2. **有界读取开销（Bounded Read Amplification）**：若允许多次跨拓扑增量链级联，节点恢复时需扫描历史上所有拓扑结构下的所有碎片，读取复杂度从 $O(N_{\text{checkpoints}})$ 退化为 $O(N_{\text{participants}} \times N_{\text{checkpoints}})$。
+拓扑变更后首个检查点强制为 `FULL` 的技术考量：
+1. **分片基线连续性（Base Slice Continuity）**：增量片段仅记录当前步变更的条目。若在新节点接管键后直接保存增量，未在该步被修改的存量键将遗失在增量之外，后续恢复将无法仅依赖新节点的父链还原完整状态，退化为跨节点递归回溯。
+2. **有界读取开销（Bounded Read Amplification）**：若允许多次跨拓扑增量链级联，节点恢复时需扫描前序所有拓扑结构下的全部物理分片，读取复杂度从 $O(N_{\text{checkpoints}})$ 退化为 $O(N_{\text{participants}} \times N_{\text{checkpoints}})$。
 3. **序列号域隔离与墓碑消除（Sequence Domain Isolation & Tombstone Elimination）**：变动序号仅在各 Worker 本地单调递增，无全局物理时钟。跨节点的删除墓碑若直接多源归并，极易因缺乏绝对偏序导致已删除条目被误判或复活。
-4. **血缘截断与存储垃圾回收（Lineage Truncation & Safe GC）**：若增量跨拓扑延续，历史拓扑的物理文件将被下游增量依赖永久锚定无法释放。强制执行一次 `FULL` 本质上是**状态物化与血缘截断边界**，使新节点建立完整自包含基线，旧拓扑历史文件得以被安全回收。完成该全量保存后，后续训练步骤可继续执行轻量级 `INCREMENTAL` 保存。
+4. **血缘截断与存储垃圾回收（Lineage Truncation & Safe GC）**：若增量跨拓扑延续，前序拓扑的物理文件将被下游增量依赖永久锚定无法释放。强制执行一次 `FULL` 本质上是**状态物化与血缘截断边界**，使新节点建立完整自包含基线，前序拓扑物理分片得以被安全回收。完成该全量保存后，后续训练步骤可继续执行轻量级 `INCREMENTAL` 保存。
 
 ---
 
@@ -160,7 +177,7 @@ committed_inc = checkpoint.save_training_checkpoint(
 print("已提交增量版本:", committed_inc.version_id.decode())
 ```
 
-> **注意**：增量检查点必须与父检查点保持相同的 Lineage 名称（如 `"user_model"`），并且必须指定有效的 `parent_handle`。未提供父句柄时系统将严格抛出 `ValueError`，杜绝悬空版本。
+> **注意**：增量检查点必须与父检查点保持相同的 Lineage 名称（如 `"user_model"`），并且必须指定有效的 `parent_handle`。未提供父句柄时系统将严格抛出 `ValueError`，杜绝悬空版本。若当前 Store 构建时配置了 `enable_mutation_journal=False`，尝试保存增量快照将抛出 `RuntimeError("incremental checkpoint requires mutation journal to be enabled")`。
 
 ### 3.2 从增量链条恢复状态
 
@@ -168,6 +185,7 @@ print("已提交增量版本:", committed_inc.version_id.decode())
 
 ```python
 from sparse_embedding.checkpoint import (
+    DTypeCastPolicy,
     IngestionEngine,
     PartitionSpec,
     RestorePlan,
@@ -198,6 +216,8 @@ reshard_plan = RestorePlan.from_partition(
 elastic_store = se.EmbeddingStore(config)
 checkpoint.load_training_checkpoint(elastic_store, committed_inc.handle, reshard_plan)
 ```
+
+默认要求 embedding dtype 一致。目前只支持一种显式转换：在 `RestorePlan.from_partition` 中传入 `embedding_cast_policy=DTypeCastPolicy.SAFE`，把 FP16 权重恢复到 FP32 表。原生条目读取器只转换目标分区的权重，page image 仍要求 dtype 一致。训练恢复保留 mutation watermark；实际发生转换时，下一次保存必须为 FULL，确认后可用它作为后续增量的父 checkpoint。优化器状态保持原 dtype。
 
 ### 3.3 流式 Compaction 合流压缩
 

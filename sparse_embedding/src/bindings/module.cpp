@@ -96,6 +96,7 @@ void construct_store(EmbeddingStoreWrapper &self, const PyInitializer &init_cfg,
       se::GradientDType::kFloat32, 1.0f};
   request.gradient_dtype = kind.gradient_dtype;
   request.gradient_scale = kind.gradient_scale;
+  request.enable_mutation_journal = emb_cfg.enable_mutation_journal;
   se::create_hogwild_store(kind, std::move(target), std::move(request),
                            thread_budget);
 }
@@ -468,14 +469,15 @@ NB_MODULE(_core, m) {
   nb::class_<se::EmbeddingConfig>(m, "_EmbeddingConfig")
       .def(nb::init<std::vector<size_t>, size_t, std::string, std::string,
                     std::string, float, std::string, se::StorageOptions,
-                    se::storage::StorageTuningOptions, bool>(),
+                    se::storage::StorageTuningOptions, bool, bool>(),
            nb::arg("dims"), nb::arg("thread_budget") = 0,
            nb::arg("value_dtype") = "float32", nb::arg("optimizer_dtype") = "",
            nb::arg("gradient_dtype") = "", nb::arg("gradient_scale") = 1.0f,
            nb::arg("key_dtype") = "int64",
            nb::arg("storage") = se::StorageOptions{},
            nb::arg("storage_tuning") = se::storage::StorageTuningOptions{},
-           nb::arg("enable_optimizer") = true)
+           nb::arg("enable_optimizer") = true,
+           nb::arg("enable_mutation_journal") = true)
       .def_rw("dims", &se::EmbeddingConfig::dims)
       .def_rw("thread_budget", &se::EmbeddingConfig::thread_budget)
       .def_rw("value_dtype", &se::EmbeddingConfig::value_dtype)
@@ -483,6 +485,8 @@ NB_MODULE(_core, m) {
       .def_rw("gradient_dtype", &se::EmbeddingConfig::gradient_dtype)
       .def_rw("gradient_scale", &se::EmbeddingConfig::gradient_scale)
       .def_rw("enable_optimizer", &se::EmbeddingConfig::enable_optimizer)
+      .def_rw("enable_mutation_journal",
+              &se::EmbeddingConfig::enable_mutation_journal)
       .def_rw("key_dtype", &se::EmbeddingConfig::key_dtype)
       .def_rw("storage_tuning", &se::EmbeddingConfig::storage_tuning);
 
@@ -699,7 +703,7 @@ NB_MODULE(_core, m) {
       .def("initialize_checkpoint_baseline",
            &EmbeddingStoreWrapper::initialize_checkpoint_baseline,
            nb::arg("baseline"), nb::arg("watermark"),
-           nb::arg("resharded") = false)
+           nb::arg("requires_full_checkpoint") = false)
       .def("mark_terminal_failure",
            &EmbeddingStoreWrapper::mark_terminal_failure)
       .def("is_operational", &EmbeddingStoreWrapper::is_operational)
@@ -836,13 +840,17 @@ NB_MODULE(_core, m) {
          std::optional<uint32_t> source_participant_index,
          const nb::dict &storage_options, bool load_optimizer_state,
          const std::string &assignment_name,
-         const nb::dict &assignment_parameters) {
+         const nb::dict &assignment_parameters,
+         std::optional<std::string> source_embedding_dtype) {
         self.restore_native_partition_entries(
             uris, version, partition_count, partition_id, key_dtype,
             assignment_name,
             checkpoint_assignment_parameters(assignment_parameters),
             checkpoint_storage_options(storage_options), load_optimizer_state,
-            source_participant_index);
+            source_participant_index,
+            se::parse_value_dtype(source_embedding_dtype
+                                      ? *source_embedding_dtype
+                                      : self.value_dtype()));
       },
       nb::arg("store"), nb::arg("uris"), nb::arg("version"),
       nb::arg("partition_count"), nb::arg("partition_id"), nb::arg("key_dtype"),
@@ -850,7 +858,8 @@ NB_MODULE(_core, m) {
       nb::arg("storage_options") = nb::dict(),
       nb::arg("load_optimizer_state") = true,
       nb::arg("assignment_name") = std::string(se::ops::kModuloPartitionerName),
-      nb::arg("assignment_parameters") = nb::dict());
+      nb::arg("assignment_parameters") = nb::dict(),
+      nb::arg("source_embedding_dtype") = nb::none());
   checkpoint.def(
       "restore_native_page_images",
       [](EmbeddingStoreWrapper &self, const std::vector<std::string> &uris,

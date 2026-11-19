@@ -34,24 +34,34 @@
 
 namespace se {
 
+enum class OptimizerRowLayout : uint8_t {
+  kCacheLineAligned,
+  kNaturalAligned,
+};
+
 template <typename T> class OptimizerStateArena {
   static constexpr size_t kCacheLineSize = 64;
 
 public:
-  explicit OptimizerStateArena(size_t dim, PageStorage storage,
-                               bool page_eviction_enabled = false,
-                               size_t entries_per_page = 4096)
+  explicit OptimizerStateArena(
+      size_t dim, PageStorage storage, bool page_eviction_enabled = false,
+      size_t entries_per_page = 4096,
+      OptimizerRowLayout row_layout = OptimizerRowLayout::kCacheLineAligned)
       : dim_(dim), storage_(std::move(storage)),
         page_eviction_enabled_(page_eviction_enabled),
         entries_per_page_(entries_per_page),
         entries_shift_(
             static_cast<unsigned>(std::countr_zero(entries_per_page))),
-        slot_mask_(entries_per_page - 1) {
+        slot_mask_(entries_per_page - 1), row_layout_(row_layout) {
     if (entries_per_page_ == 0 || !std::has_single_bit(entries_per_page_))
       throw std::invalid_argument(
           "optimizer state entries per page must be a power of two");
-    row_stride_ =
-        (dim * sizeof(T) + kCacheLineSize - 1) & ~(kCacheLineSize - 1);
+    if (row_layout_ == OptimizerRowLayout::kCacheLineAligned) {
+      row_stride_ =
+          (dim * sizeof(T) + kCacheLineSize - 1) & ~(kCacheLineSize - 1);
+    } else {
+      row_stride_ = (dim * sizeof(T) + alignof(T) - 1) & ~(alignof(T) - 1);
+    }
   }
 
   OptimizerStateArena(const OptimizerStateArena &) = delete;
@@ -132,6 +142,9 @@ public:
 
   constexpr size_t dim() const { return dim_; }
   constexpr size_t row_stride() const { return row_stride_; }
+  constexpr OptimizerRowLayout row_layout() const noexcept {
+    return row_layout_;
+  }
   size_t entries_per_page() const noexcept { return entries_per_page_; }
 
 private:
@@ -149,6 +162,7 @@ private:
   size_t entries_per_page_{4096};
   unsigned entries_shift_{12};
   size_t slot_mask_{4095};
+  OptimizerRowLayout row_layout_{OptimizerRowLayout::kCacheLineAligned};
   StablePageDirectory<StoragePage> pages_;
   std::vector<std::unique_ptr<StoragePage>> storage_pages_;
   std::atomic<size_t> capacity_{0};

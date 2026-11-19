@@ -3,7 +3,6 @@
 #include "sparse_embedding/src/checkpoint/lance/native_entry_restore.hpp"
 
 namespace se {
-
 template <typename ParamT, typename OptT>
 void NativeRestore<ParamT, OptT>::entries(
     pro::proxy<EmbeddingTableFacade<ParamT, OptT>> &store,
@@ -11,28 +10,38 @@ void NativeRestore<ParamT, OptT>::entries(
     pro::proxy<ops::PartitionerFacade> partitioner, uint32_t partition_id,
     std::string_view key_dtype, bool load_optimizer_state,
     const LanceStorageOptions &storage_options,
-    std::optional<uint32_t> source_participant_index) {
-  restore_native_entry_batches<uint64_t, ParamT, OptT>(
-      *store,
-      [&](NativeEntryBatchVisitor visitor) {
-        scan_native_checkpoint_entries(
-            uris, version, std::move(partitioner), partition_id, key_dtype,
-            [&](const NativeEntryBatch &batch) {
-              if (batch.embedding_dtype !=
-                      value_dtype_name(ValueDTypeOf<ParamT>::value) ||
-                  (load_optimizer_state && !batch.optimizer_dtype.empty() &&
-                   batch.optimizer_dtype !=
-                       value_dtype_name(ValueDTypeOf<OptT>::value)))
-                throw std::invalid_argument(
-                    "native checkpoint payload dtype does not match store");
-              if (load_optimizer_state)
-                store->validate_optimizer_state_layout(batch.dimensions,
-                                                       batch.optimizer_strides);
-              return visitor(batch);
-            },
-            load_optimizer_state, storage_options, source_participant_index);
-      },
-      load_optimizer_state);
+    std::optional<uint32_t> source_participant_index,
+    se::ValueDType source_embedding_dtype) {
+  const auto ingest = [&]<typename SourceT>() {
+    restore_native_entry_batches<uint64_t, ParamT, OptT, SourceT>(
+        *store,
+        [&](NativeEntryBatchVisitor visitor) {
+          scan_native_checkpoint_entries(
+              uris, version, std::move(partitioner), partition_id, key_dtype,
+              [&](const NativeEntryBatch &batch) {
+                if (batch.embedding_dtype !=
+                        value_dtype_name(ValueDTypeOf<SourceT>::value) ||
+                    (load_optimizer_state && !batch.optimizer_dtype.empty() &&
+                     batch.optimizer_dtype !=
+                         value_dtype_name(ValueDTypeOf<OptT>::value)))
+                  throw std::invalid_argument(
+                      "native checkpoint payload dtype does not match store");
+                if (load_optimizer_state)
+                  store->validate_optimizer_state_layout(
+                      batch.dimensions, batch.optimizer_strides);
+                return visitor(batch);
+              },
+              load_optimizer_state, storage_options, source_participant_index);
+        },
+        load_optimizer_state);
+  };
+  if (source_embedding_dtype == ValueDTypeOf<ParamT>::value)
+    return ingest.template operator()<ParamT>();
+  if constexpr (std::is_same_v<ParamT, float>) {
+    if (source_embedding_dtype == ValueDType::kFloat16)
+      return ingest.template operator()<float16_t>();
+  }
+  throw std::invalid_argument("unsupported native embedding dtype conversion");
 }
 
 template <typename ParamT, typename OptT>

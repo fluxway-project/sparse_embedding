@@ -378,6 +378,11 @@ class IngestionEngine(str, Enum):
     FAST_PAGE_CACHE = "fast_page_cache"
 
 
+class DTypeCastPolicy(str, Enum):
+    EXACT = "exact"
+    SAFE = "safe"
+
+
 @final
 class PartitionSpec:
     """Declarative partition specification serving as Single Source of Truth."""
@@ -508,6 +513,7 @@ class RestorePlan:
     _: KW_ONLY
     engine: IngestionEngine = IngestionEngine.RECONSTRUCT_ENTRIES
     key_dtype: str = "uint64"
+    embedding_cast_policy: DTypeCastPolicy = DTypeCastPolicy.EXACT
 
     def __post_init__(self) -> None:
         if not isinstance(self.target, PartitionTarget):
@@ -516,6 +522,8 @@ class RestorePlan:
             raise TypeError("engine must be an IngestionEngine")
         if self.key_dtype not in SUPPORTED_KEY_DTYPES:
             raise ValueError(f"unsupported key dtype: {self.key_dtype}")
+        if not isinstance(self.embedding_cast_policy, DTypeCastPolicy):
+            raise TypeError("embedding_cast_policy must be a DTypeCastPolicy")
 
     @classmethod
     def from_partition(
@@ -526,11 +534,13 @@ class RestorePlan:
         *,
         key_dtype: str = "uint64",
         engine: IngestionEngine = IngestionEngine.RECONSTRUCT_ENTRIES,
+        embedding_cast_policy: DTypeCastPolicy = DTypeCastPolicy.EXACT,
     ) -> RestorePlan:
         return cls(
             PartitionTarget(spec, partition_count, partition_id),
             key_dtype=key_dtype,
             engine=engine,
+            embedding_cast_policy=embedding_cast_policy,
         )
 
     @classmethod
@@ -646,7 +656,7 @@ class CheckpointCleanup(Protocol):
 class CheckpointableStore(Protocol):
     def checkpoint_requires_full(self) -> bool: ...
     def initialize_checkpoint_baseline(
-        self, baseline: str, watermark: int, resharded: bool = False
+        self, baseline: str, watermark: int, requires_full_checkpoint: bool = False
     ) -> str: ...
     def advance_checkpoint_baseline(
         self, watermark: int, baseline: str, capture_id: int, journal_identity: str
@@ -763,7 +773,7 @@ def resolve_effective_save_mode(
     requires_full: bool,
     parent_handle: CheckpointHandle | None,
 ) -> tuple[CheckpointSaveMode, CheckpointHandle | None]:
-    """Resolve the effective save mode given configured mode and parent/reshard state."""
+    """Resolve the effective mode given the configured mode and FULL requirement."""
     if not isinstance(configured_mode, CheckpointSaveMode):
         raise TypeError(
             f"configured_mode must be a CheckpointSaveMode; got {type(configured_mode).__name__}"

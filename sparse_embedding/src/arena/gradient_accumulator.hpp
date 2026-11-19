@@ -23,43 +23,41 @@ namespace se {
 
 enum class GradientDType : uint8_t { kFloat32, kFloat16, kBFloat16 };
 
-template <typename ParamT> class GradientBatchView {
+class NormalizedGradientBatch {
 public:
   size_t size() const noexcept { return keys_.size(); }
   uint64_t key(size_t position) const noexcept { return keys_[position]; }
   uint64_t hash(size_t position) const noexcept { return hashes_[position]; }
-  const ParamT *gradient(size_t position) const noexcept {
+  const float *gradient(size_t position) const noexcept {
     return gradients_.data() + position * dim_;
   }
-  const std::vector<uint64_t> &keys() const noexcept { return keys_; }
-  const std::vector<uint64_t> &hashes() const noexcept { return hashes_; }
-  bool contiguous() const noexcept { return true; }
 
   template <typename RawBatch>
-  void assign(const RawBatch &raw, size_t dim, float scale) {
+  void assign(const RawBatch &raw, size_t dim, double scale) {
     dim_ = dim;
-    keys_.resize(raw.size());
-    hashes_.resize(raw.size());
+    keys_ = raw.keys();
+    hashes_ = raw.hashes();
     gradients_.resize(raw.size() * dim);
     for (size_t row = 0; row < raw.size(); ++row) {
-      keys_[row] = raw.key(row);
-      hashes_[row] = raw.hash(row);
       const auto *source = raw.gradient(row);
       for (size_t col = 0; col < dim; ++col) {
-        gradients_[row * dim + col] =
-            static_cast<ParamT>(static_cast<float>(source[col]) * scale);
+        const float normalized =
+            static_cast<float>(static_cast<double>(source[col]) * scale);
+        if (!std::isfinite(normalized))
+          throw std::overflow_error("normalized gradient exceeds float32");
+        gradients_[row * dim + col] = normalized;
       }
     }
   }
 
 private:
   size_t dim_ = 0;
-  std::vector<uint64_t> keys_;
-  std::vector<uint64_t> hashes_;
-  std::vector<ParamT> gradients_;
+  std::span<const uint64_t> keys_;
+  std::span<const uint64_t> hashes_;
+  std::vector<float> gradients_;
 };
 
-template <typename ParamT> class GradientAccumulator {
+class GradientAccumulator {
   using FloatArena = std::unique_ptr<TransientArena<float>>;
   using Float16Arena = std::unique_ptr<TransientArena<float16_t>>;
   using BFloat16Arena = std::unique_ptr<TransientArena<bfloat16_t>>;
@@ -94,8 +92,7 @@ public:
           for (const GradT gradient : gradients) {
             const float scaled = static_cast<float>(gradient) / scale_;
             if (!std::isfinite(scaled) ||
-                std::abs(scaled) > dtype_max<StoredT>() ||
-                std::abs(scaled) > dtype_max<ParamT>())
+                std::abs(scaled) > dtype_max<StoredT>())
               throw std::overflow_error(
                   "gradient scale storage exceeds configured dtype");
           }
@@ -136,15 +133,17 @@ public:
           arena->with_accumulated_batch([&](const auto &raw) {
             using ArenaT = std::remove_reference_t<decltype(*arena)>;
             using StoredT = typename ArenaT::value_type;
-            if constexpr (std::is_same_v<StoredT, ParamT>) {
+            if constexpr (std::is_same_v<StoredT, float>) {
               if (normalization_steps == 1 && scale_ == 1.0f) {
                 std::forward<Fn>(fn)(raw);
                 return;
               }
             }
-            thread_local GradientBatchView<ParamT> batch;
-            batch.assign(raw, dim_,
-                         scale_ / static_cast<float>(normalization_steps));
+            thread_local NormalizedGradientBatch batch;
+            const double normalization_scale =
+                static_cast<double>(scale_) /
+                static_cast<double>(normalization_steps);
+            batch.assign(raw, dim_, normalization_scale);
             std::forward<Fn>(fn)(batch);
           });
         },

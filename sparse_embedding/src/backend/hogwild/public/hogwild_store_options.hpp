@@ -22,6 +22,7 @@ struct HogwildStoreOptions {
   storage::StorageTuningOptions storage_tuning;
   GradientDType gradient_dtype = GradientDType::kFloat32;
   float gradient_scale = 1.0f;
+  bool enable_mutation_journal = true;
 
   std::optional<OperationDispatchConfig> dispatch_config() const {
     if (locality.execution == LocalityMode::kAuto &&

@@ -12,7 +12,8 @@ template <typename ParamT, typename OptT> struct NativeRestore {
                       uint32_t partition_id, std::string_view key_dtype,
                       bool load_optimizer_state,
                       const LanceStorageOptions &storage_options,
-                      std::optional<uint32_t> source_participant_index);
+                      std::optional<uint32_t> source_participant_index,
+                      se::ValueDType source_embedding_dtype);
 
   static void pages(pro::proxy<EmbeddingTableFacade<ParamT, OptT>> &store,
                     std::span<const std::string> uris, uint64_t version,

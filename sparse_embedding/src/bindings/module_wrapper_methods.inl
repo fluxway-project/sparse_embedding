@@ -560,11 +560,13 @@ inline bool EmbeddingStoreWrapper::checkpoint_restore_is_pristine() {
 }
 
 inline std::string EmbeddingStoreWrapper::initialize_checkpoint_baseline(
-    const std::string &baseline, uint64_t watermark, bool resharded) {
+    const std::string &baseline, uint64_t watermark,
+    bool requires_full_checkpoint) {
   auto result = visit_store([&](auto &store) {
     return store->initialize_checkpoint_baseline(baseline, watermark);
   });
-  requires_full_checkpoint_.store(resharded, std::memory_order_relaxed);
+  requires_full_checkpoint_.store(requires_full_checkpoint,
+                                  std::memory_order_relaxed);
   return result;
 }
 
@@ -595,11 +597,12 @@ inline size_t EmbeddingStoreWrapper::entries_per_page() {
 inline void EmbeddingStoreWrapper::advance_checkpoint_baseline(
     uint64_t watermark, const std::string &baseline, uint64_t capture_id,
     const std::string &journal_identity) {
-  visit_store([&](auto &store) {
-    store->advance_checkpoint_baseline(watermark, baseline, capture_id,
-                                       journal_identity);
+  const bool full_checkpoint = visit_store([&](auto &store) {
+    return store->advance_checkpoint_baseline(watermark, baseline, capture_id,
+                                              journal_identity);
   });
-  requires_full_checkpoint_.store(false, std::memory_order_relaxed);
+  if (full_checkpoint)
+    requires_full_checkpoint_.store(false, std::memory_order_relaxed);
 }
 
 } // namespace se::py::detail

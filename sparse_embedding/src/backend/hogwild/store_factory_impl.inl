@@ -41,6 +41,7 @@ void make_store(StoreConstructionTarget &target,
           .storage_tuning = target.storage_tuning,
           .gradient_dtype = request.gradient_dtype,
           .gradient_scale = request.gradient_scale,
+          .enable_mutation_journal = request.enable_mutation_journal,
       });
 }
 

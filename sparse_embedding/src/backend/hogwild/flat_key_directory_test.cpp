@@ -91,9 +91,13 @@ int main() {
   require(FlatKeyDirectory::bucket_count_for_key_capacity(0) == 2,
           "zero-key capacity is wrong");
   require(FlatKeyDirectory::bucket_count_for_key_capacity(65'536) == 262'144,
-          "natural power-of-two capacity did not preserve the legacy mask");
-  require(FlatKeyDirectory::bucket_count_for_key_capacity(81'920) == 512'000,
-          "non-power-of-two capacity did not preserve the probe budget");
+          "power-of-two reservation exceeded the load budget");
+  require(FlatKeyDirectory::bucket_count_for_key_capacity(81'920) == 262'144,
+          "directory exceeded the capacity step");
+  require(FlatKeyDirectory::bucket_count_for_key_capacity(131'071) == 262'144 &&
+              FlatKeyDirectory::bucket_count_for_key_capacity(131'072) ==
+                  524'288,
+          "directory load exceeded one half across the capacity step");
   require_throws<std::overflow_error>([] {
     FlatKeyDirectory::bucket_count_for_key_capacity(
         FlatKeyDirectory::maximum_key_capacity() + size_t{1});
@@ -113,4 +117,18 @@ int main() {
     FlatKeyDirectory oversized(
         FlatKeyDirectory::maximum_bucket_count() + size_t{1}, 6);
   });
+
+  FlatKeyDirectory collisions(4, 0);
+  const auto identity = [](uint32_t slot) noexcept { return slot; };
+  constexpr uint64_t last_bucket = 3;
+  collisions.publish_reserved_absent(last_bucket, 1);
+  collisions.publish_reserved_absent(last_bucket, 2);
+  require(collisions.remove_hashed(1, last_bucket, identity) == 1,
+          "collision chain lost its head");
+  require_throws<std::logic_error>(
+      [&] { collisions.insert_hashed(2, last_bucket, 3, identity); });
+  collisions.publish_reserved_absent(last_bucket, 3);
+  require(collisions.find_hashed(2, last_bucket, identity) == 2 &&
+              collisions.find_hashed(3, last_bucket, identity) == 3,
+          "tombstone reuse broke a wrapped collision chain");
 }

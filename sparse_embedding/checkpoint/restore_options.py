@@ -9,6 +9,7 @@ import msgpack
 
 from .base import (
     SUPPORTED_KEY_DTYPES,
+    DTypeCastPolicy,
     IngestionEngine,
     PartitionSpec,
     PartitionTarget,
@@ -106,6 +107,8 @@ def encode_restore_options(plan: RestorePlan) -> bytes:
         "sparse_assignment_name": assignment.name,
         "sparse_assignment_parameters": assignment.parameters,
     }
+    if plan.embedding_cast_policy is not DTypeCastPolicy.EXACT:
+        payload["embedding_cast_policy"] = plan.embedding_cast_policy.value
     encoded = _pack(payload)
     if len(encoded) > _MAX_PAYLOAD_BYTES:
         raise ValueError("restore options exceed the maximum payload size")
@@ -125,8 +128,21 @@ def _decode_restore_options(payload: bytes) -> RestorePlan:
         "sparse_assignment_name",
         "sparse_assignment_parameters",
     }
-    if set(decoded) != required:
+    unknown = set(decoded) - required - {"embedding_cast_policy"}
+    if unknown or not required.issubset(decoded):
         raise ValueError("restore options contain unknown fields")
+    policy_name = decoded.get("embedding_cast_policy", DTypeCastPolicy.EXACT.value)
+    if not isinstance(policy_name, str):
+        raise TypeError("embedding_cast_policy must be a string")
+    try:
+        embedding_cast_policy = DTypeCastPolicy(policy_name)
+    except ValueError as error:
+        raise ValueError("unsupported embedding_cast_policy") from error
+    if (
+        "embedding_cast_policy" in decoded
+        and embedding_cast_policy is DTypeCastPolicy.EXACT
+    ):
+        raise ValueError("embedding_cast_policy=exact is not a canonical option")
     restore_kind = decoded["restore_kind"]
     if restore_kind != "partition":
         raise ValueError(f"unsupported restore_kind: {restore_kind!r}")
@@ -157,6 +173,7 @@ def _decode_restore_options(payload: bytes) -> RestorePlan:
         ),
         engine=engine,
         key_dtype=key_dtype,
+        embedding_cast_policy=embedding_cast_policy,
     )
 
 

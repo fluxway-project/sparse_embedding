@@ -185,7 +185,7 @@ def measure(args) -> None:
                 "uint64",
                 {},
                 False,
-                descriptor["page_layout_generation"],
+                page_layout_generation=descriptor["page_layout_generation"],
             )
         else:
             _core.checkpoint.restore_native_partition_entries(

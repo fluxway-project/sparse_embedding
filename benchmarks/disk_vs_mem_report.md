@@ -27,7 +27,7 @@ The following metrics show the Queries Per Second (QPS) for bulk `lookup_or_inse
 ## Interpretation
 
 ### 1. Lookup Performance (ReadOnly)
-Under extreme concurrency (128 threads), the pure memory lookup reaches ~21.3M keys/s. Remarkably, the pure disk lookup retains ~17.4M keys/s, which is **81.58% of the pure memory performance**.
+Under extreme concurrency (128 threads), the pure memory lookup reaches ~21.3M keys/s. Pure disk lookup retains ~17.4M keys/s, achieving **81.58% of the pure memory performance**.
 The result is specific to this workload and warm-up state. Disk-backed pages may be
 served by the operating-system cache; it must not be interpreted as a storage
 device latency or durability guarantee.
@@ -43,7 +43,7 @@ so the table compares data-path behavior rather than resizing overhead.
 
 ---
 
-**Script Location:** The benchmark script used to generate this report can be found at [`python/benchmark_disk_vs_mem.py`](python/benchmark_disk_vs_mem.py).
+**Script Location:** The benchmark script used to generate this report can be found at [`benchmarks/python/benchmark_disk_vs_mem.py`](python/benchmark_disk_vs_mem.py).
 **To reproduce:**
 ```bash
 python benchmarks/python/benchmark_disk_vs_mem.py --num_keys 10000000 --batch_size 8192 --concurrency 128 --iterations 1

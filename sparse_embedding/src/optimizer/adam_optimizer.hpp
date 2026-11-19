@@ -23,7 +23,6 @@
 #include <ranges>
 #include <span>
 
-#include "sparse_embedding/src/optimizer/learning_rate.hpp"
 #include "sparse_embedding/src/optimizer/optimizer_config.hpp"
 #include "sparse_embedding/src/optimizer/optimizer_contract.hpp"
 #include "sparse_embedding/src/optimizer/optimizer_state.hpp"
@@ -50,8 +49,9 @@ public:
   explicit AdamOptimizer(size_t dim, const AdamConfig &cfg, PageStorage storage,
                          LearningRateT lr)
       : m_state(dim, storage), v_state(dim, storage),
-        step_state(1, std::move(storage)), config(cfg),
-        learning_rate(std::move(lr)) {
+        step_state(1, std::move(storage), false, 4096,
+                   OptimizerRowLayout::kNaturalAligned),
+        config(cfg), learning_rate(std::move(lr)) {
     bc1_table_[0] = 1.0f;
     bc2_table_[0] = 1.0f;
     for (size_t t = 1; t < kMaxCachedSteps; ++t) {
@@ -136,7 +136,7 @@ public:
   }
 
   void step(uint32_t idx, std::span<ParamT> param_span,
-            std::span<const ParamT> grad_span,
+            std::span<const float> grad_span,
             [[maybe_unused]] uint64_t global_step, uint64_t score) {
     uint32_t &id_step = *step_state.data(idx);
     id_step++;
@@ -152,7 +152,7 @@ public:
 
     size_t dim = param_span.size();
     ParamT *param = param_span.data();
-    const ParamT *accumulated_grad = grad_span.data();
+    const float *accumulated_grad = grad_span.data();
 
     OptT *m = m_state.data(idx);
     OptT *v = v_state.data(idx);

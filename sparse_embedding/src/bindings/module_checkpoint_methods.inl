@@ -26,13 +26,14 @@ inline void EmbeddingStoreWrapper::restore_native_partition_entries(
     const std::string &key_dtype, const std::string &assignment_name,
     const std::unordered_map<std::string, std::string> &assignment_parameters,
     const se::LanceStorageOptions &storage_options, bool load_optimizer_state,
-    std::optional<uint32_t> source_participant_index) {
+    std::optional<uint32_t> source_participant_index,
+    se::ValueDType source_embedding_dtype) {
   validate_key_dtype(key_type_enum_, se::parse_key_dtype(key_dtype));
   dispatch_types([&]<typename P, typename O>() {
     CheckpointOpsImpl<P, O>::restore_native_partition_entries(
         *this, uris, version, partition_count, partition_id, key_dtype,
         assignment_name, assignment_parameters, storage_options,
-        load_optimizer_state, source_participant_index);
+        load_optimizer_state, source_participant_index, source_embedding_dtype);
   });
 }
 
